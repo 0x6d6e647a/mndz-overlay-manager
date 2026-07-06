@@ -5,6 +5,7 @@ module CLI.Parser
   , Command(..)
   , Verbosity(..)
   , parserInfo
+  , showHelp
   ) where
 
 import Options.Applicative
@@ -82,3 +83,12 @@ parserInfo =
    <> progDesc "mndz-overlay-mgr - Gentoo overlay management tool"
    <> header "mndz-overlay-mgr - manage your mndz Gentoo overlay"
     )
+
+-- | Render the top-level help text, identical to the @--help@ flag.
+--
+-- Reuses the same failure/render path that @helper@ triggers, so output,
+-- stdout routing, and exit code match @--help@ exactly. Never returns.
+showHelp :: IO a
+showHelp =
+  handleParseResult . Failure $
+    parserFailure defaultPrefs parserInfo (ShowHelpText Nothing) mempty
