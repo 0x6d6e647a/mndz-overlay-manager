@@ -3,7 +3,6 @@ module Overlay.Validation
   , validateOverlay
   ) where
 
-import Data.List (isPrefixOf)
 import System.Directory (doesDirectoryExist, doesFileExist)
 import System.FilePath ((</>))
 
@@ -14,11 +13,15 @@ data OverlayError
   | RepoNameMismatch FilePath String
   deriving (Eq, Show)
 
-requiredEntries :: [FilePath]
-requiredEntries =
+requiredDirectories :: [FilePath]
+requiredDirectories =
   [ "profiles"
   , "metadata"
-  , "profiles" </> "repo_name"
+  ]
+
+requiredFiles :: [FilePath]
+requiredFiles =
+  [ "profiles" </> "repo_name"
   , "metadata" </> "layout.conf"
   ]
 
@@ -30,22 +33,29 @@ validateOverlay path = do
   isDir <- doesDirectoryExist path
   if not isDir
     then pure (Left (NotADirectory path))
-    else checkEntries path
+    else checkDirectories path
 
-checkEntries :: FilePath -> IO (Either OverlayError ())
-checkEntries root = go requiredEntries
+checkDirectories :: FilePath -> IO (Either OverlayError ())
+checkDirectories root = go requiredDirectories
+  where
+    go [] = checkFiles root
+    go (entry : rest) = do
+      let full = root </> entry
+      exists <- doesDirectoryExist full
+      if exists
+        then go rest
+        else pure (Left (MissingDirectory full))
+
+checkFiles :: FilePath -> IO (Either OverlayError ())
+checkFiles root = go requiredFiles
   where
     go [] = checkRepoName root
     go (entry : rest) = do
       let full = root </> entry
-      exists <- if "repo_name" `isPrefixOf` entry || "layout.conf" `isPrefixOf` entry
-                then doesFileExist full
-                else doesDirectoryExist full
+      exists <- doesFileExist full
       if exists
         then go rest
-        else pure (Left (if "repo_name" `isPrefixOf` entry || "layout.conf" `isPrefixOf` entry
-                         then MissingFile full
-                         else MissingDirectory full))
+        else pure (Left (MissingFile full))
 
 checkRepoName :: FilePath -> IO (Either OverlayError ())
 checkRepoName root = do

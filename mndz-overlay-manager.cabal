@@ -66,6 +66,8 @@ library
       , Config.Loader
       , Config.Types
       , Logging.Bootstrap
+      , Overlay.Discovery
+      , Overlay.Types
       , Overlay.Validation
       , MyLib
 
@@ -110,6 +112,7 @@ executable mndz-overlay-manager
         co-log ^>=0.7,
         mndz-overlay-manager,
         optparse-applicative ^>=0.19,
+        text ^>=2.1,
         toml-parser ^>=2.0
 
     -- Directories containing source files.
@@ -143,4 +146,7 @@ test-suite mndz-overlay-manager-test
     -- Test dependencies.
     build-depends:
         base ^>=4.20.2.0,
-        mndz-overlay-manager
+        directory ^>=1.3,
+        filepath ^>=1.5,
+        mndz-overlay-manager,
+        text ^>=2.1

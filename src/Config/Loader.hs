@@ -1,12 +1,15 @@
 module Config.Loader
   ( loadConfig
   , ConfigError(..)
+  , configErrorMessage
   ) where
 
 import Config.Types (OverlayConfig (..))
+import Data.Text.IO qualified as T
 import System.Directory (doesFileExist, getHomeDirectory)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
+import Toml (Result (..), decode)
 
 data ConfigError
   = ConfigNotFound FilePath
@@ -27,4 +30,15 @@ loadConfig override = do
   exists <- doesFileExist path
   if not exists
     then pure (Left (ConfigNotFound path))
-    else pure (Right (OverlayConfig path))
+    else do
+      content <- T.readFile path
+      pure $ case decode content of
+        Failure errs -> Left (DecodeError (unlines errs))
+        Success _ cfg -> Right cfg
+
+configErrorMessage :: ConfigError -> String
+configErrorMessage = \case
+  ConfigNotFound path ->
+    "config file not found: " <> path
+  DecodeError err ->
+    "failed to decode config: " <> err

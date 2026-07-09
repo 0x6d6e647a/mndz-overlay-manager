@@ -19,13 +19,14 @@ data Verbosity
 
 data Command
   = Help
-  | Other String
+  | List
   deriving (Eq, Show)
 
 data Options = Options
-  { optConfig    :: Maybe FilePath
-  , optVerbosity :: Verbosity
-  , optCommand   :: Command
+  { optConfig      :: Maybe FilePath
+  , optOverlayPath :: Maybe FilePath
+  , optVerbosity   :: Verbosity
+  , optCommand     :: Command
   }
   deriving (Eq, Show)
 
@@ -61,19 +62,28 @@ configParser =
    <> help "Path to overlay-manager.toml (overrides XDG default)"
     )
 
+overlayPathParser :: Parser (Maybe FilePath)
+overlayPathParser =
+  optional $ strOption
+    ( long "overlay-path"
+   <> metavar "DIR"
+   <> help "Override overlay path from config"
+    )
+
 commandParser :: Parser Command
 commandParser =
   hsubparser
     ( command "help" (info (pure Help) (progDesc "Show this help message"))
+   <> command "list" (info (pure List) (progDesc "List all ebuilds in the overlay"))
    <> metavar "COMMAND"
     )
-  <|> pure (Other "default")
 
 optionsParser :: Parser Options
 optionsParser = do
-  optConfig    <- configParser
-  optVerbosity <- verbosityParser
-  optCommand   <- commandParser
+  optConfig      <- configParser
+  optOverlayPath <- overlayPathParser
+  optVerbosity   <- verbosityParser
+  optCommand     <- commandParser
   pure Options {..}
 
 parserInfo :: ParserInfo Options
