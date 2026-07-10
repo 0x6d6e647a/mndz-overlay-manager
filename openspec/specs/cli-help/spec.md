@@ -31,3 +31,12 @@ The CLI SHALL provide a `help` subcommand that produces output and exit behavior
 - **WHEN** the output of the `help` subcommand is compared to the output of the `--help` flag
 - **THEN** the two outputs are identical
 - **AND** both exit with status `0`
+
+### Requirement: Help enumerates outdated subcommand
+
+The top-level usage/help text SHALL list the `outdated` subcommand among available commands so users can discover update checking alongside `list` and `help`.
+
+#### Scenario: Help mentions outdated
+
+- **WHEN** the user runs the program with `--help` or the `help` subcommand
+- **THEN** the usage text includes the `outdated` subcommand

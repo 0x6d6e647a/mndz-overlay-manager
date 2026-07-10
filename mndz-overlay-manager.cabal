@@ -69,6 +69,15 @@ library
       , Overlay.Discovery
       , Overlay.Types
       , Overlay.Validation
+      , Overlay.Version
+      , Update.Check
+      , Update.GitHub
+      , Update.Hardcoded
+      , Update.Http
+      , Update.Infer
+      , Update.Npm
+      , Update.Resolve
+      , Update.Types
       , MyLib
 
     -- Modules included in this library but not exported.
@@ -80,9 +89,15 @@ library
     -- Other library packages from which modules are imported.
     build-depends:
         base ^>=4.20.2.0,
+        aeson ^>=2.2,
+        bytestring ^>=0.12,
         co-log ^>=0.7,
+        containers ^>=0.7,
         directory ^>=1.3,
         filepath ^>=1.5,
+        http-client ^>=0.7,
+        http-client-tls ^>=0.3,
+        http-types ^>=0.12,
         optparse-applicative ^>=0.19,
         text ^>=2.1,
         toml-parser ^>=2.0

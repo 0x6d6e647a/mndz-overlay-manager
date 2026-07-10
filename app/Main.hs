@@ -1,7 +1,8 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Main (main) where
 
-import CLI.Parser (Command (..), Options (..), parserInfo, showHelp)
-import Colog (Message, WithLog, logError, usingLoggerT)
+import CLI.Parser (Command (Help, List, Outdated), Options (..), parserInfo, showHelp)
+import Colog (Message, WithLog, logError, logWarning, usingLoggerT)
 import Config.Loader (configErrorMessage, loadConfig)
 import Config.Types (OverlayConfig (..))
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -10,9 +11,17 @@ import Data.Text.IO qualified as T
 import Logging.Bootstrap (bootstrapLogger)
 import Options.Applicative (execParser)
 import Overlay.Discovery (collectEbuilds, discoveryErrorMessage)
-import Overlay.Types (ebuildAtom)
+import Overlay.Types (Ebuild, ebuildAtom)
 import Overlay.Validation (OverlayError (..), validateOverlay)
+import Overlay.Version (prettyVersion)
 import System.Exit (ExitCode (..), exitWith)
+import Update.Check (checkOverlay, productionFetcher)
+import Update.Types
+  ( UpdateReport (..)
+  , UpdateStatus (Ahead, FetchError, Ok, Unconfigured)
+  , packageKeyText
+  )
+import Update.Types qualified as U
 
 main :: IO ()
 main = usingLoggerT bootstrapLogger $ do
@@ -20,9 +29,25 @@ main = usingLoggerT bootstrapLogger $ do
   case optCommand opts of
     Help -> liftIO showHelp
     List -> runList opts
+    Outdated -> runOutdated opts
 
 runList :: (WithLog env Message m, MonadIO m) => Options -> m ()
 runList opts = do
+  ebuilds <- loadValidatedEbuilds opts
+  liftIO $ mapM_ (T.putStrLn . ebuildAtom) ebuilds
+
+runOutdated :: (WithLog env Message m, MonadIO m) => Options -> m ()
+runOutdated opts = do
+  ebuilds <- loadValidatedEbuilds opts
+  fetch <- liftIO productionFetcher
+  reports <- liftIO (checkOverlay fetch ebuilds)
+  mapM_ emitReport reports
+
+loadValidatedEbuilds
+  :: (WithLog env Message m, MonadIO m)
+  => Options
+  -> m [Ebuild]
+loadValidatedEbuilds opts = do
   cfg <- loadConfigOrDie (optConfig opts)
   let overlayPath = case optOverlayPath opts of
         Just p  -> p
@@ -33,8 +58,37 @@ runList opts = do
   liftIO (collectEbuilds overlayPath) >>= \case
     Left err -> dieError (discoveryErrorMessage err)
     Right [] -> dieError ("no ebuilds found in overlay: " <> overlayPath)
-    Right ebuilds ->
-      liftIO $ mapM_ (T.putStrLn . ebuildAtom) ebuilds
+    Right ebuilds -> pure ebuilds
+
+emitReport :: (WithLog env Message m, MonadIO m) => UpdateReport -> m ()
+emitReport report =
+  case reportStatus report of
+    U.Outdated local remote ->
+      liftIO $
+        T.putStrLn $
+          packageKeyText (reportKey report)
+            <> " "
+            <> prettyVersion local
+            <> " -> "
+            <> prettyVersion remote
+    Ok _ -> pure ()
+    Ahead local remote ->
+      logWarning $
+        packageKeyText (reportKey report)
+          <> " is ahead of upstream ("
+          <> prettyVersion local
+          <> " > "
+          <> prettyVersion remote
+          <> ")"
+    Unconfigured ->
+      logWarning $
+        packageKeyText (reportKey report)
+          <> ": no update source configured"
+    FetchError err ->
+      logWarning $
+        packageKeyText (reportKey report)
+          <> ": "
+          <> err
 
 loadConfigOrDie :: (WithLog env Message m, MonadIO m) => Maybe FilePath -> m OverlayConfig
 loadConfigOrDie override = do

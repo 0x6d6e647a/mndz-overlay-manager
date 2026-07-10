@@ -20,6 +20,7 @@ data Verbosity
 data Command
   = Help
   | List
+  | Outdated
   deriving (Eq, Show)
 
 data Options = Options
@@ -75,6 +76,7 @@ commandParser =
   hsubparser
     ( command "help" (info (pure Help) (progDesc "Show this help message"))
    <> command "list" (info (pure List) (progDesc "List all ebuilds in the overlay"))
+   <> command "outdated" (info (pure Outdated) (progDesc "Report packages with newer upstream versions"))
    <> metavar "COMMAND"
     )
 
