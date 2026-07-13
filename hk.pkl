@@ -1,0 +1,75 @@
+amends "package://github.com/jdx/hk/releases/download/v1.50.0/hk@1.50.0#/Config.pkl"
+
+// Project-local tools only (strict). Install with: ./scripts/install-dev-tools
+local toolsBin = ".tools/bin"
+local ormolu = "\(toolsBin)/ormolu"
+local hlint = "\(toolsBin)/hlint"
+local stan = "\(toolsBin)/stan"
+local weeder = "\(toolsBin)/weeder"
+
+local hsGlob = List("**/*.hs")
+
+local linters = new Mapping<String, Step> {
+  ["tools-preflight"] {
+    exclusive = true
+    check = #"
+      missing=0
+      for t in ormolu hlint stan weeder; do
+        if [ ! -x ".tools/bin/$t" ]; then
+          echo "error: missing project tool: .tools/bin/$t" >&2
+          missing=1
+        fi
+      done
+      if [ "$missing" -ne 0 ]; then
+        echo "error: install project tools first: ./scripts/install-dev-tools" >&2
+        echo "error: hooks use .tools/bin only (strict; no global PATH fallback)" >&2
+        exit 1
+      fi
+    "#
+  }
+  ["ormolu"] {
+    glob = hsGlob
+    batch = true
+    check = "\(ormolu) --mode check {{files}}"
+    fix = "\(ormolu) --mode inplace {{files}}"
+  }
+  ["cabal-test"] {
+    exclusive = true
+    workspace_indicator = "mndz-overlay-manager.cabal"
+    // Build all components (HIE for app+lib+test) then run tests.
+    check = "cabal build all && cabal test all"
+  }
+  ["hlint"] {
+    glob = hsGlob
+    batch = true
+    check = "\(hlint) {{files}}"
+  }
+  ["stan"] {
+    exclusive = true
+    workspace_indicator = "mndz-overlay-manager.cabal"
+    check = "\(stan) --hiedir=.hie"
+  }
+  ["weeder"] {
+    exclusive = true
+    workspace_indicator = "mndz-overlay-manager.cabal"
+    check = "\(weeder) --config=weeder.toml --hie-directory=.hie"
+  }
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = linters
+  }
+  ["check"] {
+    steps = linters
+  }
+  ["fix"] {
+    fix = true
+    steps {
+      ["tools-preflight"] = linters["tools-preflight"]
+      ["ormolu"] = linters["ormolu"]
+    }
+  }
+}

@@ -1,11 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Overlay.Version
-  ( EbuildVersion (..)
-  , parseEbuildVersion
-  , prettyVersion
-  , renderPV
-  , comparePV
-  ) where
+  ( EbuildVersion (..),
+    parseEbuildVersion,
+    prettyVersion,
+    renderPV,
+    comparePV,
+  )
+where
 
 import Data.Char (isDigit)
 import Data.Text (Text)
@@ -14,8 +16,8 @@ import Data.Text qualified as T
 -- | Numeric components with optional Gentoo revision, or an unparsed raw string.
 data EbuildVersion
   = Numeric
-      { evComponents :: [Word]
-      , evRevision   :: Maybe Word
+      { evComponents :: [Word],
+        evRevision :: Maybe Word
       }
   | Raw Text
   deriving (Eq, Show)
@@ -68,8 +70,8 @@ renderPV (Raw t) = t
 renderPV (Numeric comps mrev) =
   T.intercalate "." (map (T.pack . show) comps)
     <> case mrev of
-         Nothing -> ""
-         Just r  -> "-r" <> T.pack (show r)
+      Nothing -> ""
+      Just r -> "-r" <> T.pack (show r)
 
 -- | Compare for update detection: numeric components only, revision ignored.
 -- Returns 'Nothing' if incomparable (raw involved or empty components).
@@ -79,7 +81,7 @@ comparePV (Numeric a _) (Numeric b _) =
 comparePV _ _ = Nothing
 
 compareComponents :: [Word] -> [Word] -> Ordering
-compareComponents xs ys = go xs ys
+compareComponents = go
   where
     go [] [] = EQ
     go [] (y : ys')
@@ -91,4 +93,4 @@ compareComponents xs ys = go xs ys
     go (x : xs') (y : ys') =
       case compare x y of
         EQ -> go xs' ys'
-        o  -> o
+        o -> o

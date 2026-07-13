@@ -1,26 +1,28 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Update.GitHub
-  ( fetchGitHub
-  , fetchGitHubWith
-  ) where
+  ( fetchGitHub,
+    fetchGitHubWith,
+  )
+where
 
 import Control.Exception (SomeException, catch)
 import Data.Aeson (Value, eitherDecode, withArray, withObject, (.:))
 import Data.Aeson.Types (Parser, parseMaybe)
-import Data.ByteString.Char8 qualified as BS8
 import Data.Foldable (toList)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding (encodeUtf8)
 import Network.HTTP.Client
-  ( Manager
-  , httpLbs
-  , method
-  , newManager
-  , parseRequest
-  , requestHeaders
-  , responseBody
-  , responseStatus
+  ( Manager,
+    httpLbs,
+    method,
+    newManager,
+    parseRequest,
+    requestHeaders,
+    responseBody,
+    responseStatus,
   )
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders)
@@ -36,21 +38,22 @@ fetchGitHub src = do
   token <- lookupEnv "GITHUB_TOKEN"
   fetchGitHubWith mgr token src
 
-fetchGitHubWith
-  :: Manager
-  -> Maybe String
-  -> UpdateSource
-  -> IO (Either Text EbuildVersion)
+fetchGitHubWith ::
+  Manager ->
+  Maybe String ->
+  UpdateSource ->
+  IO (Either Text EbuildVersion)
 fetchGitHubWith mgr mToken = \case
   GitHub owner repo prefix -> do
     let authHeaders = case mToken of
-          Just t | not (null t) ->
-            [ ("Authorization", BS8.pack ("Bearer " <> t))
-            ]
+          Just t
+            | not (null t) ->
+                [ ("Authorization", encodeUtf8 (T.pack ("Bearer " <> t)))
+                ]
           _ -> []
         commonHeaders =
-          [ ("User-Agent", "mndz-overlay-manager")
-          , ("Accept", "application/vnd.github+json")
+          [ ("User-Agent", "mndz-overlay-manager"),
+            ("Accept", "application/vnd.github+json")
           ]
             <> authHeaders
     releaseResult <- fetchLatestRelease mgr commonHeaders owner repo prefix
@@ -61,13 +64,13 @@ fetchGitHubWith mgr mToken = \case
   other ->
     pure (Left ("Update.GitHub: not a GitHub source: " <> T.pack (show other)))
 
-fetchLatestRelease
-  :: Manager
-  -> RequestHeaders
-  -> Text
-  -> Text
-  -> Text
-  -> IO (Either Text EbuildVersion)
+fetchLatestRelease ::
+  Manager ->
+  RequestHeaders ->
+  Text ->
+  Text ->
+  Text ->
+  IO (Either Text EbuildVersion)
 fetchLatestRelease mgr headers owner repo prefix = do
   let url =
         "https://api.github.com/repos/"
@@ -83,13 +86,13 @@ fetchLatestRelease mgr headers owner repo prefix = do
         Nothing -> Left "could not parse releases/latest tag_name"
         Just tag -> stripAndParse prefix tag
 
-fetchMaxTag
-  :: Manager
-  -> RequestHeaders
-  -> Text
-  -> Text
-  -> Text
-  -> IO (Either Text EbuildVersion)
+fetchMaxTag ::
+  Manager ->
+  RequestHeaders ->
+  Text ->
+  Text ->
+  Text ->
+  IO (Either Text EbuildVersion)
 fetchMaxTag mgr headers owner repo prefix = do
   let url =
         "https://api.github.com/repos/"
@@ -112,29 +115,26 @@ fetchMaxTag mgr headers owner repo prefix = do
                         _ -> Nothing
                   )
                   tags
-          in case maximumByPV versions of
-               Nothing -> Left "no comparable tags after prefix strip"
-               Just v -> Right v
+           in case maximumByPV versions of
+                Nothing -> Left "no comparable tags after prefix strip"
+                Just v -> Right v
 
 parseTagName :: Value -> Parser Text
 parseTagName = withObject "release" $ \o -> o .: "tag_name"
 
 parseTagNames :: Value -> Parser [Text]
 parseTagNames = withArray "tags" $ \arr ->
-  mapM (\v -> withObject "tag" (.: "name") v) (toList arr)
+  mapM (withObject "tag" (.: "name")) (toList arr)
 
 stripAndParse :: Text -> Text -> Either Text EbuildVersion
 stripAndParse prefix tag =
-  let stripped =
-        if T.null prefix
-          then tag
-          else
-            if prefix `T.isPrefixOf` tag
-              then T.drop (T.length prefix) tag
-              else tag
-  in if T.null stripped
-       then Left ("empty version after stripping prefix from tag " <> tag)
-       else Right (parseEbuildVersion stripped)
+  let stripped
+        | T.null prefix = tag
+        | prefix `T.isPrefixOf` tag = T.drop (T.length prefix) tag
+        | otherwise = tag
+   in if T.null stripped
+        then Left ("empty version after stripping prefix from tag " <> tag)
+        else Right (parseEbuildVersion stripped)
 
 maximumByPV :: [EbuildVersion] -> Maybe EbuildVersion
 maximumByPV [] = Nothing
@@ -143,32 +143,31 @@ maximumByPV (x : xs) = Just (foldl' maxPV x xs)
     maxPV a b =
       case comparePV a b of
         Just LT -> b
-        Just _  -> a
+        Just _ -> a
         Nothing -> a
 
-httpGetJson
-  :: Manager
-  -> RequestHeaders
-  -> String
-  -> IO (Either Text Value)
+httpGetJson ::
+  Manager ->
+  RequestHeaders ->
+  String ->
+  IO (Either Text Value)
 httpGetJson mgr headers url = do
   req0 <- parseRequest url
   let req =
         req0
-          { method = "GET"
-          , requestHeaders = headers
+          { method = "GET",
+            requestHeaders = headers
           }
   eres <- tryHttp (httpLbs req mgr)
   pure $ case eres of
     Left err -> Left err
     Right resp ->
       let code = statusCode (responseStatus resp)
-      in if code >= 200 && code < 300
-           then
-             case eitherDecode (responseBody resp) of
-               Left e -> Left (T.pack e)
-               Right v -> Right v
-           else Left ("HTTP " <> T.pack (show code) <> " from " <> T.pack url)
+       in if code >= 200 && code < 300
+            then case eitherDecode (responseBody resp) of
+              Left e -> Left (T.pack e)
+              Right v -> Right v
+            else Left ("HTTP " <> T.pack (show code) <> " from " <> T.pack url)
 
 tryHttp :: IO a -> IO (Either Text a)
 tryHttp action =

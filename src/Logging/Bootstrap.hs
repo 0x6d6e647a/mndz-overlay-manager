@@ -1,7 +1,8 @@
 module Logging.Bootstrap
-  ( bootstrapLogger
-  , runWithLogger
-  ) where
+  ( bootstrapLogger,
+    runWithLogger,
+  )
+where
 
 import Colog (LogAction, Message, cmap, fmtMessage, logTextStderr, usingLoggerT)
 import Control.Monad.IO.Class (liftIO)

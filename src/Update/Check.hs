@@ -1,11 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Update.Check
-  ( groupNewest
-  , PackageEntry (..)
-  , checkOverlay
-  , checkPackage
-  , productionFetcher
-  ) where
+  ( groupNewest,
+    PackageEntry (..),
+    checkOverlay,
+    checkPackage,
+    productionFetcher,
+  )
+where
 
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
@@ -21,21 +23,21 @@ import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
 import Update.Resolve (resolveSource)
 import Update.Types
-  ( Fetcher
-  , PackageKey (..)
-  , UpdateReport (..)
-  , UpdateSource (..)
-  , UpdateStatus (..)
-  , mkPackageKey
-  , packageKeyText
+  ( Fetcher,
+    PackageKey (..),
+    UpdateReport (..),
+    UpdateSource (..),
+    UpdateStatus (..),
+    mkPackageKey,
+    packageKeyText,
   )
 
 -- | One package's newest local ebuild used for checks.
 data PackageEntry = PackageEntry
-  { peKey   :: PackageKey
-  , pePN    :: Text
-  , peLocal :: EbuildVersion
-  , pePath  :: FilePath
+  { peKey :: PackageKey,
+    pePN :: Text,
+    peLocal :: EbuildVersion,
+    pePath :: FilePath
   }
   deriving (Eq, Show)
 
@@ -49,12 +51,12 @@ groupNewest ebuilds =
           local = parseEbuildVersion (ebuildVersion e)
           entry =
             PackageEntry
-              { peKey = key
-              , pePN = ebuildPackage e
-              , peLocal = local
-              , pePath = ebuildPath e
+              { peKey = key,
+                pePN = ebuildPackage e,
+                peLocal = local,
+                pePath = ebuildPath e
               }
-      in Map.insertWith preferNewer key entry acc
+       in Map.insertWith preferNewer key entry acc
 
     preferNewer new old =
       case compareForNewest (peLocal new) (peLocal old) of
@@ -90,16 +92,16 @@ checkPackage fetch entry = do
   mSrc <- resolveSource key pn pvText (pePath entry)
   case mSrc of
     Nothing ->
-      pure UpdateReport { reportKey = key, reportStatus = Unconfigured }
+      pure UpdateReport {reportKey = key, reportStatus = Unconfigured}
     Just src -> do
       result <- fetch src
       pure $ case result of
         Left err ->
-          UpdateReport { reportKey = key, reportStatus = FetchError err }
+          UpdateReport {reportKey = key, reportStatus = FetchError err}
         Right remote ->
           UpdateReport
-            { reportKey = key
-            , reportStatus = statusFromCompare local remote
+            { reportKey = key,
+              reportStatus = statusFromCompare local remote
             }
 
 statusFromCompare :: EbuildVersion -> EbuildVersion -> UpdateStatus
@@ -127,6 +129,6 @@ productionFetcher = do
   mgr <- newManager tlsManagerSettings
   token <- lookupEnv "GITHUB_TOKEN"
   pure $ \src -> case src of
-    Http {}   -> fetchHttpWith mgr src
+    Http {} -> fetchHttpWith mgr src
     GitHub {} -> fetchGitHubWith mgr token src
-    Npm {}    -> fetchNpmWith mgr src
+    Npm {} -> fetchNpmWith mgr src

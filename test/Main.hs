@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Main (main) where
 
 import Config.Loader (ConfigError (..), loadConfig)
@@ -7,17 +8,17 @@ import Control.Monad (unless)
 import Data.List (sort)
 import Data.Text qualified as T
 import Overlay.Discovery
-  ( DiscoveryError (..)
-  , collectEbuilds
-  , parseEbuildFileName
+  ( DiscoveryError (..),
+    collectEbuilds,
+    parseEbuildFileName,
   )
 import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Validation (validateOverlay)
 import Overlay.Version
-  ( EbuildVersion (..)
-  , comparePV
-  , parseEbuildVersion
-  , prettyVersion
+  ( EbuildVersion (..),
+    comparePV,
+    parseEbuildVersion,
+    prettyVersion,
   )
 import System.Directory (makeAbsolute)
 import System.Exit (exitFailure)
@@ -27,12 +28,12 @@ import Update.Hardcoded (lookupHardcoded)
 import Update.Infer (PackageContext (..), expandEbuild, inferSource)
 import Update.Resolve (resolveFromText)
 import Update.Types
-  ( PackageKey (..)
-  , UpdateReport (..)
-  , UpdateSource (..)
-  , UpdateStatus (..)
-  , mkPackageKey
-  , packageKeyText
+  ( PackageKey (..),
+    UpdateReport (..),
+    UpdateSource (..),
+    UpdateStatus (..),
+    mkPackageKey,
+    packageKeyText,
   )
 
 main :: IO ()
@@ -104,10 +105,11 @@ testDiscoveryHappyPath = do
   root <- makeAbsolute "test/fixtures/populated-overlay"
   ebuilds <- assertRight "happy collect" =<< collectEbuilds root
   let atoms = sort (map (T.unpack . ebuildAtom) ebuilds)
-  assertEq "atoms"
-    [ "app-editors/vim-9.0.1234"
-    , "dev-lang/haskell-9.4.5"
-    , "dev-lang/haskell-9.6.1"
+  assertEq
+    "atoms"
+    [ "app-editors/vim-9.0.1234",
+      "dev-lang/haskell-9.4.5",
+      "dev-lang/haskell-9.6.1"
     ]
     atoms
 
@@ -116,10 +118,10 @@ testDiscoverySkipsNonCategories = do
   root <- makeAbsolute "test/fixtures/populated-overlay"
   ebuilds <- assertRight "skip non-cat" =<< collectEbuilds root
   let cats = map (T.unpack . ebuildCategory) ebuilds
-  assertTrue "no eclass category" (notElem "eclass" cats)
-  assertTrue "no licenses category" (notElem "licenses" cats)
-  assertTrue "no profiles category" (notElem "profiles" cats)
-  assertTrue "no metadata category" (notElem "metadata" cats)
+  assertTrue "no eclass category" ("eclass" `notElem` cats)
+  assertTrue "no licenses category" ("licenses" `notElem` cats)
+  assertTrue "no profiles category" ("profiles" `notElem` cats)
+  assertTrue "no metadata category" ("metadata" `notElem` cats)
 
 testDiscoveryBadName :: IO ()
 testDiscoveryBadName = do
@@ -192,37 +194,46 @@ testValidatePopulated = do
 
 testVersionParse :: IO ()
 testVersionParse = do
-  assertEq "numeric with rev"
+  assertEq
+    "numeric with rev"
     (Numeric [1, 5, 3] (Just 2))
     (parseEbuildVersion "1.5.3-r2")
-  assertEq "numeric no rev"
+  assertEq
+    "numeric no rev"
     (Numeric [0, 2, 93] Nothing)
     (parseEbuildVersion "0.2.93")
-  assertEq "raw fallback"
+  assertEq
+    "raw fallback"
     (Raw "1.0_alpha")
     (parseEbuildVersion "1.0_alpha")
 
 testVersionRender :: IO ()
 testVersionRender = do
-  assertEq "pretty with rev"
+  assertEq
+    "pretty with rev"
     "v1.5.3-r2"
     (prettyVersion (Numeric [1, 5, 3] (Just 2)))
-  assertEq "pretty no rev"
+  assertEq
+    "pretty no rev"
     "v2.1.10"
     (prettyVersion (Numeric [2, 1, 10] Nothing))
 
 testVersionCompare :: IO ()
 testVersionCompare = do
-  assertEq "outdated"
+  assertEq
+    "outdated"
     (Just LT)
     (comparePV (parseEbuildVersion "1.17.16") (parseEbuildVersion "1.17.18"))
-  assertEq "rev ignored"
+  assertEq
+    "rev ignored"
     (Just EQ)
     (comparePV (parseEbuildVersion "1.2.3-r5") (parseEbuildVersion "1.2.3"))
-  assertEq "numeric order"
+  assertEq
+    "numeric order"
     (Just GT)
     (comparePV (parseEbuildVersion "1.10.0") (parseEbuildVersion "1.9.0"))
-  assertEq "incomparable raw"
+  assertEq
+    "incomparable raw"
     Nothing
     (comparePV (Raw "foo") (parseEbuildVersion "1.0"))
 
@@ -251,28 +262,28 @@ testHardcodedGrok = do
 doltSnippet :: T.Text
 doltSnippet =
   T.unlines
-    [ "HOMEPAGE=\"https://github.com/dolthub/dolt\""
-    , "SRC_URI=\"https://github.com/dolthub/dolt/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\""
-    , "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/dolt-2.1.6/dolt-2.1.6-vendor.tar.xz\""
+    [ "HOMEPAGE=\"https://github.com/dolthub/dolt\"",
+      "SRC_URI=\"https://github.com/dolthub/dolt/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+      "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/dolt-2.1.6/dolt-2.1.6-vendor.tar.xz\""
     ]
 
 bunSnippet :: T.Text
 bunSnippet =
   T.unlines
-    [ "BUN_PN=\"${PN//-bin/}\""
-    , "BASE_URI=\"https://github.com/oven-sh/${BUN_PN}/releases/download/${BUN_PN}-v${PV}\""
-    , "SRC_URI=\"${BASE_URI}/bun-linux-x64.zip\""
+    [ "BUN_PN=\"${PN//-bin/}\"",
+      "BASE_URI=\"https://github.com/oven-sh/${BUN_PN}/releases/download/${BUN_PN}-v${PV}\"",
+      "SRC_URI=\"${BASE_URI}/bun-linux-x64.zip\""
     ]
 
 openspecSnippet :: T.Text
 openspecSnippet =
   T.unlines
-    [ "HOMEPAGE=\"https://github.com/Fission-AI/OpenSpec\""
-    , "SRC_URI=\""
-    , "\thttps://registry.npmjs.org/@fission-ai/openspec/-/openspec-${PV}.tgz"
-    , "\t\t-> ${P}.tgz"
-    , "\thttps://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/openspec-${PV}/openspec-${PV}-deps.tar.xz"
-    , "\""
+    [ "HOMEPAGE=\"https://github.com/Fission-AI/OpenSpec\"",
+      "SRC_URI=\"",
+      "\thttps://registry.npmjs.org/@fission-ai/openspec/-/openspec-${PV}.tgz",
+      "\t\t-> ${P}.tgz",
+      "\thttps://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/openspec-${PV}/openspec-${PV}-deps.tar.xz",
+      "\""
     ]
 
 assetsOnlySnippet :: T.Text
@@ -329,9 +340,9 @@ testInferAssetsOnly = do
 testGroupNewest :: IO ()
 testGroupNewest = do
   let ebuilds =
-        [ Ebuild "dev-lang" "haskell" "9.4.5" "/tmp/haskell-9.4.5.ebuild"
-        , Ebuild "dev-lang" "haskell" "9.6.1" "/tmp/haskell-9.6.1.ebuild"
-        , Ebuild "app-editors" "vim" "9.0.1234" "/tmp/vim.ebuild"
+        [ Ebuild "dev-lang" "haskell" "9.4.5" "/tmp/haskell-9.4.5.ebuild",
+          Ebuild "dev-lang" "haskell" "9.6.1" "/tmp/haskell-9.6.1.ebuild",
+          Ebuild "app-editors" "vim" "9.0.1234" "/tmp/vim.ebuild"
         ]
       grouped = groupNewest ebuilds
       keys = sort (map (T.unpack . packageKeyText . peKey) grouped)
@@ -352,18 +363,20 @@ testCheckOverlayStatuses = do
         GitHub "ahead" "ahead" _ -> Right (parseEbuildVersion "1.5.0")
         GitHub "fail" "fail" _ -> Left "network down"
         _ -> Left "unexpected source"
-  reports <- checkWithFakeResolve fetch
-    [ (mkPackageKey "dev-db" "dolt", "dolt", "2.1.6", Just (GitHub "dolthub" "dolt" "v"))
-    , (mkPackageKey "dev-util" "okpkg", "okpkg", "1.0.0", Just (GitHub "ok" "ok" "v"))
-    , (mkPackageKey "dev-util" "ahead", "ahead", "2.0.0", Just (GitHub "ahead" "ahead" "v"))
-    , (mkPackageKey "dev-util" "none", "none", "1.0", Nothing)
-    , (mkPackageKey "dev-util" "fail", "fail", "1.0", Just (GitHub "fail" "fail" "v"))
-    ]
+  reports <-
+    checkWithFakeResolve
+      fetch
+      [ (mkPackageKey "dev-db" "dolt", "dolt", "2.1.6", Just (GitHub "dolthub" "dolt" "v")),
+        (mkPackageKey "dev-util" "okpkg", "okpkg", "1.0.0", Just (GitHub "ok" "ok" "v")),
+        (mkPackageKey "dev-util" "ahead", "ahead", "2.0.0", Just (GitHub "ahead" "ahead" "v")),
+        (mkPackageKey "dev-util" "none", "none", "1.0", Nothing),
+        (mkPackageKey "dev-util" "fail", "fail", "1.0", Just (GitHub "fail" "fail" "v"))
+      ]
   let statuses = map reportStatus reports
   assertTrue "has outdated" (any isOutdated statuses)
   assertTrue "has ok" (any isOk statuses)
   assertTrue "has ahead" (any isAhead statuses)
-  assertTrue "has unconfigured" (any (== Unconfigured) statuses)
+  assertTrue "has unconfigured" (Unconfigured `elem` statuses)
   assertTrue "has error" (any isErr statuses)
   where
     isOutdated (Outdated _ _) = True
@@ -376,27 +389,26 @@ testCheckOverlayStatuses = do
     isErr _ = False
 
 -- | Check packages with pre-resolved sources (avoids filesystem for unit tests).
-checkWithFakeResolve
-  :: (UpdateSource -> IO (Either T.Text EbuildVersion))
-  -> [(PackageKey, T.Text, T.Text, Maybe UpdateSource)]
-  -> IO [UpdateReport]
-checkWithFakeResolve fetch pkgs =
-  mapM go pkgs
+checkWithFakeResolve ::
+  (UpdateSource -> IO (Either T.Text EbuildVersion)) ->
+  [(PackageKey, T.Text, T.Text, Maybe UpdateSource)] ->
+  IO [UpdateReport]
+checkWithFakeResolve fetch = mapM go
   where
     go (key, _pn, pv, mSrc) = do
       let local = parseEbuildVersion pv
       case mSrc of
         Nothing ->
-          pure UpdateReport { reportKey = key, reportStatus = Unconfigured }
+          pure UpdateReport {reportKey = key, reportStatus = Unconfigured}
         Just src -> do
           result <- fetch src
           pure $ case result of
             Left err ->
-              UpdateReport { reportKey = key, reportStatus = FetchError err }
+              UpdateReport {reportKey = key, reportStatus = FetchError err}
             Right remote ->
               UpdateReport
-                { reportKey = key
-                , reportStatus = case comparePV local remote of
+                { reportKey = key,
+                  reportStatus = case comparePV local remote of
                     Just LT -> Outdated local remote
                     Just EQ -> Ok local
                     Just GT -> Ahead local remote

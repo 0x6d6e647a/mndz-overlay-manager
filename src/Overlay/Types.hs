@@ -1,16 +1,18 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Overlay.Types
-  ( Ebuild (..)
-  , ebuildAtom
-  ) where
+  ( Ebuild (..),
+    ebuildAtom,
+  )
+where
 
 import Data.Text (Text)
 
 data Ebuild = Ebuild
-  { ebuildCategory :: Text
-  , ebuildPackage  :: Text
-  , ebuildVersion  :: Text
-  , ebuildPath     :: FilePath
+  { ebuildCategory :: Text,
+    ebuildPackage :: Text,
+    ebuildVersion :: Text,
+    ebuildPath :: FilePath
   }
   deriving (Eq, Show)
 

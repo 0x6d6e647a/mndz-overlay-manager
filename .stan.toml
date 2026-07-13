@@ -1,0 +1,10 @@
+# Baseline Stan config for blocking hooks.
+# Style / Warning / Performance (e.g. StrictData, catch-all _) and Infinity
+# list checks are deferred; Error-level anti-patterns stay enabled.
+# Revisit excludes as the codebase tightens.
+check = [
+  { type = "Exclude", severity = "Style", scope = "all" },
+  { type = "Exclude", severity = "Warning", scope = "all" },
+  { type = "Exclude", severity = "Performance", scope = "all" },
+  { type = "Exclude", category = "Infinite", scope = "all" },
+]

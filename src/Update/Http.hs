@@ -1,21 +1,23 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Update.Http
-  ( fetchHttp
-  , fetchHttpWith
-  ) where
+  ( fetchHttp,
+    fetchHttpWith,
+  )
+where
 
 import Control.Exception (SomeException, catch)
 import Data.ByteString.Lazy.Char8 qualified as L8
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client
-  ( Manager
-  , httpLbs
-  , method
-  , newManager
-  , parseRequest
-  , responseBody
-  , responseStatus
+  ( Manager,
+    httpLbs,
+    method,
+    newManager,
+    parseRequest,
+    responseBody,
+    responseStatus,
   )
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
@@ -44,19 +46,19 @@ fetchHttpWith mgr = \case
 tryUrl :: Manager -> Text -> IO (Either Text EbuildVersion)
 tryUrl mgr urlText = do
   req0 <- parseRequest (T.unpack urlText)
-  let req = req0 { method = "GET" }
+  let req = req0 {method = "GET"}
   eres <- tryHttp (httpLbs req mgr)
   pure $ case eres of
     Left err -> Left err
     Right resp ->
       let code = statusCode (responseStatus resp)
-      in if code >= 200 && code < 300
-           then
-             let body = T.strip (T.pack (L8.unpack (responseBody resp)))
-             in if T.null body
-                  then Left ("empty version body from " <> urlText)
-                  else Right (parseEbuildVersion body)
-           else Left ("HTTP " <> T.pack (show code) <> " from " <> urlText)
+       in if code >= 200 && code < 300
+            then
+              let body = T.strip (T.pack (L8.unpack (responseBody resp)))
+               in if T.null body
+                    then Left ("empty version body from " <> urlText)
+                    else Right (parseEbuildVersion body)
+            else Left ("HTTP " <> T.pack (show code) <> " from " <> urlText)
 
 tryHttp :: IO a -> IO (Either Text a)
 tryHttp action =

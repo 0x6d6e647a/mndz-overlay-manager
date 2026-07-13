@@ -9,3 +9,7 @@ cabal.project.local
 *~
 .DS_Store
 Thumbs.db
+
+# Dev quality tools (scripts/install-dev-tools) and HIE output (stan/weeder)
+.tools/
+.hie/

@@ -1,12 +1,14 @@
 {-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE RecordWildCards #-}
+
 module CLI.Parser
-  ( Options(..)
-  , Command(..)
-  , Verbosity(..)
-  , parserInfo
-  , showHelp
-  ) where
+  ( Options (..),
+    Command (..),
+    Verbosity (..),
+    parserInfo,
+    showHelp,
+  )
+where
 
 import Options.Applicative
 
@@ -24,10 +26,10 @@ data Command
   deriving (Eq, Show)
 
 data Options = Options
-  { optConfig      :: Maybe FilePath
-  , optOverlayPath :: Maybe FilePath
-  , optVerbosity   :: Verbosity
-  , optCommand     :: Command
+  { optConfig :: Maybe FilePath,
+    optOverlayPath :: Maybe FilePath,
+    optVerbosity :: Verbosity,
+    optCommand :: Command
   }
   deriving (Eq, Show)
 
@@ -37,63 +39,67 @@ verbosityFromCount n =
 
 parseLevel :: String -> Either String Verbosity
 parseLevel "error" = Right Error
-parseLevel "warn"  = Right Warn
-parseLevel "info"  = Right Info
+parseLevel "warn" = Right Warn
+parseLevel "info" = Right Info
 parseLevel "debug" = Right Debug
-parseLevel s       = Left $ "Unknown log level: " <> s
+parseLevel s = Left $ "Unknown log level: " <> s
 
 verbosityParser :: Parser Verbosity
 verbosityParser =
-  option (eitherReader parseLevel)
+  option
+    (eitherReader parseLevel)
     ( long "log-level"
-   <> metavar "LEVEL"
-   <> help "Set log level (error|warn|info|debug)"
-   <> value Warn
-   <> showDefaultWith (const "warn")
+        <> metavar "LEVEL"
+        <> help "Set log level (error|warn|info|debug)"
+        <> value Warn
+        <> showDefaultWith (const "warn")
     )
     <|> (verbosityFromCount . length <$> many (flag' () (short 'v' <> long "verbose" <> help "Increase verbosity (repeatable)")))
     <|> pure Warn
 
 configParser :: Parser (Maybe FilePath)
 configParser =
-  optional $ strOption
-    ( long "config"
-   <> short 'c'
-   <> metavar "FILE.toml"
-   <> help "Path to overlay-manager.toml (overrides XDG default)"
-    )
+  optional $
+    strOption
+      ( long "config"
+          <> short 'c'
+          <> metavar "FILE.toml"
+          <> help "Path to overlay-manager.toml (overrides XDG default)"
+      )
 
 overlayPathParser :: Parser (Maybe FilePath)
 overlayPathParser =
-  optional $ strOption
-    ( long "overlay-path"
-   <> metavar "DIR"
-   <> help "Override overlay path from config"
-    )
+  optional $
+    strOption
+      ( long "overlay-path"
+          <> metavar "DIR"
+          <> help "Override overlay path from config"
+      )
 
 commandParser :: Parser Command
 commandParser =
   hsubparser
     ( command "help" (info (pure Help) (progDesc "Show this help message"))
-   <> command "list" (info (pure List) (progDesc "List all ebuilds in the overlay"))
-   <> command "outdated" (info (pure Outdated) (progDesc "Report packages with newer upstream versions"))
-   <> metavar "COMMAND"
+        <> command "list" (info (pure List) (progDesc "List all ebuilds in the overlay"))
+        <> command "outdated" (info (pure Outdated) (progDesc "Report packages with newer upstream versions"))
+        <> metavar "COMMAND"
     )
 
 optionsParser :: Parser Options
 optionsParser = do
-  optConfig      <- configParser
+  optConfig <- configParser
   optOverlayPath <- overlayPathParser
-  optVerbosity   <- verbosityParser
-  optCommand     <- commandParser
+  optVerbosity <- verbosityParser
+  optCommand <- commandParser
   pure Options {..}
 
 parserInfo :: ParserInfo Options
 parserInfo =
-  info (optionsParser <**> helper)
+  info
+    (optionsParser <**> helper)
     ( fullDesc
-   <> progDesc "mndz-overlay-mgr - Gentoo overlay management tool"
-   <> header "mndz-overlay-mgr - manage your mndz Gentoo overlay"
+        <> progDesc "mndz-overlay-mgr - Gentoo overlay management tool"
+        <> header "mndz-overlay-mgr - manage your mndz Gentoo overlay"
     )
 
 -- | Render the top-level help text, identical to the @--help@ flag.

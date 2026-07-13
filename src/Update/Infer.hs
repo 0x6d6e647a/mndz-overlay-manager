@@ -1,9 +1,11 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Update.Infer
-  ( PackageContext (..)
-  , expandEbuild
-  , inferSource
-  ) where
+  ( PackageContext (..),
+    expandEbuild,
+    inferSource,
+  )
+where
 
 import Data.Char (isAlphaNum)
 import Data.List (find, isInfixOf, isPrefixOf, isSuffixOf)
@@ -16,8 +18,10 @@ import Update.Types (UpdateSource (..))
 
 -- | Package context for Level-1 expansion.
 data PackageContext = PackageContext
-  { ctxPN :: Text  -- ^ package name
-  , ctxPV :: Text  -- ^ package version (PV)
+  { -- | package name
+    ctxPN :: Text,
+    -- | package version (PV)
+    ctxPV :: Text
   }
   deriving (Eq, Show)
 
@@ -28,16 +32,16 @@ expandEbuild ctx original =
   let assignments = parseAssignments (T.unpack original)
       env0 = builtinEnv ctx
       env = resolveAssignments env0 assignments
-  in T.pack (expandString env (T.unpack original))
+   in T.pack (expandString env (T.unpack original))
 
 -- | Infer an update source from ebuild text. Returns Nothing if no match.
 inferSource :: PackageContext -> Text -> Maybe UpdateSource
 inferSource ctx original =
   let expanded = expandEbuild ctx original
       text = T.unpack expanded
-  in case findNpm text of
-       Just npm -> Just npm
-       Nothing  -> findGitHub (T.unpack (ctxPV ctx)) text
+   in case findNpm text of
+        Just npm -> Just npm
+        Nothing -> findGitHub (T.unpack (ctxPV ctx)) text
 
 ------------------------------------------------------------------------
 -- Assignments and expansion
@@ -49,12 +53,12 @@ builtinEnv :: PackageContext -> Env
 builtinEnv ctx =
   let pn = T.unpack (ctxPN ctx)
       pv = T.unpack (ctxPV ctx)
-      p  = pn <> "-" <> pv
-  in Map.fromList
-       [ ("PN", pn)
-       , ("PV", pv)
-       , ("P", p)
-       ]
+      p = pn <> "-" <> pv
+   in Map.fromList
+        [ ("PN", pn),
+          ("PV", pv),
+          ("P", p)
+        ]
 
 -- | Parse simple @VAR="..."@ or @VAR='...'@ assignments (one per line-ish).
 parseAssignments :: String -> [(String, String)]
@@ -63,12 +67,12 @@ parseAssignments src =
   where
     parseLine line =
       let trimmed = dropWhile (== ' ') line
-      in case break (== '=') trimmed of
-           (name, '=' : rest)
-             | isIdent name
-             , Just val <- parseQuoted rest ->
-                 Just (name, val)
-           _ -> Nothing
+       in case break (== '=') trimmed of
+            (name, '=' : rest)
+              | isIdent name,
+                Just val <- parseQuoted rest ->
+                  Just (name, val)
+            _ -> Nothing
 
     isIdent s =
       not (null s)
@@ -83,11 +87,11 @@ parseAssignments src =
 
 -- | Resolve assignment values against builtins and previously defined vars.
 resolveAssignments :: Env -> [(String, String)] -> Env
-resolveAssignments = foldl step
+resolveAssignments = foldl' step
   where
     step env (name, rawVal) =
       let expanded = expandString env rawVal
-      in Map.insert name expanded env
+       in Map.insert name expanded env
 
 -- | Expand @${PN}@, @${PV}@, @${P}@, @${PN//-bin/}@, @${VAR}@ in a string.
 expandString :: Env -> String -> String
@@ -110,12 +114,12 @@ expandString env = go
 expandRef :: Env -> String -> String
 expandRef env ref =
   case break (== '/') ref of
-    -- ${PN//-bin/}  pattern: VAR//search/replace
+    -- \${PN//-bin/}  pattern: VAR//search/replace
     (var, '/' : '/' : rest) ->
       case break (== '/') rest of
         (search, '/' : replace) ->
           let base = Map.findWithDefault "" var env
-          in replaceAll search replace base
+           in replaceAll search replace base
         _ -> Map.findWithDefault ("${" <> ref <> "}") ref env
     _ ->
       Map.findWithDefault ("${" <> ref <> "}") ref env
@@ -147,7 +151,7 @@ findNpm text =
               -- path is like @scope/pkg/-/pkg-ver.tgz or @scope/pkg
               path = takeWhile (/= ' ') after
               pkg = npmPackageFromPath path
-          in if null pkg then Nothing else Just (Npm (T.pack pkg))
+           in if null pkg then Nothing else Just (Npm (T.pack pkg))
       | otherwise = Nothing
 
     dropPrefix pfx s =
@@ -161,11 +165,11 @@ npmPackageFromPath path =
   case path of
     '@' : rest ->
       let (scope, more) = break (== '/') rest
-      in case more of
-           '/' : nameRest ->
-             let name = takeWhile (\c -> c /= '/' && c /= ' ') nameRest
-             in if null name then "" else "@" <> scope <> "/" <> name
-           _ -> ""
+       in case more of
+            '/' : nameRest ->
+              let name = takeWhile (\c -> c /= '/' && c /= ' ') nameRest
+               in if null name then "" else "@" <> scope <> "/" <> name
+            _ -> ""
     _ ->
       takeWhile (\c -> c /= '/' && c /= ' ') path
 
@@ -179,11 +183,12 @@ findGitHub pv text =
           case parseGitHubReleaseOrTag url of
             Just (owner, repo, tagSeg) ->
               let prefix = stripVersionSuffix ver tagSeg
-              in Just GitHub
-                   { ghOwner = T.pack owner
-                   , ghRepo = T.pack repo
-                   , ghTagPrefix = T.pack prefix
-                   }
+               in Just
+                    GitHub
+                      { ghOwner = T.pack owner,
+                        ghRepo = T.pack repo,
+                        ghTagPrefix = T.pack prefix
+                      }
             Nothing -> Nothing
 
 -- | Parse owner/repo and tag path segment from archive or release URLs.
@@ -214,12 +219,14 @@ parseGitHubReleaseOrTag url = do
 -- | GitHub archive URLs append @.tar.gz@ etc. to the tag name.
 stripArchiveSuffix :: String -> String
 stripArchiveSuffix s =
-  foldr stripOne s
-    [ ".tar.gz"
-    , ".tar.xz"
-    , ".tar.bz2"
-    , ".tgz"
-    , ".zip"
+  foldr
+    stripOne
+    s
+    [ ".tar.gz",
+      ".tar.xz",
+      ".tar.bz2",
+      ".tgz",
+      ".zip"
     ]
   where
     stripOne sfx str
@@ -249,7 +256,7 @@ stripVersionSuffix ver tag
     isSuffixOf' sfx str =
       let n = length sfx
           m = length str
-      in n <= m && drop (m - n) str == sfx
+       in n <= m && drop (m - n) str == sfx
 
 -- | Rough URL extraction: sequences starting with http(s)://
 extractUrls :: String -> [String]
@@ -259,10 +266,10 @@ extractUrls = go
     go s
       | "https://" `isPrefixOf` s =
           let (url, rest) = span isUrlChar s
-          in url : go rest
+           in url : go rest
       | "http://" `isPrefixOf` s =
           let (url, rest) = span isUrlChar s
-          in url : go rest
+           in url : go rest
       | otherwise = go (drop 1 s)
 
     isUrlChar c =

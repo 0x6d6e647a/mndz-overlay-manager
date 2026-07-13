@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Install project-local quality tools into .tools/bin via Cabal.
+#
+# Usage (from repository root):
+#   ./scripts/install-dev-tools
+#
+# Requirements:
+#   - cabal-install and the project GHC (ghc --version / cabal --version)
+#   - Network access to Hackage on first install
+#   - Enough free space on a non-tmpfs volume for large builds (ghc-lib-parser).
+#     This script sets TMPDIR under the repo (.tools/tmp) so /tmp is not used.
+#
+# Behavior:
+#   - Installs ormolu, hlint, stan, and weeder into .tools/bin
+#   - Uses --ignore-project so Hackage tools install outside the app plan
+#   - Pins match constraints documented in cabal.project (keep in sync)
+#   - Overwrites existing binaries (--install-method=copy)
+#   - Does NOT run from git hooks; hooks fail if tools are missing (strict policy)
+#
+# After pin bumps in cabal.project, update CONSTRAINTS below and re-run this script.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN_DIR="${ROOT}/.tools/bin"
+TMP_DIR="${ROOT}/.tools/tmp"
+TOOLS=(ormolu hlint stan weeder)
+
+# Keep in sync with cabal.project constraints (verified on GHC 9.10.3).
+CONSTRAINTS=(
+  --constraint='ormolu == 0.8.1.1'
+  --constraint='hlint == 3.10'
+  --constraint='stan == 0.2.1.0'
+  --constraint='weeder == 2.10.0'
+)
+
+cd "${ROOT}"
+mkdir -p "${BIN_DIR}" "${TMP_DIR}"
+export TMPDIR="${TMP_DIR}"
+
+echo "Installing dev tools into ${BIN_DIR} (TMPDIR=${TMPDIR}) ..."
+cabal install "${TOOLS[@]}" \
+  --ignore-project \
+  "${CONSTRAINTS[@]}" \
+  --installdir="${BIN_DIR}" \
+  --install-method=copy \
+  --overwrite-policy=always
+
+missing=0
+for tool in "${TOOLS[@]}"; do
+  if [[ ! -x "${BIN_DIR}/${tool}" ]]; then
+    echo "error: expected executable missing: ${BIN_DIR}/${tool}" >&2
+    missing=1
+  else
+    echo "  ok  ${tool} -> ${BIN_DIR}/${tool}"
+  fi
+done
+
+if [[ "${missing}" -ne 0 ]]; then
+  echo "error: install-dev-tools failed to produce all binaries" >&2
+  exit 1
+fi
+
+echo "Done. Quality hooks use binaries under .tools/bin only."
+echo "If a hook says tools are missing, re-run: ./scripts/install-dev-tools"

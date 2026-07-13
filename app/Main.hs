@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 module Main (main) where
 
 import CLI.Parser (Command (Help, List, Outdated), Options (..), parserInfo, showHelp)
@@ -17,9 +18,9 @@ import Overlay.Version (prettyVersion)
 import System.Exit (ExitCode (..), exitWith)
 import Update.Check (checkOverlay, productionFetcher)
 import Update.Types
-  ( UpdateReport (..)
-  , UpdateStatus (Ahead, FetchError, Ok, Unconfigured)
-  , packageKeyText
+  ( UpdateReport (..),
+    UpdateStatus (Ahead, FetchError, Ok, Unconfigured),
+    packageKeyText,
   )
 import Update.Types qualified as U
 
@@ -43,14 +44,14 @@ runOutdated opts = do
   reports <- liftIO (checkOverlay fetch ebuilds)
   mapM_ emitReport reports
 
-loadValidatedEbuilds
-  :: (WithLog env Message m, MonadIO m)
-  => Options
-  -> m [Ebuild]
+loadValidatedEbuilds ::
+  (WithLog env Message m, MonadIO m) =>
+  Options ->
+  m [Ebuild]
 loadValidatedEbuilds opts = do
   cfg <- loadConfigOrDie (optConfig opts)
   let overlayPath = case optOverlayPath opts of
-        Just p  -> p
+        Just p -> p
         Nothing -> mndzOverlayPath cfg
   liftIO (validateOverlay overlayPath) >>= \case
     Left err -> dieError (overlayErrorMessage err)
@@ -94,7 +95,7 @@ loadConfigOrDie :: (WithLog env Message m, MonadIO m) => Maybe FilePath -> m Ove
 loadConfigOrDie override = do
   result <- liftIO (loadConfig override)
   case result of
-    Left err  -> dieError (configErrorMessage err)
+    Left err -> dieError (configErrorMessage err)
     Right cfg -> pure cfg
 
 dieError :: (WithLog env Message m, MonadIO m) => String -> m a

@@ -1,9 +1,10 @@
 module Overlay.Discovery
-  ( DiscoveryError (..)
-  , discoveryErrorMessage
-  , collectEbuilds
-  , parseEbuildFileName
-  ) where
+  ( DiscoveryError (..),
+    discoveryErrorMessage,
+    collectEbuilds,
+    parseEbuildFileName,
+  )
+where
 
 import Control.Monad (filterM)
 import Data.Char (isDigit)
@@ -12,7 +13,7 @@ import Data.Maybe (listToMaybe)
 import Data.Text qualified as T
 import Overlay.Types (Ebuild (..))
 import System.Directory (doesDirectoryExist, listDirectory)
-import System.FilePath ((</>), takeFileName)
+import System.FilePath (takeFileName, (</>))
 
 data DiscoveryError
   = MalformedEbuildName FilePath
@@ -24,9 +25,12 @@ discoveryErrorMessage = \case
   MalformedEbuildName path ->
     "malformed ebuild filename (expected package-version.ebuild): " <> path
   PackageNameMismatch path expected got ->
-    "package name mismatch in " <> path
-      <> ": directory is " <> expected
-      <> " but filename has package " <> got
+    "package name mismatch in "
+      <> path
+      <> ": directory is "
+      <> expected
+      <> " but filename has package "
+      <> got
 
 -- | Split @package-version.ebuild@ into package and version.
 -- Version starts at the last @-@ followed by a digit.
@@ -50,10 +54,10 @@ splitPkgVer s = do
   where
     versionHyphenIndices =
       [ i
-      | (i, c) <- zip [0 ..] s
-      , c == '-'
-      , i + 1 < length s
-      , isDigit (s !! (i + 1))
+      | (i, c) <- zip [0 ..] s,
+        c == '-',
+        i + 1 < length s,
+        isDigit (s !! (i + 1))
       ]
 
 collectEbuilds :: FilePath -> IO (Either DiscoveryError [Ebuild])
@@ -113,17 +117,18 @@ collectPackage root cat pkg = do
 toEbuild :: FilePath -> FilePath -> FilePath -> FilePath -> FilePath -> Either DiscoveryError Ebuild
 toEbuild _root cat pkg pkgPath file =
   let full = pkgPath </> file
-  in case parseEbuildFileName (takeFileName file) of
-    Nothing -> Left (MalformedEbuildName full)
-    Just (name, ver)
-      | name /= pkg -> Left (PackageNameMismatch full pkg name)
-      | otherwise ->
-          Right Ebuild
-            { ebuildCategory = T.pack cat
-            , ebuildPackage  = T.pack pkg
-            , ebuildVersion  = T.pack ver
-            , ebuildPath     = full
-            }
+   in case parseEbuildFileName (takeFileName file) of
+        Nothing -> Left (MalformedEbuildName full)
+        Just (name, ver)
+          | name /= pkg -> Left (PackageNameMismatch full pkg name)
+          | otherwise ->
+              Right
+                Ebuild
+                  { ebuildCategory = T.pack cat,
+                    ebuildPackage = T.pack pkg,
+                    ebuildVersion = T.pack ver,
+                    ebuildPath = full
+                  }
 
 anyM :: (Monad m) => (a -> m Bool) -> [a] -> m Bool
 anyM _ [] = pure False

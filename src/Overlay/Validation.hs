@@ -1,7 +1,8 @@
 module Overlay.Validation
-  ( OverlayError(..)
-  , validateOverlay
-  ) where
+  ( OverlayError (..),
+    validateOverlay,
+  )
+where
 
 import System.Directory (doesDirectoryExist, doesFileExist)
 import System.FilePath ((</>))
@@ -15,14 +16,14 @@ data OverlayError
 
 requiredDirectories :: [FilePath]
 requiredDirectories =
-  [ "profiles"
-  , "metadata"
+  [ "profiles",
+    "metadata"
   ]
 
 requiredFiles :: [FilePath]
 requiredFiles =
-  [ "profiles" </> "repo_name"
-  , "metadata" </> "layout.conf"
+  [ "profiles" </> "repo_name",
+    "metadata" </> "layout.conf"
   ]
 
 expectedRepoName :: String

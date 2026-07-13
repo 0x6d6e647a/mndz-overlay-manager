@@ -1,8 +1,9 @@
 module Config.Loader
-  ( loadConfig
-  , ConfigError(..)
-  , configErrorMessage
-  ) where
+  ( loadConfig,
+    ConfigError (..),
+    configErrorMessage,
+  )
+where
 
 import Config.Types (OverlayConfig (..))
 import Data.Text.IO qualified as T
@@ -22,7 +23,7 @@ defaultConfigPath = do
   home <- getHomeDirectory
   pure $ case xdg of
     Just dir -> dir </> "mndz" </> "overlay-manager.toml"
-    Nothing  -> home </> ".config" </> "mndz" </> "overlay-manager.toml"
+    Nothing -> home </> ".config" </> "mndz" </> "overlay-manager.toml"
 
 loadConfig :: Maybe FilePath -> IO (Either ConfigError OverlayConfig)
 loadConfig override = do

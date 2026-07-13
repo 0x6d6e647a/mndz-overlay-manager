@@ -1,0 +1,9 @@
+packages: .
+
+-- Dev quality tools installed into .tools/bin via scripts/install-dev-tools.
+-- Pins are set to versions known to build with the project GHC (see script header).
+constraints:
+  ormolu == 0.8.1.1,
+  hlint == 3.10,
+  stan == 0.2.1.0,
+  weeder == 2.10.0

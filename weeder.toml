@@ -1,0 +1,26 @@
+# Dead-code analysis roots.
+# Main.main (app + test) anchors the runtime graph; root-modules keep library
+# public exports alive for intentional library API surface.
+roots = [
+  "^Main\\.main$",
+  "^Paths_mndz_overlay_manager\\..*",
+]
+root-modules = [
+  "CLI.Parser",
+  "Config.Loader",
+  "Config.Types",
+  "Logging.Bootstrap",
+  "Overlay.Discovery",
+  "Overlay.Types",
+  "Overlay.Validation",
+  "Overlay.Version",
+  "Update.Check",
+  "Update.GitHub",
+  "Update.Hardcoded",
+  "Update.Http",
+  "Update.Infer",
+  "Update.Npm",
+  "Update.Resolve",
+  "Update.Types",
+]
+type-class-roots = true
