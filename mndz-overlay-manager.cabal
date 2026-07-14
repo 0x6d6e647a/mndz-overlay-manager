@@ -73,13 +73,16 @@ library
       , Overlay.Types
       , Overlay.Validation
       , Overlay.Version
+      , Update.Apply
       , Update.Check
+      , Update.Git
       , Update.GitHub
       , Update.Hardcoded
       , Update.Http
-      , Update.Infer
       , Update.Npm
+      , Update.Preflight
       , Update.Resolve
+      , Update.Targets
       , Update.Types
 
     -- Modules included in this library but not exported.
@@ -100,7 +103,9 @@ library
         http-client ^>=0.7,
         http-client-tls ^>=0.3,
         http-types ^>=0.12,
+        async ^>=2.2,
         optparse-applicative ^>=0.19,
+        process ^>=1.6,
         text ^>=2.1,
         toml-parser ^>=2.0
 

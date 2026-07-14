@@ -6,6 +6,8 @@ module Update.Check
     checkOverlay,
     checkPackage,
     productionFetcher,
+    statusFromCompare,
+    renderPVNoRev,
   )
 where
 
@@ -87,10 +89,7 @@ checkPackage :: Fetcher -> PackageEntry -> IO UpdateReport
 checkPackage fetch entry = do
   let key = peKey entry
       local = peLocal entry
-      pn = pePN entry
-      pvText = renderPVNoRev local
-  mSrc <- resolveSource key pn pvText (pePath entry)
-  case mSrc of
+  case resolveSource key of
     Nothing ->
       pure UpdateReport {reportKey = key, reportStatus = Unconfigured}
     Just src -> do

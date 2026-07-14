@@ -23,15 +23,24 @@ import Overlay.Version
 import System.Directory (makeAbsolute)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
+import Update.Apply
+  ( foldExitHardFail,
+    newEbuildFileName,
+    renderPVNoRev,
+  )
 import Update.Check (PackageEntry (..), groupNewest)
-import Update.Hardcoded (lookupHardcoded)
-import Update.Infer (PackageContext (..), expandEbuild, inferSource)
-import Update.Resolve (resolveFromText)
+import Update.Hardcoded (lookupHardcoded, lookupPolicy)
+import Update.Preflight (checkToolsOnPath, updateRequiredTools)
+import Update.Resolve (resolveSource)
+import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types
-  ( PackageKey (..),
+  ( ApplyOutcome (..),
+    PackageKey (..),
+    PackagePolicy (..),
     UpdateReport (..),
     UpdateSource (..),
     UpdateStatus (..),
+    UpdateTechnique (..),
     mkPackageKey,
     packageKeyText,
   )
@@ -54,12 +63,14 @@ main = do
   testVersionRender
   testVersionCompare
   testHardcodedGrok
-  testInferDolt
-  testInferBun
-  testInferOpenspecNpm
-  testInferAssetsOnly
+  testPolicyClassification
+  testResolveMapOnly
   testGroupNewest
   testCheckOverlayStatuses
+  testTargetResolution
+  testPreflightMissingTools
+  testNewEbuildFileName
+  testFoldExitHardFail
   putStrLn "All tests passed."
 
 assertEq :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -238,7 +249,7 @@ testVersionCompare = do
     (comparePV (Raw "foo") (parseEbuildVersion "1.0"))
 
 ------------------------------------------------------------------------
--- Inference / hardcoded
+-- Hardcoded policy
 ------------------------------------------------------------------------
 
 testHardcodedGrok :: IO ()
@@ -251,87 +262,37 @@ testHardcodedGrok = do
     other -> do
       hPutStrLn stderr $ "expected hardcoded Http, got " <> show other
       exitFailure
-  let resolved =
-        resolveFromText key "grok-build-bin" "0.2.93" "SRC_URI=https://example.com"
-  case resolved of
-    Just (Http {}) -> pure ()
+  assertEq "resolve map only" (lookupHardcoded key) (resolveSource key)
+
+testPolicyClassification :: IO ()
+testPolicyClassification = do
+  case lookupPolicy (PackageKey "dev-util/opencode-bin") of
+    Just (PackagePolicy _ GitMvAndManifest) -> pure ()
     other -> do
-      hPutStrLn stderr $ "resolve should prefer hardcoded: " <> show other
+      hPutStrLn stderr $ "opencode technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/mise") of
+    Just (PackagePolicy _ (Unsupported _)) -> pure ()
+    other -> do
+      hPutStrLn stderr $ "mise technique: " <> show other
+      exitFailure
+  assertEq "unmapped" Nothing (lookupPolicy (PackageKey "dev-lang/haskell"))
+  case lookupPolicy (PackageKey "dev-lang/bun-bin") of
+    Just (PackagePolicy (GitHub "oven-sh" "bun" "bun-v") GitMvAndManifest) -> pure ()
+    other -> do
+      hPutStrLn stderr $ "bun policy: " <> show other
       exitFailure
 
-doltSnippet :: T.Text
-doltSnippet =
-  T.unlines
-    [ "HOMEPAGE=\"https://github.com/dolthub/dolt\"",
-      "SRC_URI=\"https://github.com/dolthub/dolt/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
-      "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/dolt-2.1.6/dolt-2.1.6-vendor.tar.xz\""
-    ]
-
-bunSnippet :: T.Text
-bunSnippet =
-  T.unlines
-    [ "BUN_PN=\"${PN//-bin/}\"",
-      "BASE_URI=\"https://github.com/oven-sh/${BUN_PN}/releases/download/${BUN_PN}-v${PV}\"",
-      "SRC_URI=\"${BASE_URI}/bun-linux-x64.zip\""
-    ]
-
-openspecSnippet :: T.Text
-openspecSnippet =
-  T.unlines
-    [ "HOMEPAGE=\"https://github.com/Fission-AI/OpenSpec\"",
-      "SRC_URI=\"",
-      "\thttps://registry.npmjs.org/@fission-ai/openspec/-/openspec-${PV}.tgz",
-      "\t\t-> ${P}.tgz",
-      "\thttps://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/openspec-${PV}/openspec-${PV}-deps.tar.xz",
-      "\""
-    ]
-
-assetsOnlySnippet :: T.Text
-assetsOnlySnippet =
-  "SRC_URI=\"https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/foo-1.0/foo.tar.xz\""
-
-testInferDolt :: IO ()
-testInferDolt = do
-  let ctx = PackageContext "dolt" "2.1.6"
-  case inferSource ctx doltSnippet of
-    Just (GitHub owner repo prefix) -> do
-      assertEq "owner" "dolthub" owner
-      assertEq "repo" "dolt" repo
-      assertEq "prefix" "v" prefix
-    other -> do
-      hPutStrLn stderr $ "dolt infer: " <> show other
-      exitFailure
-
-testInferBun :: IO ()
-testInferBun = do
-  let ctx = PackageContext "bun-bin" "1.3.14"
-  case inferSource ctx bunSnippet of
-    Just (GitHub owner repo prefix) -> do
-      assertEq "owner" "oven-sh" owner
-      assertEq "repo" "bun" repo
-      assertEq "prefix" "bun-v" prefix
-    other -> do
-      hPutStrLn stderr $
-        "bun infer: "
-          <> show other
-          <> " expanded="
-          <> T.unpack (expandEbuild ctx bunSnippet)
-      exitFailure
-
-testInferOpenspecNpm :: IO ()
-testInferOpenspecNpm = do
-  let ctx = PackageContext "openspec" "1.4.1"
-  case inferSource ctx openspecSnippet of
-    Just (Npm pkg) ->
-      assertEq "npm pkg" "@fission-ai/openspec" pkg
-    other -> do
-      hPutStrLn stderr $ "openspec infer: " <> show other
-      exitFailure
-
-testInferAssetsOnly :: IO ()
-testInferAssetsOnly = do
-  let ctx = PackageContext "foo" "1.0"
-  assertEq "assets only" Nothing (inferSource ctx assetsOnlySnippet)
+testResolveMapOnly :: IO ()
+testResolveMapOnly = do
+  assertEq
+    "dolt source"
+    (Just (GitHub "dolthub" "dolt" "v"))
+    (resolveSource (PackageKey "dev-db/dolt"))
+  assertEq
+    "unknown"
+    Nothing
+    (resolveSource (PackageKey "no/such"))
 
 ------------------------------------------------------------------------
 -- Check pipeline
@@ -414,3 +375,121 @@ checkWithFakeResolve fetch = mapM go
                     Just GT -> Ahead local remote
                     Nothing -> FetchError "incomparable"
                 }
+
+------------------------------------------------------------------------
+-- Targets / preflight / apply helpers
+------------------------------------------------------------------------
+
+sampleEntries :: [PackageEntry]
+sampleEntries =
+  [ PackageEntry
+      { peKey = PackageKey "dev-lang/deno-bin",
+        pePN = "deno-bin",
+        peLocal = parseEbuildVersion "2.9.2",
+        pePath = "/overlay/dev-lang/deno-bin/deno-bin-2.9.2.ebuild"
+      },
+    PackageEntry
+      { peKey = PackageKey "dev-util/opencode-bin",
+        pePN = "opencode-bin",
+        peLocal = parseEbuildVersion "1.0",
+        pePath = "/overlay/dev-util/opencode-bin/opencode-bin-1.0.ebuild"
+      },
+    PackageEntry
+      { peKey = PackageKey "bar/foo",
+        pePN = "foo",
+        peLocal = parseEbuildVersion "1.0",
+        pePath = "/overlay/bar/foo/foo-1.0.ebuild"
+      },
+    PackageEntry
+      { peKey = PackageKey "baz/foo",
+        pePN = "foo",
+        peLocal = parseEbuildVersion "1.0",
+        pePath = "/overlay/baz/foo/foo-1.0.ebuild"
+      }
+  ]
+
+testTargetResolution :: IO ()
+testTargetResolution = do
+  assertEq
+    "full key"
+    (Right (PackageKey "dev-lang/deno-bin"))
+    (resolveTargetToken sampleEntries "dev-lang/deno-bin")
+  assertEq
+    "bare unique"
+    (Right (PackageKey "dev-util/opencode-bin"))
+    (resolveTargetToken sampleEntries "opencode-bin")
+  case resolveTargetToken sampleEntries "foo" of
+    Left (AmbiguousPackage "foo" keys) ->
+      assertEq
+        "ambiguous keys"
+        (sort (map packageKeyText keys))
+        ["bar/foo", "baz/foo"]
+    other -> do
+      hPutStrLn stderr $ "expected ambiguous foo, got " <> show other
+      exitFailure
+  case resolveTargets sampleEntries [] of
+    Right keys ->
+      assertEq "all keys count" 4 (length keys)
+    Left e -> do
+      hPutStrLn stderr $ "all targets: " <> show e
+      exitFailure
+  case resolveTargets sampleEntries ["deno-bin", "nope"] of
+    Left errs ->
+      assertTrue "has unknown" (any isUnknown errs)
+    Right _ -> do
+      hPutStrLn stderr "expected unknown error"
+      exitFailure
+  where
+    isUnknown (UnknownPackage _) = True
+    isUnknown _ = False
+
+testPreflightMissingTools :: IO ()
+testPreflightMissingTools = do
+  missing <-
+    checkToolsOnPath
+      ( \name ->
+          pure $
+            if name == "ebuild"
+              then Nothing
+              else Just ("/usr/bin/" <> name)
+      )
+      updateRequiredTools
+  assertEq "missing ebuild only" ["ebuild"] missing
+  none <-
+    checkToolsOnPath
+      (\name -> pure (Just ("/bin/" <> name)))
+      updateRequiredTools
+  assertEq "none missing" [] none
+
+testNewEbuildFileName :: IO ()
+testNewEbuildFileName = do
+  assertEq
+    "filename"
+    "opencode-bin-1.17.20.ebuild"
+    (newEbuildFileName "opencode-bin" (parseEbuildVersion "1.17.20"))
+  assertEq
+    "render strips rev for filename base"
+    "0.2.99"
+    (renderPVNoRev (parseEbuildVersion "0.2.99-r1"))
+  assertEq
+    "render remote"
+    "0.2.101"
+    (renderPVNoRev (parseEbuildVersion "0.2.101"))
+
+testFoldExitHardFail :: IO ()
+testFoldExitHardFail = do
+  let soft =
+        [ ApplySoftSkip (PackageKey "a/b") "unsupported",
+          ApplySoftSkip (PackageKey "c/d") "not outdated"
+        ]
+      mixed =
+        soft
+          <> [ ApplyHardFail (PackageKey "e/f") "dirty" False,
+               ApplySuccess
+                 (PackageKey "g/h")
+                 (parseEbuildVersion "1.0")
+                 (parseEbuildVersion "1.1")
+                 ["g/h/g-h-1.1.ebuild"]
+             ]
+  assertEq "soft only" False (foldExitHardFail soft)
+  assertEq "mixed" True (foldExitHardFail mixed)

@@ -22,46 +22,21 @@ The library SHALL model an update source as one of: GitHub (owner, repository, t
 
 ### Requirement: Hardcoded source overrides
 
-The library SHALL provide a hardcoded map from package key `category/package` to update source. Hardcoded entries SHALL take precedence over ebuild inference. At minimum, `dev-util/grok-build-bin` SHALL map to an Http source for the grok-build stable channel (primary `https://x.ai/cli/stable` with the known GCS fallback).
+The library SHALL provide a hardcoded map from package key `category/package` to update source as part of each package’s policy entry. Resolution of an update source SHALL use only this hardcoded map. At minimum, `dev-util/grok-build-bin` SHALL map to an Http source for the grok-build stable channel (primary `https://x.ai/cli/stable` with the known GCS fallback). The map SHALL also include explicit sources for all other packages known in the mndz overlay policy set (GitHub, npm, or Http as appropriate).
 
 #### Scenario: Grok-build uses hardcoded Http
 
 - **WHEN** resolving an update source for `dev-util/grok-build-bin`
-- **THEN** the hardcoded Http stable-channel source is used without requiring successful ebuild inference
+- **THEN** the hardcoded Http stable-channel source is used
 
-### Requirement: Level-1 ebuild inference
+#### Scenario: Mapped GitHub package
 
-When no hardcoded source exists for a package, the library SHALL attempt to infer an update source by reading the newest local ebuild file text, applying a narrow expander for simple assignments and `${PN}`, `${PV}`, `${P}`, `${PN//-bin/}`, and `${VAR}` references in URL-like strings, then matching:
+- **WHEN** resolving an update source for a package whose policy specifies a GitHub source
+- **THEN** that GitHub source is returned without reading ebuild text for inference
 
-1. npm registry URLs → Npm source  
-2. else GitHub tag-archive or release-download URLs (excluding `github.com/0x6d6e647a/mndz-overlay-assets`) → GitHub source with owner, repo, and tag prefix derived from the path segment containing PV  
-3. else no source  
+#### Scenario: Unmapped package has no source
 
-HOMEPAGE alone SHALL NOT establish a source when it conflicts with a stronger SRC_URI signal; npm matches SHALL take priority over GitHub.
-
-#### Scenario: Infer GitHub tag archive
-
-- **WHEN** ebuild text contains `https://github.com/dolthub/dolt/archive/refs/tags/v${PV}.tar.gz` and no npm URL
-- **THEN** inference yields GitHub owner `dolthub`, repo `dolt`, prefix `v`
-
-#### Scenario: Infer GitHub release with variable expansion
-
-- **WHEN** package name is `bun-bin` and ebuild text assigns `BUN_PN="${PN//-bin/}"` and uses `https://github.com/oven-sh/${BUN_PN}/releases/download/${BUN_PN}-v${PV}`
-- **THEN** inference yields GitHub owner `oven-sh`, repo `bun`, prefix `bun-v`
-
-#### Scenario: Infer npm over GitHub homepage
-
-- **WHEN** ebuild text contains both an npm registry URL for `@fission-ai/openspec` and a GitHub HOMEPAGE
-- **THEN** inference yields Npm package `@fission-ai/openspec`
-
-#### Scenario: Ignore overlay assets URLs
-
-- **WHEN** the only GitHub URLs in the ebuild point at `0x6d6e647a/mndz-overlay-assets`
-- **THEN** inference does not treat the assets repository as the upstream source
-
-#### Scenario: Inference failure
-
-- **WHEN** no hardcoded source exists and inference finds no usable npm or GitHub pattern
+- **WHEN** resolving an update source for a package key absent from the hardcoded map
 - **THEN** resolve reports no source for that package
 
 ### Requirement: Fetch latest upstream version

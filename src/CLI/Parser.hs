@@ -23,6 +23,7 @@ data Command
   = Help
   | List
   | Outdated
+  | Update [String]
   deriving (Eq, Show)
 
 data Options = Options
@@ -76,12 +77,28 @@ overlayPathParser =
           <> help "Override overlay path from config"
       )
 
+updateParser :: Parser Command
+updateParser =
+  Update
+    <$> many
+      ( strArgument
+          ( metavar "PACKAGE..."
+              <> help "Package targets (category/package or unambiguous package name); omit to update all outdated"
+          )
+      )
+
 commandParser :: Parser Command
 commandParser =
   hsubparser
     ( command "help" (info (pure Help) (progDesc "Show this help message"))
         <> command "list" (info (pure List) (progDesc "List all ebuilds in the overlay"))
         <> command "outdated" (info (pure Outdated) (progDesc "Report packages with newer upstream versions"))
+        <> command
+          "update"
+          ( info
+              updateParser
+              (progDesc "Update outdated packages (GitMvAndManifest) with signed commits")
+          )
         <> metavar "COMMAND"
     )
 

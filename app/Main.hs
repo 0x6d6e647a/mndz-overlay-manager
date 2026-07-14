@@ -2,10 +2,11 @@
 
 module Main (main) where
 
-import CLI.Parser (Command (Help, List, Outdated), Options (..), parserInfo, showHelp)
+import CLI.Parser (Command (Help, List, Outdated, Update), Options (..), parserInfo, showHelp)
 import Colog (Message, WithLog, logError, logWarning, usingLoggerT)
 import Config.Loader (configErrorMessage, loadConfig)
 import Config.Types (OverlayConfig (..))
+import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
@@ -16,9 +17,19 @@ import Overlay.Types (Ebuild, ebuildAtom)
 import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (prettyVersion)
 import System.Exit (ExitCode (..), exitWith)
-import Update.Check (checkOverlay, productionFetcher)
+import Update.Apply
+  ( applyOverlay,
+    foldExitHardFail,
+    productionEbuildRunner,
+  )
+import Update.Check (checkOverlay, groupNewest, productionFetcher)
+import Update.Git (productionGitOps)
+import Update.Preflight (preflightUpdate)
+import Update.Targets (resolveTargets, targetErrorMessage)
 import Update.Types
-  ( UpdateReport (..),
+  ( ApplyOutcome (..),
+    PackageKey (..),
+    UpdateReport (..),
     UpdateStatus (Ahead, FetchError, Ok, Unconfigured),
     packageKeyText,
   )
@@ -31,6 +42,7 @@ main = usingLoggerT bootstrapLogger $ do
     Help -> liftIO showHelp
     List -> runList opts
     Outdated -> runOutdated opts
+    Update pkgs -> runUpdate opts pkgs
 
 runList :: (WithLog env Message m, MonadIO m) => Options -> m ()
 runList opts = do
@@ -44,11 +56,76 @@ runOutdated opts = do
   reports <- liftIO (checkOverlay fetch ebuilds)
   mapM_ emitReport reports
 
+runUpdate :: (WithLog env Message m, MonadIO m) => Options -> [String] -> m ()
+runUpdate opts pkgArgs = do
+  (overlayPath, ebuilds) <- loadValidatedEbuildsWithPath opts
+  liftIO preflightUpdate >>= \case
+    Left err -> dieError (T.unpack err)
+    Right () -> pure ()
+  let entries = groupNewest ebuilds
+      tokens = map T.pack pkgArgs
+  case resolveTargets entries tokens of
+    Left errs -> do
+      mapM_ (logError . targetErrorMessage) errs
+      liftIO $ exitWith (ExitFailure 1)
+    Right keys -> do
+      fetch <- liftIO productionFetcher
+      let mFilter = if null pkgArgs then Nothing else Just keys
+          -- When no args, applyOverlay still gets all entries; soft-skips not outdated.
+          -- When args given, only those keys.
+          filterKeys = mFilter
+      outcomes <-
+        liftIO $
+          applyOverlay
+            fetch
+            productionGitOps
+            productionEbuildRunner
+            overlayPath
+            entries
+            filterKeys
+      case outcomes of
+        [ApplyHardFail (PackageKey "") msg _] ->
+          dieError (T.unpack msg)
+        _ -> do
+          mapM_ emitOutcome outcomes
+          when (foldExitHardFail outcomes) $
+            liftIO $
+              exitWith (ExitFailure 1)
+
+emitOutcome :: (WithLog env Message m, MonadIO m) => ApplyOutcome -> m ()
+emitOutcome = \case
+  ApplySuccess key local remote _paths ->
+    liftIO $
+      T.putStrLn $
+        packageKeyText key
+          <> " "
+          <> prettyVersion local
+          <> " -> "
+          <> prettyVersion remote
+  ApplySoftSkip key reason ->
+    logWarning $ packageKeyText key <> ": " <> reason
+  ApplyHardFail key msg halfApplied -> do
+    logError
+      ( if T.null (packageKeyText key)
+          then msg
+          else packageKeyText key <> ": " <> msg
+      )
+    when halfApplied $
+      logWarning $
+        packageKeyText key
+          <> ": package directory may be left dirty or half-applied; fix or restore before retrying"
+
 loadValidatedEbuilds ::
   (WithLog env Message m, MonadIO m) =>
   Options ->
   m [Ebuild]
-loadValidatedEbuilds opts = do
+loadValidatedEbuilds opts = snd <$> loadValidatedEbuildsWithPath opts
+
+loadValidatedEbuildsWithPath ::
+  (WithLog env Message m, MonadIO m) =>
+  Options ->
+  m (FilePath, [Ebuild])
+loadValidatedEbuildsWithPath opts = do
   cfg <- loadConfigOrDie (optConfig opts)
   let overlayPath = case optOverlayPath opts of
         Just p -> p
@@ -59,7 +136,7 @@ loadValidatedEbuilds opts = do
   liftIO (collectEbuilds overlayPath) >>= \case
     Left err -> dieError (discoveryErrorMessage err)
     Right [] -> dieError ("no ebuilds found in overlay: " <> overlayPath)
-    Right ebuilds -> pure ebuilds
+    Right ebuilds -> pure (overlayPath, ebuilds)
 
 emitReport :: (WithLog env Message m, MonadIO m) => UpdateReport -> m ()
 emitReport report =

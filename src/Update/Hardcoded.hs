@@ -1,26 +1,89 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.Hardcoded
-  ( hardcodedSources,
+  ( hardcodedPolicies,
+    lookupPolicy,
     lookupHardcoded,
   )
 where
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Update.Types (PackageKey (..), UpdateSource (..))
+import Update.Types
+  ( PackageKey (..),
+    PackagePolicy (..),
+    UpdateSource (..),
+    UpdateTechnique (..),
+  )
 
--- | Hardcoded package → source map. Takes precedence over inference.
-hardcodedSources :: Map PackageKey UpdateSource
-hardcodedSources =
+-- | Hardcoded package → source + technique policy (no inference).
+hardcodedPolicies :: Map PackageKey PackagePolicy
+hardcodedPolicies =
   Map.fromList
-    [ ( PackageKey "dev-util/grok-build-bin",
-        Http
-          { httpPrimary = "https://x.ai/cli/stable",
-            httpFallback = Just "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable"
-          }
-      )
+    [ policy
+        "dev-lang/bun-bin"
+        (GitHub "oven-sh" "bun" "bun-v")
+        GitMvAndManifest,
+      policy
+        "dev-lang/deno-bin"
+        (GitHub "denoland" "deno" "v")
+        GitMvAndManifest,
+      policy
+        "dev-util/grok-build-bin"
+        ( Http
+            { httpPrimary = "https://x.ai/cli/stable",
+              httpFallback =
+                Just
+                  "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable"
+            }
+        )
+        GitMvAndManifest,
+      policy
+        "dev-util/opencode-bin"
+        (GitHub "anomalyco" "opencode" "v")
+        GitMvAndManifest,
+      policy
+        "dev-db/dolt"
+        (GitHub "dolthub" "dolt" "v")
+        (Unsupported "vendor assets / mndz-overlay-assets"),
+      policy
+        "dev-util/beads"
+        (GitHub "gastownhall" "beads" "v")
+        (Unsupported "go vendor assets"),
+      policy
+        "dev-util/crush"
+        (GitHub "charmbracelet" "crush" "v")
+        (Unsupported "go vendor assets"),
+      policy
+        "dev-util/openspec"
+        (Npm "@fission-ai/openspec")
+        (Unsupported "npm deps assets"),
+      policy
+        "dev-util/ralph-tui"
+        (GitHub "subsy" "ralph-tui" "v")
+        (Unsupported "deps assets"),
+      policy
+        "dev-util/hk"
+        (GitHub "jdx" "hk" "v")
+        (Unsupported "cargo CRATES"),
+      policy
+        "dev-util/mise"
+        (GitHub "jdx" "mise" "v")
+        (Unsupported "cargo CRATES"),
+      policy
+        "dev-util/usage"
+        (GitHub "jdx" "usage" "v")
+        (Unsupported "cargo CRATES")
     ]
+  where
+    policy key src tech =
+      ( PackageKey key,
+        PackagePolicy {policySource = src, policyTechnique = tech}
+      )
 
+lookupPolicy :: PackageKey -> Maybe PackagePolicy
+lookupPolicy = (`Map.lookup` hardcodedPolicies)
+
+-- | Source-only lookup (for outdated checks).
 lookupHardcoded :: PackageKey -> Maybe UpdateSource
-lookupHardcoded = (`Map.lookup` hardcodedSources)
+lookupHardcoded key = policySource <$> lookupPolicy key
