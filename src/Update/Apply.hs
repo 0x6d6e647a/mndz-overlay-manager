@@ -9,79 +9,117 @@ module Update.Apply
     renderPVNoRev,
     EbuildRunner,
     productionEbuildRunner,
+    ApplyEnv (..),
+    needsGoAssetsApply,
   )
 where
 
 import Control.Concurrent.Async (mapConcurrently)
+import Control.Concurrent.MVar (MVar, withMVar)
 import Data.List (sortOn)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Overlay.Version (EbuildVersion (..), comparePV, prettyVersion)
-import System.Directory (doesFileExist, renameFile)
+import Data.Text.IO qualified as TIO
+import Overlay.Version (EbuildVersion (..), comparePV, prettyVersion, renderPV)
+import System.Directory
+  ( createDirectoryIfMissing,
+    doesFileExist,
+    removeFile,
+    renameFile,
+  )
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, takeFileName, (</>))
+import System.IO.Temp (withSystemTempDirectory)
 import System.Process
   ( CreateProcess (cwd),
     readCreateProcessWithExitCode,
     shell,
   )
+import Update.Assets.Hash (FileDigests (..), hashFile, writeSidecars)
+import Update.Assets.Layout
+  ( SidecarPaths (..),
+    commitMessage,
+    releaseName,
+    releaseTag,
+    sidecarPaths,
+    vendorTarballName,
+  )
+import Update.Assets.Release (ReleaseMeta (..), createReleaseWithAsset)
 import Update.Check (PackageEntry (..))
+import Update.EbuildEdit
+  ( assetsSrcUriParameterized,
+    ebuildFileNameWithRev,
+    nextRevisionVersion,
+    parameterizeAssetsSrcUri,
+    parseManifestVendorSHA512,
+  )
 import Update.Git (GitOps (..), relativeOverlayPath)
+import Update.Go.Vendor (VendorOps (..), buildVendorTarball)
 import Update.Hardcoded (lookupPolicy)
 import Update.Types
   ( ApplyOutcome (..),
     Fetcher,
     PackageKey (..),
     PackagePolicy (..),
-    UpdateSource,
+    UpdateSource (..),
     UpdateTechnique (..),
     outcomeIsHardFail,
     packageKeyText,
+    splitPackageKey,
+    techniqueNeedsAssets,
   )
 
--- | Run @ebuild ./file.ebuild manifest@ with cwd = package directory.
 type EbuildRunner = FilePath -> FilePath -> IO (Either Text ())
 
 productionEbuildRunner :: EbuildRunner
 productionEbuildRunner pkgDir ebuildFileName = do
   let cmd = "ebuild ./" <> ebuildFileName <> " manifest"
-      proc = (shell cmd) {cwd = Just pkgDir}
-  (code, _out, err) <- readCreateProcessWithExitCode proc ""
+      proc' = (shell cmd) {cwd = Just pkgDir}
+  (code, _out, err) <- readCreateProcessWithExitCode proc' ""
   pure $
     if code == ExitSuccess
       then Right ()
       else Left ("ebuild manifest failed: " <> T.pack err)
 
--- | Version string for filenames and commit messages (no leading v, no -rN).
+data ApplyEnv = ApplyEnv
+  { aeFetcher :: Fetcher,
+    aeGitOps :: GitOps,
+    aeEbuildRunner :: EbuildRunner,
+    aeVendorOps :: VendorOps,
+    aeAssetsRoot :: Maybe FilePath,
+    aeGitHubToken :: Maybe Text,
+    aeAssetsOwner :: Text,
+    aeAssetsRepo :: Text,
+    aeAssetsLock :: MVar ()
+  }
+
+needsGoAssetsApply :: [PackageEntry] -> Bool
+needsGoAssetsApply =
+  any $ \e ->
+    case lookupPolicy (peKey e) of
+      Just p -> techniqueNeedsAssets (policyTechnique p)
+      Nothing -> False
+
 renderPVNoRev :: EbuildVersion -> Text
 renderPVNoRev (Raw t) = t
 renderPVNoRev (Numeric comps _) =
   T.intercalate "." (map (T.pack . show) comps)
 
--- | @pn-NEWPV.ebuild@
 newEbuildFileName :: Text -> EbuildVersion -> FilePath
 newEbuildFileName pn remote =
   T.unpack pn <> "-" <> T.unpack (renderPVNoRev remote) <> ".ebuild"
 
--- | True if any hard failure in outcomes.
 foldExitHardFail :: [ApplyOutcome] -> Bool
 foldExitHardFail = any outcomeIsHardFail
 
--- | Full update pipeline: phase 1 parallel, phase 2 serial signed commits.
---
--- If the overlay is not a git work tree, returns a single hard-fail outcome
--- with an empty package key (spine should treat as fatal).
 applyOverlay ::
-  Fetcher ->
-  GitOps ->
-  EbuildRunner ->
+  ApplyEnv ->
   FilePath ->
   [PackageEntry] ->
-  -- | When Just, only these keys; Nothing means all entries.
   Maybe [PackageKey] ->
   IO [ApplyOutcome]
-applyOverlay fetch gitOps ebuildRun overlayRoot entries mFilter = do
-  isGit <- goIsWorkTree gitOps overlayRoot
+applyOverlay env overlayRoot entries mFilter = do
+  isGit <- goIsWorkTree (aeGitOps env) overlayRoot
   if not isGit
     then
       pure
@@ -89,21 +127,19 @@ applyOverlay fetch gitOps ebuildRun overlayRoot entries mFilter = do
             (PackageKey "")
             "overlay path is not a git work tree"
             False
+            False
         ]
     else do
       let selected = case mFilter of
             Nothing -> entries
             Just keys -> [e | e <- entries, peKey e `elem` keys]
-      phase1 <-
-        mapConcurrently
-          (applyPackagePhase1 fetch gitOps ebuildRun overlayRoot)
-          selected
+      phase1 <- mapConcurrently (applyPackagePhase1 env overlayRoot) selected
       let successes =
             sortOn
               (packageKeyText . successKey)
               [o | o@ApplySuccess {} <- phase1]
           others = [o | o <- phase1, not (isSuccess o)]
-      committed <- commitSuccesses gitOps overlayRoot successes
+      committed <- commitSuccesses (aeGitOps env) overlayRoot successes
       pure (others <> committed)
   where
     successKey (ApplySuccess k _ _ _) = k
@@ -111,21 +147,15 @@ applyOverlay fetch gitOps ebuildRun overlayRoot entries mFilter = do
     isSuccess ApplySuccess {} = True
     isSuccess _ = False
 
--- | Phase 1 for one package: policy, fetch, dirty, rename, manifest.
 applyPackagePhase1 ::
-  Fetcher ->
-  GitOps ->
-  EbuildRunner ->
+  ApplyEnv ->
   FilePath ->
   PackageEntry ->
   IO ApplyOutcome
-applyPackagePhase1 fetch gitOps ebuildRun overlayRoot entry =
+applyPackagePhase1 env overlayRoot entry =
   case lookupPolicy (peKey entry) of
     Nothing ->
-      pure $
-        ApplySoftSkip
-          (peKey entry)
-          "no hardcoded policy for package"
+      pure $ ApplySoftSkip (peKey entry) "no hardcoded policy for package"
     Just policy ->
       case policyTechnique policy of
         Unsupported reason ->
@@ -134,28 +164,36 @@ applyPackagePhase1 fetch gitOps ebuildRun overlayRoot entry =
               (peKey entry)
               ("unsupported update technique: " <> reason)
         GitMvAndManifest ->
-          applyGitMv fetch gitOps ebuildRun overlayRoot entry (policySource policy)
+          applyGitMv env overlayRoot entry (policySource policy)
+        GoVendorAndAssets mSub ->
+          applyGoVendor env overlayRoot entry (policySource policy) mSub
+
+------------------------------------------------------------------------
+-- GitMvAndManifest
+------------------------------------------------------------------------
 
 applyGitMv ::
-  Fetcher ->
-  GitOps ->
-  EbuildRunner ->
+  ApplyEnv ->
   FilePath ->
   PackageEntry ->
   UpdateSource ->
   IO ApplyOutcome
-applyGitMv fetch gitOps ebuildRun overlayRoot entry src = do
+applyGitMv env overlayRoot entry src = do
   let key = peKey entry
       local = peLocal entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
-  fetched <- fetch src
+      pn = pePN entry
+      gitOps = aeGitOps env
+      ebuildRun = aeEbuildRunner env
+  fetched <- aeFetcher env src
   case fetched of
     Left err ->
-      pure $ ApplyHardFail key ("fetch failed: " <> err) False
+      pure $ ApplyHardFail key ("fetch failed: " <> err) False False
     Right remote ->
       case comparePV local remote of
-        Just LT -> doApply key local remote oldPath pkgDir
+        Just LT ->
+          gitMvDo key local remote oldPath pkgDir pn gitOps ebuildRun overlayRoot
         Just EQ ->
           pure $ ApplySoftSkip key "already at latest upstream version"
         Just GT ->
@@ -178,61 +216,334 @@ applyGitMv fetch gitOps ebuildRun overlayRoot entry src = do
                   <> T.pack (show remote)
               )
               False
-  where
-    doApply key local remote oldPath pkgDir = do
-      ebuildRel <- relativeOverlayPath overlayRoot oldPath
-      let manifestAbs = pkgDir </> "Manifest"
-      manifestRel <- relativeOverlayPath overlayRoot manifestAbs
-      dirty <- goPathsDirty gitOps overlayRoot [ebuildRel, manifestRel]
-      case dirty of
-        Left err -> pure $ ApplyHardFail key err False
-        Right True ->
+              False
+
+gitMvDo ::
+  PackageKey ->
+  EbuildVersion ->
+  EbuildVersion ->
+  FilePath ->
+  FilePath ->
+  Text ->
+  GitOps ->
+  EbuildRunner ->
+  FilePath ->
+  IO ApplyOutcome
+gitMvDo key local remote oldPath pkgDir pn gitOps ebuildRun overlayRoot = do
+  ebuildRel <- relativeOverlayPath overlayRoot oldPath
+  let manifestAbs = pkgDir </> "Manifest"
+  manRel0 <- relativeOverlayPath overlayRoot manifestAbs
+  dirty' <- goPathsDirty gitOps overlayRoot [ebuildRel, manRel0]
+  case dirty' of
+    Left err -> pure $ ApplyHardFail key err False False
+    Right True ->
+      pure $
+        ApplyHardFail
+          key
+          "involved paths are dirty (newest ebuild and/or Manifest)"
+          False
+          False
+    Right False -> do
+      let newName = newEbuildFileName pn remote
+          newPath = pkgDir </> newName
+      existsNew <- doesFileExist newPath
+      if existsNew && takeFileName oldPath /= newName
+        then
           pure $
             ApplyHardFail
               key
-              "involved paths are dirty (newest ebuild and/or Manifest)"
+              ("target ebuild already exists: " <> T.pack newName)
               False
-        Right False -> do
-          let newName = newEbuildFileName (pePN entry) remote
-              newPath = pkgDir </> newName
-          existsNew <- doesFileExist newPath
-          if existsNew && takeFileName oldPath /= newName
-            then
+              False
+        else do
+          renamed <-
+            if takeFileName oldPath == newName
+              then pure False
+              else do
+                renameFile oldPath newPath
+                pure True
+          manResult <- ebuildRun pkgDir newName
+          case manResult of
+            Left err -> pure $ ApplyHardFail key err renamed False
+            Right () -> do
+              newRel <- relativeOverlayPath overlayRoot newPath
+              manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+              let paths =
+                    if renamed
+                      then [ebuildRel, newRel, manRel]
+                      else [newRel, manRel]
+              pure $ ApplySuccess key local remote paths
+
+------------------------------------------------------------------------
+-- GoVendorAndAssets
+------------------------------------------------------------------------
+
+applyGoVendor ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  UpdateSource ->
+  Maybe FilePath ->
+  IO ApplyOutcome
+applyGoVendor env overlayRoot entry src mSub = do
+  let key = peKey entry
+      local = peLocal entry
+      oldPath = pePath entry
+  case src of
+    GitHub owner repo prefix -> do
+      fetched <- aeFetcher env src
+      case fetched of
+        Left err ->
+          pure $ ApplyHardFail key ("fetch failed: " <> err) False False
+        Right remote -> do
+          content <- TIO.readFile oldPath
+          let parameterized = assetsSrcUriParameterized content
+          case comparePV local remote of
+            Just GT ->
+              pure $
+                ApplySoftSkip
+                  key
+                  ( "local version is ahead of upstream ("
+                      <> prettyVersion local
+                      <> " > "
+                      <> prettyVersion remote
+                      <> ")"
+                  )
+            Just EQ
+              | parameterized ->
+                  pure $ ApplySoftSkip key "already at latest upstream version"
+            Just EQ ->
+              goPublishAndOverlay
+                env
+                overlayRoot
+                entry
+                owner
+                repo
+                prefix
+                mSub
+                local
+                (nextRevisionVersion local)
+            Just LT ->
+              goPublishAndOverlay
+                env
+                overlayRoot
+                entry
+                owner
+                repo
+                prefix
+                mSub
+                local
+                ( case remote of
+                    Numeric comps _ -> Numeric comps Nothing
+                    Raw t -> Raw t
+                )
+            Nothing ->
               pure $
                 ApplyHardFail
                   key
-                  ("target ebuild already exists: " <> T.pack newName)
+                  ( "incomparable versions: local="
+                      <> T.pack (show local)
+                      <> " remote="
+                      <> T.pack (show remote)
+                  )
                   False
-            else do
-              renamed <-
-                if takeFileName oldPath == newName
-                  then pure False
-                  else do
-                    renameFile oldPath newPath
-                    pure True
-              manResult <- ebuildRun pkgDir newName
-              case manResult of
-                Left err ->
+                  False
+    _ ->
+      pure $
+        ApplyHardFail
+          key
+          "GoVendorAndAssets requires a GitHub update source"
+          False
+          False
+
+goPublishAndOverlay ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  EbuildVersion ->
+  EbuildVersion ->
+  IO ApplyOutcome
+goPublishAndOverlay env overlayRoot entry owner repo prefix mSub local targetVer = do
+  let key = peKey entry
+      pn = pePN entry
+      pvNoRev = renderPVNoRev targetVer
+      tarballName = vendorTarballName pn pvNoRev
+  case (aeAssetsRoot env, aeGitHubToken env) of
+    (Nothing, _) ->
+      pure $
+        ApplyHardFail
+          key
+          "mndz-overlay-assets-path is required for Go vendor packages"
+          False
+          False
+    (_, Nothing) ->
+      pure $
+        ApplyHardFail
+          key
+          "GitHub token is required to publish assets releases"
+          False
+          False
+    (Just assetsRoot, Just token) ->
+      case splitPackageKey key of
+        Nothing ->
+          pure $ ApplyHardFail key "invalid package key" False False
+        Just (category, _) ->
+          withSystemTempDirectory "mndz-vendor-out-" $ \outDir -> do
+            built <-
+              buildVendorTarball
+                (aeVendorOps env)
+                owner
+                repo
+                prefix
+                pvNoRev
+                mSub
+                outDir
+                tarballName
+            case built of
+              Left err -> pure $ ApplyHardFail key err False False
+              Right tarballPath -> do
+                digests <- hashFile tarballPath
+                let sp = sidecarPaths assetsRoot category pn tarballName
+                    relSidecars =
+                      [ T.unpack category </> T.unpack pn </> tarballName <> ext
+                      | ext <- [".sha256", ".sha512", ".b3"]
+                      ]
+                createDirectoryIfMissing True (takeDirectory (spSha256 sp))
+                writeSidecars
+                  tarballPath
+                  digests
+                  (spSha256 sp)
+                  (spSha512 sp)
+                  (spB3 sp)
+                let msg = commitMessage category pn (renderPV targetVer)
+                pubResult <-
+                  withMVar (aeAssetsLock env) $ \() -> do
+                    committed <-
+                      goAddAndCommit
+                        (aeGitOps env)
+                        assetsRoot
+                        relSidecars
+                        msg
+                    case committed of
+                      Left err -> pure (Left err)
+                      Right () -> do
+                        pushed <- goPush (aeGitOps env) assetsRoot
+                        case pushed of
+                          Left err -> pure (Left err)
+                          Right () -> do
+                            let meta =
+                                  ReleaseMeta
+                                    { rmOwner = aeAssetsOwner env,
+                                      rmRepo = aeAssetsRepo env,
+                                      rmTag = releaseTag pn pvNoRev,
+                                      rmName = releaseName category pn pvNoRev,
+                                      rmBody = msg,
+                                      rmTargetCommitish = "main"
+                                    }
+                            createReleaseWithAsset token meta tarballPath
+                case pubResult of
+                  Left err ->
+                    pure $
+                      ApplyHardFail
+                        key
+                        ("assets publish failed: " <> err)
+                        False
+                        False
+                  Right () ->
+                    overlayAfterAssets
+                      env
+                      overlayRoot
+                      entry
+                      local
+                      targetVer
+                      digests
+                      tarballName
+
+overlayAfterAssets ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  EbuildVersion ->
+  EbuildVersion ->
+  FileDigests ->
+  FilePath ->
+  IO ApplyOutcome
+overlayAfterAssets env overlayRoot entry local targetVer digests tarballName = do
+  let key = peKey entry
+      oldPath = pePath entry
+      pkgDir = takeDirectory oldPath
+      pn = pePN entry
+      gitOps = aeGitOps env
+      ebuildRun = aeEbuildRunner env
+      orphan = True
+  ebuildRel <- relativeOverlayPath overlayRoot oldPath
+  manRel0 <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+  dirty <- goPathsDirty gitOps overlayRoot [ebuildRel, manRel0]
+  case dirty of
+    Left err -> pure $ ApplyHardFail key err False orphan
+    Right True ->
+      pure $
+        ApplyHardFail
+          key
+          "involved paths are dirty (newest ebuild and/or Manifest)"
+          False
+          orphan
+    Right False -> do
+      content <- TIO.readFile oldPath
+      let fixed = parameterizeAssetsSrcUri pn content
+          newName = ebuildFileNameWithRev pn targetVer
+          newPath = pkgDir </> newName
+      existsNew <- doesFileExist newPath
+      if existsNew && takeFileName oldPath /= newName
+        then
+          pure $
+            ApplyHardFail
+              key
+              ("target ebuild already exists: " <> T.pack newName)
+              False
+              orphan
+        else do
+          TIO.writeFile newPath fixed
+          renamed <-
+            if takeFileName oldPath == newName
+              then pure False
+              else do
+                removeFile oldPath
+                pure True
+          manResult <- ebuildRun pkgDir newName
+          case manResult of
+            Left err -> pure $ ApplyHardFail key err True orphan
+            Right () -> do
+              manText <- TIO.readFile (pkgDir </> "Manifest")
+              case parseManifestVendorSHA512 manText tarballName of
+                Nothing ->
                   pure $
                     ApplyHardFail
                       key
-                      err
-                      renamed
-                Right () -> do
-                  newRel <- relativeOverlayPath overlayRoot newPath
-                  manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-                  -- Stage the old ebuild path as well so git records the
-                  -- deletion (plain rename leaves a D unstaged if we only
-                  -- add the new name). git add on a deleted tracked path
-                  -- stages the removal; together with newRel this is a rename.
-                  let paths =
-                        if renamed
-                          then [ebuildRel, newRel, manRel]
-                          else [newRel, manRel]
-                  pure $
-                    ApplySuccess key local remote paths
+                      "could not parse vendor SHA512 from Manifest after ebuild manifest"
+                      True
+                      orphan
+                Just manSha
+                  | manSha == digestSHA512 digests -> do
+                      newRel <- relativeOverlayPath overlayRoot newPath
+                      manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+                      let paths =
+                            if renamed
+                              then [ebuildRel, newRel, manRel]
+                              else [newRel, manRel]
+                      pure $ ApplySuccess key local targetVer paths
+                  | otherwise ->
+                      pure $
+                        ApplyHardFail
+                          key
+                          "Manifest SHA512 does not match published vendor tarball"
+                          True
+                          orphan
 
--- | Phase 2: signed commits for successful applies (already sorted by caller).
 commitSuccesses ::
   GitOps ->
   FilePath ->
@@ -241,12 +552,9 @@ commitSuccesses ::
 commitSuccesses gitOps overlayRoot = mapM commitOne
   where
     commitOne (ApplySuccess key local remote paths) = do
-      let msg =
-            packageKeyText key
-              <> ": "
-              <> renderPVNoRev remote
+      let msg = packageKeyText key <> ": " <> renderPV remote
       result <- goAddAndCommit gitOps overlayRoot paths msg
       pure $ case result of
         Right () -> ApplySuccess key local remote paths
-        Left err -> ApplyHardFail key err False
+        Left err -> ApplyHardFail key err False False
     commitOne other = pure other

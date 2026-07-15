@@ -28,27 +28,26 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
-import System.Environment (lookupEnv)
 import Update.Types (UpdateSource (..))
 
 -- | Fetch latest version from GitHub (releases/latest, then tags fallback).
+-- Uses unauthenticated API when @mToken@ is 'Nothing'.
 fetchGitHub :: UpdateSource -> IO (Either Text EbuildVersion)
 fetchGitHub src = do
   mgr <- newManager tlsManagerSettings
-  token <- lookupEnv "GITHUB_TOKEN"
-  fetchGitHubWith mgr token src
+  fetchGitHubWith mgr Nothing src
 
 fetchGitHubWith ::
   Manager ->
-  Maybe String ->
+  Maybe Text ->
   UpdateSource ->
   IO (Either Text EbuildVersion)
 fetchGitHubWith mgr mToken = \case
   GitHub owner repo prefix -> do
     let authHeaders = case mToken of
           Just t
-            | not (null t) ->
-                [ ("Authorization", encodeUtf8 (T.pack ("Bearer " <> t)))
+            | not (T.null t) ->
+                [ ("Authorization", encodeUtf8 ("Bearer " <> t))
                 ]
           _ -> []
         commonHeaders =

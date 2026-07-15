@@ -1,10 +1,4 @@
-# overlay-path-resolution Specification
-
-## Purpose
-
-Define how non-help commands load configuration, resolve the overlay path (including CLI override), and gate work on overlay validation.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Config is loaded for every non-help invocation
 
@@ -32,34 +26,7 @@ When a subcommand other than top-level help is invoked, the program SHALL load t
 - **WHEN** the config file defines `mndz-overlay-path` but omits `github-token`
 - **THEN** config load succeeds and the token is resolved from the environment if present
 
-### Requirement: Overlay path CLI override after config load
-
-The CLI SHALL provide a top-level `--overlay-path` option. For non-help commands the program SHALL always load configuration first, then set the effective overlay path to the `--overlay-path` value when present, otherwise to `mndz-overlay-path` from the config.
-
-#### Scenario: Override wins over config path
-
-- **WHEN** the user supplies `--overlay-path /tmp/other-overlay` and a config that points at a different path
-- **THEN** the program uses `/tmp/other-overlay` as the effective overlay path for validation and subsequent work
-
-#### Scenario: Config path used when override absent
-
-- **WHEN** the user runs a non-help command without `--overlay-path`
-- **THEN** the program uses `mndz-overlay-path` from the loaded config as the effective overlay path
-
-### Requirement: Overlay validation gates non-help commands
-
-After resolving the effective overlay path, the program SHALL run overlay validation (existence of required Gentoo layout entries and `repo_name` equal to `mndz`). Validation failure SHALL produce an error-level log and exit status `1`. Help invocations SHALL NOT require config load or overlay validation.
-
-#### Scenario: Invalid overlay after path resolution
-
-- **WHEN** the effective overlay path fails validation
-- **THEN** the program logs an error describing the validation failure
-- **AND** the program exits with status `1`
-
-#### Scenario: Help skips config and validation
-
-- **WHEN** the user runs `help` or `--help`
-- **THEN** the program shows help without requiring a valid config file or overlay path
+## ADDED Requirements
 
 ### Requirement: Assets path available from config when set
 

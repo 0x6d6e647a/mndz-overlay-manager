@@ -7,6 +7,7 @@ import Config.Types (OverlayConfig (..))
 import Control.Monad (unless)
 import Data.List (sort)
 import Data.Text qualified as T
+import Data.Text.Encoding (encodeUtf8)
 import Overlay.Discovery
   ( DiscoveryError (..),
     collectEbuilds,
@@ -28,10 +29,25 @@ import Update.Apply
     newEbuildFileName,
     renderPVNoRev,
   )
+import Update.Assets.Hash (FileDigests (..), hashBytes, sidecarLine)
+import Update.Auth (resolveGitHubTokenWith)
 import Update.Check (PackageEntry (..), groupNewest)
+import Update.EbuildEdit
+  ( assetsSrcUriParameterized,
+    nextRevisionVersion,
+    parameterizeAssetsSrcUri,
+    parseManifestVendorSHA512,
+  )
 import Update.Hardcoded (lookupHardcoded, lookupPolicy)
-import Update.Preflight (checkToolsOnPath, updateRequiredTools)
+import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
+import Update.SshAgent
+  ( AgentIdentities (..),
+    SshAgentOps (..),
+    SshSession (..),
+    ensureSshAgent,
+    parseIdentityFiles,
+  )
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types
   ( ApplyOutcome (..),
@@ -57,6 +73,7 @@ main = do
   testConfigLoadSuccess
   testConfigLoadMissing
   testConfigLoadMissingKey
+  testConfigOptionalKeys
   testEmptyInventoryIsEmptyList
   testValidatePopulated
   testVersionParse
@@ -71,6 +88,11 @@ main = do
   testPreflightMissingTools
   testNewEbuildFileName
   testFoldExitHardFail
+  testTokenResolver
+  testHashBytes
+  testSidecarLine
+  testEbuildEdit
+  testSshAgentReuse
   putStrLn "All tests passed."
 
 assertEq :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -166,6 +188,15 @@ testConfigLoadSuccess :: IO ()
 testConfigLoadSuccess = do
   cfg <- assertRight "valid config" =<< loadConfig (Just "test/fixtures/valid-config.toml")
   assertEq "path key" "test/fixtures/populated-overlay" (mndzOverlayPath cfg)
+  assertEq "assets optional absent" Nothing (mndzOverlayAssetsPath cfg)
+  assertEq "token optional absent" Nothing (githubToken cfg)
+
+testConfigOptionalKeys :: IO ()
+testConfigOptionalKeys = do
+  cfg <- assertRight "full config" =<< loadConfig (Just "test/fixtures/full-config.toml")
+  assertEq "path" "/tmp/overlay" (mndzOverlayPath cfg)
+  assertEq "assets" (Just "/tmp/assets") (mndzOverlayAssetsPath cfg)
+  assertEq "token" (Just "secret-token") (githubToken cfg)
 
 testConfigLoadMissing :: IO ()
 testConfigLoadMissing = do
@@ -281,6 +312,16 @@ testPolicyClassification = do
     Just (PackagePolicy (GitHub "oven-sh" "bun" "bun-v") GitMvAndManifest) -> pure ()
     other -> do
       hPutStrLn stderr $ "bun policy: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-db/dolt") of
+    Just (PackagePolicy _ (GoVendorAndAssets (Just "go"))) -> pure ()
+    other -> do
+      hPutStrLn stderr $ "dolt technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/beads") of
+    Just (PackagePolicy _ (GoVendorAndAssets Nothing)) -> pure ()
+    other -> do
+      hPutStrLn stderr $ "beads technique: " <> show other
       exitFailure
 
 testResolveMapOnly :: IO ()
@@ -484,7 +525,7 @@ testFoldExitHardFail = do
         ]
       mixed =
         soft
-          <> [ ApplyHardFail (PackageKey "e/f") "dirty" False,
+          <> [ ApplyHardFail (PackageKey "e/f") "dirty" False False,
                ApplySuccess
                  (PackageKey "g/h")
                  (parseEbuildVersion "1.0")
@@ -493,3 +534,130 @@ testFoldExitHardFail = do
              ]
   assertEq "soft only" False (foldExitHardFail soft)
   assertEq "mixed" True (foldExitHardFail mixed)
+
+testTokenResolver :: IO ()
+testTokenResolver = do
+  assertEq
+    "env wins"
+    (Just "from-env")
+    (resolveGitHubTokenWith (Just "from-env") (Just "gh") (Just "cfg"))
+  assertEq
+    "gh token second"
+    (Just "from-gh")
+    (resolveGitHubTokenWith Nothing (Just "from-gh") (Just "cfg"))
+  assertEq
+    "config last"
+    (Just "cfg")
+    (resolveGitHubTokenWith Nothing Nothing (Just "cfg"))
+  assertEq
+    "empty env skipped"
+    (Just "cfg")
+    (resolveGitHubTokenWith (Just "") Nothing (Just "cfg"))
+  assertEq
+    "none"
+    Nothing
+    (resolveGitHubTokenWith Nothing Nothing Nothing)
+
+testHashBytes :: IO ()
+testHashBytes = do
+  let d = hashBytes (encodeUtf8 "hello")
+  -- SHA-256 of "hello"
+  assertEq
+    "sha256 hello"
+    "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    (digestSHA256 d)
+  assertTrue "sha512 nonempty" (T.length (digestSHA512 d) == 128)
+  assertTrue "blake3 nonempty" (T.length (digestBLAKE3 d) == 64)
+
+testSidecarLine :: IO ()
+testSidecarLine = do
+  assertEq
+    "basename only"
+    "abc  crush-0.76.0-vendor.tar.xz"
+    (sidecarLine "abc" "/tmp/build/crush-0.76.0-vendor.tar.xz")
+
+testEbuildEdit :: IO ()
+testEbuildEdit = do
+  let frozen =
+        T.unlines
+          [ "SRC_URI=\"https://github.com/dolthub/dolt/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/dolt-2.1.6/dolt-2.1.6-vendor.tar.xz\""
+          ]
+      fixed = parameterizeAssetsSrcUri "dolt" frozen
+      already =
+        "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/beads-${PV}/beads-${PV}-vendor.tar.xz\"\n"
+  assertEq "frozen not parameterized" False (assetsSrcUriParameterized frozen)
+  assertTrue "fixed parameterized" (assetsSrcUriParameterized fixed)
+  assertTrue "has ${PV} tag" ("dolt-${PV}/dolt-${PV}-vendor" `T.isInfixOf` fixed)
+  -- Regression: intercalate must keep the assets host path (not strip it).
+  assertTrue
+    "keeps mndz-overlay-assets download path"
+    ( "https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/dolt-${PV}/dolt-${PV}-vendor.tar.xz"
+        `T.isInfixOf` fixed
+    )
+  assertTrue
+    "does not produce bare user/repo URL"
+    (not ("https://github.com/0x6d6e647a/dolt-" `T.isInfixOf` fixed))
+  assertEq
+    "already parameterized unchanged path"
+    already
+    (parameterizeAssetsSrcUri "beads" already)
+  let rev1 = nextRevisionVersion (parseEbuildVersion "2.1.6")
+  assertEq "r1" (Numeric [2, 1, 6] (Just 1)) rev1
+  let man =
+        "DIST dolt-2.1.6-vendor.tar.xz 123 BLAKE2B deadbeef SHA512 abcdef0123456789\n"
+  assertEq
+    "manifest sha512"
+    (Just "abcdef0123456789")
+    (parseManifestVendorSHA512 man "dolt-2.1.6-vendor.tar.xz")
+
+testSshAgentReuse :: IO ()
+testSshAgentReuse = do
+  let opsWithKeys =
+        SshAgentOps
+          { saoLookupEnv = \k -> pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/agent" else Nothing,
+            saoSetEnv = \_ _ -> pure (),
+            saoUnsetEnv = \_ -> pure (),
+            saoRunAgent = pure (Left "should not start"),
+            saoSshAdd = pure (Left "should not add"),
+            saoListIdentities = pure HasIdentities,
+            saoKillAgent = \_ -> pure ()
+          }
+  result <- ensureSshAgent opsWithKeys
+  case result of
+    Right SshSessionReused -> pure ()
+    other -> do
+      hPutStrLn stderr $ "expected reused session, got " <> show other
+      exitFailure
+  let opsEmpty =
+        opsWithKeys
+          { saoListIdentities = pure NoIdentities,
+            saoSshAdd = pure (Right ())
+          }
+  resultEmpty <- ensureSshAgent opsEmpty
+  case resultEmpty of
+    Left msg ->
+      assertTrue
+        "mentions no identities"
+        ("no identities" `T.isInfixOf` msg)
+    Right _ -> do
+      hPutStrLn stderr "expected failure when agent stays empty"
+      exitFailure
+  let parsed =
+        parseIdentityFiles
+          "/home/u"
+          "Host github.com\n  IdentityFile ~/.ssh/keys/github\n# IdentityFile ~/.ssh/skip\nIdentityFile /abs/key\n"
+  assertEq
+    "parsed identity files"
+    ["/home/u/.ssh/keys/github", "/abs/key"]
+    parsed
+  missing <-
+    checkToolsOnPath
+      ( \name ->
+          pure $
+            if name == "go"
+              then Nothing
+              else Just ("/bin/" <> name)
+      )
+      goAssetsRequiredTools
+  assertEq "go missing among assets tools" ["go"] missing

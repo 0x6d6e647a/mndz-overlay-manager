@@ -45,15 +45,15 @@ hardcodedPolicies =
       policy
         "dev-db/dolt"
         (GitHub "dolthub" "dolt" "v")
-        (Unsupported "vendor assets / mndz-overlay-assets"),
+        (GoVendorAndAssets (Just "go")),
       policy
         "dev-util/beads"
         (GitHub "gastownhall" "beads" "v")
-        (Unsupported "go vendor assets"),
+        (GoVendorAndAssets Nothing),
       policy
         "dev-util/crush"
         (GitHub "charmbracelet" "crush" "v")
-        (Unsupported "go vendor assets"),
+        (GoVendorAndAssets Nothing),
       policy
         "dev-util/openspec"
         (Npm "@fission-ai/openspec")

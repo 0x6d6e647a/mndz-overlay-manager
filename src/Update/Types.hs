@@ -14,6 +14,7 @@ module Update.Types
     ApplyOutcome (..),
     outcomeIsHardFail,
     outcomeIsSuccess,
+    techniqueNeedsAssets,
   )
 where
 
@@ -80,8 +81,15 @@ type Fetcher = UpdateSource -> IO (Either Text EbuildVersion)
 -- | How (or whether) to apply a version bump in the overlay.
 data UpdateTechnique
   = GitMvAndManifest
+  | -- | Optional subdirectory containing go.mod relative to repo root.
+    GoVendorAndAssets (Maybe FilePath)
   | Unsupported Text
   deriving (Eq, Show)
+
+-- | True when the technique publishes to mndz-overlay-assets.
+techniqueNeedsAssets :: UpdateTechnique -> Bool
+techniqueNeedsAssets (GoVendorAndAssets _) = True
+techniqueNeedsAssets _ = False
 
 -- | Hardcoded per-package source and apply technique.
 data PackagePolicy = PackagePolicy
@@ -95,8 +103,8 @@ data ApplyOutcome
   = -- | local, remote, paths relative to overlay root for git add
     ApplySuccess PackageKey EbuildVersion EbuildVersion [FilePath]
   | ApplySoftSkip PackageKey Text
-  | -- | message, half-applied (rename done, later step failed)
-    ApplyHardFail PackageKey Text Bool
+  | -- | message, half-applied (overlay mutated), assets already published
+    ApplyHardFail PackageKey Text Bool Bool
   deriving (Eq, Show)
 
 outcomeIsHardFail :: ApplyOutcome -> Bool

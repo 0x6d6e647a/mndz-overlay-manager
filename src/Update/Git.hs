@@ -4,6 +4,7 @@ module Update.Git
   ( isGitWorkTree,
     pathsDirty,
     gitAddAndSignedCommit,
+    gitPush,
     relativeOverlayPath,
     GitOps (..),
     productionGitOps,
@@ -21,7 +22,8 @@ import System.Process (readProcessWithExitCode)
 data GitOps = GitOps
   { goIsWorkTree :: FilePath -> IO Bool,
     goPathsDirty :: FilePath -> [FilePath] -> IO (Either Text Bool),
-    goAddAndCommit :: FilePath -> [FilePath] -> Text -> IO (Either Text ())
+    goAddAndCommit :: FilePath -> [FilePath] -> Text -> IO (Either Text ()),
+    goPush :: FilePath -> IO (Either Text ())
   }
 
 productionGitOps :: GitOps
@@ -29,7 +31,8 @@ productionGitOps =
   GitOps
     { goIsWorkTree = isGitWorkTree,
       goPathsDirty = pathsDirty,
-      goAddAndCommit = gitAddAndSignedCommit
+      goAddAndCommit = gitAddAndSignedCommit,
+      goPush = gitPush
     }
 
 -- | True if @dir@ is inside a git work tree.
@@ -84,6 +87,20 @@ gitAddAndSignedCommit overlayRoot relPaths message = do
         if codeC == ExitSuccess
           then Right ()
           else Left ("git commit -S failed: " <> T.pack errC)
+
+-- | Push the current branch to its configured remote.
+gitPush :: FilePath -> IO (Either Text ())
+gitPush root = do
+  rootAbs <- makeAbsolute root
+  (code, _, err) <-
+    readProcessWithExitCode
+      "git"
+      ["-C", rootAbs, "push"]
+      ""
+  pure $
+    if code == ExitSuccess
+      then Right ()
+      else Left ("git push failed: " <> T.pack err)
 
 -- | Path of @file@ relative to @overlayRoot@ (both absolute preferred).
 relativeOverlayPath :: FilePath -> FilePath -> IO FilePath

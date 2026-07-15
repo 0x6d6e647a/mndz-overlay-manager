@@ -6,6 +6,7 @@ module Update.Check
     checkOverlay,
     checkPackage,
     productionFetcher,
+    productionFetcherWithToken,
     statusFromCompare,
     renderPVNoRev,
   )
@@ -19,7 +20,6 @@ import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
-import System.Environment (lookupEnv)
 import Update.GitHub (fetchGitHubWith)
 import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
@@ -124,10 +124,13 @@ renderPVNoRev (Numeric comps _) =
 
 -- | Production fetcher dispatching to Http / GitHub / npm clients.
 productionFetcher :: IO Fetcher
-productionFetcher = do
+productionFetcher = productionFetcherWithToken Nothing
+
+-- | Like 'productionFetcher' with an optional resolved GitHub token.
+productionFetcherWithToken :: Maybe T.Text -> IO Fetcher
+productionFetcherWithToken mToken = do
   mgr <- newManager tlsManagerSettings
-  token <- lookupEnv "GITHUB_TOKEN"
   pure $ \src -> case src of
     Http {} -> fetchHttpWith mgr src
-    GitHub {} -> fetchGitHubWith mgr token src
+    GitHub {} -> fetchGitHubWith mgr mToken src
     Npm {} -> fetchNpmWith mgr src

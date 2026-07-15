@@ -74,14 +74,21 @@ library
       , Overlay.Validation
       , Overlay.Version
       , Update.Apply
+      , Update.Assets.Hash
+      , Update.Assets.Layout
+      , Update.Assets.Release
+      , Update.Auth
       , Update.Check
+      , Update.EbuildEdit
       , Update.Git
       , Update.GitHub
+      , Update.Go.Vendor
       , Update.Hardcoded
       , Update.Http
       , Update.Npm
       , Update.Preflight
       , Update.Resolve
+      , Update.SshAgent
       , Update.Targets
       , Update.Types
 
@@ -95,17 +102,21 @@ library
     build-depends:
         base ^>=4.20.2.0,
         aeson ^>=2.2,
+        blake3 ^>=0.3,
         bytestring ^>=0.12,
         co-log ^>=0.7,
         containers ^>=0.7,
+        crypton ^>=1.0,
         directory ^>=1.3,
         filepath ^>=1.5,
         http-client ^>=0.7,
         http-client-tls ^>=0.3,
         http-types ^>=0.12,
         async ^>=2.2,
+        memory ^>=0.18,
         optparse-applicative ^>=0.19,
         process ^>=1.6,
+        temporary ^>=1.3,
         text ^>=2.1,
         toml-parser ^>=2.0
 
@@ -168,6 +179,7 @@ test-suite mndz-overlay-manager-test
     -- Test dependencies.
     build-depends:
         base ^>=4.20.2.0,
+        bytestring ^>=0.12,
         directory ^>=1.3,
         filepath ^>=1.5,
         mndz-overlay-manager,

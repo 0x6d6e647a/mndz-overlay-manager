@@ -19,11 +19,18 @@ root-modules = [
   "Update.Targets",
   "Update.Preflight",
   "Update.Apply",
+  "Update.Assets.Hash",
+  "Update.Assets.Layout",
+  "Update.Assets.Release",
+  "Update.Auth",
+  "Update.EbuildEdit",
   "Update.GitHub",
+  "Update.Go.Vendor",
   "Update.Hardcoded",
   "Update.Http",
   "Update.Npm",
   "Update.Resolve",
+  "Update.SshAgent",
   "Update.Types",
 ]
 type-class-roots = true

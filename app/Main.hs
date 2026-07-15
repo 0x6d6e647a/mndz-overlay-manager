@@ -6,6 +6,8 @@ import CLI.Parser (Command (Help, List, Outdated, Update), Options (..), parserI
 import Colog (Message, WithLog, logError, logWarning, usingLoggerT)
 import Config.Loader (configErrorMessage, loadConfig)
 import Config.Types (OverlayConfig (..))
+import Control.Concurrent.MVar (newMVar)
+import Control.Exception (bracket)
 import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Text qualified as T
@@ -18,20 +20,39 @@ import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (prettyVersion)
 import System.Exit (ExitCode (..), exitWith)
 import Update.Apply
-  ( applyOverlay,
+  ( ApplyEnv (..),
+    applyOverlay,
     foldExitHardFail,
     productionEbuildRunner,
   )
-import Update.Check (checkOverlay, groupNewest, productionFetcher)
+import Update.Auth (resolveGitHubToken)
+import Update.Check
+  ( PackageEntry (..),
+    checkOverlay,
+    groupNewest,
+    productionFetcherWithToken,
+  )
 import Update.Git (productionGitOps)
-import Update.Preflight (preflightUpdate)
+import Update.Go.Vendor (productionVendorOps)
+import Update.Hardcoded (lookupPolicy)
+import Update.Preflight
+  ( preflightUpdateWith,
+    validateAssetsPath,
+  )
+import Update.SshAgent
+  ( ensureSshAgent,
+    productionSshAgentOps,
+    teardownSshSession,
+  )
 import Update.Targets (resolveTargets, targetErrorMessage)
 import Update.Types
   ( ApplyOutcome (..),
     PackageKey (..),
+    PackagePolicy (..),
     UpdateReport (..),
     UpdateStatus (Ahead, FetchError, Ok, Unconfigured),
     packageKeyText,
+    techniqueNeedsAssets,
   )
 import Update.Types qualified as U
 
@@ -51,17 +72,15 @@ runList opts = do
 
 runOutdated :: (WithLog env Message m, MonadIO m) => Options -> m ()
 runOutdated opts = do
-  ebuilds <- loadValidatedEbuilds opts
-  fetch <- liftIO productionFetcher
+  (cfg, ebuilds) <- loadValidatedEbuildsWithConfig opts
+  token <- liftIO (resolveGitHubToken cfg)
+  fetch <- liftIO (productionFetcherWithToken token)
   reports <- liftIO (checkOverlay fetch ebuilds)
   mapM_ emitReport reports
 
 runUpdate :: (WithLog env Message m, MonadIO m) => Options -> [String] -> m ()
 runUpdate opts pkgArgs = do
-  (overlayPath, ebuilds) <- loadValidatedEbuildsWithPath opts
-  liftIO preflightUpdate >>= \case
-    Left err -> dieError (T.unpack err)
-    Right () -> pure ()
+  (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull opts
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
   case resolveTargets entries tokens of
@@ -69,28 +88,80 @@ runUpdate opts pkgArgs = do
       mapM_ (logError . targetErrorMessage) errs
       liftIO $ exitWith (ExitFailure 1)
     Right keys -> do
-      fetch <- liftIO productionFetcher
       let mFilter = if null pkgArgs then Nothing else Just keys
-          -- When no args, applyOverlay still gets all entries; soft-skips not outdated.
-          -- When args given, only those keys.
-          filterKeys = mFilter
+          selected = case mFilter of
+            Nothing -> entries
+            Just ks -> [e | e <- entries, peKey e `elem` ks]
+          needAssets = any entryNeedsAssets selected
+      liftIO (preflightUpdateWith needAssets) >>= \case
+        Left err -> dieError (T.unpack err)
+        Right () -> pure ()
+      token <- liftIO (resolveGitHubToken cfg)
+      assetsRoot <-
+        if needAssets
+          then
+            liftIO (validateAssetsPath (mndzOverlayAssetsPath cfg)) >>= \case
+              Left err -> dieError (T.unpack err)
+              Right p -> pure (Just p)
+          else pure Nothing
+      when needAssets $
+        case token of
+          Nothing ->
+            dieError
+              "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
+          Just _ -> pure ()
+      let runApply = do
+            lock <- newMVar ()
+            fetch <- productionFetcherWithToken token
+            let env =
+                  ApplyEnv
+                    { aeFetcher = fetch,
+                      aeGitOps = productionGitOps,
+                      aeEbuildRunner = productionEbuildRunner,
+                      aeVendorOps = productionVendorOps,
+                      aeAssetsRoot = assetsRoot,
+                      aeGitHubToken = token,
+                      aeAssetsOwner = "0x6d6e647a",
+                      aeAssetsRepo = "mndz-overlay-assets",
+                      aeAssetsLock = lock
+                    }
+            applyOverlay env overlayPath entries mFilter
       outcomes <-
         liftIO $
-          applyOverlay
-            fetch
-            productionGitOps
-            productionEbuildRunner
-            overlayPath
-            entries
-            filterKeys
+          if needAssets
+            then
+              bracket
+                (ensureSshAgent productionSshAgentOps)
+                ( \case
+                    Left _ -> pure ()
+                    Right sess -> teardownSshSession productionSshAgentOps sess
+                )
+                ( \case
+                    Left err ->
+                      pure
+                        [ ApplyHardFail
+                            (PackageKey "")
+                            ("SSH agent setup failed: " <> err)
+                            False
+                            False
+                        ]
+                    Right _sess -> runApply
+                )
+            else runApply
       case outcomes of
-        [ApplyHardFail (PackageKey "") msg _] ->
+        [ApplyHardFail (PackageKey "") msg _ _] ->
           dieError (T.unpack msg)
         _ -> do
           mapM_ emitOutcome outcomes
           when (foldExitHardFail outcomes) $
             liftIO $
               exitWith (ExitFailure 1)
+
+entryNeedsAssets :: PackageEntry -> Bool
+entryNeedsAssets e =
+  case lookupPolicy (peKey e) of
+    Just p -> techniqueNeedsAssets (policyTechnique p)
+    Nothing -> False
 
 emitOutcome :: (WithLog env Message m, MonadIO m) => ApplyOutcome -> m ()
 emitOutcome = \case
@@ -104,7 +175,7 @@ emitOutcome = \case
           <> prettyVersion remote
   ApplySoftSkip key reason ->
     logWarning $ packageKeyText key <> ": " <> reason
-  ApplyHardFail key msg halfApplied -> do
+  ApplyHardFail key msg halfApplied assetsPublished -> do
     logError
       ( if T.null (packageKeyText key)
           then msg
@@ -114,18 +185,32 @@ emitOutcome = \case
       logWarning $
         packageKeyText key
           <> ": package directory may be left dirty or half-applied; fix or restore before retrying"
+    when assetsPublished $
+      logWarning $
+        packageKeyText key
+          <> ": assets release may already be published but the overlay update did not complete"
 
 loadValidatedEbuilds ::
   (WithLog env Message m, MonadIO m) =>
   Options ->
   m [Ebuild]
-loadValidatedEbuilds opts = snd <$> loadValidatedEbuildsWithPath opts
+loadValidatedEbuilds opts = do
+  (_, _, ebuilds) <- loadValidatedEbuildsFull opts
+  pure ebuilds
 
-loadValidatedEbuildsWithPath ::
+loadValidatedEbuildsWithConfig ::
   (WithLog env Message m, MonadIO m) =>
   Options ->
-  m (FilePath, [Ebuild])
-loadValidatedEbuildsWithPath opts = do
+  m (OverlayConfig, [Ebuild])
+loadValidatedEbuildsWithConfig opts = do
+  (cfg, _, ebuilds) <- loadValidatedEbuildsFull opts
+  pure (cfg, ebuilds)
+
+loadValidatedEbuildsFull ::
+  (WithLog env Message m, MonadIO m) =>
+  Options ->
+  m (OverlayConfig, FilePath, [Ebuild])
+loadValidatedEbuildsFull opts = do
   cfg <- loadConfigOrDie (optConfig opts)
   let overlayPath = case optOverlayPath opts of
         Just p -> p
@@ -136,7 +221,7 @@ loadValidatedEbuildsWithPath opts = do
   liftIO (collectEbuilds overlayPath) >>= \case
     Left err -> dieError (discoveryErrorMessage err)
     Right [] -> dieError ("no ebuilds found in overlay: " <> overlayPath)
-    Right ebuilds -> pure (overlayPath, ebuilds)
+    Right ebuilds -> pure (cfg, overlayPath, ebuilds)
 
 emitReport :: (WithLog env Message m, MonadIO m) => UpdateReport -> m ()
 emitReport report =
