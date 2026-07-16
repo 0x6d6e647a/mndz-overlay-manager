@@ -23,6 +23,8 @@ import CLI.Progress
     withStepProgress,
   )
 import Control.Concurrent.MVar (MVar, withMVar)
+import Control.Monad (when)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (nub, sortOn)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -77,8 +79,9 @@ import Update.Go.Lanes
   )
 import Update.Go.Plan
   ( PlanOps (..),
+    PlanProgress (..),
     isLivePackageVersion,
-    planGoPackage,
+    planGoPackageWithProgress,
   )
 import Update.Go.Vendor (VendorOps (..), VendorResult (..), buildVendorTarball)
 import Update.Hardcoded (lookupPolicy)
@@ -383,10 +386,12 @@ applyGoVendorLanes ::
 applyGoVendorLanes env overlayRoot entry src mSub = do
   let key = peKey entry
       mh = aeMulti env
+  planDoneRef <- newIORef (0 :: Int)
+  let progress = goApplyPlanProgress mh key planDoneRef
   case src of
     GitHub owner repo prefix -> do
-      mhStatus mh key "planning"
-      planResult <- planGoPackage (aePlanOps env) src mSub
+      planResult <-
+        planGoPackageWithProgress (aePlanOps env) progress src mSub
       case planResult of
         Left err ->
           pure [ApplyHardFail key ("Go tree-lane plan failed: " <> err) False False]
@@ -396,7 +401,8 @@ applyGoVendorLanes env overlayRoot entry src mSub = do
           contentFix <- contentFixNeeded pkgDir (pePN entry) plan
           if not (planNeedsWork localPVs contentFix plan)
             then pure [ApplySoftSkip key "already matches Go tree-lane plan"]
-            else
+            else do
+              planDone <- readIORef planDoneRef
               materializePlan
                 env
                 overlayRoot
@@ -408,6 +414,7 @@ applyGoVendorLanes env overlayRoot entry src mSub = do
                 plan
                 localPVs
                 contentFix
+                planDone
     _ ->
       pure
         [ ApplyHardFail
@@ -416,6 +423,26 @@ applyGoVendorLanes env overlayRoot entry src mSub = do
             False
             False
         ]
+
+-- | Planning progress during update apply (same step model as outdated).
+goApplyPlanProgress :: MultiHandle -> PackageKey -> IORef Int -> PlanProgress
+goApplyPlanProgress mh key doneRef =
+  PlanProgress
+    { ppOnCeilingsStart = do
+        mhSteps mh key 2
+        mhStatus mh key "discovering go ceilings",
+      ppOnCeilingsDone = do
+        atomicModifyIORef' doneRef (\n -> (n + 1, ()))
+        mhStep mh key "discovering go ceilings",
+      ppOnListStart = mhStatus mh key "listing versions",
+      ppOnListDone = \n -> do
+        mhSteps mh key (2 + n)
+        atomicModifyIORef' doneRef (\d -> (d + 1, ()))
+        mhStep mh key "listing versions",
+      ppOnProbeDone = do
+        atomicModifyIORef' doneRef (\n -> (n + 1, ()))
+        mhStep mh key "probing go.mod"
+    }
 
 listLocalNonLivePVs :: FilePath -> Text -> IO [EbuildVersion]
 listLocalNonLivePVs pkgDir pn = do
@@ -473,9 +500,11 @@ materializePlan ::
   GoLanePlan ->
   [EbuildVersion] ->
   [EbuildVersion] ->
+  Int ->
   IO [ApplyOutcome]
-materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs contentFix = do
+materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs contentFix planDone = do
   let key = peKey entry
+      mh = aeMulti env
       needPVs =
         nub
           ( missingTargets localPVs plan
@@ -490,6 +519,11 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
                 Raw _ -> []
           )
           planned
+      -- Per-PV: vendoring, publishing assets, regenerating manifest.
+      applySteps = length sortedPlanned * 3
+  -- Extend step total so apply phases continue the same package row bar.
+  when (applySteps > 0) $
+    mhSteps mh key (planDone + applySteps)
   results <- mapM (materializeOne env overlayRoot entry owner repo prefix mSub localPVs plan) sortedPlanned
   let failures = [o | o@ApplyHardFail {} <- results]
       successes = [o | o@ApplySuccess {} <- results]
@@ -661,6 +695,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
             case built of
               Left err -> pure $ ApplyHardFail key err False False
               Right VendorResult {vrTarballPath = tarballPath, vrGoModVersion = mGoVer} -> do
+                mhStep mh key "vendoring"
                 digests <- hashFile tarballPath
                 let sp = sidecarPaths assetsRoot category pn tarballName
                     relSidecars =
@@ -710,17 +745,23 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
                         False
                         False
                   Right () -> do
+                    mhStep mh key "publishing assets"
                     mhStatus mh key "regenerating manifest"
-                    overlayAfterAssets
-                      env
-                      overlayRoot
-                      entry
-                      keywords
-                      lines_
-                      targetVer
-                      digests
-                      tarballName
-                      mGoVer
+                    outcome <-
+                      overlayAfterAssets
+                        env
+                        overlayRoot
+                        entry
+                        keywords
+                        lines_
+                        targetVer
+                        digests
+                        tarballName
+                        mGoVer
+                    case outcome of
+                      ApplySuccess {} -> mhStep mh key "regenerating manifest"
+                      _ -> pure ()
+                    pure outcome
 
 overlayAfterAssets ::
   ApplyEnv ->

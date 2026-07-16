@@ -44,8 +44,9 @@ import Update.Go.Lanes
   )
 import Update.Go.Plan
   ( PlanOps,
+    PlanProgress (..),
     localNonLivePVs,
-    planGoPackage,
+    planGoPackageWithProgress,
     productionPlanOps,
   )
 import Update.Hardcoded (lookupPolicy)
@@ -126,6 +127,8 @@ checkOverlay jobs = checkOverlayWith jobs noopMulti
       MultiHandle
         { mhStart = \_ -> pure (),
           mhStatus = \_ _ -> pure (),
+          mhSteps = \_ _ -> pure (),
+          mhStep = \_ _ -> pure (),
           mhSuccess = \_ -> pure (),
           mhFail = \_ _ -> pure ()
         }
@@ -138,7 +141,7 @@ checkOverlayWith ::
   [Ebuild] ->
   IO [UpdateReport]
 checkOverlayWith jobs mh fetch ebuilds = do
-  planOps <- productionPlanOps Nothing
+  planOps <- productionPlanOps Nothing jobs
   checkOverlayWithPlan jobs mh fetch planOps ebuilds
 
 -- | Like 'checkOverlayWith' with injectable Go plan ops (token-aware list/mod).
@@ -164,9 +167,13 @@ checkOne ::
 checkOne mh fetch planOps byPkg entry = do
   let key = peKey entry
   mhStart mh key
-  mhStatus mh key "fetching"
   let locals = Map.findWithDefault [] key byPkg
-  report <- checkPackageDispatch fetch planOps entry locals
+  report <- case lookupPolicy key of
+    Just (PackagePolicy src (GoVendorAndAssets mSub)) ->
+      checkPackageGo mh planOps entry locals src mSub
+    _ -> do
+      mhStatus mh key "fetching"
+      checkPackage fetch entry
   case reportStatus report of
     Outdated _ -> mhSuccess mh key
     Ok _ -> mhSuccess mh key
@@ -181,18 +188,6 @@ shortReason t =
    in if T.length oneLine > 60
         then T.take 57 oneLine <> "..."
         else oneLine
-
-checkPackageDispatch ::
-  Fetcher ->
-  PlanOps ->
-  PackageEntry ->
-  [Ebuild] ->
-  IO UpdateReport
-checkPackageDispatch fetch planOps entry locals =
-  case lookupPolicy (peKey entry) of
-    Just (PackagePolicy src (GoVendorAndAssets mSub)) ->
-      checkPackageGo planOps entry locals src mSub
-    _ -> checkPackage fetch entry
 
 -- | Resolve, fetch, and compare one package (latest-only path).
 checkPackage :: Fetcher -> PackageEntry -> IO UpdateReport
@@ -213,17 +208,19 @@ checkPackage fetch entry = do
               reportStatus = statusFromCompare local remote
             }
 
--- | Go tree-lane outdated check.
+-- | Go tree-lane outdated check with multi-step progress.
 checkPackageGo ::
+  MultiHandle ->
   PlanOps ->
   PackageEntry ->
   [Ebuild] ->
   UpdateSource ->
   Maybe FilePath ->
   IO UpdateReport
-checkPackageGo planOps entry locals src mSub = do
+checkPackageGo mh planOps entry locals src mSub = do
   let key = peKey entry
-  planResult <- planGoPackage planOps src mSub
+      progress = goPlanProgress mh key
+  planResult <- planGoPackageWithProgress planOps progress src mSub
   case planResult of
     Left err ->
       pure UpdateReport {reportKey = key, reportStatus = FetchError err}
@@ -255,6 +252,21 @@ checkPackageGo planOps entry locals src mSub = do
                     | g <- gaps
                     ]
           }
+
+-- | Progress hooks: ceilings + list + one step per go.mod probe.
+goPlanProgress :: MultiHandle -> PackageKey -> PlanProgress
+goPlanProgress mh key =
+  PlanProgress
+    { ppOnCeilingsStart = do
+        mhSteps mh key 2
+        mhStatus mh key "discovering go ceilings",
+      ppOnCeilingsDone = mhStep mh key "discovering go ceilings",
+      ppOnListStart = mhStatus mh key "listing versions",
+      ppOnListDone = \n -> do
+        mhSteps mh key (2 + n)
+        mhStep mh key "listing versions",
+      ppOnProbeDone = mhStep mh key "probing go.mod"
+    }
 
 -- | Local PVs present in plan but needing content/KEYWORDS fix.
 contentFixPVs :: [Ebuild] -> GoLanePlan -> IO [EbuildVersion]

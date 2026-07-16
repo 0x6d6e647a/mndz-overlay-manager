@@ -1,33 +1,4 @@
-# cli-activity Specification
-
-## Purpose
-
-Interactive progress/spinner UI for long-running command work: TTY/flag gating, multi-progress and sequential step bars, log queuing during indicators, and shared presentation rules.
-
-## Requirements
-
-### Requirement: Activity indicators on stderr only
-
-When activity indicators are enabled, the program SHALL render progress bars, spinners, and related chrome exclusively on standard error. Standard output SHALL NOT receive indicator frames or cursor-control sequences.
-
-#### Scenario: Indicator output is on stderr
-
-- **WHEN** the user runs `outdated` or `update` on a TTY with progress enabled
-- **THEN** animated indicator content is written to stderr and not to stdout
-
-### Requirement: Indicator enablement gate
-
-Activity indicators SHALL be enabled only when standard error is a terminal and the global `--no-progress` flag is not set. When indicators are disabled, the program SHALL perform the same functional work without rendering a progress panel.
-
-#### Scenario: Non-TTY disables indicators
-
-- **WHEN** stderr is not a terminal (for example when piped)
-- **THEN** the program does not render progress bars or spinners
-
-#### Scenario: --no-progress disables indicators
-
-- **WHEN** the user passes `--no-progress`
-- **THEN** the program does not render progress bars or spinners even if stderr is a terminal
+## MODIFIED Requirements
 
 ### Requirement: Multi-progress for concurrent package work
 
@@ -71,6 +42,8 @@ When every package job has reached a terminal state, the program SHALL clear the
 - **WHEN** a multi-step package advances its inner step counter during multi-progress
 - **THEN** the top-level done/total counter does not increase solely due to that inner step advance; it increases only when a package job reaches a terminal state
 
+## ADDED Requirements
+
 ### Requirement: Step telemetry for long package pipelines
 
 When indicators are enabled, long multi-step package pipelines (including Go tree-lane planning during `outdated` and multi-phase work during `update` phase 1) SHALL update the package row’s step total, step completion count, and current step name as work proceeds so the row reflects real progress rather than a single frozen phase label for the entire job.
@@ -79,35 +52,3 @@ When indicators are enabled, long multi-step package pipelines (including Go tre
 
 - **WHEN** the user runs `outdated` with indicators enabled on a `GoVendorAndAssets` package whose plan probes multiple upstream versions
 - **THEN** the package row’s step progress advances through planning work (including version probes) with updating step names rather than remaining on a single static label for the whole check
-
-### Requirement: Sequential step bars for preflight and commits
-
-When indicators are enabled, `update` preflight SHALL show a sequential determinate progress bar with done/total and a description of the current preflight step, clearing when preflight completes. When indicators are enabled, the sequential signed-commit phase SHALL show a sequential determinate progress bar with done/total and the current package being committed, clearing when commits complete. These phases SHALL NOT use multi-row package spinners.
-
-#### Scenario: Preflight bar clears
-
-- **WHEN** update preflight runs with indicators enabled and completes successfully
-- **THEN** a step progress bar is shown during preflight and is cleared afterward
-
-#### Scenario: Commit bar only
-
-- **WHEN** update is committing multiple successful packages with indicators enabled
-- **THEN** a single sequential progress bar is shown (not a multi-spinner panel) and is cleared after commits finish
-
-### Requirement: Deferred logs during active indicators
-
-While an activity indicator panel is active, the program SHALL NOT write persistent co-log messages to stderr immediately. Such messages SHALL be queued and emitted in order after the panel is cleared. Compact failure or warning text on the indicator row itself is allowed during the panel.
-
-#### Scenario: Warning appears after clear
-
-- **WHEN** a package is unconfigured during an indicated `outdated` run
-- **THEN** the full warning log line is written to stderr only after the multi-progress panel is cleared
-
-### Requirement: layoutz-backed presentation
-
-Activity indicators SHALL be implemented using the `layoutz` library for rendering progress bars, spinners, and multi-line inline updates. Log severity formatting SHALL NOT be required to use `layoutz`.
-
-#### Scenario: Progress uses layoutz
-
-- **WHEN** indicators are enabled for package work
-- **THEN** the progress presentation is produced via layoutz primitives or apps (for example spinners, bars, or inline layout apps)

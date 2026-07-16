@@ -2,17 +2,33 @@
 
 module Main (main) where
 
-import CLI.Jobs (mapConcurrentlyN)
+import CLI.Jobs
+  ( mapConcurrentlyN,
+    newWorkBudget,
+    withWorkSlot,
+    workBudgetCapacity,
+  )
 import CLI.Parser (ColorMode (..), resolveVerbosity)
 import CLI.Parser qualified as V
+import CLI.Progress
+  ( ActiveJob (..),
+    JobRow (..),
+    MultiHandle (..),
+    MultiState (..),
+    multiHandle,
+    renderMulti,
+  )
 import Colog (Msg (..))
 import Colog qualified as C
 import Config.Loader (ConfigError (..), loadConfig)
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (mapConcurrently)
+import Control.Concurrent.MVar (newMVar)
 import Control.Monad (unless, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
+import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -79,7 +95,7 @@ import Update.Go.Lanes
     planNeedsWork,
     selectAllLaneTargets,
   )
-import Update.Go.ModFetch (GoModKey (..))
+import Update.Go.ModFetch (GoModKey (..), withGoModCache)
 import Update.Go.Plan (PlanOps (..), planGoPackage)
 import Update.Go.Tree
   ( GoArch (..),
@@ -186,6 +202,10 @@ main = do
   testNoColorStripsEscapes
   testJobsBound
   testJobsOneSerial
+  testGoModCacheConcurrentDistinctKeys
+  testGoModCacheHitNoRefetch
+  testWorkBudgetBound
+  testMultiProgressState
   testGoTreeCeilings
   testGoKeywordsAssembly
   testGoLaneSelection
@@ -1478,6 +1498,8 @@ testGoPlanIntegrationMocked = do
       "mock tilde"
       (Just (parseEbuildVersion "1.26.5"))
       (gcAmd64Tilde ceilings)
+    budget <- newWorkBudget 2
+    ceilingsCache <- newMVar Nothing
     let planOps =
           PlanOps
             { poPortageq = portageq,
@@ -1493,7 +1515,9 @@ testGoPlanIntegrationMocked = do
                     case gmkTag key of
                       "v0.82.0" -> "module x\ngo 1.26.3\n"
                       "v0.84.0" -> "module x\ngo 1.26.5\n"
-                      _ -> "module x\n"
+                      _ -> "module x\n",
+              poWorkBudget = budget,
+              poCeilingsCache = ceilingsCache
             }
     plan <-
       assertRight "plan go package"
@@ -1505,3 +1529,126 @@ testGoPlanIntegrationMocked = do
     assertTrue
       "has 0.84"
       (parseEbuildVersion "0.84.0" `elem` glpUniquePVs plan)
+
+------------------------------------------------------------------------
+-- Richer activity progress / work budget / go.mod cache
+------------------------------------------------------------------------
+
+testGoModCacheConcurrentDistinctKeys :: IO ()
+testGoModCacheConcurrentDistinctKeys = do
+  inFlight <- newIORef (0 :: Int)
+  maxSeen <- newIORef (0 :: Int)
+  fetchCount <- newIORef (0 :: Int)
+  let base key = do
+        atomicModifyIORef' fetchCount (\n -> (n + 1, ()))
+        cur <-
+          atomicModifyIORef' inFlight $ \n ->
+            let n' = n + 1 in (n', n')
+        atomicModifyIORef' maxSeen $ \m -> (max m cur, ())
+        threadDelay 40_000
+        atomicModifyIORef' inFlight $ \n -> (n - 1, ())
+        pure (Right ("body-" <> gmkTag key))
+  cached <- withGoModCache base
+  let keys =
+        [ GoModKey "o" "r" "v1" Nothing,
+          GoModKey "o" "r" "v2" Nothing,
+          GoModKey "o" "r" "v3" Nothing,
+          GoModKey "o" "r" "v4" Nothing
+        ]
+  results <- mapConcurrently cached keys
+  peak <- readIORef maxSeen
+  fetches <- readIORef fetchCount
+  assertEq "four results" 4 (length results)
+  assertTrue "distinct keys overlap" (peak > 1)
+  assertEq "one fetch per key" 4 fetches
+
+testGoModCacheHitNoRefetch :: IO ()
+testGoModCacheHitNoRefetch = do
+  fetchCount <- newIORef (0 :: Int)
+  let key = GoModKey "o" "r" "v1" Nothing
+      base _ = do
+        atomicModifyIORef' fetchCount (\n -> (n + 1, ()))
+        pure (Right "mod")
+  cached <- withGoModCache base
+  r1 <- cached key
+  r2 <- cached key
+  fetches <- readIORef fetchCount
+  assertEq "first hit" (Right "mod") r1
+  assertEq "second hit" (Right "mod") r2
+  assertEq "single network fetch" 1 fetches
+
+testWorkBudgetBound :: IO ()
+testWorkBudgetBound = do
+  let jobs = 3
+  assertEq "capacity 2*jobs" 6 (workBudgetCapacity jobs)
+  assertEq "capacity jobs=1" 2 (workBudgetCapacity 1)
+  assertEq "capacity jobs=0 treated as 1" 2 (workBudgetCapacity 0)
+  budget <- newWorkBudget jobs
+  inFlight <- newIORef (0 :: Int)
+  maxSeen <- newIORef (0 :: Int)
+  let unit _ = withWorkSlot budget $ do
+        cur <-
+          atomicModifyIORef' inFlight $ \n ->
+            let n' = n + 1 in (n', n')
+        atomicModifyIORef' maxSeen $ \m -> (max m cur, ())
+        threadDelay 30_000
+        atomicModifyIORef' inFlight $ \n -> (n - 1, ())
+  void $ mapConcurrently unit [1 .. 20 :: Int]
+  peak <- readIORef maxSeen
+  assertTrue "peak <= 2*jobs" (peak <= workBudgetCapacity jobs)
+  assertTrue "peak can exceed 1" (peak > 1)
+
+testMultiProgressState :: IO ()
+testMultiProgressState = do
+  stateRef <-
+    newIORef
+      MultiState
+        { msLabel = "Checking packages",
+          msTotal = 2,
+          msSucceeded = 0,
+          msJobs = Map.empty,
+          msTick = 0
+        }
+  let mh = multiHandle stateRef
+      k1 = mkPackageKey "app-misc" "foo"
+      k2 = mkPackageKey "dev-lang" "bar"
+  mhStart mh k1
+  mhStart mh k2
+  mhStatus mh k1 "fetching"
+  mhSteps mh k2 5
+  mhStatus mh k2 "probing go.mod"
+  mhStep mh k2 "probing go.mod"
+  mhStep mh k2 "probing go.mod"
+  s1 <- readIORef stateRef
+  assertEq "top package done still 0" 0 (msSucceeded s1)
+  case Map.lookup k1 (msJobs s1) of
+    Just (JobActive aj) -> do
+      assertEq "single-step total unset" 0 (ajStepTotal aj)
+      assertEq "single-step name" "fetching" (ajName aj)
+      assertTrue "omit bar when total <= 1" (ajStepTotal aj <= 1)
+    _ -> do
+      hPutStrLn stderr "expected active job for k1"
+      exitFailure
+  case Map.lookup k2 (msJobs s1) of
+    Just (JobActive aj) -> do
+      assertEq "multi step total" 5 (ajStepTotal aj)
+      assertEq "multi step done" 2 (ajStepDone aj)
+      assertTrue "show bar when total > 1" (ajStepTotal aj > 1)
+    _ -> do
+      hPutStrLn stderr "expected active job for k2"
+      exitFailure
+  -- Inner step advances must not bump package-level success counter.
+  mhStep mh k2 "probing go.mod"
+  s2 <- readIORef stateRef
+  assertEq "top still 0 after inner steps" 0 (msSucceeded s2)
+  mhSuccess mh k2
+  s3 <- readIORef stateRef
+  assertEq "package success bumps top" 1 (msSucceeded s3)
+  assertTrue "success removes row" (Map.notMember k2 (msJobs s3))
+  let frame = renderMulti ColorOff s1
+  assertTrue "frame has package key" ("app-misc/foo" `T.isInfixOf` T.pack frame)
+  assertTrue "frame has step fraction for multi" ("2/5" `T.isInfixOf` T.pack frame)
+  -- Single-step row should not include a 0/0-style fraction.
+  assertTrue
+    "single-step omits 0/0 fraction"
+    (not ("0/0" `T.isInfixOf` T.pack frame))

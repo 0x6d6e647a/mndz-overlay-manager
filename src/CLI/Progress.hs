@@ -14,6 +14,12 @@ module CLI.Progress
     withUiSuspended,
     pauseActivePanel,
     resumeActivePanel,
+    -- Pure multi-progress state (for tests)
+    ActiveJob (..),
+    JobRow (..),
+    MultiState (..),
+    renderMulti,
+    multiHandle,
   )
 where
 
@@ -37,6 +43,7 @@ import Layoutz
     SpinnerStyle (SpinnerDots),
     inlineBar,
     layout,
+    row,
     spinner,
     text,
     withColor,
@@ -65,7 +72,12 @@ data PanelController = PanelController
 -- | Handle for multi-progress package rows.
 data MultiHandle = MultiHandle
   { mhStart :: PackageKey -> IO (),
+    -- | Set current step/phase name without advancing the step counter.
     mhStatus :: PackageKey -> Text -> IO (),
+    -- | Set or revise the per-package step total (keeps done, clamped to total).
+    mhSteps :: PackageKey -> Int -> IO (),
+    -- | Advance steps done by 1 and set the current step name.
+    mhStep :: PackageKey -> Text -> IO (),
     mhSuccess :: PackageKey -> IO (),
     mhFail :: PackageKey -> Text -> IO ()
   }
@@ -80,6 +92,8 @@ noopMultiHandle =
   MultiHandle
     { mhStart = \_ -> pure (),
       mhStatus = \_ _ -> pure (),
+      mhSteps = \_ _ -> pure (),
+      mhStep = \_ _ -> pure (),
       mhSuccess = \_ -> pure (),
       mhFail = \_ _ -> pure ()
     }
@@ -134,8 +148,17 @@ withUiSuspended cfg =
 -- Multi-progress
 ------------------------------------------------------------------------
 
+-- | In-flight package row state (inner step counters; top bar is package-level).
+data ActiveJob = ActiveJob
+  { -- | 0 = unset / single-step (omit row bar and fraction).
+    ajStepTotal :: Int,
+    ajStepDone :: Int,
+    ajName :: Text
+  }
+  deriving (Eq, Show)
+
 data JobRow
-  = JobActive Text
+  = JobActive ActiveJob
   | JobFailed Text
   deriving (Eq, Show)
 
@@ -146,6 +169,7 @@ data MultiState = MultiState
     msJobs :: Map PackageKey JobRow,
     msTick :: Int
   }
+  deriving (Eq, Show)
 
 withMultiProgress ::
   ProgressConfig ->
@@ -195,7 +219,19 @@ multiHandle stateRef =
   MultiHandle
     { mhStart = \key ->
         atomicModifyIORef' stateRef $ \s ->
-          ( s {msJobs = Map.insert key (JobActive "") (msJobs s)},
+          ( s
+              { msJobs =
+                  Map.insert
+                    key
+                    ( JobActive
+                        ActiveJob
+                          { ajStepTotal = 0,
+                            ajStepDone = 0,
+                            ajName = ""
+                          }
+                    )
+                    (msJobs s)
+              },
             ()
           ),
       mhStatus = \key phase ->
@@ -204,7 +240,50 @@ multiHandle stateRef =
               { msJobs =
                   Map.adjust
                     ( \case
-                        JobActive _ -> JobActive phase
+                        JobActive aj -> JobActive aj {ajName = phase}
+                        other -> other
+                    )
+                    key
+                    (msJobs s)
+              },
+            ()
+          ),
+      mhSteps = \key total ->
+        atomicModifyIORef' stateRef $ \s ->
+          ( s
+              { msJobs =
+                  Map.adjust
+                    ( \case
+                        JobActive aj ->
+                          JobActive
+                            aj
+                              { ajStepTotal = total,
+                                ajStepDone = min (ajStepDone aj) total
+                              }
+                        other -> other
+                    )
+                    key
+                    (msJobs s)
+              },
+            ()
+          ),
+      mhStep = \key name ->
+        atomicModifyIORef' stateRef $ \s ->
+          ( s
+              { msJobs =
+                  Map.adjust
+                    ( \case
+                        JobActive aj ->
+                          let total = ajStepTotal aj
+                              done' =
+                                if total > 0
+                                  then min total (ajStepDone aj + 1)
+                                  else ajStepDone aj + 1
+                           in JobActive
+                                aj
+                                  { ajStepDone = done',
+                                    ajName = name
+                                  }
                         other -> other
                     )
                     key
@@ -291,14 +370,35 @@ renderMulti color MultiState {..} =
 
 renderJob :: ColorMode -> Int -> PackageKey -> JobRow -> L
 renderJob color tick key = \case
-  JobActive phase ->
-    let base = T.unpack (packageKeyText key)
-        label =
-          if T.null phase
-            then base
-            else base <> "  " <> T.unpack phase
-     in maybeColor color ColorBrightWhite $
-          spinner label tick SpinnerDots
+  JobActive ActiveJob {..} ->
+    let pkg = T.unpack (packageKeyText key)
+        name = T.unpack ajName
+     in if ajStepTotal > 1
+          then
+            let frac =
+                  if ajStepTotal == 0
+                    then 1.0
+                    else fromIntegral (min ajStepDone ajStepTotal) / fromIntegral ajStepTotal
+                barLabel = show ajStepDone <> "/" <> show ajStepTotal
+                bar = inlineBar barLabel frac
+                nameEl =
+                  if null name
+                    then text ""
+                    else text ("  " <> name)
+             in maybeColor color ColorBrightWhite $
+                  row
+                    [ spinner pkg tick SpinnerDots,
+                      text "  ",
+                      bar,
+                      nameEl
+                    ]
+          else
+            let label =
+                  if null name
+                    then pkg
+                    else pkg <> "  " <> name
+             in maybeColor color ColorBrightWhite $
+                  spinner label tick SpinnerDots
   JobFailed reason ->
     let line =
           "✗ "

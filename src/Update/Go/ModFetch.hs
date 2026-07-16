@@ -10,7 +10,7 @@ module Update.Go.ModFetch
   )
 where
 
-import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, withMVar)
 import Control.Exception (SomeException, catch)
 import Data.ByteString.Lazy qualified as LBS
 import Data.Map.Strict (Map)
@@ -51,6 +51,9 @@ parseGoReqFromMod :: Text -> Maybe Text
 parseGoReqFromMod = parseGoModGoDirective
 
 -- | Process-local cache wrapper around a base fetcher.
+--
+-- The cache lock is not held across the network fetch on miss, so concurrent
+-- fetches for distinct keys can proceed in parallel.
 withGoModCache :: GoModFetcher -> IO GoModFetcher
 withGoModCache base = do
   cacheVar <- newMVar (Map.empty :: Map GoModKey (Either Text Text))
@@ -61,13 +64,17 @@ cachedFetch ::
   GoModFetcher ->
   GoModKey ->
   IO (Either Text Text)
-cachedFetch cacheVar base key =
-  modifyMVar cacheVar $ \cache ->
-    case Map.lookup key cache of
-      Just hit -> pure (cache, hit)
-      Nothing -> do
-        result <- base key
-        pure (Map.insert key result cache, result)
+cachedFetch cacheVar base key = do
+  mHit <- withMVar cacheVar (pure . Map.lookup key)
+  case mHit of
+    Just hit -> pure hit
+    Nothing -> do
+      result <- base key
+      modifyMVar cacheVar $ \cache ->
+        case Map.lookup key cache of
+          -- First insert wins on same-key races (return cached value).
+          Just hit -> pure (cache, hit)
+          Nothing -> pure (Map.insert key result cache, result)
 
 -- | Production fetcher using raw.githubusercontent.com with optional token.
 productionGoModFetcher :: Maybe Text -> IO GoModFetcher

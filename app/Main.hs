@@ -127,7 +127,7 @@ runOutdated rt = do
   (cfg, ebuilds) <- loadValidatedEbuildsWithConfig (rtOptions rt)
   token <- liftIO (resolveGitHubToken cfg)
   fetch <- liftIO (productionFetcherWithToken token)
-  planOps <- liftIO (productionPlanOps token)
+  planOps <- liftIO (productionPlanOps token (rtJobs rt))
   let total = length (groupNewest ebuilds)
   reports <-
     liftIO $
@@ -171,7 +171,7 @@ runUpdate rt pkgArgs = do
       let runApply gpg = do
             lock <- newMVar ()
             fetch <- productionFetcherWithToken token
-            planOps <- productionPlanOps token
+            planOps <- productionPlanOps token (rtJobs rt)
             let env =
                   ApplyEnv
                     { aeFetcher = fetch,
