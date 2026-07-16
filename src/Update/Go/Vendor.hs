@@ -2,6 +2,7 @@
 
 module Update.Go.Vendor
   ( VendorOps (..),
+    VendorResult (..),
     productionVendorOps,
     buildVendorTarball,
     githubCloneUrl,
@@ -11,16 +12,33 @@ where
 
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (CreateProcess (..), cwd, env, proc, readCreateProcessWithExitCode)
+import Update.Go.Version
+  ( enrichGoModDownloadError,
+    goVersionTooOldMessage,
+    hostMeetsGoRequirement,
+    parseGoModGoDirective,
+    parseGoVersionOutput,
+  )
+
+-- | Result of a successful vendor tarball build.
+data VendorResult = VendorResult
+  { vrTarballPath :: FilePath,
+    -- | Exact @go@ directive version from go.mod (for BDEPEND), if present.
+    vrGoModVersion :: Maybe Text
+  }
 
 -- | Injectable process steps for vendor construction.
 data VendorOps = VendorOps
   { voClone :: Text -> Text -> FilePath -> IO (Either Text ()),
+    -- | Host Go language version string (e.g. @"1.26.4"@), or error.
+    voHostGoVersion :: IO (Either Text Text),
     voGoModDownload :: FilePath -> IO (Either Text ()),
     voTarXz :: FilePath -> FilePath -> FilePath -> IO (Either Text ())
   }
@@ -29,6 +47,7 @@ productionVendorOps :: VendorOps
 productionVendorOps =
   VendorOps
     { voClone = gitCloneTag,
+      voHostGoVersion = probeHostGoVersion,
       voGoModDownload = goModDownload,
       voTarXz = tarXzGoMod
     }
@@ -40,8 +59,8 @@ githubCloneUrl owner repo =
 versionTag :: Text -> Text -> Text
 versionTag prefix pv = prefix <> pv
 
--- | Clone upstream at tag, run go mod download, produce vendor tarball in
--- @outDir@ as @tarballName@. Uses a system temp directory for the clone.
+-- | Clone upstream at tag, gate on host Go vs go.mod, run go mod download,
+-- produce vendor tarball in @outDir@ as @tarballName@.
 buildVendorTarball ::
   VendorOps ->
   Text ->
@@ -51,7 +70,7 @@ buildVendorTarball ::
   Maybe FilePath ->
   FilePath ->
   FilePath ->
-  IO (Either Text FilePath)
+  IO (Either Text VendorResult)
 buildVendorTarball ops owner repo prefix pv mSubdir outDir tarballName = do
   createDirectoryIfMissing True outDir
   let tag = versionTag prefix pv
@@ -70,14 +89,57 @@ buildVendorTarball ops owner repo prefix pv mSubdir outDir tarballName = do
         if not hasMod
           then pure $ Left ("go.mod not found in " <> T.pack goDir)
           else do
-            downloaded <- voGoModDownload ops goDir
-            case downloaded of
+            modText <- TIO.readFile (goDir </> "go.mod")
+            let mReq = parseGoModGoDirective modText
+            gated <- gateHostGo ops mReq
+            case gated of
               Left err -> pure (Left err)
               Right () -> do
-                tared <- voTarXz ops goDir "go-mod" outPath
-                pure $ case tared of
-                  Left err -> Left err
-                  Right () -> Right outPath
+                downloaded <- voGoModDownload ops goDir
+                case downloaded of
+                  Left err -> pure (Left err)
+                  Right () -> do
+                    tared <- voTarXz ops goDir "go-mod" outPath
+                    pure $ case tared of
+                      Left err -> Left err
+                      Right () ->
+                        Right
+                          VendorResult
+                            { vrTarballPath = outPath,
+                              vrGoModVersion = mReq
+                            }
+
+-- | If go.mod has a parseable @go@ line, require host Go >= that version.
+gateHostGo :: VendorOps -> Maybe Text -> IO (Either Text ())
+gateHostGo _ Nothing = pure (Right ())
+gateHostGo ops (Just required) = do
+  hostE <- voHostGoVersion ops
+  pure $ case hostE of
+    Left err -> Left err
+    Right host ->
+      case hostMeetsGoRequirement host required of
+        Just True -> Right ()
+        Just False -> Left (goVersionTooOldMessage host required)
+        Nothing ->
+          Left $
+            "could not compare host Go version "
+              <> host
+              <> " with go.mod requirement "
+              <> required
+
+probeHostGoVersion :: IO (Either Text Text)
+probeHostGoVersion = do
+  (code, out, err) <-
+    readCreateProcessWithExitCode (proc "go" ["version"]) ""
+  pure $
+    if code /= ExitSuccess
+      then Left ("go version failed: " <> T.pack err)
+      else case parseGoVersionOutput (T.pack out) of
+        Just v -> Right v
+        Nothing ->
+          Left $
+            "could not parse host Go version from: "
+              <> T.strip (T.pack out)
 
 gitCloneTag :: Text -> Text -> FilePath -> IO (Either Text ())
 gitCloneTag url tag dest = do
@@ -105,6 +167,7 @@ goModDownload goDir = do
   let cacheDir = goDir </> "go-mod"
   createDirectoryIfMissing True cacheDir
   env0 <- getEnvironment
+  -- Only override GOMODCACHE; do not force GOTOOLCHAIN=auto.
   let cp =
         (proc "go" ["mod", "download", "-modcacherw"])
           { cwd = Just goDir,
@@ -114,7 +177,7 @@ goModDownload goDir = do
   pure $
     if code == ExitSuccess
       then Right ()
-      else Left ("go mod download failed: " <> T.pack err)
+      else Left (enrichGoModDownloadError (T.pack err))
 
 tarXzGoMod :: FilePath -> FilePath -> FilePath -> IO (Either Text ())
 tarXzGoMod goDir entryName outPath = do

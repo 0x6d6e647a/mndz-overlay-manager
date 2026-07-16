@@ -28,6 +28,7 @@ root-modules = [
   "Update.EbuildEdit",
   "Update.GitHub",
   "Update.Go.Vendor",
+  "Update.Go.Version",
   "Update.Hardcoded",
   "Update.Http",
   "Update.Npm",

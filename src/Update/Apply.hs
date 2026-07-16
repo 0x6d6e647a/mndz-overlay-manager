@@ -56,12 +56,14 @@ import Update.Check (PackageEntry (..))
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
     ebuildFileNameWithRev,
+    ebuildHasDevLangGoBdepend,
+    ensureGoBdepend,
     nextRevisionVersion,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
   )
 import Update.Git (GitOps (..), relativeOverlayPath)
-import Update.Go.Vendor (VendorOps (..), buildVendorTarball)
+import Update.Go.Vendor (VendorOps (..), VendorResult (..), buildVendorTarball)
 import Update.Hardcoded (lookupPolicy)
 import Update.Types
   ( ApplyOutcome (..),
@@ -350,6 +352,9 @@ applyGoVendor env overlayRoot entry src mSub = do
         Right remote -> do
           content <- TIO.readFile oldPath
           let parameterized = assetsSrcUriParameterized content
+              hasGoBdepend = ebuildHasDevLangGoBdepend content
+              -- Same-PV content fix when SRC_URI or Go BDEPEND still needs work.
+              needsSamePvFix = not parameterized || not hasGoBdepend
           case comparePV local remote of
             Just GT ->
               pure $
@@ -362,7 +367,7 @@ applyGoVendor env overlayRoot entry src mSub = do
                       <> ")"
                   )
             Just EQ
-              | parameterized ->
+              | not needsSamePvFix ->
                   pure $ ApplySoftSkip key "already at latest upstream version"
             Just EQ ->
               goPublishAndOverlay
@@ -459,7 +464,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub local targetVer
                 tarballName
             case built of
               Left err -> pure $ ApplyHardFail key err False False
-              Right tarballPath -> do
+              Right VendorResult {vrTarballPath = tarballPath, vrGoModVersion = mGoVer} -> do
                 digests <- hashFile tarballPath
                 let sp = sidecarPaths assetsRoot category pn tarballName
                     relSidecars =
@@ -518,6 +523,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub local targetVer
                       targetVer
                       digests
                       tarballName
+                      mGoVer
 
 overlayAfterAssets ::
   ApplyEnv ->
@@ -527,8 +533,9 @@ overlayAfterAssets ::
   EbuildVersion ->
   FileDigests ->
   FilePath ->
+  Maybe Text ->
   IO ApplyOutcome
-overlayAfterAssets env overlayRoot entry local targetVer digests tarballName = do
+overlayAfterAssets env overlayRoot entry local targetVer digests tarballName mGoVer = do
   let key = peKey entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
@@ -550,55 +557,61 @@ overlayAfterAssets env overlayRoot entry local targetVer digests tarballName = d
           orphan
     Right False -> do
       content <- TIO.readFile oldPath
-      let fixed = parameterizeAssetsSrcUri pn content
-          newName = ebuildFileNameWithRev pn targetVer
-          newPath = pkgDir </> newName
-      existsNew <- doesFileExist newPath
-      if existsNew && takeFileName oldPath /= newName
-        then
-          pure $
-            ApplyHardFail
-              key
-              ("target ebuild already exists: " <> T.pack newName)
-              False
-              orphan
-        else do
-          TIO.writeFile newPath fixed
-          renamed <-
-            if takeFileName oldPath == newName
-              then pure False
-              else do
-                removeFile oldPath
-                pure True
-          manResult <- ebuildRun pkgDir newName
-          case manResult of
-            Left err -> pure $ ApplyHardFail key err True orphan
-            Right () -> do
-              manText <- TIO.readFile (pkgDir </> "Manifest")
-              case parseManifestVendorSHA512 manText tarballName of
-                Nothing ->
-                  pure $
-                    ApplyHardFail
-                      key
-                      "could not parse vendor SHA512 from Manifest after ebuild manifest"
-                      True
-                      orphan
-                Just manSha
-                  | manSha == digestSHA512 digests -> do
-                      newRel <- relativeOverlayPath overlayRoot newPath
-                      manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-                      let paths =
-                            if renamed
-                              then [ebuildRel, newRel, manRel]
-                              else [newRel, manRel]
-                      pure $ ApplySuccess key local targetVer paths
-                  | otherwise ->
+      let parameterized = parameterizeAssetsSrcUri pn content
+      contentFixed <- case mGoVer of
+        Nothing -> pure (Right parameterized)
+        Just goVer -> pure (ensureGoBdepend goVer parameterized)
+      case contentFixed of
+        Left err -> pure $ ApplyHardFail key err False orphan
+        Right fixed -> do
+          let newName = ebuildFileNameWithRev pn targetVer
+              newPath = pkgDir </> newName
+          existsNew <- doesFileExist newPath
+          if existsNew && takeFileName oldPath /= newName
+            then
+              pure $
+                ApplyHardFail
+                  key
+                  ("target ebuild already exists: " <> T.pack newName)
+                  False
+                  orphan
+            else do
+              TIO.writeFile newPath fixed
+              renamed <-
+                if takeFileName oldPath == newName
+                  then pure False
+                  else do
+                    removeFile oldPath
+                    pure True
+              manResult <- ebuildRun pkgDir newName
+              case manResult of
+                Left err -> pure $ ApplyHardFail key err True orphan
+                Right () -> do
+                  manText <- TIO.readFile (pkgDir </> "Manifest")
+                  case parseManifestVendorSHA512 manText tarballName of
+                    Nothing ->
                       pure $
                         ApplyHardFail
                           key
-                          "Manifest SHA512 does not match published vendor tarball"
+                          "could not parse vendor SHA512 from Manifest after ebuild manifest"
                           True
                           orphan
+                    Just manSha
+                      | manSha == digestSHA512 digests -> do
+                          newRel <- relativeOverlayPath overlayRoot newPath
+                          manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+                          let paths =
+                                if renamed
+                                  then [ebuildRel, newRel, manRel]
+                                  else [newRel, manRel]
+                          pure $ ApplySuccess key local targetVer paths
+                      | otherwise ->
+                          pure $
+                            ApplyHardFail
+                              key
+                              "Manifest SHA512 does not match published vendor tarball"
+                              True
+                              orphan
 
 commitSuccesses ::
   GitOps ->

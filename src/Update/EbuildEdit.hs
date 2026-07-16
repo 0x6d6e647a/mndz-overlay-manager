@@ -6,10 +6,14 @@ module Update.EbuildEdit
     nextRevisionVersion,
     ebuildFileNameWithRev,
     parseManifestVendorSHA512,
+    goBdependAtom,
+    ebuildHasDevLangGoBdepend,
+    goBdependMatches,
+    ensureGoBdepend,
   )
 where
 
-import Data.Char (isHexDigit)
+import Data.Char (isDigit, isHexDigit)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), renderPV)
@@ -100,3 +104,94 @@ parseManifestVendorSHA512 manifestContent distfile =
             | otherwise = Nothing
           go (_ : xs) = go xs
        in go (T.words ln)
+
+-- | Portage atom for a go.mod language version (e.g. @"1.26.5"@).
+goBdependAtom :: Text -> Text
+goBdependAtom goVer = ">=dev-lang/go-" <> goVer <> ":="
+
+-- | True when the ebuild text mentions a @dev-lang/go@ dependency atom.
+ebuildHasDevLangGoBdepend :: Text -> Bool
+ebuildHasDevLangGoBdepend content =
+  "dev-lang/go" `T.isInfixOf` content
+
+-- | True when the ebuild already has the exact required go BDEPEND atom.
+goBdependMatches :: Text -> Text -> Bool
+goBdependMatches goVer content =
+  goBdependAtom goVer `T.isInfixOf` content
+
+-- | Ensure the ebuild declares @BDEPEND@ with @>=dev-lang/go-<ver>:=@.
+-- Replaces existing @dev-lang/go@ atoms inside @BDEPEND@ / @BDEPEND+@ lines;
+-- inserts a new @BDEPEND@ line after @inherit@ when none is present.
+ensureGoBdepend :: Text -> Text -> Either Text Text
+ensureGoBdepend goVer content
+  | T.null (T.strip goVer) = Left "empty go version for BDEPEND"
+  | not (validGoVer goVer) =
+      Left ("invalid go version for BDEPEND: " <> goVer)
+  | ebuildHasDevLangGoBdepend content =
+      Right (replaceGoAtoms (goBdependAtom goVer) content)
+  | otherwise =
+      case insertAfterInherit (goBdependAtom goVer) content of
+        Just fixed -> Right fixed
+        Nothing ->
+          Left "could not insert BDEPEND: no inherit line found in ebuild"
+  where
+    validGoVer v =
+      let parts = T.splitOn "." v
+       in not (null parts)
+            && all (\p -> not (T.null p) && T.all isDigit p) parts
+
+-- | Replace each @dev-lang/go…@ dependency atom with the required atom.
+replaceGoAtoms :: Text -> Text -> Text
+replaceGoAtoms atom content =
+  T.unlines (map (replaceInLine atom) (T.lines content))
+  where
+    replaceInLine a ln
+      | "dev-lang/go" `T.isInfixOf` ln = replaceAtomsInText a ln
+      | otherwise = ln
+
+-- | Replace @>=dev-lang/go-1.x@-style tokens (optional operators, version, @:=@).
+replaceAtomsInText :: Text -> Text -> Text
+replaceAtomsInText atom = go
+  where
+    go t =
+      case T.breakOn "dev-lang/go" t of
+        (_, rest)
+          | T.null rest -> t
+        (before, rest) ->
+          let prefix = T.dropWhileEnd isAtomOp before
+              afterAtom = dropGoAtom rest
+           in prefix <> atom <> go afterAtom
+
+    isAtomOp c = c == '>' || c == '=' || c == '<' || c == '~'
+
+    -- @rest@ starts with @dev-lang/go@.
+    dropGoAtom rest =
+      let afterPkg = T.drop (T.length ("dev-lang/go" :: Text)) rest
+          -- optional -version and := / :slot
+          verPart =
+            T.takeWhile
+              (\c -> isDigit c || c == '.' || c == '-' || c == ':' || c == '=')
+              afterPkg
+       in T.drop (T.length verPart) afterPkg
+
+insertAfterInherit :: Text -> Text -> Maybe Text
+insertAfterInherit atom content =
+  let lns = T.lines content
+      bdependLine = "BDEPEND=\"" <> atom <> "\""
+   in case findLastInheritIdx lns of
+        Nothing -> Nothing
+        Just idx ->
+          let (pre, post) = splitAt (idx + 1) lns
+              -- Skip a blank line after inherit if present, insert after that blank.
+              (blanks, rest) = span T.null post
+              insertion =
+                case blanks of
+                  [] -> [""] <> [bdependLine] <> [""]
+                  (_ : _) -> blanks <> [bdependLine] <> [""]
+           in Just (T.unlines (pre <> insertion <> rest))
+
+findLastInheritIdx :: [Text] -> Maybe Int
+findLastInheritIdx lns =
+  case [i | (i, ln) <- zip [0 ..] lns, "inherit" `T.isPrefixOf` T.stripStart ln] of
+    [] -> Nothing
+    xs -> Just (last xs)

@@ -15,6 +15,7 @@ import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
+import Data.Text.IO qualified as TIO
 import GHC.Stack (callStack)
 import Logging.Bootstrap
   ( fmtMessageColored,
@@ -34,9 +35,11 @@ import Overlay.Version
     parseEbuildVersion,
     prettyVersion,
   )
-import System.Directory (makeAbsolute)
+import System.Directory (createDirectoryIfMissing, makeAbsolute)
 import System.Exit (exitFailure)
+import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
+import System.IO.Temp (withSystemTempDirectory)
 import Update.Apply
   ( foldExitHardFail,
     newEbuildFileName,
@@ -47,9 +50,28 @@ import Update.Auth (resolveGitHubTokenWith)
 import Update.Check (PackageEntry (..), groupNewest)
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
+    ebuildHasDevLangGoBdepend,
+    ensureGoBdepend,
+    goBdependAtom,
+    goBdependMatches,
     nextRevisionVersion,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
+  )
+import Update.Go.Vendor
+  ( VendorOps (..),
+    VendorResult (..),
+    buildVendorTarball,
+  )
+import Update.Go.Version
+  ( compareGoVersions,
+    enrichGoModDownloadError,
+    goVersionTooOldMessage,
+    hostMeetsGoRequirement,
+    looksLikeToolchainError,
+    parseGoModGoDirective,
+    parseGoVersionOutput,
+    parseGoVersionToken,
   )
 import Update.GpgAgent
   ( GpgAgentOps (..),
@@ -115,6 +137,9 @@ main = do
   testHashBytes
   testSidecarLine
   testEbuildEdit
+  testGoVersionParse
+  testGoBdependEdit
+  testVendorGoVersionGate
   testSshAgentReuse
   testGpgSignReadiness
   testVerbosityResolution
@@ -640,6 +665,185 @@ testEbuildEdit = do
     "manifest sha512"
     (Just "abcdef0123456789")
     (parseManifestVendorSHA512 man "dolt-2.1.6-vendor.tar.xz")
+
+testGoVersionParse :: IO ()
+testGoVersionParse = do
+  let modSample =
+        T.unlines
+          [ "module github.com/charmbracelet/crush",
+            "",
+            "go 1.26.5",
+            "",
+            "toolchain go1.26.5",
+            "",
+            "require (",
+            "        github.com/foo/bar v1.0.0",
+            ")"
+          ]
+  assertEq
+    "go.mod directive"
+    (Just "1.26.5")
+    (parseGoModGoDirective modSample)
+  assertEq
+    "commented go ignored"
+    Nothing
+    (parseGoModGoDirective "// go 1.99.0\nmodule x\n")
+  assertEq
+    "missing go line"
+    Nothing
+    (parseGoModGoDirective "module x\nrequire github.com/a/b v1\n")
+  assertEq
+    "go version output"
+    (Just "1.26.4")
+    (parseGoVersionOutput "go version go1.26.4 linux/amd64\n")
+  assertEq
+    "go version with experiment suffix"
+    (Just "1.26.4")
+    (parseGoVersionOutput "go version go1.26.4-X:nodwarf5 linux/amd64\n")
+  assertEq
+    "1.26 pads like 1.26.0"
+    (parseGoVersionToken "1.26")
+    (parseGoVersionToken "1.26.0")
+  assertEq
+    "host older"
+    (Just LT)
+    (compareGoVersions "1.26.4" "1.26.5")
+  assertEq
+    "host equal"
+    (Just EQ)
+    (compareGoVersions "1.26.5" "1.26.5")
+  assertEq
+    "host newer"
+    (Just GT)
+    (compareGoVersions "1.27.0" "1.26.5")
+  assertEq
+    "meets requirement"
+    (Just True)
+    (hostMeetsGoRequirement "1.26.5" "1.26.5")
+  assertEq
+    "does not meet"
+    (Just False)
+    (hostMeetsGoRequirement "1.26.4" "1.26.5")
+  assertTrue
+    "too-old message names versions"
+    ( "1.26.4" `T.isInfixOf` goVersionTooOldMessage "1.26.4" "1.26.5"
+        && "1.26.5" `T.isInfixOf` goVersionTooOldMessage "1.26.4" "1.26.5"
+        && "GOTOOLCHAIN=auto" `T.isInfixOf` goVersionTooOldMessage "1.26.4" "1.26.5"
+    )
+  assertTrue
+    "toolchain stderr detected"
+    (looksLikeToolchainError "go: go.mod requires go >= 1.26.5 (running go 1.26.4; GOTOOLCHAIN=local)")
+  assertTrue
+    "enrich mentions upgrade"
+    ("dev-lang/go" `T.isInfixOf` enrichGoModDownloadError "toolchain not available")
+
+testGoBdependEdit :: IO ()
+testGoBdependEdit = do
+  let base =
+        T.unlines
+          [ "# Copyright",
+            "EAPI=8",
+            "",
+            "inherit go-module",
+            "",
+            "DESCRIPTION=\"x\"",
+            "SRC_URI=\"https://example/a-${PV}.tar.gz\""
+          ]
+  inserted <- assertRight "insert bdepend" (ensureGoBdepend "1.26.5" base)
+  assertTrue
+    "inserted atom"
+    (goBdependAtom "1.26.5" `T.isInfixOf` inserted)
+  assertTrue "has go bdepend" (ebuildHasDevLangGoBdepend inserted)
+  assertTrue "matches" (goBdependMatches "1.26.5" inserted)
+  let withOld =
+        T.unlines
+          [ "inherit go-module",
+            "BDEPEND=\">=dev-lang/go-1.24.11:=\"",
+            "BDEPEND+=\" app-arch/unzip\"",
+            "DESCRIPTION=\"y\""
+          ]
+  replaced <- assertRight "replace bdepend" (ensureGoBdepend "1.26.5" withOld)
+  assertTrue
+    "new atom present"
+    (goBdependMatches "1.26.5" replaced)
+  assertTrue
+    "old atom gone"
+    (not (">=dev-lang/go-1.24.11:=" `T.isInfixOf` replaced))
+  assertTrue
+    "unrelated bdepend kept"
+    ("app-arch/unzip" `T.isInfixOf` replaced)
+  case ensureGoBdepend "1.26.5" "DESCRIPTION=\"no inherit\"\n" of
+    Left msg ->
+      assertTrue "no inherit error" ("inherit" `T.isInfixOf` msg)
+    Right _ -> do
+      hPutStrLn stderr "expected Left when no inherit line"
+      exitFailure
+  case ensureGoBdepend "" base of
+    Left _ -> pure ()
+    Right _ -> do
+      hPutStrLn stderr "expected Left for empty go version"
+      exitFailure
+
+testVendorGoVersionGate :: IO ()
+testVendorGoVersionGate = do
+  downloadCalls <- newIORef (0 :: Int)
+  let goMod =
+        T.unlines
+          [ "module example.com/pkg",
+            "go 1.26.5"
+          ]
+      writeClone _url _tag dest = do
+        createDirectoryIfMissing True dest
+        TIO.writeFile (dest </> "go.mod") goMod
+        pure (Right ())
+      ops hostVer =
+        VendorOps
+          { voClone = writeClone,
+            voHostGoVersion = pure (Right hostVer),
+            voGoModDownload = \_ -> do
+              atomicModifyIORef' downloadCalls (\n -> (n + 1, ()))
+              pure (Right ()),
+            voTarXz = \_goDir _entry outPath -> do
+              writeFile outPath "fake-tarball"
+              pure (Right ())
+          }
+  -- Older host: fail before download
+  atomicModifyIORef' downloadCalls (const (0, ()))
+  older <- buildVendorTarball (ops "1.26.4") "o" "r" "v" "0.1.0" Nothing "/tmp" "pkg-0.1.0-vendor.tar.xz"
+  case older of
+    Left msg -> do
+      assertTrue "names host" ("1.26.4" `T.isInfixOf` msg)
+      assertTrue "names required" ("1.26.5" `T.isInfixOf` msg)
+      n <- readIORef downloadCalls
+      assertEq "download not called when host old" 0 n
+    Right _ -> do
+      hPutStrLn stderr "expected hard-fail for older host Go"
+      exitFailure
+  -- Equal host: proceeds
+  atomicModifyIORef' downloadCalls (const (0, ()))
+  withSystemTempDirectory "mndz-vendor-test-" $ \outDir -> do
+    ok <-
+      buildVendorTarball
+        (ops "1.26.5")
+        "o"
+        "r"
+        "v"
+        "0.1.0"
+        Nothing
+        outDir
+        "pkg-0.1.0-vendor.tar.xz"
+    case ok of
+      Right VendorResult {vrGoModVersion = mVer, vrTarballPath = path} -> do
+        assertEq "go.mod version plumbed" (Just "1.26.5") mVer
+        n <- readIORef downloadCalls
+        assertEq "download called once" 1 n
+        assertEq
+          "tarball path"
+          (outDir </> "pkg-0.1.0-vendor.tar.xz")
+          path
+      Left err -> do
+        hPutStrLn stderr $ "expected success, got " <> T.unpack err
+        exitFailure
 
 testSshAgentReuse :: IO ()
 testSshAgentReuse = do

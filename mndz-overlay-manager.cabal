@@ -85,6 +85,7 @@ library
       , Update.Git
       , Update.GitHub
       , Update.Go.Vendor
+      , Update.Go.Version
       , Update.Hardcoded
       , Update.Http
       , Update.Npm
@@ -189,4 +190,5 @@ test-suite mndz-overlay-manager-test
         directory ^>=1.3,
         filepath ^>=1.5,
         mndz-overlay-manager,
+        temporary ^>=1.3,
         text ^>=2.1
