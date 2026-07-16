@@ -4,13 +4,13 @@ module Main (main) where
 
 import CLI.Parser
   ( ColorMode,
-    Command (Help, List, Outdated, Update),
     Options (..),
     parserInfo,
     resolveColorMode,
     resolveJobs,
     showHelp,
   )
+import CLI.Parser qualified as Cmd
 import CLI.Progress
   ( ProgressConfig,
     StepHandle (..),
@@ -48,11 +48,12 @@ import Update.Apply
 import Update.Auth (resolveGitHubToken)
 import Update.Check
   ( PackageEntry (..),
-    checkOverlayWith,
+    checkOverlayWithPlan,
     groupNewest,
     productionFetcherWithToken,
   )
 import Update.Git (productionGitOps)
+import Update.Go.Plan (productionPlanOps)
 import Update.Go.Vendor (productionVendorOps)
 import Update.GpgAgent
   ( newGpgHandle,
@@ -72,10 +73,11 @@ import Update.SshAgent
 import Update.Targets (resolveTargets, targetErrorMessage)
 import Update.Types
   ( ApplyOutcome (..),
+    OutdatedLine (..),
     PackageKey (..),
     PackagePolicy (..),
+    SuccessLine (..),
     UpdateReport (..),
-    UpdateStatus (Ahead, FetchError, Ok, Unconfigured),
     packageKeyText,
     techniqueNeedsAssets,
   )
@@ -110,10 +112,10 @@ main = do
           }
   usingLoggerT logger $
     case optCommand opts of
-      Help -> liftIO showHelp
-      List -> runList rt
-      Outdated -> runOutdated rt
-      Update pkgs -> runUpdate rt pkgs
+      Cmd.Help -> liftIO showHelp
+      Cmd.List -> runList rt
+      Cmd.Outdated -> runOutdated rt
+      Cmd.Update pkgs -> runUpdate rt pkgs
 
 runList :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runList rt = do
@@ -125,11 +127,12 @@ runOutdated rt = do
   (cfg, ebuilds) <- loadValidatedEbuildsWithConfig (rtOptions rt)
   token <- liftIO (resolveGitHubToken cfg)
   fetch <- liftIO (productionFetcherWithToken token)
+  planOps <- liftIO (productionPlanOps token)
   let total = length (groupNewest ebuilds)
   reports <-
     liftIO $
       withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
-        checkOverlayWith (rtJobs rt) mh fetch ebuilds
+        checkOverlayWithPlan (rtJobs rt) mh fetch planOps ebuilds
   mapM_ emitReport reports
 
 runUpdate :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> m ()
@@ -168,6 +171,7 @@ runUpdate rt pkgArgs = do
       let runApply gpg = do
             lock <- newMVar ()
             fetch <- productionFetcherWithToken token
+            planOps <- productionPlanOps token
             let env =
                   ApplyEnv
                     { aeFetcher = fetch,
@@ -181,7 +185,8 @@ runUpdate rt pkgArgs = do
                       aeAssetsLock = lock,
                       aeJobs = rtJobs rt,
                       aeMulti = noopMultiHandle,
-                      aeCommitStep = noopStepHandle
+                      aeCommitStep = noopStepHandle,
+                      aePlanOps = planOps
                     }
             applyOverlay (rtProgress rt) env overlayPath entries mFilter
       let pcfg = rtProgress rt
@@ -252,14 +257,9 @@ entryNeedsAssets e =
 
 emitOutcome :: (WithLog env Message m, MonadIO m) => ApplyOutcome -> m ()
 emitOutcome = \case
-  ApplySuccess key local remote _paths ->
+  ApplySuccess key lines_ _paths ->
     liftIO $
-      T.putStrLn $
-        packageKeyText key
-          <> " "
-          <> prettyVersion local
-          <> " -> "
-          <> prettyVersion remote
+      mapM_ (T.putStrLn . formatSuccessLine key) lines_
   ApplySoftSkip key reason ->
     logWarning $ packageKeyText key <> ": " <> reason
   ApplyHardFail key msg halfApplied assetsPublished -> do
@@ -276,6 +276,17 @@ emitOutcome = \case
       logWarning $
         packageKeyText key
           <> ": assets release may already be published but the overlay update did not complete"
+
+formatSuccessLine :: PackageKey -> SuccessLine -> T.Text
+formatSuccessLine key sl =
+  packageKeyText key
+    <> " "
+    <> prettyVersion (slFrom sl)
+    <> " -> "
+    <> prettyVersion (slTo sl)
+    <> case slLabel sl of
+      Nothing -> ""
+      Just lab -> " " <> lab
 
 loadValidatedEbuilds ::
   (WithLog env Message m, MonadIO m) =>
@@ -313,16 +324,11 @@ loadValidatedEbuildsFull opts = do
 emitReport :: (WithLog env Message m, MonadIO m) => UpdateReport -> m ()
 emitReport report =
   case reportStatus report of
-    U.Outdated local remote ->
+    U.Outdated lines_ ->
       liftIO $
-        T.putStrLn $
-          packageKeyText (reportKey report)
-            <> " "
-            <> prettyVersion local
-            <> " -> "
-            <> prettyVersion remote
-    Ok _ -> pure ()
-    Ahead local remote ->
+        mapM_ (T.putStrLn . formatOutdatedLine (reportKey report)) lines_
+    U.Ok _ -> pure ()
+    U.Ahead local remote ->
       logWarning $
         packageKeyText (reportKey report)
           <> " is ahead of upstream ("
@@ -330,15 +336,26 @@ emitReport report =
           <> " > "
           <> prettyVersion remote
           <> ")"
-    Unconfigured ->
+    U.Unconfigured ->
       logWarning $
         packageKeyText (reportKey report)
           <> ": no update source configured"
-    FetchError err ->
+    U.FetchError err ->
       logWarning $
         packageKeyText (reportKey report)
           <> ": "
           <> err
+
+formatOutdatedLine :: PackageKey -> OutdatedLine -> T.Text
+formatOutdatedLine key ol =
+  packageKeyText key
+    <> " "
+    <> prettyVersion (olFrom ol)
+    <> " -> "
+    <> prettyVersion (olTo ol)
+    <> case olLabel ol of
+      Nothing -> ""
+      Just lab -> " " <> lab
 
 loadConfigOrDie :: (WithLog env Message m, MonadIO m) => Maybe FilePath -> m OverlayConfig
 loadConfigOrDie override = do

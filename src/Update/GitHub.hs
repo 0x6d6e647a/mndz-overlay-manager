@@ -3,6 +3,9 @@
 module Update.GitHub
   ( fetchGitHub,
     fetchGitHubWith,
+    listGitHubVersions,
+    listGitHubVersionsWith,
+    stripAndParse,
   )
 where
 
@@ -10,6 +13,7 @@ import Control.Exception (SomeException, catch)
 import Data.Aeson (Value, eitherDecode, withArray, withObject, (.:))
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.Foldable (toList)
+import Data.List (nub, sortBy)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -44,17 +48,7 @@ fetchGitHubWith ::
   IO (Either Text EbuildVersion)
 fetchGitHubWith mgr mToken = \case
   GitHub owner repo prefix -> do
-    let authHeaders = case mToken of
-          Just t
-            | not (T.null t) ->
-                [ ("Authorization", encodeUtf8 ("Bearer " <> t))
-                ]
-          _ -> []
-        commonHeaders =
-          [ ("User-Agent", "mndz-overlay-manager"),
-            ("Accept", "application/vnd.github+json")
-          ]
-            <> authHeaders
+    let commonHeaders = githubHeaders mToken
     releaseResult <- fetchLatestRelease mgr commonHeaders owner repo prefix
     case releaseResult of
       Right v -> pure (Right v)
@@ -62,6 +56,89 @@ fetchGitHubWith mgr mToken = \case
         fetchMaxTag mgr commonHeaders owner repo prefix
   other ->
     pure (Left ("Update.GitHub: not a GitHub source: " <> T.pack (show other)))
+
+githubHeaders :: Maybe Text -> RequestHeaders
+githubHeaders mToken =
+  let authHeaders = case mToken of
+        Just t
+          | not (T.null t) ->
+              [ ("Authorization", encodeUtf8 ("Bearer " <> t))
+              ]
+        _ -> []
+   in [ ("User-Agent", "mndz-overlay-manager"),
+        ("Accept", "application/vnd.github+json")
+      ]
+        <> authHeaders
+
+-- | List comparable package versions (paginated tags), ordered newest-first by PV.
+listGitHubVersions :: UpdateSource -> IO (Either Text [EbuildVersion])
+listGitHubVersions src = do
+  mgr <- newManager tlsManagerSettings
+  listGitHubVersionsWith mgr Nothing src
+
+listGitHubVersionsWith ::
+  Manager ->
+  Maybe Text ->
+  UpdateSource ->
+  IO (Either Text [EbuildVersion])
+listGitHubVersionsWith mgr mToken = \case
+  GitHub owner repo prefix -> do
+    let headers = githubHeaders mToken
+    tags <- fetchAllTagNames mgr headers owner repo 1 []
+    pure $ case tags of
+      Left err -> Left err
+      Right allTags ->
+        let versions =
+              mapMaybe
+                ( \tag ->
+                    case stripAndParse prefix tag of
+                      Right v@(Numeric {}) -> Just v
+                      _ -> Nothing
+                )
+                allTags
+            unique = nub versions
+            ordered =
+              sortBy
+                ( \a b ->
+                    case comparePV a b of
+                      Just LT -> GT
+                      Just GT -> LT
+                      Just EQ -> EQ
+                      Nothing -> EQ
+                )
+                unique
+         in Right ordered
+  other ->
+    pure (Left ("Update.GitHub: not a GitHub source: " <> T.pack (show other)))
+
+-- | Paginate tags via @page=@ until a short page is returned.
+fetchAllTagNames ::
+  Manager ->
+  RequestHeaders ->
+  Text ->
+  Text ->
+  Int ->
+  [Text] ->
+  IO (Either Text [Text])
+fetchAllTagNames mgr headers owner repo page acc = do
+  let url =
+        "https://api.github.com/repos/"
+          <> T.unpack owner
+          <> "/"
+          <> T.unpack repo
+          <> "/tags?per_page=100&page="
+          <> show page
+  eres <- httpGetJson mgr headers url
+  case eres of
+    Left err -> pure (Left err)
+    Right val ->
+      case parseMaybe parseTagNames val of
+        Nothing -> pure (Left "could not parse tags list")
+        Just tags ->
+          let acc' = acc <> tags
+           in if length tags < 100
+                then pure (Right acc')
+                else fetchAllTagNames mgr headers owner repo (page + 1) acc'
 
 fetchLatestRelease ::
   Manager ->

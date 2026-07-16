@@ -2,10 +2,13 @@
 
 module Update.Check
   ( groupNewest,
+    groupByPackage,
     PackageEntry (..),
     checkOverlay,
     checkOverlayWith,
+    checkOverlayWithPlan,
     checkPackage,
+    checkPackageGo,
     productionFetcher,
     productionFetcherWithToken,
     statusFromCompare,
@@ -19,25 +22,50 @@ import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
+import System.Directory (doesFileExist)
+import Update.EbuildEdit
+  ( assetsSrcUriParameterized,
+    ebuildHasDevLangGoBdepend,
+    keywordsMatch,
+  )
 import Update.GitHub (fetchGitHubWith)
+import Update.Go.Lanes
+  ( GapLine (..),
+    GoLanePlan (..),
+    PlannedEbuild (..),
+    buildGapLines,
+    missingTargets,
+    planNeedsWork,
+  )
+import Update.Go.Plan
+  ( PlanOps,
+    localNonLivePVs,
+    planGoPackage,
+    productionPlanOps,
+  )
+import Update.Hardcoded (lookupPolicy)
 import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
 import Update.Resolve (resolveSource)
 import Update.Types
   ( Fetcher,
+    OutdatedLine (..),
     PackageKey (..),
+    PackagePolicy (..),
     UpdateReport (..),
     UpdateSource (..),
     UpdateStatus (..),
+    UpdateTechnique (..),
     mkPackageKey,
     packageKeyText,
   )
 
--- | One package's newest local ebuild used for checks.
+-- | One package's newest local ebuild used for checks / apply entry.
 data PackageEntry = PackageEntry
   { peKey :: PackageKey,
     pePN :: Text,
@@ -75,6 +103,15 @@ groupNewest ebuilds =
             (Numeric _ (Just _), Numeric _ Nothing) -> new
             _ -> old
 
+-- | All ebuilds grouped by package key.
+groupByPackage :: [Ebuild] -> Map.Map PackageKey [Ebuild]
+groupByPackage =
+  foldl' insert Map.empty
+  where
+    insert acc e =
+      let key = mkPackageKey (ebuildCategory e) (ebuildPackage e)
+       in Map.insertWith (<>) key [e] acc
+
 compareForNewest :: EbuildVersion -> EbuildVersion -> Ordering
 compareForNewest a b =
   case comparePV a b of
@@ -101,17 +138,37 @@ checkOverlayWith ::
   [Ebuild] ->
   IO [UpdateReport]
 checkOverlayWith jobs mh fetch ebuilds = do
-  let entries = sortOn (packageKeyText . peKey) (groupNewest ebuilds)
-  mapConcurrentlyN jobs (checkOne mh fetch) entries
+  planOps <- productionPlanOps Nothing
+  checkOverlayWithPlan jobs mh fetch planOps ebuilds
 
-checkOne :: MultiHandle -> Fetcher -> PackageEntry -> IO UpdateReport
-checkOne mh fetch entry = do
+-- | Like 'checkOverlayWith' with injectable Go plan ops (token-aware list/mod).
+checkOverlayWithPlan ::
+  Int ->
+  MultiHandle ->
+  Fetcher ->
+  PlanOps ->
+  [Ebuild] ->
+  IO [UpdateReport]
+checkOverlayWithPlan jobs mh fetch planOps ebuilds = do
+  let entries = sortOn (packageKeyText . peKey) (groupNewest ebuilds)
+      byPkg = groupByPackage ebuilds
+  mapConcurrentlyN jobs (checkOne mh fetch planOps byPkg) entries
+
+checkOne ::
+  MultiHandle ->
+  Fetcher ->
+  PlanOps ->
+  Map.Map PackageKey [Ebuild] ->
+  PackageEntry ->
+  IO UpdateReport
+checkOne mh fetch planOps byPkg entry = do
   let key = peKey entry
   mhStart mh key
   mhStatus mh key "fetching"
-  report <- checkPackage fetch entry
+  let locals = Map.findWithDefault [] key byPkg
+  report <- checkPackageDispatch fetch planOps entry locals
   case reportStatus report of
-    Outdated _ _ -> mhSuccess mh key
+    Outdated _ -> mhSuccess mh key
     Ok _ -> mhSuccess mh key
     Ahead _ _ -> mhFail mh key "ahead of upstream"
     Unconfigured -> mhFail mh key "unconfigured"
@@ -125,7 +182,19 @@ shortReason t =
         then T.take 57 oneLine <> "..."
         else oneLine
 
--- | Resolve, fetch, and compare one package.
+checkPackageDispatch ::
+  Fetcher ->
+  PlanOps ->
+  PackageEntry ->
+  [Ebuild] ->
+  IO UpdateReport
+checkPackageDispatch fetch planOps entry locals =
+  case lookupPolicy (peKey entry) of
+    Just (PackagePolicy src (GoVendorAndAssets mSub)) ->
+      checkPackageGo planOps entry locals src mSub
+    _ -> checkPackage fetch entry
+
+-- | Resolve, fetch, and compare one package (latest-only path).
 checkPackage :: Fetcher -> PackageEntry -> IO UpdateReport
 checkPackage fetch entry = do
   let key = peKey entry
@@ -144,10 +213,89 @@ checkPackage fetch entry = do
               reportStatus = statusFromCompare local remote
             }
 
+-- | Go tree-lane outdated check.
+checkPackageGo ::
+  PlanOps ->
+  PackageEntry ->
+  [Ebuild] ->
+  UpdateSource ->
+  Maybe FilePath ->
+  IO UpdateReport
+checkPackageGo planOps entry locals src mSub = do
+  let key = peKey entry
+  planResult <- planGoPackage planOps src mSub
+  case planResult of
+    Left err ->
+      pure UpdateReport {reportKey = key, reportStatus = FetchError err}
+    Right plan -> do
+      let localPVs = localNonLivePVs locals
+      contentFix <- contentFixPVs locals plan
+      let needsWork =
+            missingTargets localPVs plan
+              <> contentFix
+          gaps =
+            if planNeedsWork localPVs contentFix plan
+              then buildGapLines localPVs needsWork plan
+              else []
+      pure $
+        UpdateReport
+          { reportKey = key,
+            reportStatus =
+              if null gaps
+                then case localPVs of
+                  (v : _) -> Ok v
+                  [] -> Ok (peLocal entry)
+                else
+                  Outdated
+                    [ OutdatedLine
+                        { olFrom = glFrom g,
+                          olTo = glTo g,
+                          olLabel = Just (glLabel g)
+                        }
+                    | g <- gaps
+                    ]
+          }
+
+-- | Local PVs present in plan but needing content/KEYWORDS fix.
+contentFixPVs :: [Ebuild] -> GoLanePlan -> IO [EbuildVersion]
+contentFixPVs locals plan = do
+  let planned = glpEbuilds plan
+  concat <$> mapM (checkOneEbuild locals) planned
+  where
+    checkOneEbuild es pe = do
+      let matches =
+            [ e
+            | e <- es,
+              samePV
+                (parseEbuildVersion (ebuildVersion e))
+                (pePV pe)
+            ]
+      case matches of
+        [] -> pure []
+        (e : _) -> do
+          exists <- doesFileExist (ebuildPath e)
+          if not exists
+            then pure [pePV pe]
+            else do
+              content <- TIO.readFile (ebuildPath e)
+              let bad =
+                    not (assetsSrcUriParameterized content)
+                      || not (ebuildHasDevLangGoBdepend content)
+                      || not (keywordsMatch (peKeywords pe) content)
+              pure [pePV pe | bad]
+    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
+
 statusFromCompare :: EbuildVersion -> EbuildVersion -> UpdateStatus
 statusFromCompare local remote =
   case comparePV local remote of
-    Just LT -> Outdated local remote
+    Just LT ->
+      Outdated
+        [ OutdatedLine
+            { olFrom = local,
+              olTo = remote,
+              olLabel = Nothing
+            }
+        ]
     Just EQ -> Ok local
     Just GT -> Ahead local remote
     Nothing ->

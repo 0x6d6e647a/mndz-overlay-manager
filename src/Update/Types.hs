@@ -6,11 +6,13 @@ module Update.Types
     packageKeyText,
     mkPackageKey,
     splitPackageKey,
+    OutdatedLine (..),
     UpdateStatus (..),
     UpdateReport (..),
     Fetcher,
     UpdateTechnique (..),
     PackagePolicy (..),
+    SuccessLine (..),
     ApplyOutcome (..),
     outcomeIsHardFail,
     outcomeIsSuccess,
@@ -59,9 +61,18 @@ splitPackageKey (PackageKey t) =
           Just (cat, pkg)
     _ -> Nothing
 
+-- | One outdated report line (optional Go tree-lane label).
+data OutdatedLine = OutdatedLine
+  { olFrom :: EbuildVersion,
+    olTo :: EbuildVersion,
+    -- | e.g. @Just "(dev-lang/go amd64)"@ for Go tree-lane lines.
+    olLabel :: Maybe Text
+  }
+  deriving (Eq, Show)
+
 data UpdateStatus
-  = -- | local, remote
-    Outdated EbuildVersion EbuildVersion
+  = -- | One or more outdated transitions (non-Go: single unlabeled line).
+    Outdated [OutdatedLine]
   | Ok EbuildVersion
   | -- | local, remote
     Ahead EbuildVersion EbuildVersion
@@ -72,6 +83,14 @@ data UpdateStatus
 data UpdateReport = UpdateReport
   { reportKey :: PackageKey,
     reportStatus :: UpdateStatus
+  }
+  deriving (Eq, Show)
+
+-- | One success stdout line after apply/commit.
+data SuccessLine = SuccessLine
+  { slFrom :: EbuildVersion,
+    slTo :: EbuildVersion,
+    slLabel :: Maybe Text
   }
   deriving (Eq, Show)
 
@@ -98,10 +117,10 @@ data PackagePolicy = PackagePolicy
   }
   deriving (Eq, Show)
 
--- | Result of attempting to update one package.
+-- | Result of attempting to update one package (or one PV commit unit).
 data ApplyOutcome
-  = -- | local, remote, paths relative to overlay root for git add
-    ApplySuccess PackageKey EbuildVersion EbuildVersion [FilePath]
+  = -- | success lines (stdout), paths relative to overlay root for git add
+    ApplySuccess PackageKey [SuccessLine] [FilePath]
   | ApplySoftSkip PackageKey Text
   | -- | message, half-applied (overlay mutated), assets already published
     ApplyHardFail PackageKey Text Bool Bool

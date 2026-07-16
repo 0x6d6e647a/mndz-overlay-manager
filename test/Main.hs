@@ -54,9 +54,45 @@ import Update.EbuildEdit
     ensureGoBdepend,
     goBdependAtom,
     goBdependMatches,
+    keywordsMatch,
     nextRevisionVersion,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
+    setKeywords,
+  )
+import Update.GitHub (stripAndParse)
+import Update.Go.Lanes
+  ( GapLine (..),
+    GoLanePlan (..),
+    LaneId (..),
+    LaneTarget (..),
+    PlannedEbuild (..),
+    VersionCandidate (..),
+    assembleKeywords,
+    buildGapLines,
+    collapsePlannedEbuilds,
+    extrasToDelete,
+    laneLabel,
+    maxVersionUnder,
+    missingTargets,
+    planFromTargets,
+    planNeedsWork,
+    selectAllLaneTargets,
+  )
+import Update.Go.ModFetch (GoModKey (..))
+import Update.Go.Plan (PlanOps (..), planGoPackage)
+import Update.Go.Tree
+  ( GoArch (..),
+    GoCeilings (..),
+    GoEbuildMeta (..),
+    computeCeilings,
+    discoverGoCeilingsWith,
+    emptyCeilings,
+    isLiveGoVersion,
+    keywordsHasBare,
+    keywordsHasTildeOrBare,
+    parseGoEbuildMeta,
+    parseKeywordsField,
   )
 import Update.Go.Vendor
   ( VendorOps (..),
@@ -96,8 +132,10 @@ import Update.SshAgent
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types
   ( ApplyOutcome (..),
+    OutdatedLine (..),
     PackageKey (..),
     PackagePolicy (..),
+    SuccessLine (..),
     UpdateReport (..),
     UpdateSource (..),
     UpdateStatus (..),
@@ -148,6 +186,14 @@ main = do
   testNoColorStripsEscapes
   testJobsBound
   testJobsOneSerial
+  testGoTreeCeilings
+  testGoKeywordsAssembly
+  testGoLaneSelection
+  testGoLaneCollapse
+  testGoGapLines
+  testGoStripAndParseList
+  testSetKeywords
+  testGoPlanIntegrationMocked
   putStrLn "All tests passed."
 
 assertEq :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -436,7 +482,7 @@ testCheckOverlayStatuses = do
   assertTrue "has unconfigured" (Unconfigured `elem` statuses)
   assertTrue "has error" (any isErr statuses)
   where
-    isOutdated (Outdated _ _) = True
+    isOutdated (Outdated _) = True
     isOutdated _ = False
     isOk (Ok _) = True
     isOk _ = False
@@ -466,7 +512,14 @@ checkWithFakeResolve fetch = mapM go
               UpdateReport
                 { reportKey = key,
                   reportStatus = case comparePV local remote of
-                    Just LT -> Outdated local remote
+                    Just LT ->
+                      Outdated
+                        [ OutdatedLine
+                            { olFrom = local,
+                              olTo = remote,
+                              olLabel = Nothing
+                            }
+                        ]
                     Just EQ -> Ok local
                     Just GT -> Ahead local remote
                     Nothing -> FetchError "incomparable"
@@ -583,8 +636,12 @@ testFoldExitHardFail = do
           <> [ ApplyHardFail (PackageKey "e/f") "dirty" False False,
                ApplySuccess
                  (PackageKey "g/h")
-                 (parseEbuildVersion "1.0")
-                 (parseEbuildVersion "1.1")
+                 [ SuccessLine
+                     { slFrom = parseEbuildVersion "1.0",
+                       slTo = parseEbuildVersion "1.1",
+                       slLabel = Nothing
+                     }
+                 ]
                  ["g/h/g-h-1.1.ebuild"]
              ]
   assertEq "soft only" False (foldExitHardFail soft)
@@ -1189,3 +1246,262 @@ testJobsOneSerial = do
   void $ mapConcurrentlyN 3 job2 [1 .. 6 :: Int]
   peak2 <- readIORef maxSeen2
   assertTrue "jobs 3 can exceed 1" (peak2 > 1)
+
+------------------------------------------------------------------------
+-- Go tree-lane planner
+------------------------------------------------------------------------
+
+testGoTreeCeilings :: IO ()
+testGoTreeCeilings = do
+  let kwPlain = parseKeywordsField "KEYWORDS=\"amd64 ~arm64\"\n"
+      kwTilde = parseKeywordsField "KEYWORDS=\"~amd64 ~arm64\"\n"
+  assertTrue "bare amd64" (keywordsHasBare Amd64 kwPlain)
+  assertTrue "not bare when tilde only" (not (keywordsHasBare Amd64 kwTilde))
+  assertTrue "tilde or bare for ~amd64" (keywordsHasTildeOrBare Amd64 kwTilde)
+  assertTrue "tilde or bare for bare" (keywordsHasTildeOrBare Amd64 kwPlain)
+  assertTrue "live 9999" (isLiveGoVersion (parseEbuildVersion "9999"))
+  assertTrue "not live" (not (isLiveGoVersion (parseEbuildVersion "1.26.3")))
+  case parseGoEbuildMeta "/x/go-9999.ebuild" "KEYWORDS=\"~amd64\"\n" of
+    Nothing -> pure ()
+    Just _ -> do
+      hPutStrLn stderr "expected Nothing for live go ebuild"
+      exitFailure
+  let metas =
+        [ GoEbuildMeta (parseEbuildVersion "1.26.3") ["amd64", "arm64"],
+          GoEbuildMeta (parseEbuildVersion "1.26.4") ["~amd64", "~arm64"],
+          GoEbuildMeta (parseEbuildVersion "1.25.0") ["~amd64"]
+        ]
+      ceilings = computeCeilings metas
+  assertEq "amd64 plain" (Just (parseEbuildVersion "1.26.3")) (gcAmd64Plain ceilings)
+  assertEq "amd64 tilde" (Just (parseEbuildVersion "1.26.4")) (gcAmd64Tilde ceilings)
+  assertEq "arm64 plain" (Just (parseEbuildVersion "1.26.3")) (gcArm64Plain ceilings)
+  assertEq "arm64 tilde" (Just (parseEbuildVersion "1.26.4")) (gcArm64Tilde ceilings)
+  assertEq "empty ceilings" emptyCeilings (computeCeilings [])
+
+testGoKeywordsAssembly :: IO ()
+testGoKeywordsAssembly = do
+  assertEq "both arches" ["~amd64", "~arm64"] (assembleKeywords [Amd64, Arm64])
+  assertEq "amd64 only" ["~amd64"] (assembleKeywords [Amd64])
+  assertEq "arm64 only" ["~arm64"] (assembleKeywords [Arm64])
+
+testGoLaneSelection :: IO ()
+testGoLaneSelection = do
+  let ceilings =
+        GoCeilings
+          { gcAmd64Plain = Just (parseEbuildVersion "1.26.3"),
+            gcAmd64Tilde = Just (parseEbuildVersion "1.26.5"),
+            gcArm64Plain = Just (parseEbuildVersion "1.26.3"),
+            gcArm64Tilde = Just (parseEbuildVersion "1.26.5")
+          }
+      candidates =
+        [ VersionCandidate (parseEbuildVersion "0.82.0") (Just "1.26.3"),
+          VersionCandidate (parseEbuildVersion "0.84.0") (Just "1.26.5"),
+          VersionCandidate (parseEbuildVersion "0.85.0") Nothing
+        ]
+  assertEq
+    "max under plain"
+    (Just (parseEbuildVersion "0.82.0", "1.26.3"))
+    (maxVersionUnder (parseEbuildVersion "1.26.3") candidates)
+  assertEq
+    "max under tilde"
+    (Just (parseEbuildVersion "0.84.0", "1.26.5"))
+    (maxVersionUnder (parseEbuildVersion "1.26.5") candidates)
+  let targets = selectAllLaneTargets ceilings candidates
+      plan = planFromTargets targets
+  assertEq "two unique PVs" 2 (length (glpUniquePVs plan))
+  case [ltPackagePV t | t <- targets, ltLane t == LaneAmd64Plain] of
+    [Just pv] -> assertEq "plain lane" (parseEbuildVersion "0.82.0") pv
+    other -> do
+      hPutStrLn stderr $ "plain lane target: " <> show other
+      exitFailure
+  case [ltPackagePV t | t <- targets, ltLane t == LaneAmd64Tilde] of
+    [Just pv] -> assertEq "tilde lane" (parseEbuildVersion "0.84.0") pv
+    other -> do
+      hPutStrLn stderr $ "tilde lane target: " <> show other
+      exitFailure
+
+testGoLaneCollapse :: IO ()
+testGoLaneCollapse = do
+  let allSame =
+        [ LaneTarget LaneAmd64Plain (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5"),
+          LaneTarget LaneAmd64Tilde (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5"),
+          LaneTarget LaneArm64Plain (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5"),
+          LaneTarget LaneArm64Tilde (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5")
+        ]
+      collapsed = collapsePlannedEbuilds allSame
+  assertEq "single PV collapse" 1 (length collapsed)
+  case collapsed of
+    [pe] -> do
+      assertEq "pv" (parseEbuildVersion "0.84.0") (pePV pe)
+      assertTrue "has ~amd64" ("~amd64" `elem` peKeywords pe)
+      assertTrue "has ~arm64" ("~arm64" `elem` peKeywords pe)
+    _ -> exitFailure
+  let divergent =
+        [ LaneTarget LaneAmd64Plain (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5"),
+          LaneTarget LaneAmd64Tilde (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5"),
+          LaneTarget LaneArm64Plain (Just (parseEbuildVersion "1.26.3")) (Just (parseEbuildVersion "0.82.0")) (Just "1.26.3"),
+          LaneTarget LaneArm64Tilde (Just (parseEbuildVersion "1.26.3")) (Just (parseEbuildVersion "0.82.0")) (Just "1.26.3")
+        ]
+      divCollapsed = collapsePlannedEbuilds divergent
+  assertEq "arch divergent count" 2 (length divCollapsed)
+  case [pe | pe <- divCollapsed, pePV pe == parseEbuildVersion "0.84.0"] of
+    [pe] -> do
+      assertTrue "0.84 ~amd64" ("~amd64" `elem` peKeywords pe)
+      assertTrue "0.84 no ~arm64" ("~arm64" `notElem` peKeywords pe)
+    other -> do
+      hPutStrLn stderr $ "0.84 ebuild: " <> show other
+      exitFailure
+  let fourDistinct =
+        [ LaneTarget LaneAmd64Plain Nothing (Just (parseEbuildVersion "0.80.0")) (Just "1.0"),
+          LaneTarget LaneAmd64Tilde Nothing (Just (parseEbuildVersion "0.81.0")) (Just "1.0"),
+          LaneTarget LaneArm64Plain Nothing (Just (parseEbuildVersion "0.82.0")) (Just "1.0"),
+          LaneTarget LaneArm64Tilde Nothing (Just (parseEbuildVersion "0.83.0")) (Just "1.0")
+        ]
+  assertEq "four ebuilds" 4 (length (collapsePlannedEbuilds fourDistinct))
+  let plan = planFromTargets allSame
+      locals = [parseEbuildVersion "0.80.0", parseEbuildVersion "0.82.0"]
+  assertEq "missing target" [parseEbuildVersion "0.84.0"] (missingTargets locals plan)
+  assertEq
+    "extras"
+    [parseEbuildVersion "0.80.0", parseEbuildVersion "0.82.0"]
+    (extrasToDelete locals plan)
+  assertTrue "needs work" (planNeedsWork locals [] plan)
+  assertTrue "satisfied" (not (planNeedsWork [parseEbuildVersion "0.84.0"] [] plan))
+
+testGoGapLines :: IO ()
+testGoGapLines = do
+  assertEq
+    "labels"
+    "(dev-lang/go amd64)"
+    (laneLabel LaneAmd64Plain)
+  assertEq
+    "tilde label"
+    "(dev-lang/go ~amd64)"
+    (laneLabel LaneAmd64Tilde)
+  let planSplit =
+        planFromTargets
+          [ LaneTarget LaneAmd64Plain (Just (parseEbuildVersion "1.26.3")) (Just (parseEbuildVersion "0.82.0")) (Just "1.26.3"),
+            LaneTarget LaneAmd64Tilde (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5")
+          ]
+      locals1 = [parseEbuildVersion "0.80.0"]
+      needs = [parseEbuildVersion "0.82.0", parseEbuildVersion "0.84.0"]
+      linesSplit = buildGapLines locals1 needs planSplit
+  assertEq "split line count" 2 (length linesSplit)
+  assertTrue
+    "split from 0.80"
+    (all (\g -> glFrom g == parseEbuildVersion "0.80.0") linesSplit)
+  assertTrue
+    "has 0.82"
+    (any (\g -> glTo g == parseEbuildVersion "0.82.0") linesSplit)
+  assertTrue
+    "has 0.84"
+    (any (\g -> glTo g == parseEbuildVersion "0.84.0") linesSplit)
+  let planConverge =
+        planFromTargets
+          [ LaneTarget LaneAmd64Plain (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5"),
+            LaneTarget LaneAmd64Tilde (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5")
+          ]
+      locals2 = [parseEbuildVersion "0.80.0", parseEbuildVersion "0.82.0"]
+      linesConv = buildGapLines locals2 [parseEbuildVersion "0.84.0"] planConverge
+  assertEq "converge line count" 2 (length linesConv)
+  assertTrue
+    "converge has 0.80"
+    (any (\g -> glFrom g == parseEbuildVersion "0.80.0") linesConv)
+  assertTrue
+    "converge has 0.82"
+    (any (\g -> glFrom g == parseEbuildVersion "0.82.0") linesConv)
+  assertTrue
+    "converge to 0.84"
+    (all (\g -> glTo g == parseEbuildVersion "0.84.0") linesConv)
+
+testGoStripAndParseList :: IO ()
+testGoStripAndParseList = do
+  case stripAndParse "v" "v0.80.0" of
+    Right v -> assertEq "prefix v" (parseEbuildVersion "0.80.0") v
+    Left err -> do
+      hPutStrLn stderr (T.unpack err)
+      exitFailure
+  case stripAndParse "bun-v" "bun-v1.2.3" of
+    Right v -> assertEq "bun prefix" (parseEbuildVersion "1.2.3") v
+    Left err -> do
+      hPutStrLn stderr (T.unpack err)
+      exitFailure
+
+testSetKeywords :: IO ()
+testSetKeywords = do
+  let base =
+        T.unlines
+          [ "inherit go-module",
+            "KEYWORDS=\"~amd64\"",
+            "DESCRIPTION=\"x\""
+          ]
+      fixed = setKeywords ["~amd64", "~arm64"] base
+  assertTrue "match dual" (keywordsMatch ["~amd64", "~arm64"] fixed)
+  assertTrue "no bare amd64" (not (" amd64" `T.isInfixOf` fixed || "KEYWORDS=\"amd64" `T.isInfixOf` fixed))
+  let noKw =
+        T.unlines
+          [ "inherit go-module",
+            "",
+            "DESCRIPTION=\"y\""
+          ]
+      inserted = setKeywords ["~amd64"] noKw
+  assertTrue "inserted" (keywordsMatch ["~amd64"] inserted)
+
+testGoPlanIntegrationMocked :: IO ()
+testGoPlanIntegrationMocked = do
+  withSystemTempDirectory "mndz-go-tree-" $ \tmp -> do
+    let gentoo = tmp </> "gentoo"
+        goDir = gentoo </> "dev-lang" </> "go"
+    createDirectoryIfMissing True goDir
+    TIO.writeFile
+      (goDir </> "go-1.26.3.ebuild")
+      "KEYWORDS=\"amd64 arm64\"\n"
+    TIO.writeFile
+      (goDir </> "go-1.26.5.ebuild")
+      "KEYWORDS=\"~amd64 ~arm64\"\n"
+    TIO.writeFile
+      (goDir </> "go-9999.ebuild")
+      "KEYWORDS=\"~amd64\"\n"
+    let portageq args =
+          pure $
+            if args == ["get_repo_path", "/", "gentoo"]
+              then Right (T.pack gentoo)
+              else Left "unexpected portageq"
+    ceilings <-
+      assertRight "discover ceilings"
+        =<< discoverGoCeilingsWith portageq
+    assertEq
+      "mock plain"
+      (Just (parseEbuildVersion "1.26.3"))
+      (gcAmd64Plain ceilings)
+    assertEq
+      "mock tilde"
+      (Just (parseEbuildVersion "1.26.5"))
+      (gcAmd64Tilde ceilings)
+    let planOps =
+          PlanOps
+            { poPortageq = portageq,
+              poListVersions = \_ ->
+                pure $
+                  Right
+                    [ parseEbuildVersion "0.82.0",
+                      parseEbuildVersion "0.84.0"
+                    ],
+              poFetchGoMod = \key ->
+                pure $
+                  Right $
+                    case gmkTag key of
+                      "v0.82.0" -> "module x\ngo 1.26.3\n"
+                      "v0.84.0" -> "module x\ngo 1.26.5\n"
+                      _ -> "module x\n"
+            }
+    plan <-
+      assertRight "plan go package"
+        =<< planGoPackage planOps (GitHub "o" "r" "v") Nothing
+    assertEq "planned unique" 2 (length (glpUniquePVs plan))
+    assertTrue
+      "has 0.82"
+      (parseEbuildVersion "0.82.0" `elem` glpUniquePVs plan)
+    assertTrue
+      "has 0.84"
+      (parseEbuildVersion "0.84.0" `elem` glpUniquePVs plan)

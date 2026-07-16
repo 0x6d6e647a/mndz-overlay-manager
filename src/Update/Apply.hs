@@ -23,14 +23,16 @@ import CLI.Progress
     withStepProgress,
   )
 import Control.Concurrent.MVar (MVar, withMVar)
-import Data.List (sortOn)
+import Data.List (nub, sortOn)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Overlay.Version (EbuildVersion (..), comparePV, prettyVersion, renderPV)
+import Overlay.Discovery (parseEbuildFileName)
+import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, prettyVersion, renderPV)
 import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
+    listDirectory,
     removeFile,
     renameFile,
   )
@@ -58,11 +60,26 @@ import Update.EbuildEdit
     ebuildFileNameWithRev,
     ebuildHasDevLangGoBdepend,
     ensureGoBdepend,
+    keywordsMatch,
     nextRevisionVersion,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
+    setKeywords,
   )
 import Update.Git (GitOps (..), relativeOverlayPath)
+import Update.Go.Lanes
+  ( GapLine (..),
+    GoLanePlan (..),
+    PlannedEbuild (..),
+    buildGapLines,
+    missingTargets,
+    planNeedsWork,
+  )
+import Update.Go.Plan
+  ( PlanOps (..),
+    isLivePackageVersion,
+    planGoPackage,
+  )
 import Update.Go.Vendor (VendorOps (..), VendorResult (..), buildVendorTarball)
 import Update.Hardcoded (lookupPolicy)
 import Update.Types
@@ -70,6 +87,7 @@ import Update.Types
     Fetcher,
     PackageKey (..),
     PackagePolicy (..),
+    SuccessLine (..),
     UpdateSource (..),
     UpdateTechnique (..),
     outcomeIsHardFail,
@@ -101,9 +119,9 @@ data ApplyEnv = ApplyEnv
     aeAssetsRepo :: Text,
     aeAssetsLock :: MVar (),
     aeJobs :: Int,
-    -- | Mutated for the duration of phase-1 / commit panels.
     aeMulti :: MultiHandle,
-    aeCommitStep :: StepHandle
+    aeCommitStep :: StepHandle,
+    aePlanOps :: PlanOps
   }
 
 needsGoAssetsApply :: [PackageEntry] -> Bool
@@ -147,14 +165,15 @@ applyOverlay pcfg env overlayRoot entries mFilter = do
       let selected = case mFilter of
             Nothing -> entries
             Just keys -> [e | e <- entries, peKey e `elem` keys]
-      phase1 <-
+      phase1Nested <-
         withMultiProgress pcfg "Updating packages" (length selected) $ \mh ->
           let env' = env {aeMulti = mh}
            in mapConcurrentlyN
                 (aeJobs env')
                 (applyPackagePhase1Tracked env' overlayRoot)
                 selected
-      let successes =
+      let phase1 = concat phase1Nested
+          successes =
             sortOn
               (packageKeyText . successKey)
               [o | o@ApplySuccess {} <- phase1]
@@ -168,7 +187,7 @@ applyOverlay pcfg env overlayRoot entries mFilter = do
             successes
       pure (others <> committed)
   where
-    successKey (ApplySuccess k _ _ _) = k
+    successKey (ApplySuccess k _ _) = k
     successKey _ = PackageKey ""
     isSuccess ApplySuccess {} = True
     isSuccess _ = False
@@ -177,17 +196,33 @@ applyPackagePhase1Tracked ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
-  IO ApplyOutcome
+  IO [ApplyOutcome]
 applyPackagePhase1Tracked env overlayRoot entry = do
   let key = peKey entry
       mh = aeMulti env
   mhStart mh key
-  outcome <- applyPackagePhase1 env overlayRoot entry
-  case outcome of
-    ApplySuccess {} -> mhSuccess mh key
-    ApplySoftSkip _ reason -> mhFail mh key (shortReason reason)
-    ApplyHardFail _ msg _ _ -> mhFail mh key (shortReason msg)
-  pure outcome
+  outcomes <- applyPackagePhase1 env overlayRoot entry
+  case outcomes of
+    [] -> mhSuccess mh key
+    _ ->
+      if any outcomeIsHardFail outcomes
+        then
+          let msg = case [m | ApplyHardFail _ m _ _ <- outcomes] of
+                (m : _) -> m
+                [] -> "hard fail"
+           in mhFail mh key (shortReason msg)
+        else
+          if all isSoft outcomes
+            then
+              let reason = case [r | ApplySoftSkip _ r <- outcomes] of
+                    (r : _) -> r
+                    [] -> "skipped"
+               in mhFail mh key (shortReason reason)
+            else mhSuccess mh key
+  pure outcomes
+  where
+    isSoft ApplySoftSkip {} = True
+    isSoft _ = False
 
 shortReason :: Text -> Text
 shortReason t =
@@ -200,22 +235,23 @@ applyPackagePhase1 ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
-  IO ApplyOutcome
+  IO [ApplyOutcome]
 applyPackagePhase1 env overlayRoot entry =
   case lookupPolicy (peKey entry) of
     Nothing ->
-      pure $ ApplySoftSkip (peKey entry) "no hardcoded policy for package"
+      pure [ApplySoftSkip (peKey entry) "no hardcoded policy for package"]
     Just policy ->
       case policyTechnique policy of
         Unsupported reason ->
-          pure $
-            ApplySoftSkip
-              (peKey entry)
-              ("unsupported update technique: " <> reason)
+          pure
+            [ ApplySoftSkip
+                (peKey entry)
+                ("unsupported update technique: " <> reason)
+            ]
         GitMvAndManifest ->
-          applyGitMv env overlayRoot entry (policySource policy)
+          (: []) <$> applyGitMv env overlayRoot entry (policySource policy)
         GoVendorAndAssets mSub ->
-          applyGoVendor env overlayRoot entry (policySource policy) mSub
+          applyGoVendorLanes env overlayRoot entry (policySource policy) mSub
 
 ------------------------------------------------------------------------
 -- GitMvAndManifest
@@ -324,53 +360,44 @@ gitMvDo key local remote oldPath pkgDir pn gitOps ebuildRun overlayRoot = do
                     if renamed
                       then [ebuildRel, newRel, manRel]
                       else [newRel, manRel]
-              pure $ ApplySuccess key local remote paths
+                  lines_ =
+                    [ SuccessLine
+                        { slFrom = local,
+                          slTo = remote,
+                          slLabel = Nothing
+                        }
+                    ]
+              pure $ ApplySuccess key lines_ paths
 
 ------------------------------------------------------------------------
--- GoVendorAndAssets
+-- GoVendorAndAssets (tree-lane multi-PV)
 ------------------------------------------------------------------------
 
-applyGoVendor ::
+applyGoVendorLanes ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
   UpdateSource ->
   Maybe FilePath ->
-  IO ApplyOutcome
-applyGoVendor env overlayRoot entry src mSub = do
+  IO [ApplyOutcome]
+applyGoVendorLanes env overlayRoot entry src mSub = do
   let key = peKey entry
-      local = peLocal entry
-      oldPath = pePath entry
       mh = aeMulti env
   case src of
     GitHub owner repo prefix -> do
-      mhStatus mh key "fetching"
-      fetched <- aeFetcher env src
-      case fetched of
+      mhStatus mh key "planning"
+      planResult <- planGoPackage (aePlanOps env) src mSub
+      case planResult of
         Left err ->
-          pure $ ApplyHardFail key ("fetch failed: " <> err) False False
-        Right remote -> do
-          content <- TIO.readFile oldPath
-          let parameterized = assetsSrcUriParameterized content
-              hasGoBdepend = ebuildHasDevLangGoBdepend content
-              -- Same-PV content fix when SRC_URI or Go BDEPEND still needs work.
-              needsSamePvFix = not parameterized || not hasGoBdepend
-          case comparePV local remote of
-            Just GT ->
-              pure $
-                ApplySoftSkip
-                  key
-                  ( "local version is ahead of upstream ("
-                      <> prettyVersion local
-                      <> " > "
-                      <> prettyVersion remote
-                      <> ")"
-                  )
-            Just EQ
-              | not needsSamePvFix ->
-                  pure $ ApplySoftSkip key "already at latest upstream version"
-            Just EQ ->
-              goPublishAndOverlay
+          pure [ApplyHardFail key ("Go tree-lane plan failed: " <> err) False False]
+        Right plan -> do
+          let pkgDir = takeDirectory (pePath entry)
+          localPVs <- listLocalNonLivePVs pkgDir (pePN entry)
+          contentFix <- contentFixNeeded pkgDir (pePN entry) plan
+          if not (planNeedsWork localPVs contentFix plan)
+            then pure [ApplySoftSkip key "already matches Go tree-lane plan"]
+            else
+              materializePlan
                 env
                 overlayRoot
                 entry
@@ -378,40 +405,208 @@ applyGoVendor env overlayRoot entry src mSub = do
                 repo
                 prefix
                 mSub
-                local
-                (nextRevisionVersion local)
-            Just LT ->
-              goPublishAndOverlay
-                env
-                overlayRoot
-                entry
-                owner
-                repo
-                prefix
-                mSub
-                local
-                ( case remote of
-                    Numeric comps _ -> Numeric comps Nothing
-                    Raw t -> Raw t
-                )
-            Nothing ->
-              pure $
-                ApplyHardFail
-                  key
-                  ( "incomparable versions: local="
-                      <> T.pack (show local)
-                      <> " remote="
-                      <> T.pack (show remote)
-                  )
-                  False
-                  False
+                plan
+                localPVs
+                contentFix
     _ ->
-      pure $
-        ApplyHardFail
-          key
-          "GoVendorAndAssets requires a GitHub update source"
-          False
-          False
+      pure
+        [ ApplyHardFail
+            key
+            "GoVendorAndAssets requires a GitHub update source"
+            False
+            False
+        ]
+
+listLocalNonLivePVs :: FilePath -> Text -> IO [EbuildVersion]
+listLocalNonLivePVs pkgDir pn = do
+  names <- listDirectory pkgDir
+  let vers =
+        [ parseEbuildVersion (T.pack verStr)
+        | name <- names,
+          Just (pkg, verStr) <- [parseEbuildFileName name],
+          T.pack pkg == pn,
+          let v = parseEbuildVersion (T.pack verStr),
+          not (isLivePackageVersion v)
+        ]
+  pure vers
+
+contentFixNeeded :: FilePath -> Text -> GoLanePlan -> IO [EbuildVersion]
+contentFixNeeded pkgDir pn plan =
+  concat <$> mapM checkPlanned (glpEbuilds plan)
+  where
+    checkPlanned pe = do
+      let name = ebuildFileNameWithRev pn (pePV pe)
+          path = pkgDir </> name
+      -- Also try without revision suffix variants by scanning dir.
+      exists <- doesFileExist path
+      paths <-
+        if exists
+          then pure [path]
+          else do
+            names <- listDirectory pkgDir
+            pure
+              [ pkgDir </> n
+              | n <- names,
+                Just (pkg, verStr) <- [parseEbuildFileName n],
+                T.pack pkg == pn,
+                samePV (parseEbuildVersion (T.pack verStr)) (pePV pe)
+              ]
+      case paths of
+        [] -> pure []
+        (p : _) -> do
+          content <- TIO.readFile p
+          let bad =
+                not (assetsSrcUriParameterized content)
+                  || not (ebuildHasDevLangGoBdepend content)
+                  || not (keywordsMatch (peKeywords pe) content)
+          pure [pePV pe | bad]
+    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
+
+materializePlan ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  GoLanePlan ->
+  [EbuildVersion] ->
+  [EbuildVersion] ->
+  IO [ApplyOutcome]
+materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs contentFix = do
+  let key = peKey entry
+      needPVs =
+        nub
+          ( missingTargets localPVs plan
+              <> contentFix
+          )
+      planned = [pe | pe <- glpEbuilds plan, any (samePV (pePV pe)) needPVs]
+      sortedPlanned =
+        sortOn
+          ( \pe ->
+              case pePV pe of
+                Numeric comps _ -> comps
+                Raw _ -> []
+          )
+          planned
+  results <- mapM (materializeOne env overlayRoot entry owner repo prefix mSub localPVs plan) sortedPlanned
+  let failures = [o | o@ApplyHardFail {} <- results]
+      successes = [o | o@ApplySuccess {} <- results]
+  if not (null failures)
+    then pure (successes <> failures)
+    else do
+      -- Prune only after all targets materialized.
+      pruneResult <- pruneExtras env overlayRoot entry plan
+      case pruneResult of
+        Left err ->
+          pure
+            ( successes
+                <> [ApplyHardFail key err True False]
+            )
+        Right extraPaths ->
+          pure $
+            case reverse successes of
+              [] ->
+                -- Prune-only / keywords-only with no materialize (shouldn't happen often)
+                if null extraPaths
+                  then [ApplySoftSkip key "already matches Go tree-lane plan"]
+                  else
+                    let lines_ = gapSuccessLines localPVs needPVs plan
+                     in [ApplySuccess key lines_ extraPaths]
+              (ApplySuccess k sls paths : rest) ->
+                reverse rest
+                  <> [ApplySuccess k sls (nub (paths <> extraPaths))]
+              _ -> successes
+  where
+    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
+
+gapSuccessLines :: [EbuildVersion] -> [EbuildVersion] -> GoLanePlan -> [SuccessLine]
+gapSuccessLines localPVs needs plan =
+  [ SuccessLine
+      { slFrom = glFrom g,
+        slTo = glTo g,
+        slLabel = Just (glLabel g)
+      }
+  | g <- buildGapLines localPVs needs plan
+  ]
+
+materializeOne ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  [EbuildVersion] ->
+  GoLanePlan ->
+  PlannedEbuild ->
+  IO ApplyOutcome
+materializeOne env overlayRoot entry owner repo prefix mSub localPVs plan pe = do
+  let targetVer = case pePV pe of
+        Numeric comps _ -> Numeric comps Nothing
+        Raw t -> Raw t
+      -- Content-fix same PV may need revision bump.
+      alreadyLocal = any (samePV targetVer) localPVs
+      writeVer =
+        if alreadyLocal
+          then nextRevisionVersion targetVer
+          else targetVer
+      lines_ =
+        filter
+          (\sl -> samePV (slTo sl) targetVer)
+          (gapSuccessLines localPVs [targetVer] plan)
+  goPublishAndOverlay
+    env
+    overlayRoot
+    entry
+    owner
+    repo
+    prefix
+    mSub
+    (peKeywords pe)
+    lines_
+    writeVer
+  where
+    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
+
+pruneExtras ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  GoLanePlan ->
+  IO (Either Text [FilePath])
+pruneExtras env overlayRoot entry plan = do
+  let pkgDir = takeDirectory (pePath entry)
+      pn = pePN entry
+  names <- listDirectory pkgDir
+  let extras =
+        [ pkgDir </> n
+        | n <- names,
+          Just (pkg, verStr) <- [parseEbuildFileName n],
+          T.pack pkg == pn,
+          let v = parseEbuildVersion (T.pack verStr),
+          not (isLivePackageVersion v),
+          not (any (samePV v) (glpUniquePVs plan))
+        ]
+  if null extras
+    then pure (Right [])
+    else do
+      mapM_ removeFile extras
+      rels <- mapM (relativeOverlayPath overlayRoot) extras
+      -- Manifest after deletions.
+      manResult <-
+        case [n | n <- names, ".ebuild" `T.isSuffixOf` T.pack n, n `notElem` map takeFileName extras] of
+          (keep : _) -> aeEbuildRunner env pkgDir keep
+          [] -> pure (Right ())
+      case manResult of
+        Left err -> pure (Left err)
+        Right () -> do
+          manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+          pure (Right (rels <> [manRel]))
+  where
+    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 goPublishAndOverlay ::
   ApplyEnv ->
@@ -421,10 +616,11 @@ goPublishAndOverlay ::
   Text ->
   Text ->
   Maybe FilePath ->
-  EbuildVersion ->
+  [Text] ->
+  [SuccessLine] ->
   EbuildVersion ->
   IO ApplyOutcome
-goPublishAndOverlay env overlayRoot entry owner repo prefix mSub local targetVer = do
+goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_ targetVer = do
   let key = peKey entry
       pn = pePN entry
       pvNoRev = renderPVNoRev targetVer
@@ -519,7 +715,8 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub local targetVer
                       env
                       overlayRoot
                       entry
-                      local
+                      keywords
+                      lines_
                       targetVer
                       digests
                       tarballName
@@ -529,13 +726,14 @@ overlayAfterAssets ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
-  EbuildVersion ->
+  [Text] ->
+  [SuccessLine] ->
   EbuildVersion ->
   FileDigests ->
   FilePath ->
   Maybe Text ->
   IO ApplyOutcome
-overlayAfterAssets env overlayRoot entry local targetVer digests tarballName mGoVer = do
+overlayAfterAssets env overlayRoot entry keywords lines_ targetVer digests tarballName mGoVer = do
   let key = peKey entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
@@ -543,7 +741,9 @@ overlayAfterAssets env overlayRoot entry local targetVer digests tarballName mGo
       gitOps = aeGitOps env
       ebuildRun = aeEbuildRunner env
       orphan = True
-  ebuildRel <- relativeOverlayPath overlayRoot oldPath
+  -- Prefer an existing ebuild for this PV as template; else newest tip.
+  templatePath <- findTemplate pkgDir pn targetVer oldPath
+  ebuildRel <- relativeOverlayPath overlayRoot templatePath
   manRel0 <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
   dirty <- goPathsDirty gitOps overlayRoot [ebuildRel, manRel0]
   case dirty of
@@ -556,62 +756,80 @@ overlayAfterAssets env overlayRoot entry local targetVer digests tarballName mGo
           False
           orphan
     Right False -> do
-      content <- TIO.readFile oldPath
+      content <- TIO.readFile templatePath
       let parameterized = parameterizeAssetsSrcUri pn content
+          withKw = setKeywords keywords parameterized
       contentFixed <- case mGoVer of
-        Nothing -> pure (Right parameterized)
-        Just goVer -> pure (ensureGoBdepend goVer parameterized)
+        Nothing -> pure (Right withKw)
+        Just goVer -> pure (ensureGoBdepend goVer withKw)
       case contentFixed of
         Left err -> pure $ ApplyHardFail key err False orphan
         Right fixed -> do
           let newName = ebuildFileNameWithRev pn targetVer
               newPath = pkgDir </> newName
-          existsNew <- doesFileExist newPath
-          if existsNew && takeFileName oldPath /= newName
-            then
-              pure $
-                ApplyHardFail
-                  key
-                  ("target ebuild already exists: " <> T.pack newName)
-                  False
-                  orphan
-            else do
-              TIO.writeFile newPath fixed
-              renamed <-
-                if takeFileName oldPath == newName
-                  then pure False
-                  else do
-                    removeFile oldPath
-                    pure True
-              manResult <- ebuildRun pkgDir newName
-              case manResult of
-                Left err -> pure $ ApplyHardFail key err True orphan
-                Right () -> do
-                  manText <- TIO.readFile (pkgDir </> "Manifest")
-                  case parseManifestVendorSHA512 manText tarballName of
-                    Nothing ->
+          -- Writing same path is fine; different existing path for same PV is replace.
+          TIO.writeFile newPath fixed
+          removedTemplate <-
+            if templatePath /= newPath && takeFileName templatePath /= newName
+              then do
+                -- Only remove template when it was a different version file we are replacing
+                -- as part of rename from newest tip. For multi-PV, keep other versions.
+                let templateIsTarget =
+                      case parseEbuildFileName (takeFileName templatePath) of
+                        Just (_, verStr) ->
+                          case comparePV (parseEbuildVersion (T.pack verStr)) targetVer of
+                            Just EQ -> True
+                            _ -> False
+                        Nothing -> False
+                if templateIsTarget
+                  then removeFile templatePath >> pure True
+                  else pure False
+              else pure False
+          manResult <- ebuildRun pkgDir newName
+          case manResult of
+            Left err -> pure $ ApplyHardFail key err True orphan
+            Right () -> do
+              manText <- TIO.readFile (pkgDir </> "Manifest")
+              case parseManifestVendorSHA512 manText tarballName of
+                Nothing ->
+                  pure $
+                    ApplyHardFail
+                      key
+                      "could not parse vendor SHA512 from Manifest after ebuild manifest"
+                      True
+                      orphan
+                Just manSha
+                  | manSha == digestSHA512 digests -> do
+                      newRel <- relativeOverlayPath overlayRoot newPath
+                      manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+                      let paths =
+                            nub $
+                              [newRel, manRel]
+                                <> [ebuildRel | removedTemplate || templatePath /= newPath]
+                      pure $ ApplySuccess key lines_ paths
+                  | otherwise ->
                       pure $
                         ApplyHardFail
                           key
-                          "could not parse vendor SHA512 from Manifest after ebuild manifest"
+                          "Manifest SHA512 does not match published vendor tarball"
                           True
                           orphan
-                    Just manSha
-                      | manSha == digestSHA512 digests -> do
-                          newRel <- relativeOverlayPath overlayRoot newPath
-                          manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-                          let paths =
-                                if renamed
-                                  then [ebuildRel, newRel, manRel]
-                                  else [newRel, manRel]
-                          pure $ ApplySuccess key local targetVer paths
-                      | otherwise ->
-                          pure $
-                            ApplyHardFail
-                              key
-                              "Manifest SHA512 does not match published vendor tarball"
-                              True
-                              orphan
+
+findTemplate :: FilePath -> Text -> EbuildVersion -> FilePath -> IO FilePath
+findTemplate pkgDir pn targetVer fallback = do
+  names <- listDirectory pkgDir
+  let same =
+        [ pkgDir </> n
+        | n <- names,
+          Just (pkg, verStr) <- [parseEbuildFileName n],
+          T.pack pkg == pn,
+          case comparePV (parseEbuildVersion (T.pack verStr)) targetVer of
+            Just EQ -> True
+            _ -> False
+        ]
+  pure $ case same of
+    (p : _) -> p
+    [] -> fallback
 
 commitSuccesses ::
   GitOps ->
@@ -621,11 +839,14 @@ commitSuccesses ::
   IO [ApplyOutcome]
 commitSuccesses gitOps step overlayRoot = mapM commitOne
   where
-    commitOne (ApplySuccess key local remote paths) = do
+    commitOne (ApplySuccess key lines_ paths) = do
       shStep step (packageKeyText key)
-      let msg = packageKeyText key <> ": " <> renderPV remote
+      let verText = case lines_ of
+            (SuccessLine _ to _ : _) -> renderPV to
+            [] -> "update"
+          msg = packageKeyText key <> ": " <> verText
       result <- goAddAndCommit gitOps overlayRoot paths msg
       pure $ case result of
-        Right () -> ApplySuccess key local remote paths
+        Right () -> ApplySuccess key lines_ paths
         Left err -> ApplyHardFail key err False False
     commitOne other = pure other

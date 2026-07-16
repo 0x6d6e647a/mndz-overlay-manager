@@ -10,6 +10,9 @@ module Update.EbuildEdit
     ebuildHasDevLangGoBdepend,
     goBdependMatches,
     ensureGoBdepend,
+    parseKeywordsLine,
+    setKeywords,
+    keywordsMatch,
   )
 where
 
@@ -195,3 +198,53 @@ findLastInheritIdx lns =
   case [i | (i, ln) <- zip [0 ..] lns, "inherit" `T.isPrefixOf` T.stripStart ln] of
     [] -> Nothing
     xs -> Just (last xs)
+
+-- | Parse KEYWORDS tokens from ebuild content (first KEYWORDS= line).
+parseKeywordsLine :: Text -> [Text]
+parseKeywordsLine content =
+  case mapMaybe lineKeywords (T.lines content) of
+    (toks : _) -> toks
+    [] -> []
+  where
+    mapMaybe f = foldr (\x acc -> case f x of Just y -> y : acc; Nothing -> acc) []
+    lineKeywords ln =
+      let stripped = T.stripStart ln
+       in if "KEYWORDS=" `T.isPrefixOf` stripped
+            then Just (tokenize (T.drop (T.length ("KEYWORDS=" :: Text)) stripped))
+            else Nothing
+    tokenize raw =
+      let unquoted = stripQuotes (T.strip raw)
+       in filter (not . T.null) (T.words unquoted)
+    stripQuotes t
+      | T.length t >= 2,
+        T.head t == '"',
+        T.last t == '"' =
+          T.init (T.tail t)
+      | otherwise = t
+
+-- | True when KEYWORDS tokens match exactly (order-insensitive multiset).
+keywordsMatch :: [Text] -> Text -> Bool
+keywordsMatch expected content =
+  let actual = parseKeywordsLine content
+   in length expected == length actual
+        && all (`elem` actual) expected
+        && all (`elem` expected) actual
+
+-- | Set or replace KEYWORDS to the given space-joined tokens (quoted).
+setKeywords :: [Text] -> Text -> Text
+setKeywords toks content =
+  let line = "KEYWORDS=\"" <> T.unwords toks <> "\""
+      lns = T.lines content
+      (pre, post) = break isKeywordsLine lns
+   in case post of
+        (_old : rest) -> T.unlines (pre <> [line] <> rest)
+        [] ->
+          -- Insert after inherit block when missing.
+          case findLastInheritIdx lns of
+            Nothing -> T.unlines (lns <> ["", line])
+            Just idx ->
+              let (before, after) = splitAt (idx + 1) lns
+                  (blanks, rest) = span T.null after
+               in T.unlines (before <> blanks <> [line] <> rest)
+  where
+    isKeywordsLine ln = "KEYWORDS=" `T.isPrefixOf` T.stripStart ln
