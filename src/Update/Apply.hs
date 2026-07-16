@@ -14,7 +14,14 @@ module Update.Apply
   )
 where
 
-import Control.Concurrent.Async (mapConcurrently)
+import CLI.Jobs (mapConcurrentlyN)
+import CLI.Progress
+  ( MultiHandle (..),
+    ProgressConfig,
+    StepHandle (..),
+    withMultiProgress,
+    withStepProgress,
+  )
 import Control.Concurrent.MVar (MVar, withMVar)
 import Data.List (sortOn)
 import Data.Text (Text)
@@ -90,7 +97,11 @@ data ApplyEnv = ApplyEnv
     aeGitHubToken :: Maybe Text,
     aeAssetsOwner :: Text,
     aeAssetsRepo :: Text,
-    aeAssetsLock :: MVar ()
+    aeAssetsLock :: MVar (),
+    aeJobs :: Int,
+    -- | Mutated for the duration of phase-1 / commit panels.
+    aeMulti :: MultiHandle,
+    aeCommitStep :: StepHandle
   }
 
 needsGoAssetsApply :: [PackageEntry] -> Bool
@@ -113,12 +124,13 @@ foldExitHardFail :: [ApplyOutcome] -> Bool
 foldExitHardFail = any outcomeIsHardFail
 
 applyOverlay ::
+  ProgressConfig ->
   ApplyEnv ->
   FilePath ->
   [PackageEntry] ->
   Maybe [PackageKey] ->
   IO [ApplyOutcome]
-applyOverlay env overlayRoot entries mFilter = do
+applyOverlay pcfg env overlayRoot entries mFilter = do
   isGit <- goIsWorkTree (aeGitOps env) overlayRoot
   if not isGit
     then
@@ -133,19 +145,54 @@ applyOverlay env overlayRoot entries mFilter = do
       let selected = case mFilter of
             Nothing -> entries
             Just keys -> [e | e <- entries, peKey e `elem` keys]
-      phase1 <- mapConcurrently (applyPackagePhase1 env overlayRoot) selected
+      phase1 <-
+        withMultiProgress pcfg "Updating packages" (length selected) $ \mh ->
+          let env' = env {aeMulti = mh}
+           in mapConcurrentlyN
+                (aeJobs env')
+                (applyPackagePhase1Tracked env' overlayRoot)
+                selected
       let successes =
             sortOn
               (packageKeyText . successKey)
               [o | o@ApplySuccess {} <- phase1]
           others = [o | o <- phase1, not (isSuccess o)]
-      committed <- commitSuccesses (aeGitOps env) overlayRoot successes
+      committed <-
+        withStepProgress pcfg (length successes) $ \sh ->
+          commitSuccesses
+            (aeGitOps env)
+            sh
+            overlayRoot
+            successes
       pure (others <> committed)
   where
     successKey (ApplySuccess k _ _ _) = k
     successKey _ = PackageKey ""
     isSuccess ApplySuccess {} = True
     isSuccess _ = False
+
+applyPackagePhase1Tracked ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  IO ApplyOutcome
+applyPackagePhase1Tracked env overlayRoot entry = do
+  let key = peKey entry
+      mh = aeMulti env
+  mhStart mh key
+  outcome <- applyPackagePhase1 env overlayRoot entry
+  case outcome of
+    ApplySuccess {} -> mhSuccess mh key
+    ApplySoftSkip _ reason -> mhFail mh key (shortReason reason)
+    ApplyHardFail _ msg _ _ -> mhFail mh key (shortReason msg)
+  pure outcome
+
+shortReason :: Text -> Text
+shortReason t =
+  let oneLine = T.unwords (T.words t)
+   in if T.length oneLine > 60
+        then T.take 57 oneLine <> "..."
+        else oneLine
 
 applyPackagePhase1 ::
   ApplyEnv ->
@@ -186,13 +233,16 @@ applyGitMv env overlayRoot entry src = do
       pn = pePN entry
       gitOps = aeGitOps env
       ebuildRun = aeEbuildRunner env
+      mh = aeMulti env
+  mhStatus mh key "fetching"
   fetched <- aeFetcher env src
   case fetched of
     Left err ->
       pure $ ApplyHardFail key ("fetch failed: " <> err) False False
     Right remote ->
       case comparePV local remote of
-        Just LT ->
+        Just LT -> do
+          mhStatus mh key "applying"
           gitMvDo key local remote oldPath pkgDir pn gitOps ebuildRun overlayRoot
         Just EQ ->
           pure $ ApplySoftSkip key "already at latest upstream version"
@@ -289,8 +339,10 @@ applyGoVendor env overlayRoot entry src mSub = do
   let key = peKey entry
       local = peLocal entry
       oldPath = pePath entry
+      mh = aeMulti env
   case src of
     GitHub owner repo prefix -> do
+      mhStatus mh key "fetching"
       fetched <- aeFetcher env src
       case fetched of
         Left err ->
@@ -372,6 +424,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub local targetVer
       pn = pePN entry
       pvNoRev = renderPVNoRev targetVer
       tarballName = vendorTarballName pn pvNoRev
+      mh = aeMulti env
   case (aeAssetsRoot env, aeGitHubToken env) of
     (Nothing, _) ->
       pure $
@@ -393,6 +446,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub local targetVer
           pure $ ApplyHardFail key "invalid package key" False False
         Just (category, _) ->
           withSystemTempDirectory "mndz-vendor-out-" $ \outDir -> do
+            mhStatus mh key "vendoring"
             built <-
               buildVendorTarball
                 (aeVendorOps env)
@@ -420,6 +474,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub local targetVer
                   (spSha512 sp)
                   (spB3 sp)
                 let msg = commitMessage category pn (renderPV targetVer)
+                mhStatus mh key "publishing assets"
                 pubResult <-
                   withMVar (aeAssetsLock env) $ \() -> do
                     committed <-
@@ -453,7 +508,8 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub local targetVer
                         ("assets publish failed: " <> err)
                         False
                         False
-                  Right () ->
+                  Right () -> do
+                    mhStatus mh key "regenerating manifest"
                     overlayAfterAssets
                       env
                       overlayRoot
@@ -546,12 +602,14 @@ overlayAfterAssets env overlayRoot entry local targetVer digests tarballName = d
 
 commitSuccesses ::
   GitOps ->
+  StepHandle ->
   FilePath ->
   [ApplyOutcome] ->
   IO [ApplyOutcome]
-commitSuccesses gitOps overlayRoot = mapM commitOne
+commitSuccesses gitOps step overlayRoot = mapM commitOne
   where
     commitOne (ApplySuccess key local remote paths) = do
+      shStep step (packageKeyText key)
       let msg = packageKeyText key <> ": " <> renderPV remote
       result <- goAddAndCommit gitOps overlayRoot paths msg
       pure $ case result of

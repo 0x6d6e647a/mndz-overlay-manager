@@ -2,12 +2,25 @@
 
 module Main (main) where
 
+import CLI.Jobs (mapConcurrentlyN)
+import CLI.Parser (ColorMode (..), resolveVerbosity)
+import CLI.Parser qualified as V
+import Colog (Msg (..))
+import Colog qualified as C
 import Config.Loader (ConfigError (..), loadConfig)
 import Config.Types (OverlayConfig (..))
-import Control.Monad (unless)
+import Control.Concurrent (threadDelay)
+import Control.Monad (unless, void)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
+import GHC.Stack (callStack)
+import Logging.Bootstrap
+  ( fmtMessageColored,
+    showSeverityColored,
+    verbosityToSeverity,
+  )
 import Overlay.Discovery
   ( DiscoveryError (..),
     collectEbuilds,
@@ -93,6 +106,12 @@ main = do
   testSidecarLine
   testEbuildEdit
   testSshAgentReuse
+  testVerbosityResolution
+  testSeverityFilterMapping
+  testSeverityColors
+  testNoColorStripsEscapes
+  testJobsBound
+  testJobsOneSerial
   putStrLn "All tests passed."
 
 assertEq :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -661,3 +680,93 @@ testSshAgentReuse = do
       )
       goAssetsRequiredTools
   assertEq "go missing among assets tools" ["go"] missing
+
+------------------------------------------------------------------------
+-- Verbosity / logging / concurrency
+------------------------------------------------------------------------
+
+testVerbosityResolution :: IO ()
+testVerbosityResolution = do
+  assertEq "default" V.Warn (resolveVerbosity Nothing 0)
+  assertEq "single -v" V.Info (resolveVerbosity Nothing 1)
+  assertEq "double -v" V.Debug (resolveVerbosity Nothing 2)
+  assertEq "triple caps at debug" V.Debug (resolveVerbosity Nothing 5)
+  assertEq "explicit overrides -v" V.Error (resolveVerbosity (Just V.Error) 2)
+  assertEq "explicit warn overrides -vv" V.Warn (resolveVerbosity (Just V.Warn) 2)
+  assertEq "explicit debug" V.Debug (resolveVerbosity (Just V.Debug) 0)
+
+testSeverityFilterMapping :: IO ()
+testSeverityFilterMapping = do
+  assertEq "error" C.Error (verbosityToSeverity V.Error)
+  assertEq "warn" C.Warning (verbosityToSeverity V.Warn)
+  assertEq "info" C.Info (verbosityToSeverity V.Info)
+  assertEq "debug" C.Debug (verbosityToSeverity V.Debug)
+  -- filterBySeverity keeps messages with severity >= threshold
+  assertTrue "warn hides info" (C.Info < C.Warning)
+  assertTrue "warn shows warning" (C.Warning >= C.Warning)
+  assertTrue "debug shows all" (C.Debug <= C.Info && C.Debug <= C.Error)
+
+testSeverityColors :: IO ()
+testSeverityColors = do
+  let err = showSeverityColored ColorOn C.Error
+      info = showSeverityColored ColorOn C.Info
+      warn = showSeverityColored ColorOn C.Warning
+      dbg = showSeverityColored ColorOn C.Debug
+  assertTrue "error has escape" ("\ESC[" `T.isInfixOf` err)
+  assertTrue "info has escape" ("\ESC[" `T.isInfixOf` info)
+  assertTrue "warning has escape" ("\ESC[" `T.isInfixOf` warn)
+  assertTrue "debug has escape" ("\ESC[" `T.isInfixOf` dbg)
+  assertTrue "error tag text" ("[Error]" `T.isInfixOf` err)
+  assertTrue "info tag text" ("[Info]" `T.isInfixOf` info)
+
+testNoColorStripsEscapes :: IO ()
+testNoColorStripsEscapes = do
+  let plain = showSeverityColored ColorOff C.Error
+      msg =
+        Msg
+          { msgSeverity = C.Warning,
+            msgStack = callStack,
+            msgText = "hello"
+          }
+      formatted = fmtMessageColored ColorOff msg
+  assertTrue "plain error no esc" (not ("\ESC[" `T.isInfixOf` plain))
+  assertTrue "plain still has tag" ("[Error]" `T.isInfixOf` plain)
+  assertTrue "fmt no esc" (not ("\ESC[" `T.isInfixOf` formatted))
+  assertTrue "fmt has warning" ("[Warning]" `T.isInfixOf` formatted)
+  assertTrue "fmt has body" ("hello" `T.isInfixOf` formatted)
+
+testJobsBound :: IO ()
+testJobsBound = do
+  results <- mapConcurrentlyN 4 pure [1 .. 10 :: Int]
+  assertEq "preserves values" [1 .. 10] (sort results)
+
+-- | With --jobs 1, concurrent slots never exceed one in-flight job.
+testJobsOneSerial :: IO ()
+testJobsOneSerial = do
+  inFlight <- newIORef (0 :: Int)
+  maxSeen <- newIORef (0 :: Int)
+  let job _ = do
+        cur <-
+          atomicModifyIORef' inFlight $ \n ->
+            let n' = n + 1 in (n', n')
+        atomicModifyIORef' maxSeen $ \m -> (max m cur, ())
+        threadDelay 20_000
+        atomicModifyIORef' inFlight $ \n -> (n - 1, ())
+        pure ()
+  void $ mapConcurrentlyN 1 job [1 .. 6 :: Int]
+  peak <- readIORef maxSeen
+  assertEq "jobs 1 peak concurrency" 1 peak
+  -- Also verify higher bound can exceed 1 when work overlaps.
+  inFlight2 <- newIORef (0 :: Int)
+  maxSeen2 <- newIORef (0 :: Int)
+  let job2 _ = do
+        cur <-
+          atomicModifyIORef' inFlight2 $ \n ->
+            let n' = n + 1 in (n', n')
+        atomicModifyIORef' maxSeen2 $ \m -> (max m cur, ())
+        threadDelay 50_000
+        atomicModifyIORef' inFlight2 $ \n -> (n - 1, ())
+        pure ()
+  void $ mapConcurrentlyN 3 job2 [1 .. 6 :: Int]
+  peak2 <- readIORef maxSeen2
+  assertTrue "jobs 3 can exceed 1" (peak2 > 1)

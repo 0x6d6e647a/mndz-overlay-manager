@@ -65,7 +65,9 @@ library
 
     -- Modules exported by the library.
     exposed-modules:
-        CLI.Parser
+        CLI.Jobs
+      , CLI.Parser
+      , CLI.Progress
       , Config.Loader
       , Config.Types
       , Logging.Bootstrap
@@ -102,6 +104,8 @@ library
     build-depends:
         base ^>=4.20.2.0,
         aeson ^>=2.2,
+        ansi-terminal ^>=1.1,
+        async ^>=2.2,
         blake3 ^>=0.3,
         bytestring ^>=0.12,
         co-log ^>=0.7,
@@ -112,7 +116,7 @@ library
         http-client ^>=0.7,
         http-client-tls ^>=0.3,
         http-types ^>=0.12,
-        async ^>=2.2,
+        layoutz ^>=0.3.4,
         memory ^>=0.18,
         optparse-applicative ^>=0.19,
         process ^>=1.6,
@@ -180,6 +184,7 @@ test-suite mndz-overlay-manager-test
     build-depends:
         base ^>=4.20.2.0,
         bytestring ^>=0.12,
+        co-log ^>=0.7,
         directory ^>=1.3,
         filepath ^>=1.5,
         mndz-overlay-manager,

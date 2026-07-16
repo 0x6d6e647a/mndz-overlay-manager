@@ -2,8 +2,26 @@
 
 module Main (main) where
 
-import CLI.Parser (Command (Help, List, Outdated, Update), Options (..), parserInfo, showHelp)
-import Colog (Message, WithLog, logError, logWarning, usingLoggerT)
+import CLI.Parser
+  ( ColorMode,
+    Command (Help, List, Outdated, Update),
+    Options (..),
+    parserInfo,
+    resolveColorMode,
+    resolveJobs,
+    showHelp,
+  )
+import CLI.Progress
+  ( ProgressConfig,
+    StepHandle (..),
+    mkProgressConfig,
+    noopMultiHandle,
+    noopStepHandle,
+    progressEnabled,
+    withMultiProgress,
+    withStepProgress,
+  )
+import Colog (LogAction, Message, WithLog, logError, logWarning, usingLoggerT)
 import Config.Loader (configErrorMessage, loadConfig)
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent.MVar (newMVar)
@@ -12,7 +30,7 @@ import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
-import Logging.Bootstrap (bootstrapLogger)
+import Logging.Bootstrap (LogHold, mkLogHold, mkLogger)
 import Options.Applicative (execParser)
 import Overlay.Discovery (collectEbuilds, discoveryErrorMessage)
 import Overlay.Types (Ebuild, ebuildAtom)
@@ -28,7 +46,7 @@ import Update.Apply
 import Update.Auth (resolveGitHubToken)
 import Update.Check
   ( PackageEntry (..),
-    checkOverlay,
+    checkOverlayWith,
     groupNewest,
     productionFetcherWithToken,
   )
@@ -56,31 +74,60 @@ import Update.Types
   )
 import Update.Types qualified as U
 
-main :: IO ()
-main = usingLoggerT bootstrapLogger $ do
-  opts <- liftIO $ execParser parserInfo
-  case optCommand opts of
-    Help -> liftIO showHelp
-    List -> runList opts
-    Outdated -> runOutdated opts
-    Update pkgs -> runUpdate opts pkgs
+data Runtime = Runtime
+  { rtOptions :: Options,
+    rtJobs :: Int,
+    rtColor :: ColorMode,
+    rtLogger :: LogAction IO Message,
+    rtHold :: LogHold,
+    rtProgress :: ProgressConfig
+  }
 
-runList :: (WithLog env Message m, MonadIO m) => Options -> m ()
-runList opts = do
-  ebuilds <- loadValidatedEbuilds opts
+main :: IO ()
+main = do
+  opts <- execParser parserInfo
+  color <- resolveColorMode (optNoColor opts)
+  jobs <- resolveJobs (optJobs opts)
+  hold <- mkLogHold
+  let logger = mkLogger (optVerbosity opts) color hold
+  enabled <- progressEnabled (optNoProgress opts)
+  pcfg <- mkProgressConfig enabled color hold logger
+  let rt =
+        Runtime
+          { rtOptions = opts,
+            rtJobs = jobs,
+            rtColor = color,
+            rtLogger = logger,
+            rtHold = hold,
+            rtProgress = pcfg
+          }
+  usingLoggerT logger $
+    case optCommand opts of
+      Help -> liftIO showHelp
+      List -> runList rt
+      Outdated -> runOutdated rt
+      Update pkgs -> runUpdate rt pkgs
+
+runList :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
+runList rt = do
+  ebuilds <- loadValidatedEbuilds (rtOptions rt)
   liftIO $ mapM_ (T.putStrLn . ebuildAtom) ebuilds
 
-runOutdated :: (WithLog env Message m, MonadIO m) => Options -> m ()
-runOutdated opts = do
-  (cfg, ebuilds) <- loadValidatedEbuildsWithConfig opts
+runOutdated :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
+runOutdated rt = do
+  (cfg, ebuilds) <- loadValidatedEbuildsWithConfig (rtOptions rt)
   token <- liftIO (resolveGitHubToken cfg)
   fetch <- liftIO (productionFetcherWithToken token)
-  reports <- liftIO (checkOverlay fetch ebuilds)
+  let total = length (groupNewest ebuilds)
+  reports <-
+    liftIO $
+      withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
+        checkOverlayWith (rtJobs rt) mh fetch ebuilds
   mapM_ emitReport reports
 
-runUpdate :: (WithLog env Message m, MonadIO m) => Options -> [String] -> m ()
-runUpdate opts pkgArgs = do
-  (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull opts
+runUpdate :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> m ()
+runUpdate rt pkgArgs = do
+  (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
   case resolveTargets entries tokens of
@@ -93,7 +140,8 @@ runUpdate opts pkgArgs = do
             Nothing -> entries
             Just ks -> [e | e <- entries, peKey e `elem` ks]
           needAssets = any entryNeedsAssets selected
-      liftIO (preflightUpdateWith needAssets) >>= \case
+      preflightOk <- liftIO $ runPreflightSteps (rtProgress rt) needAssets
+      case preflightOk of
         Left err -> dieError (T.unpack err)
         Right () -> pure ()
       token <- liftIO (resolveGitHubToken cfg)
@@ -123,9 +171,12 @@ runUpdate opts pkgArgs = do
                       aeGitHubToken = token,
                       aeAssetsOwner = "0x6d6e647a",
                       aeAssetsRepo = "mndz-overlay-assets",
-                      aeAssetsLock = lock
+                      aeAssetsLock = lock,
+                      aeJobs = rtJobs rt,
+                      aeMulti = noopMultiHandle,
+                      aeCommitStep = noopStepHandle
                     }
-            applyOverlay env overlayPath entries mFilter
+            applyOverlay (rtProgress rt) env overlayPath entries mFilter
       outcomes <-
         liftIO $
           if needAssets
@@ -156,6 +207,25 @@ runUpdate opts pkgArgs = do
           when (foldExitHardFail outcomes) $
             liftIO $
               exitWith (ExitFailure 1)
+
+-- | Sequential preflight step bar covering tool checks (and counting conditional steps).
+runPreflightSteps :: ProgressConfig -> Bool -> IO (Either T.Text ())
+runPreflightSteps pcfg needAssets = do
+  let stepDescs =
+        ["Checking required tools"]
+          <> ["Validating assets path" | needAssets]
+          <> ["Resolving GitHub credentials" | needAssets]
+          <> ["Preparing SSH agent" | needAssets]
+      total = length stepDescs
+  withStepProgress pcfg total $ \step -> do
+    shStep step "Checking required tools"
+    tools <- preflightUpdateWith needAssets
+    case tools of
+      Left err -> pure (Left err)
+      Right () -> do
+        -- Remaining steps are informational markers; real work runs after return.
+        mapM_ (shStep step) (drop 1 stepDescs)
+        pure (Right ())
 
 entryNeedsAssets :: PackageEntry -> Bool
 entryNeedsAssets e =

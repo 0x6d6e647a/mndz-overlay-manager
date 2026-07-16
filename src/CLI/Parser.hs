@@ -5,12 +5,18 @@ module CLI.Parser
   ( Options (..),
     Command (..),
     Verbosity (..),
+    ColorMode (..),
     parserInfo,
     showHelp,
+    resolveVerbosity,
+    resolveColorMode,
+    resolveJobs,
   )
 where
 
+import GHC.Conc (getNumProcessors)
 import Options.Applicative
+import System.Environment (lookupEnv)
 
 data Verbosity
   = Error
@@ -18,6 +24,12 @@ data Verbosity
   | Info
   | Debug
   deriving (Eq, Show, Enum, Bounded)
+
+-- | Whether ANSI color is enabled for logs and activity chrome.
+data ColorMode
+  = ColorOn
+  | ColorOff
+  deriving (Eq, Show)
 
 data Command
   = Help
@@ -30,13 +42,20 @@ data Options = Options
   { optConfig :: Maybe FilePath,
     optOverlayPath :: Maybe FilePath,
     optVerbosity :: Verbosity,
+    optJobs :: Maybe Int,
+    optNoProgress :: Bool,
+    optNoColor :: Bool,
     optCommand :: Command
   }
   deriving (Eq, Show)
 
+-- | Map @-v@ count to verbosity starting from 'Warn'.
+-- Each flag steps Warn → Info → Debug (capped).
 verbosityFromCount :: Int -> Verbosity
-verbosityFromCount n =
-  toEnum (min (fromEnum (maxBound :: Verbosity)) n)
+verbosityFromCount n
+  | n <= 0 = Warn
+  | n == 1 = Info
+  | otherwise = Debug
 
 parseLevel :: String -> Either String Verbosity
 parseLevel "error" = Right Error
@@ -45,18 +64,57 @@ parseLevel "info" = Right Info
 parseLevel "debug" = Right Debug
 parseLevel s = Left $ "Unknown log level: " <> s
 
+-- | Resolve verbosity from optional explicit level and @-v@ count.
+-- Explicit @--log-level@ wins over @-v@.
+resolveVerbosity :: Maybe Verbosity -> Int -> Verbosity
+resolveVerbosity (Just level) _ = level
+resolveVerbosity Nothing count = verbosityFromCount count
+
 verbosityParser :: Parser Verbosity
-verbosityParser =
-  option
-    (eitherReader parseLevel)
-    ( long "log-level"
-        <> metavar "LEVEL"
-        <> help "Set log level (error|warn|info|debug)"
-        <> value Warn
-        <> showDefaultWith (const "warn")
+verbosityParser = do
+  mLevel <-
+    optional $
+      option
+        (eitherReader parseLevel)
+        ( long "log-level"
+            <> metavar "LEVEL"
+            <> help "Set log level (error|warn|info|debug); overrides -v when set"
+        )
+  vCount <-
+    length
+      <$> many
+        ( flag'
+            ()
+            ( short 'v'
+                <> long "verbose"
+                <> help "Increase verbosity from warn (repeatable: -v info, -vv debug)"
+            )
+        )
+  pure (resolveVerbosity mLevel vCount)
+
+jobsParser :: Parser (Maybe Int)
+jobsParser =
+  optional $
+    option
+      auto
+      ( long "jobs"
+          <> metavar "N"
+          <> help "Max concurrent package jobs (default: host processor count)"
+      )
+
+noProgressParser :: Parser Bool
+noProgressParser =
+  switch
+    ( long "no-progress"
+        <> help "Disable interactive activity indicators"
     )
-    <|> (verbosityFromCount . length <$> many (flag' () (short 'v' <> long "verbose" <> help "Increase verbosity (repeatable)")))
-    <|> pure Warn
+
+noColorParser :: Parser Bool
+noColorParser =
+  switch
+    ( long "no-color"
+        <> help "Disable ANSI colors in logs and indicators"
+    )
 
 configParser :: Parser (Maybe FilePath)
 configParser =
@@ -107,6 +165,9 @@ optionsParser = do
   optConfig <- configParser
   optOverlayPath <- overlayPathParser
   optVerbosity <- verbosityParser
+  optJobs <- jobsParser
+  optNoProgress <- noProgressParser
+  optNoColor <- noColorParser
   optCommand <- commandParser
   pure Options {..}
 
@@ -127,3 +188,20 @@ showHelp :: IO a
 showHelp =
   handleParseResult . Failure $
     parserFailure defaultPrefs parserInfo (ShowHelpText Nothing) mempty
+
+-- | Resolve color mode from @--no-color@ and non-empty @NO_COLOR@.
+resolveColorMode :: Bool -> IO ColorMode
+resolveColorMode noColorFlag
+  | noColorFlag = pure ColorOff
+  | otherwise = do
+      mNoColor <- lookupEnv "NO_COLOR"
+      pure $ case mNoColor of
+        Just s | not (null s) -> ColorOff
+        _ -> ColorOn
+
+-- | Resolve jobs: explicit positive @--jobs N@, else host processor count.
+resolveJobs :: Maybe Int -> IO Int
+resolveJobs (Just n)
+  | n > 0 = pure n
+  | otherwise = pure 1
+resolveJobs Nothing = getNumProcessors

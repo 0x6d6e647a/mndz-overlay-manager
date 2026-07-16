@@ -7,7 +7,9 @@ roots = [
 ]
 root-modules = [
   "Update.Git",
+  "CLI.Jobs",
   "CLI.Parser",
+  "CLI.Progress",
   "Config.Loader",
   "Config.Types",
   "Logging.Bootstrap",

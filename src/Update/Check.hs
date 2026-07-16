@@ -4,6 +4,7 @@ module Update.Check
   ( groupNewest,
     PackageEntry (..),
     checkOverlay,
+    checkOverlayWith,
     checkPackage,
     productionFetcher,
     productionFetcherWithToken,
@@ -12,6 +13,8 @@ module Update.Check
   )
 where
 
+import CLI.Jobs (mapConcurrentlyN)
+import CLI.Progress (MultiHandle (..))
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
@@ -78,11 +81,49 @@ compareForNewest a b =
     Just o -> o
     Nothing -> compare (show a) (show b)
 
--- | Run update checks for all packages with the given fetcher.
-checkOverlay :: Fetcher -> [Ebuild] -> IO [UpdateReport]
-checkOverlay fetch ebuilds = do
+-- | Run update checks concurrently with a jobs limit (no progress UI).
+checkOverlay :: Int -> Fetcher -> [Ebuild] -> IO [UpdateReport]
+checkOverlay jobs = checkOverlayWith jobs noopMulti
+  where
+    noopMulti =
+      MultiHandle
+        { mhStart = \_ -> pure (),
+          mhStatus = \_ _ -> pure (),
+          mhSuccess = \_ -> pure (),
+          mhFail = \_ _ -> pure ()
+        }
+
+-- | Concurrent checks with multi-progress callbacks.
+checkOverlayWith ::
+  Int ->
+  MultiHandle ->
+  Fetcher ->
+  [Ebuild] ->
+  IO [UpdateReport]
+checkOverlayWith jobs mh fetch ebuilds = do
   let entries = sortOn (packageKeyText . peKey) (groupNewest ebuilds)
-  mapM (checkPackage fetch) entries
+  mapConcurrentlyN jobs (checkOne mh fetch) entries
+
+checkOne :: MultiHandle -> Fetcher -> PackageEntry -> IO UpdateReport
+checkOne mh fetch entry = do
+  let key = peKey entry
+  mhStart mh key
+  mhStatus mh key "fetching"
+  report <- checkPackage fetch entry
+  case reportStatus report of
+    Outdated _ _ -> mhSuccess mh key
+    Ok _ -> mhSuccess mh key
+    Ahead _ _ -> mhFail mh key "ahead of upstream"
+    Unconfigured -> mhFail mh key "unconfigured"
+    FetchError err -> mhFail mh key (shortReason err)
+  pure report
+
+shortReason :: Text -> Text
+shortReason t =
+  let oneLine = T.unwords (T.words t)
+   in if T.length oneLine > 60
+        then T.take 57 oneLine <> "..."
+        else oneLine
 
 -- | Resolve, fetch, and compare one package.
 checkPackage :: Fetcher -> PackageEntry -> IO UpdateReport
