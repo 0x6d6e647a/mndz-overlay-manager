@@ -17,7 +17,9 @@ import CLI.Progress
     mkProgressConfig,
     noopMultiHandle,
     noopStepHandle,
+    pauseActivePanel,
     progressEnabled,
+    resumeActivePanel,
     withMultiProgress,
     withStepProgress,
   )
@@ -52,6 +54,11 @@ import Update.Check
   )
 import Update.Git (productionGitOps)
 import Update.Go.Vendor (productionVendorOps)
+import Update.GpgAgent
+  ( newGpgHandle,
+    productionGpgAgentOps,
+    teardownGpgHandle,
+  )
 import Update.Hardcoded (lookupPolicy)
 import Update.Preflight
   ( preflightUpdateWith,
@@ -158,13 +165,13 @@ runUpdate rt pkgArgs = do
             dieError
               "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
           Just _ -> pure ()
-      let runApply = do
+      let runApply gpg = do
             lock <- newMVar ()
             fetch <- productionFetcherWithToken token
             let env =
                   ApplyEnv
                     { aeFetcher = fetch,
-                      aeGitOps = productionGitOps,
+                      aeGitOps = productionGitOps gpg,
                       aeEbuildRunner = productionEbuildRunner,
                       aeVendorOps = productionVendorOps,
                       aeAssetsRoot = assetsRoot,
@@ -177,28 +184,38 @@ runUpdate rt pkgArgs = do
                       aeCommitStep = noopStepHandle
                     }
             applyOverlay (rtProgress rt) env overlayPath entries mFilter
+      let pcfg = rtProgress rt
+          gpgOps =
+            productionGpgAgentOps
+              (pauseActivePanel pcfg)
+              (resumeActivePanel pcfg)
       outcomes <-
         liftIO $
-          if needAssets
-            then
-              bracket
-                (ensureSshAgent productionSshAgentOps)
-                ( \case
-                    Left _ -> pure ()
-                    Right sess -> teardownSshSession productionSshAgentOps sess
-                )
-                ( \case
-                    Left err ->
-                      pure
-                        [ ApplyHardFail
-                            (PackageKey "")
-                            ("SSH agent setup failed: " <> err)
-                            False
-                            False
-                        ]
-                    Right _sess -> runApply
-                )
-            else runApply
+          bracket
+            (newGpgHandle gpgOps)
+            teardownGpgHandle
+            ( \gpg ->
+                if needAssets
+                  then
+                    bracket
+                      (ensureSshAgent productionSshAgentOps)
+                      ( \case
+                          Left _ -> pure ()
+                          Right sess -> teardownSshSession productionSshAgentOps sess
+                      )
+                      ( \case
+                          Left err ->
+                            pure
+                              [ ApplyHardFail
+                                  (PackageKey "")
+                                  ("SSH agent setup failed: " <> err)
+                                  False
+                                  False
+                              ]
+                          Right _sess -> runApply gpg
+                      )
+                  else runApply gpg
+            )
       case outcomes of
         [ApplyHardFail (PackageKey "") msg _ _] ->
           dieError (T.unpack msg)

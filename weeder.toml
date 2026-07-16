@@ -32,6 +32,7 @@ root-modules = [
   "Update.Http",
   "Update.Npm",
   "Update.Resolve",
+  "Update.GpgAgent",
   "Update.SshAgent",
   "Update.Types",
 ]

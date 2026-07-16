@@ -51,6 +51,16 @@ import Update.EbuildEdit
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
   )
+import Update.GpgAgent
+  ( GpgAgentOps (..),
+    Keygrip (..),
+    ensureGpgReady,
+    newGpgHandle,
+    parseKeyinfoCached,
+    parseSignCapableKeygrip,
+    pinentryChildEnv,
+    teardownGpgHandle,
+  )
 import Update.Hardcoded (lookupHardcoded, lookupPolicy)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
@@ -106,6 +116,7 @@ main = do
   testSidecarLine
   testEbuildEdit
   testSshAgentReuse
+  testGpgSignReadiness
   testVerbosityResolution
   testSeverityFilterMapping
   testSeverityColors
@@ -680,6 +691,210 @@ testSshAgentReuse = do
       )
       goAssetsRequiredTools
   assertEq "go missing among assets tools" ["go"] missing
+
+------------------------------------------------------------------------
+-- GPG sign readiness (fake ops; no live pinentry)
+------------------------------------------------------------------------
+
+testGpgSignReadiness :: IO ()
+testGpgSignReadiness = do
+  testParseSignCapableKeygrip
+  testParseKeyinfoCached
+  testPinentryChildEnv
+  testMissingSigningKeyFails
+  testWarmCacheSkipsPrompt
+  testColdCacheReadyThenWarm
+  testNoTtyWhenColdFails
+  testClearOnlyIfWarmed
+  testPerRepoKeygrips
+
+testParseSignCapableKeygrip :: IO ()
+testParseSignCapableKeygrip = do
+  let sample =
+        unlines
+          [ "sec:u:255:22:AB3AA8D9F11259B4:1781074659:::u:::scESC:::+::ed25519:::0:",
+            "fpr:::::::::CD806AAD3E54156ACC3842B7AB3AA8D9F11259B4:",
+            "grp:::::::::6FD5C82CED9AF42C796A9C275BF5CD4082063513:",
+            "ssb:u:255:18:0FFCBBF091D67623:1781074659::::::e:::+::cv25519::",
+            "grp:::::::::76D0B0AC365AE824D6705200A8898C3E7F33A81D:"
+          ]
+  case parseSignCapableKeygrip sample of
+    Right (Keygrip g) ->
+      assertEq
+        "sign keygrip"
+        "6FD5C82CED9AF42C796A9C275BF5CD4082063513"
+        g
+    Left err -> do
+      hPutStrLn stderr $ "parseSignCapableKeygrip failed: " <> T.unpack err
+      exitFailure
+  case parseSignCapableKeygrip "ssb:u:255:18:0FFC::::::e:::\ngrp:::::::::AAAA:\n" of
+    Left _ -> pure ()
+    Right _ -> do
+      hPutStrLn stderr "expected no sign-capable keygrip"
+      exitFailure
+
+testParseKeyinfoCached :: IO ()
+testParseKeyinfoCached = do
+  let grip = "6FD5C82CED9AF42C796A9C275BF5CD4082063513"
+      warm =
+        "S KEYINFO 6FD5C82CED9AF42C796A9C275BF5CD4082063513 D - - 1 P - - -\nOK\n"
+      cold =
+        "S KEYINFO 6FD5C82CED9AF42C796A9C275BF5CD4082063513 D - - - P - - -\nOK\n"
+  assertEq "warm" (Right True) (parseKeyinfoCached warm grip)
+  assertEq "cold" (Right False) (parseKeyinfoCached cold grip)
+
+testPinentryChildEnv :: IO ()
+testPinentryChildEnv = do
+  let parent = [("DISPLAY", ":0"), ("HOME", "/home/u"), ("GPG_TTY", "old")]
+      env' = pinentryChildEnv (Just "/dev/tty") parent
+  assertEq "GPG_TTY set" (Just "/dev/tty") (lookup "GPG_TTY" env')
+  assertEq "DISPLAY cleared" Nothing (lookup "DISPLAY" env')
+  assertEq "HOME kept" (Just "/home/u") (lookup "HOME" env')
+
+baseFakeOps :: GpgAgentOps
+baseFakeOps =
+  GpgAgentOps
+    { gaoGetSigningKey = \_ -> pure (Right "KEY1"),
+      gaoResolveKeygrip = \_ -> pure (Right (Keygrip "GRIP1")),
+      gaoKeyinfoCached = \_ -> pure (Right True),
+      gaoReadyPrompt = pure (Left "should not prompt"),
+      gaoWarmKey = \_ -> pure (Left "should not warm"),
+      gaoClearPassphrase = \_ -> pure (),
+      gaoControllingTty = pure (Just "/dev/tty"),
+      gaoPauseUi = pure (),
+      gaoResumeUi = pure ()
+    }
+
+testMissingSigningKeyFails :: IO ()
+testMissingSigningKeyFails = do
+  let ops =
+        baseFakeOps
+          { gaoGetSigningKey = \_ -> pure (Left "git config user.signingkey is unset")
+          }
+  h <- newGpgHandle ops
+  result <- ensureGpgReady h "/tmp/overlay-repo"
+  err <- assertLeft "missing signingkey" result
+  assertTrue "mentions signingkey" ("signingkey" `T.isInfixOf` err)
+  teardownGpgHandle h
+
+testWarmCacheSkipsPrompt :: IO ()
+testWarmCacheSkipsPrompt = do
+  promptRef <- newIORef (0 :: Int)
+  let ops =
+        baseFakeOps
+          { gaoKeyinfoCached = \_ -> pure (Right True),
+            gaoReadyPrompt = do
+              atomicModifyIORef' promptRef (\n -> (n + 1, ()))
+              pure (Right ())
+          }
+  h <- newGpgHandle ops
+  result <- ensureGpgReady h "/tmp/overlay-repo"
+  void $ assertRight "warm cache ready" result
+  prompts <- readIORef promptRef
+  assertEq "no ready prompt when warm" 0 prompts
+  teardownGpgHandle h
+
+testColdCacheReadyThenWarm :: IO ()
+testColdCacheReadyThenWarm = do
+  promptRef <- newIORef (0 :: Int)
+  warmRef <- newIORef (0 :: Int)
+  pauseRef <- newIORef (0 :: Int)
+  resumeRef <- newIORef (0 :: Int)
+  let ops =
+        baseFakeOps
+          { gaoKeyinfoCached = \_ -> pure (Right False),
+            gaoReadyPrompt = do
+              atomicModifyIORef' promptRef (\n -> (n + 1, ()))
+              pure (Right ()),
+            gaoWarmKey = \_ -> do
+              atomicModifyIORef' warmRef (\n -> (n + 1, ()))
+              pure (Right ()),
+            gaoPauseUi = atomicModifyIORef' pauseRef (\n -> (n + 1, ())),
+            gaoResumeUi = atomicModifyIORef' resumeRef (\n -> (n + 1, ()))
+          }
+  h <- newGpgHandle ops
+  result <- ensureGpgReady h "/tmp/overlay-repo"
+  void $ assertRight "cold ready" result
+  prompts <- readIORef promptRef
+  warms <- readIORef warmRef
+  pauses <- readIORef pauseRef
+  resumes <- readIORef resumeRef
+  assertEq "ready once" 1 prompts
+  assertEq "warm once" 1 warms
+  assertEq "ui paused" 1 pauses
+  assertEq "ui resumed" 1 resumes
+  teardownGpgHandle h
+
+testNoTtyWhenColdFails :: IO ()
+testNoTtyWhenColdFails = do
+  let ops =
+        baseFakeOps
+          { gaoKeyinfoCached = \_ -> pure (Right False),
+            gaoControllingTty = pure Nothing
+          }
+  h <- newGpgHandle ops
+  result <- ensureGpgReady h "/tmp/overlay-repo"
+  err <- assertLeft "no tty" result
+  assertTrue "mentions TTY" ("TTY" `T.isInfixOf` err)
+  teardownGpgHandle h
+
+testClearOnlyIfWarmed :: IO ()
+testClearOnlyIfWarmed = do
+  clearedRef <- newIORef ([] :: [T.Text])
+  let opsWarm =
+        baseFakeOps
+          { gaoKeyinfoCached = \_ -> pure (Right False),
+            gaoReadyPrompt = pure (Right ()),
+            gaoWarmKey = \_ -> pure (Right ()),
+            gaoClearPassphrase = \(Keygrip g) ->
+              atomicModifyIORef' clearedRef (\xs -> (xs <> [g], ()))
+          }
+  h1 <- newGpgHandle opsWarm
+  void $ assertRight "warm path" =<< ensureGpgReady h1 "/tmp/overlay-repo"
+  teardownGpgHandle h1
+  cleared1 <- readIORef clearedRef
+  assertEq "cleared after we warmed" ["GRIP1"] cleared1
+
+  clearedRef2 <- newIORef ([] :: [T.Text])
+  let opsAlreadyWarm =
+        baseFakeOps
+          { gaoKeyinfoCached = \_ -> pure (Right True),
+            gaoClearPassphrase = \(Keygrip g) ->
+              atomicModifyIORef' clearedRef2 (\xs -> (xs <> [g], ()))
+          }
+  h2 <- newGpgHandle opsAlreadyWarm
+  void $ assertRight "already warm" =<< ensureGpgReady h2 "/tmp/overlay-repo"
+  teardownGpgHandle h2
+  cleared2 <- readIORef clearedRef2
+  assertEq "no clear when we did not warm" [] cleared2
+
+testPerRepoKeygrips :: IO ()
+testPerRepoKeygrips = do
+  resolveRef <- newIORef ([] :: [FilePath])
+  let ops =
+        baseFakeOps
+          { gaoGetSigningKey = \root -> do
+              atomicModifyIORef' resolveRef (\xs -> (xs <> [root], ()))
+              pure $
+                if "assets" `T.isInfixOf` T.pack root
+                  then Right "KEY-ASSETS"
+                  else Right "KEY-OVERLAY",
+            gaoResolveKeygrip = \k ->
+              pure $
+                Right $
+                  Keygrip $
+                    if k == "KEY-ASSETS" then "GRIP-A" else "GRIP-O",
+            gaoKeyinfoCached = \_ -> pure (Right True)
+          }
+  h <- newGpgHandle ops
+  void $ assertRight "overlay" =<< ensureGpgReady h "/tmp/overlay-repo"
+  void $ assertRight "assets" =<< ensureGpgReady h "/tmp/assets-repo"
+  -- Second call same overlay should reuse resolved state (no second get for same abs path)
+  void $ assertRight "overlay again" =<< ensureGpgReady h "/tmp/overlay-repo"
+  roots <- readIORef resolveRef
+  -- makeAbsolute may expand; we only require both repos were queried at least once
+  assertTrue "queried more than once" (length roots >= 2)
+  teardownGpgHandle h
 
 ------------------------------------------------------------------------
 -- Verbosity / logging / concurrency

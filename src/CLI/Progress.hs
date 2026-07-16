@@ -11,15 +11,19 @@ module CLI.Progress
     noopStepHandle,
     withMultiProgress,
     withStepProgress,
+    withUiSuspended,
+    pauseActivePanel,
+    resumeActivePanel,
   )
 where
 
 import CLI.Parser (ColorMode (..))
 import Colog (LogAction, Message)
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryTakeMVar)
-import Control.Exception (bracket, finally)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryTakeMVar)
+import Control.Exception (bracket, bracket_, finally)
 import Control.Monad (when)
+import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
@@ -47,7 +51,15 @@ data ProgressConfig = ProgressConfig
     pcColor :: ColorMode,
     pcLogHold :: LogHold,
     pcLogger :: LogAction IO Message,
-    pcHandle :: Handle
+    pcHandle :: Handle,
+    -- | Active panel pause controller (set while a multi/step panel is running).
+    pcPanelCtrl :: IORef (Maybe PanelController)
+  }
+
+-- | Pause/resume an active activity panel so interactive prompts can own the TTY.
+data PanelController = PanelController
+  { panelPause :: IO (),
+    panelResume :: IO ()
   }
 
 -- | Handle for multi-progress package rows.
@@ -87,15 +99,36 @@ mkProgressConfig ::
   LogHold ->
   LogAction IO Message ->
   IO ProgressConfig
-mkProgressConfig enabled color hold logger =
+mkProgressConfig enabled color hold logger = do
+  panelCtrl <- newIORef Nothing
   pure
     ProgressConfig
       { pcEnabled = enabled,
         pcColor = color,
         pcLogHold = hold,
         pcLogger = logger,
-        pcHandle = stderr
+        pcHandle = stderr,
+        pcPanelCtrl = panelCtrl
       }
+
+-- | Clear and pause the active activity panel (if any).
+pauseActivePanel :: ProgressConfig -> IO ()
+pauseActivePanel cfg = do
+  mCtrl <- readIORef (pcPanelCtrl cfg)
+  for_ mCtrl panelPause
+
+-- | Resume the active activity panel (if any) after 'pauseActivePanel'.
+resumeActivePanel :: ProgressConfig -> IO ()
+resumeActivePanel cfg = do
+  mCtrl <- readIORef (pcPanelCtrl cfg)
+  for_ mCtrl panelResume
+
+-- | Clear and pause the active activity panel (if any), run @action@, then resume.
+--
+-- Used for interactive GPG ready-prompt / pinentry so redraws do not garble the TTY.
+withUiSuspended :: ProgressConfig -> IO a -> IO a
+withUiSuspended cfg =
+  bracket_ (pauseActivePanel cfg) (resumeActivePanel cfg)
 
 ------------------------------------------------------------------------
 -- Multi-progress
@@ -135,14 +168,24 @@ withMultiProgress cfg label total action
             }
       stopVar <- newEmptyMVar
       doneVar <- newEmptyMVar
+      drawLock <- newMVar ()
+      pausedRef <- newIORef False
+      lineCountRef <- newIORef 0
       let h = pcHandle cfg
           color = pcColor cfg
           handle = multiHandle stateRef
+          ctrl =
+            PanelController
+              { panelPause = pausePanel drawLock pausedRef lineCountRef h,
+                panelResume = resumePanel drawLock pausedRef
+              }
+      writeIORef (pcPanelCtrl cfg) (Just ctrl)
       bracket
-        (forkIO (multiPanelLoop h color stateRef stopVar doneVar))
+        (forkIO (multiPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef))
         ( \_ -> do
             putMVar stopVar ()
             takeMVar doneVar
+            writeIORef (pcPanelCtrl cfg) Nothing
             flushLogHold (pcLogHold cfg) (pcLogger cfg)
         )
         (\_ -> action handle)
@@ -187,26 +230,43 @@ multiPanelLoop ::
   IORef MultiState ->
   MVar () ->
   MVar () ->
+  MVar () ->
+  IORef Bool ->
+  IORef Int ->
   IO ()
-multiPanelLoop h color stateRef stopVar doneVar = do
-  lineCountRef <- newIORef 0
+multiPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef = do
   let cleanup = do
+        takeMVar drawLock
         clearLines h =<< readIORef lineCountRef
+        writeIORef lineCountRef 0
+        putMVar drawLock ()
         putMVar doneVar ()
       tickLoop = do
         stopped <- tryTakeMVar stopVar
-        s0 <- readIORef stateRef
-        let s = s0 {msTick = msTick s0 + 1}
-        writeIORef stateRef s
-        let frame = renderMulti color s
-        prev <- readIORef lineCountRef
-        drawFrame h prev frame
-        writeIORef lineCountRef (length (lines frame))
-        case stopped of
-          Just () -> pure ()
-          Nothing -> do
-            threadDelay 80_000
-            tickLoop
+        takeMVar drawLock
+        paused <- readIORef pausedRef
+        if paused
+          then do
+            putMVar drawLock ()
+            case stopped of
+              Just () -> pure ()
+              Nothing -> do
+                threadDelay 80_000
+                tickLoop
+          else do
+            s0 <- readIORef stateRef
+            let s = s0 {msTick = msTick s0 + 1}
+            writeIORef stateRef s
+            let frame = renderMulti color s
+            prev <- readIORef lineCountRef
+            drawFrame h prev frame
+            writeIORef lineCountRef (length (lines frame))
+            putMVar drawLock ()
+            case stopped of
+              Just () -> pure ()
+              Nothing -> do
+                threadDelay 80_000
+                tickLoop
   tickLoop `finally` cleanup
 
 renderMulti :: ColorMode -> MultiState -> String
@@ -282,6 +342,9 @@ withStepProgress cfg total action
             }
       stopVar <- newEmptyMVar
       doneVar <- newEmptyMVar
+      drawLock <- newMVar ()
+      pausedRef <- newIORef False
+      lineCountRef <- newIORef 0
       let h = pcHandle cfg
           color = pcColor cfg
           handle =
@@ -292,11 +355,18 @@ withStepProgress cfg total action
                       ()
                     )
               }
+          ctrl =
+            PanelController
+              { panelPause = pausePanel drawLock pausedRef lineCountRef h,
+                panelResume = resumePanel drawLock pausedRef
+              }
+      writeIORef (pcPanelCtrl cfg) (Just ctrl)
       bracket
-        (forkIO (stepPanelLoop h color stateRef stopVar doneVar))
+        (forkIO (stepPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef))
         ( \_ -> do
             putMVar stopVar ()
             takeMVar doneVar
+            writeIORef (pcPanelCtrl cfg) Nothing
             flushLogHold (pcLogHold cfg) (pcLogger cfg)
         )
         (\_ -> action handle)
@@ -307,26 +377,43 @@ stepPanelLoop ::
   IORef StepState ->
   MVar () ->
   MVar () ->
+  MVar () ->
+  IORef Bool ->
+  IORef Int ->
   IO ()
-stepPanelLoop h color stateRef stopVar doneVar = do
-  lineCountRef <- newIORef 0
+stepPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef = do
   let cleanup = do
+        takeMVar drawLock
         clearLines h =<< readIORef lineCountRef
+        writeIORef lineCountRef 0
+        putMVar drawLock ()
         putMVar doneVar ()
       tickLoop = do
         stopped <- tryTakeMVar stopVar
-        s0 <- readIORef stateRef
-        let s = s0 {ssTick = ssTick s0 + 1}
-        writeIORef stateRef s
-        let frame = renderStep color s
-        prev <- readIORef lineCountRef
-        drawFrame h prev frame
-        writeIORef lineCountRef (length (lines frame))
-        case stopped of
-          Just () -> pure ()
-          Nothing -> do
-            threadDelay 80_000
-            tickLoop
+        takeMVar drawLock
+        paused <- readIORef pausedRef
+        if paused
+          then do
+            putMVar drawLock ()
+            case stopped of
+              Just () -> pure ()
+              Nothing -> do
+                threadDelay 80_000
+                tickLoop
+          else do
+            s0 <- readIORef stateRef
+            let s = s0 {ssTick = ssTick s0 + 1}
+            writeIORef stateRef s
+            let frame = renderStep color s
+            prev <- readIORef lineCountRef
+            drawFrame h prev frame
+            writeIORef lineCountRef (length (lines frame))
+            putMVar drawLock ()
+            case stopped of
+              Just () -> pure ()
+              Nothing -> do
+                threadDelay 80_000
+                tickLoop
   tickLoop `finally` cleanup
 
 renderStep :: ColorMode -> StepState -> String
@@ -348,8 +435,22 @@ renderStep color StepState {..} =
           else "  " <> T.unpack ssDesc
 
 ------------------------------------------------------------------------
--- stderr frame drawing
+-- Panel pause + stderr frame drawing
 ------------------------------------------------------------------------
+
+pausePanel :: MVar () -> IORef Bool -> IORef Int -> Handle -> IO ()
+pausePanel drawLock pausedRef lineCountRef h = do
+  takeMVar drawLock
+  clearLines h =<< readIORef lineCountRef
+  writeIORef lineCountRef 0
+  writeIORef pausedRef True
+  putMVar drawLock ()
+
+resumePanel :: MVar () -> IORef Bool -> IO ()
+resumePanel drawLock pausedRef = do
+  takeMVar drawLock
+  writeIORef pausedRef False
+  putMVar drawLock ()
 
 drawFrame :: Handle -> Int -> String -> IO ()
 drawFrame h prevLineCount frame = do

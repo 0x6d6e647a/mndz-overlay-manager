@@ -14,9 +14,21 @@ where
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (makeAbsolute)
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (makeRelative, normalise)
-import System.Process (readProcessWithExitCode)
+import System.Process
+  ( CreateProcess (..),
+    proc,
+    readCreateProcessWithExitCode,
+    readProcessWithExitCode,
+  )
+import Update.GpgAgent
+  ( GpgHandle,
+    ensureGpgReady,
+    lookupControllingTty,
+    pinentryChildEnv,
+  )
 
 -- | Injectable git operations for tests.
 data GitOps = GitOps
@@ -26,12 +38,14 @@ data GitOps = GitOps
     goPush :: FilePath -> IO (Either Text ())
   }
 
-productionGitOps :: GitOps
-productionGitOps =
+-- | Production git ops: GPG readiness before every signed commit, TTY pinentry
+-- environment for @git commit -S@.
+productionGitOps :: GpgHandle -> GitOps
+productionGitOps gpg =
   GitOps
     { goIsWorkTree = isGitWorkTree,
       goPathsDirty = pathsDirty,
-      goAddAndCommit = gitAddAndSignedCommit,
+      goAddAndCommit = gitAddAndSignedCommit gpg,
       goPush = gitPush
     }
 
@@ -60,33 +74,48 @@ pathsDirty overlayRoot relPaths = do
       then Left ("git status failed: " <> T.pack err)
       else Right (not (null (lines out)))
 
--- | Stage only the given pathspecs and create a signed commit.
-gitAddAndSignedCommit :: FilePath -> [FilePath] -> Text -> IO (Either Text ())
-gitAddAndSignedCommit overlayRoot relPaths message = do
+-- | Stage only the given pathspecs and create a signed commit after GPG readiness.
+gitAddAndSignedCommit ::
+  GpgHandle ->
+  FilePath ->
+  [FilePath] ->
+  Text ->
+  IO (Either Text ())
+gitAddAndSignedCommit gpg overlayRoot relPaths message = do
   rootAbs <- makeAbsolute overlayRoot
-  (codeAdd, _, errAdd) <-
-    readProcessWithExitCode
-      "git"
-      (["-C", rootAbs, "add", "--"] <> relPaths)
-      ""
-  if codeAdd /= ExitSuccess
-    then pure $ Left ("git add failed: " <> T.pack errAdd)
-    else do
-      (codeC, _, errC) <-
+  ready <- ensureGpgReady gpg rootAbs
+  case ready of
+    Left err -> pure (Left err)
+    Right () -> do
+      (codeAdd, _, errAdd) <-
         readProcessWithExitCode
           "git"
-          [ "-C",
-            rootAbs,
-            "commit",
-            "-S",
-            "-m",
-            T.unpack message
-          ]
+          (["-C", rootAbs, "add", "--"] <> relPaths)
           ""
-      pure $
-        if codeC == ExitSuccess
-          then Right ()
-          else Left ("git commit -S failed: " <> T.pack errC)
+      if codeAdd /= ExitSuccess
+        then pure $ Left ("git add failed: " <> T.pack errAdd)
+        else do
+          mTty <- lookupControllingTty gpg
+          env0 <- getEnvironment
+          let env1 = pinentryChildEnv mTty env0
+              cp =
+                ( proc
+                    "git"
+                    [ "-C",
+                      rootAbs,
+                      "commit",
+                      "-S",
+                      "-m",
+                      T.unpack message
+                    ]
+                )
+                  { env = Just env1
+                  }
+          (codeC, _, errC) <- readCreateProcessWithExitCode cp ""
+          pure $
+            if codeC == ExitSuccess
+              then Right ()
+              else Left ("git commit -S failed: " <> T.pack errC)
 
 -- | Push the current branch to its configured remote.
 gitPush :: FilePath -> IO (Either Text ())

@@ -90,6 +90,7 @@ library
       , Update.Npm
       , Update.Preflight
       , Update.Resolve
+      , Update.GpgAgent
       , Update.SshAgent
       , Update.Targets
       , Update.Types
