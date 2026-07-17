@@ -20,6 +20,9 @@ module CLI.Progress
     MultiState (..),
     renderMulti,
     multiHandle,
+    -- Pure frame draw plan (for tests)
+    DrawPlan (..),
+    planDraw,
   )
 where
 
@@ -338,8 +341,8 @@ multiPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef 
             writeIORef stateRef s
             let frame = renderMulti color s
             prev <- readIORef lineCountRef
-            drawFrame h prev frame
-            writeIORef lineCountRef (length (lines frame))
+            store <- drawFrame h prev frame
+            writeIORef lineCountRef store
             putMVar drawLock ()
             case stopped of
               Just () -> pure ()
@@ -506,8 +509,8 @@ stepPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef =
             writeIORef stateRef s
             let frame = renderStep color s
             prev <- readIORef lineCountRef
-            drawFrame h prev frame
-            writeIORef lineCountRef (length (lines frame))
+            store <- drawFrame h prev frame
+            writeIORef lineCountRef store
             putMVar drawLock ()
             case stopped of
               Just () -> pure ()
@@ -552,22 +555,56 @@ resumePanel drawLock pausedRef = do
   writeIORef pausedRef False
   putMVar drawLock ()
 
-drawFrame :: Handle -> Int -> String -> IO ()
+-- | Pure plan for one multi-line panel redraw.
+--
+-- Invariant after emit: cursor sits just below the current content band, and
+-- 'dpStore' equals the logical content line count (tight dynamic height).
+data DrawPlan = DrawPlan
+  { -- | Cursor-up distance to the panel origin before rewriting.
+    dpMoveUp :: Int,
+    -- | Logical content lines for this frame.
+    dpContentLines :: [String],
+    -- | Blank clear-to-EOL lines needed when the previous band was taller.
+    dpClearExtra :: Int,
+    -- | Cursor-up after clear-extra so the cursor ends just below content.
+    dpMoveBack :: Int,
+    -- | Owned height to store for the next redraw or 'clearLines'.
+    dpStore :: Int
+  }
+  deriving (Eq, Show)
+
+-- | Plan a redraw from the previous owned height and the new frame string.
+planDraw :: Int -> String -> DrawPlan
+planDraw prevLineCount frame =
+  let contentLines = lines frame
+      n = length contentLines
+      clearExtra = max 0 (prevLineCount - n)
+   in DrawPlan
+        { dpMoveUp = prevLineCount,
+          dpContentLines = contentLines,
+          dpClearExtra = clearExtra,
+          dpMoveBack = clearExtra,
+          dpStore = n
+        }
+
+-- | Emit ANSI for one frame from 'planDraw'; returns the store count.
+drawFrame :: Handle -> Int -> String -> IO Int
 drawFrame h prevLineCount frame = do
-  let renderedLines = lines frame
+  let DrawPlan {..} = planDraw prevLineCount frame
       moveUp =
-        if prevLineCount > 0
-          then "\ESC[" <> show prevLineCount <> "A\r"
+        if dpMoveUp > 0
+          then "\ESC[" <> show dpMoveUp <> "A\r"
           else ""
       body =
-        concatMap (<> "\ESC[K\n") renderedLines
-          <> concat
-            ( replicate
-                (max 0 (prevLineCount - length renderedLines))
-                "\ESC[K\n"
-            )
-  hPutStr h (moveUp <> body)
+        concatMap (<> "\ESC[K\n") dpContentLines
+          <> concat (replicate dpClearExtra "\ESC[K\n")
+      moveBack =
+        if dpMoveBack > 0
+          then "\ESC[" <> show dpMoveBack <> "A\r"
+          else ""
+  hPutStr h (moveUp <> body <> moveBack)
   hFlush h
+  pure dpStore
 
 clearLines :: Handle -> Int -> IO ()
 clearLines h n = when (n > 0) $ do

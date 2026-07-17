@@ -12,10 +12,12 @@ import CLI.Parser (ColorMode (..), resolveVerbosity)
 import CLI.Parser qualified as V
 import CLI.Progress
   ( ActiveJob (..),
+    DrawPlan (..),
     JobRow (..),
     MultiHandle (..),
     MultiState (..),
     multiHandle,
+    planDraw,
     renderMulti,
   )
 import Colog (Msg (..))
@@ -206,6 +208,7 @@ main = do
   testGoModCacheHitNoRefetch
   testWorkBudgetBound
   testMultiProgressState
+  testPlanDraw
   testGoTreeCeilings
   testGoKeywordsAssembly
   testGoLaneSelection
@@ -1652,3 +1655,73 @@ testMultiProgressState = do
   assertTrue
     "single-step omits 0/0 fraction"
     (not ("0/0" `T.isInfixOf` T.pack frame))
+
+------------------------------------------------------------------------
+-- Pure panel redraw plan (tight dynamic height)
+------------------------------------------------------------------------
+
+testPlanDraw :: IO ()
+testPlanDraw = do
+  -- First frame: no previous band.
+  let first = planDraw 0 "top\nrow1\nrow2"
+  assertEq "first move-up" 0 (dpMoveUp first)
+  assertEq "first content" ["top", "row1", "row2"] (dpContentLines first)
+  assertEq "first clear-extra" 0 (dpClearExtra first)
+  assertEq "first move-back" 0 (dpMoveBack first)
+  assertEq "first store" 3 (dpStore first)
+  assertPlanInvariants "first" 0 first
+
+  -- Grow: more content than previous height.
+  let grow = planDraw 2 "a\nb\nc\nd"
+  assertEq "grow move-up" 2 (dpMoveUp grow)
+  assertEq "grow content count" 4 (length (dpContentLines grow))
+  assertEq "grow clear-extra" 0 (dpClearExtra grow)
+  assertEq "grow move-back" 0 (dpMoveBack grow)
+  assertEq "grow store" 4 (dpStore grow)
+  assertPlanInvariants "grow" 2 grow
+
+  -- Same height: rewrite in place, no clear-extra / move-back.
+  let same = planDraw 3 "x\ny\nz"
+  assertEq "same move-up" 3 (dpMoveUp same)
+  assertEq "same clear-extra" 0 (dpClearExtra same)
+  assertEq "same move-back" 0 (dpMoveBack same)
+  assertEq "same store" 3 (dpStore same)
+  assertPlanInvariants "same" 3 same
+
+  -- Shrink: clear leftover band lines and move cursor back under content.
+  let shrink = planDraw 5 "top\nrow"
+  assertEq "shrink move-up" 5 (dpMoveUp shrink)
+  assertEq "shrink content" ["top", "row"] (dpContentLines shrink)
+  assertEq "shrink clear-extra" 3 (dpClearExtra shrink)
+  assertEq "shrink move-back" 3 (dpMoveBack shrink)
+  assertEq "shrink store" 2 (dpStore shrink)
+  assertPlanInvariants "shrink" 5 shrink
+
+  -- Empty / clear-shaped: reclaim entire previous band.
+  let empty = planDraw 4 ""
+  assertEq "empty move-up" 4 (dpMoveUp empty)
+  assertEq "empty content" [] (dpContentLines empty)
+  assertEq "empty clear-extra" 4 (dpClearExtra empty)
+  assertEq "empty move-back" 4 (dpMoveBack empty)
+  assertEq "empty store" 0 (dpStore empty)
+  assertPlanInvariants "empty" 4 empty
+
+  -- Empty with no previous height is a no-op plan.
+  let empty0 = planDraw 0 ""
+  assertEq "empty0 store" 0 (dpStore empty0)
+  assertPlanInvariants "empty0" 0 empty0
+
+-- | store == content line count; move-back == max(0, prev − n); clear-extra matches.
+assertPlanInvariants :: String -> Int -> DrawPlan -> IO ()
+assertPlanInvariants label prev plan = do
+  let n = length (dpContentLines plan)
+  assertEq (label <> " store equals content lines") n (dpStore plan)
+  assertEq
+    (label <> " move-back equals max(0, prev - n)")
+    (max 0 (prev - n))
+    (dpMoveBack plan)
+  assertEq
+    (label <> " clear-extra equals move-back")
+    (dpMoveBack plan)
+    (dpClearExtra plan)
+  assertEq (label <> " move-up is prev") prev (dpMoveUp plan)
