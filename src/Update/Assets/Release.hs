@@ -5,6 +5,16 @@ module Update.Assets.Release
     createReleaseWithAssetHttp,
     ReleaseMeta (..),
     deleteReleaseBestEffort,
+    -- Lookup / download (reuse path)
+    ReleaseAsset (..),
+    ReleaseInfo (..),
+    ReleaseOps (..),
+    productionReleaseOps,
+    getReleaseByTagHttp,
+    findAssetByName,
+    downloadReleaseAssetHttp,
+    lookupNamedAsset,
+    parseReleaseInfo,
   )
 where
 
@@ -29,7 +39,8 @@ import Network.HTTP.Client
   )
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders, statusCode)
-import System.FilePath (takeFileName)
+import System.Directory (createDirectoryIfMissing)
+import System.FilePath (takeDirectory, takeFileName)
 
 data ReleaseMeta = ReleaseMeta
   { rmOwner :: Text,
@@ -40,6 +51,39 @@ data ReleaseMeta = ReleaseMeta
     rmTargetCommitish :: Text
   }
   deriving (Eq, Show)
+
+-- | One asset attached to a GitHub release.
+data ReleaseAsset = ReleaseAsset
+  { raName :: Text,
+    raBrowserDownloadUrl :: Text
+  }
+  deriving (Eq, Show)
+
+-- | Release metadata needed for lookup/download.
+data ReleaseInfo = ReleaseInfo
+  { riId :: Int,
+    riTag :: Text,
+    riAssets :: [ReleaseAsset]
+  }
+  deriving (Eq, Show)
+
+-- | Injectable release lookup + download (tests / production).
+data ReleaseOps = ReleaseOps
+  { -- | @owner repo tag@ → hard error | not found | release body.
+    roGetReleaseByTag :: Text -> Text -> Text -> IO (Either Text (Maybe ReleaseInfo)),
+    -- | Download asset body from a browser_download_url to a local path.
+    roDownloadAsset :: Text -> FilePath -> IO (Either Text ())
+  }
+
+-- | Production ops using the same Bearer token headers as create-release.
+productionReleaseOps :: Text -> IO ReleaseOps
+productionReleaseOps token = do
+  mgr <- newManager tlsManagerSettings
+  pure
+    ReleaseOps
+      { roGetReleaseByTag = getReleaseByTagHttp mgr token,
+        roDownloadAsset = downloadReleaseAssetHttp mgr token
+      }
 
 -- | Create a GitHub release and upload one asset. On upload failure after
 -- create, best-effort deletes the release.
@@ -196,6 +240,141 @@ deleteReleaseBestEffort mgr headers owner repo releaseId = do
           }
   _ <- tryHttp (httpLbs req mgr)
   pure ()
+
+------------------------------------------------------------------------
+-- Lookup release by tag + download named asset
+------------------------------------------------------------------------
+
+-- | GET @/repos/{owner}/{repo}/releases/tags/{tag}@.
+--
+-- @Right Nothing@ = release tag not found (HTTP 404).
+-- @Left@ = network / auth / parse hard errors.
+getReleaseByTagHttp ::
+  Manager ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  IO (Either Text (Maybe ReleaseInfo))
+getReleaseByTagHttp mgr token owner repo tag = do
+  let url =
+        "https://api.github.com/repos/"
+          <> T.unpack owner
+          <> "/"
+          <> T.unpack repo
+          <> "/releases/tags/"
+          <> T.unpack tag
+      headers = authHeaders token
+  req0 <- parseRequest url
+  let req =
+        req0
+          { method = "GET",
+            requestHeaders = headers
+          }
+  eres <- tryHttp (httpLbs req mgr)
+  pure $ case eres of
+    Left err -> Left err
+    Right resp ->
+      let code = statusCode (responseStatus resp)
+       in if code == 404
+            then Right Nothing
+            else
+              if code >= 200 && code < 300
+                then case eitherDecode (responseBody resp) of
+                  Left e -> Left (T.pack e)
+                  Right val ->
+                    case parseMaybe parseReleaseInfo val of
+                      Nothing -> Left "could not parse get release by tag response"
+                      Just info -> Right (Just info)
+                else
+                  Left $
+                    "HTTP "
+                      <> T.pack (show code)
+                      <> " getting release by tag: "
+                      <> T.pack (take 500 (show (responseBody resp)))
+
+-- | Pure parser for a GitHub release JSON object (tests + HTTP path).
+parseReleaseInfo :: Value -> Parser ReleaseInfo
+parseReleaseInfo =
+  withObject "release" $ \o -> do
+    rid <- o .: "id"
+    tag <- o .: "tag_name"
+    assetsRaw <- o .: "assets" :: Parser [Value]
+    assets <- mapM parseReleaseAsset assetsRaw
+    pure
+      ReleaseInfo
+        { riId = rid,
+          riTag = tag,
+          riAssets = assets
+        }
+
+parseReleaseAsset :: Value -> Parser ReleaseAsset
+parseReleaseAsset =
+  withObject "asset" $ \o -> do
+    name <- o .: "name"
+    url <- o .: "browser_download_url"
+    pure ReleaseAsset {raName = name, raBrowserDownloadUrl = url}
+
+-- | Find an asset by exact filename.
+findAssetByName :: ReleaseInfo -> Text -> Maybe ReleaseAsset
+findAssetByName info name =
+  case [a | a <- riAssets info, raName a == name] of
+    (a : _) -> Just a
+    [] -> Nothing
+
+-- | Download asset bytes from @browser_download_url@ to @destPath@.
+downloadReleaseAssetHttp ::
+  Manager ->
+  Text ->
+  Text ->
+  FilePath ->
+  IO (Either Text ())
+downloadReleaseAssetHttp mgr token downloadUrl destPath = do
+  req0 <- parseRequest (T.unpack downloadUrl)
+  let req =
+        req0
+          { method = "GET",
+            requestHeaders =
+              [ ("User-Agent", "mndz-overlay-manager"),
+                ("Accept", "application/octet-stream"),
+                ("Authorization", encodeUtf8 ("Bearer " <> token))
+              ]
+          }
+  eres <- tryHttp (httpLbs req mgr)
+  case eres of
+    Left err -> pure (Left err)
+    Right resp ->
+      let code = statusCode (responseStatus resp)
+       in if code >= 200 && code < 300
+            then do
+              createDirectoryIfMissing True (takeDirectory destPath)
+              LBS.writeFile destPath (responseBody resp)
+              pure (Right ())
+            else
+              pure $
+                Left $
+                  "HTTP "
+                    <> T.pack (show code)
+                    <> " downloading release asset"
+
+-- | Lookup release by tag and resolve exact asset name to a download URL.
+--
+-- @Right Nothing@ when the tag is missing or the asset name is not present
+-- (not-found, not a hard publish failure).
+lookupNamedAsset ::
+  ReleaseOps ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  IO (Either Text (Maybe Text))
+lookupNamedAsset ops owner repo tag assetName = do
+  eres <- roGetReleaseByTag ops owner repo tag
+  pure $ case eres of
+    Left err -> Left err
+    Right Nothing -> Right Nothing
+    Right (Just info) ->
+      Right (raBrowserDownloadUrl <$> findAssetByName info assetName)
 
 tryHttp :: IO a -> IO (Either Text a)
 tryHttp action =

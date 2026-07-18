@@ -6,6 +6,8 @@ module Update.EbuildEdit
     nextRevisionVersion,
     ebuildFileNameWithRev,
     parseManifestVendorSHA512,
+    manifestHasVendorDist,
+    ebuildNeedsContentFix,
     goBdependAtom,
     ebuildHasDevLangGoBdepend,
     goBdependMatches,
@@ -107,6 +109,23 @@ parseManifestVendorSHA512 manifestContent distfile =
             | otherwise = Nothing
           go (_ : xs) = go xs
        in go (T.words ln)
+
+-- | True when Manifest has a DIST line for the vendor tarball basename.
+manifestHasVendorDist :: Text -> FilePath -> Bool
+manifestHasVendorDist manifestContent distfile =
+  let name = T.pack (takeFileName distfile)
+   in any
+        ( \ln ->
+            "DIST" `T.isPrefixOf` ln && name `T.isInfixOf` ln
+        )
+        (T.lines manifestContent)
+
+-- | True when ebuild content needs overlay fix (SRC_URI / BDEPEND / KEYWORDS).
+ebuildNeedsContentFix :: [Text] -> Text -> Bool
+ebuildNeedsContentFix keywords content =
+  not (assetsSrcUriParameterized content)
+    || not (ebuildHasDevLangGoBdepend content)
+    || not (keywordsMatch keywords content)
 
 -- | Portage atom for a go.mod language version (e.g. @"1.26.5"@).
 goBdependAtom :: Text -> Text

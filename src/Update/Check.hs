@@ -28,10 +28,11 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import System.Directory (doesFileExist)
+import System.FilePath (takeDirectory, (</>))
+import Update.Assets.Layout (vendorTarballName)
 import Update.EbuildEdit
-  ( assetsSrcUriParameterized,
-    ebuildHasDevLangGoBdepend,
-    keywordsMatch,
+  ( ebuildNeedsContentFix,
+    manifestHasVendorDist,
   )
 import Update.GitHub (fetchGitHubWith)
 import Update.Go.Lanes
@@ -227,13 +228,17 @@ checkPackageGo mh planOps entry locals src mSub = do
     Right plan -> do
       let localPVs = localNonLivePVs locals
       contentFix <- contentFixPVs locals plan
-      let needsWork =
-            missingTargets localPVs plan
-              <> contentFix
+      let missing = missingTargets localPVs plan
+          needsWork = missing <> contentFix
           gaps =
             if planNeedsWork localPVs contentFix plan
               then buildGapLines localPVs needsWork plan
               else []
+          -- Same-PV overlay/Manifest fix: local ebuild for target already exists.
+          contentFixSet = contentFix
+          isContentOnly toPV =
+            any (samePV toPV) contentFixSet
+              && not (any (samePV toPV) missing)
       pure $
         UpdateReport
           { reportKey = key,
@@ -247,11 +252,14 @@ checkPackageGo mh planOps entry locals src mSub = do
                     [ OutdatedLine
                         { olFrom = glFrom g,
                           olTo = glTo g,
-                          olLabel = Just (glLabel g)
+                          olLabel = Just (glLabel g),
+                          olAssetsReusable = isContentOnly (glTo g)
                         }
                     | g <- gaps
                     ]
           }
+  where
+    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 -- | Progress hooks: ceilings + list + one step per go.mod probe.
 goPlanProgress :: MultiHandle -> PackageKey -> PlanProgress
@@ -268,7 +276,7 @@ goPlanProgress mh key =
       ppOnProbeDone = mhStep mh key "probing go.mod"
     }
 
--- | Local PVs present in plan but needing content/KEYWORDS fix.
+-- | Local PVs present in plan but needing content/KEYWORDS/Manifest fix.
 contentFixPVs :: [Ebuild] -> GoLanePlan -> IO [EbuildVersion]
 contentFixPVs locals plan = do
   let planned = glpEbuilds plan
@@ -290,10 +298,22 @@ contentFixPVs locals plan = do
             then pure [pePV pe]
             else do
               content <- TIO.readFile (ebuildPath e)
+              let pkgDir = takeDirectory (ebuildPath e)
+                  pn = ebuildPackage e
+                  tarball =
+                    vendorTarballName
+                      pn
+                      (renderPVNoRev (pePV pe))
+                  manPath = pkgDir </> "Manifest"
+              manMissing <- do
+                manExists <- doesFileExist manPath
+                if not manExists
+                  then pure True
+                  else do
+                    manText <- TIO.readFile manPath
+                    pure (not (manifestHasVendorDist manText tarball))
               let bad =
-                    not (assetsSrcUriParameterized content)
-                      || not (ebuildHasDevLangGoBdepend content)
-                      || not (keywordsMatch (peKeywords pe) content)
+                    ebuildNeedsContentFix (peKeywords pe) content || manMissing
               pure [pePV pe | bad]
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
@@ -305,7 +325,8 @@ statusFromCompare local remote =
         [ OutdatedLine
             { olFrom = local,
               olTo = remote,
-              olLabel = Nothing
+              olLabel = Nothing,
+              olAssetsReusable = False
             }
         ]
     Just EQ -> Ok local

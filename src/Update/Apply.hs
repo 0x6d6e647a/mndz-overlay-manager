@@ -11,6 +11,9 @@ module Update.Apply
     productionEbuildRunner,
     ApplyEnv (..),
     needsGoAssetsApply,
+    contentFixNeeded,
+    goPublishAndOverlay,
+    markSuccessLinesReused,
   )
 where
 
@@ -55,14 +58,18 @@ import Update.Assets.Layout
     sidecarPaths,
     vendorTarballName,
   )
-import Update.Assets.Release (ReleaseMeta (..), createReleaseWithAsset)
+import Update.Assets.Release
+  ( ReleaseMeta (..),
+    ReleaseOps (..),
+    createReleaseWithAsset,
+    lookupNamedAsset,
+  )
 import Update.Check (PackageEntry (..))
 import Update.EbuildEdit
-  ( assetsSrcUriParameterized,
-    ebuildFileNameWithRev,
-    ebuildHasDevLangGoBdepend,
+  ( ebuildFileNameWithRev,
+    ebuildNeedsContentFix,
     ensureGoBdepend,
-    keywordsMatch,
+    manifestHasVendorDist,
     nextRevisionVersion,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
@@ -77,13 +84,14 @@ import Update.Go.Lanes
     missingTargets,
     planNeedsWork,
   )
+import Update.Go.ModFetch (GoModKey (..), parseGoReqFromMod)
 import Update.Go.Plan
   ( PlanOps (..),
     PlanProgress (..),
     isLivePackageVersion,
     planGoPackageWithProgress,
   )
-import Update.Go.Vendor (VendorOps (..), VendorResult (..), buildVendorTarball)
+import Update.Go.Vendor (VendorOps (..), VendorResult (..), buildVendorTarball, versionTag)
 import Update.Hardcoded (lookupPolicy)
 import Update.Types
   ( ApplyOutcome (..),
@@ -116,6 +124,7 @@ data ApplyEnv = ApplyEnv
     aeGitOps :: GitOps,
     aeEbuildRunner :: EbuildRunner,
     aeVendorOps :: VendorOps,
+    aeReleaseOps :: ReleaseOps,
     aeAssetsRoot :: Maybe FilePath,
     aeGitHubToken :: Maybe Text,
     aeAssetsOwner :: Text,
@@ -367,7 +376,8 @@ gitMvDo key local remote oldPath pkgDir pn gitOps ebuildRun overlayRoot = do
                     [ SuccessLine
                         { slFrom = local,
                           slTo = remote,
-                          slLabel = Nothing
+                          slLabel = Nothing,
+                          slAssetsReused = False
                         }
                     ]
               pure $ ApplySuccess key lines_ paths
@@ -464,6 +474,7 @@ contentFixNeeded pkgDir pn plan =
     checkPlanned pe = do
       let name = ebuildFileNameWithRev pn (pePV pe)
           path = pkgDir </> name
+          tarball = vendorTarballName pn (renderPVNoRev (pePV pe))
       -- Also try without revision suffix variants by scanning dir.
       exists <- doesFileExist path
       paths <-
@@ -482,12 +493,22 @@ contentFixNeeded pkgDir pn plan =
         [] -> pure []
         (p : _) -> do
           content <- TIO.readFile p
+          manMissing <- vendorManifestMissing pkgDir tarball
           let bad =
-                not (assetsSrcUriParameterized content)
-                  || not (ebuildHasDevLangGoBdepend content)
-                  || not (keywordsMatch (peKeywords pe) content)
+                ebuildNeedsContentFix (peKeywords pe) content || manMissing
           pure [pePV pe | bad]
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
+
+-- | True when package Manifest lacks a DIST line for the vendor tarball.
+vendorManifestMissing :: FilePath -> FilePath -> IO Bool
+vendorManifestMissing pkgDir tarballName = do
+  let manPath = pkgDir </> "Manifest"
+  exists <- doesFileExist manPath
+  if not exists
+    then pure True
+    else do
+      manText <- TIO.readFile manPath
+      pure (not (manifestHasVendorDist manText tarballName))
 
 materializePlan ::
   ApplyEnv ->
@@ -560,10 +581,15 @@ gapSuccessLines localPVs needs plan =
   [ SuccessLine
       { slFrom = glFrom g,
         slTo = glTo g,
-        slLabel = Just (glLabel g)
+        slLabel = Just (glLabel g),
+        slAssetsReused = False
       }
   | g <- buildGapLines localPVs needs plan
   ]
+
+-- | Mark success lines as completed via the release-asset reuse path.
+markSuccessLinesReused :: [SuccessLine] -> [SuccessLine]
+markSuccessLinesReused = map (\sl -> sl {slAssetsReused = True})
 
 materializeOne ::
   ApplyEnv ->
@@ -659,6 +685,8 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
       pn = pePN entry
       pvNoRev = renderPVNoRev targetVer
       tarballName = vendorTarballName pn pvNoRev
+      tag = releaseTag pn pvNoRev
+      assetName = T.pack tarballName
       mh = aeMulti env
   case (aeAssetsRoot env, aeGitHubToken env) of
     (Nothing, _) ->
@@ -679,89 +707,325 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
       case splitPackageKey key of
         Nothing ->
           pure $ ApplyHardFail key "invalid package key" False False
-        Just (category, _) ->
-          withSystemTempDirectory "mndz-vendor-out-" $ \outDir -> do
-            mhStatus mh key "vendoring"
-            built <-
-              buildVendorTarball
-                (aeVendorOps env)
+        Just (category, _) -> do
+          -- Probe existing release asset first (reuse short-circuit).
+          looked <-
+            lookupNamedAsset
+              (aeReleaseOps env)
+              (aeAssetsOwner env)
+              (aeAssetsRepo env)
+              tag
+              assetName
+          case looked of
+            Left err ->
+              pure $
+                ApplyHardFail
+                  key
+                  ("release asset lookup failed: " <> err)
+                  False
+                  False
+            Right (Just downloadUrl) ->
+              reuseReleaseAsset
+                env
+                overlayRoot
+                entry
                 owner
                 repo
                 prefix
-                pvNoRev
                 mSub
-                outDir
+                keywords
+                lines_
+                targetVer
+                assetsRoot
+                category
+                pn
+                pvNoRev
                 tarballName
-            case built of
-              Left err -> pure $ ApplyHardFail key err False False
-              Right VendorResult {vrTarballPath = tarballPath, vrGoModVersion = mGoVer} -> do
-                mhStep mh key "vendoring"
-                digests <- hashFile tarballPath
-                let sp = sidecarPaths assetsRoot category pn tarballName
-                    relSidecars =
-                      [ T.unpack category </> T.unpack pn </> tarballName <> ext
-                      | ext <- [".sha256", ".sha512", ".b3"]
-                      ]
-                createDirectoryIfMissing True (takeDirectory (spSha256 sp))
-                writeSidecars
-                  tarballPath
+                downloadUrl
+            Right Nothing ->
+              fullPublishAndOverlay
+                env
+                overlayRoot
+                entry
+                owner
+                repo
+                prefix
+                mSub
+                keywords
+                lines_
+                targetVer
+                assetsRoot
+                token
+                category
+                pn
+                pvNoRev
+                tarballName
+                mh
+                key
+
+-- | Full vendor + assets publish + overlay path (release asset absent).
+fullPublishAndOverlay ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  [Text] ->
+  [SuccessLine] ->
+  EbuildVersion ->
+  FilePath ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  FilePath ->
+  MultiHandle ->
+  PackageKey ->
+  IO ApplyOutcome
+fullPublishAndOverlay
+  env
+  overlayRoot
+  entry
+  owner
+  repo
+  prefix
+  mSub
+  keywords
+  lines_
+  targetVer
+  assetsRoot
+  token
+  category
+  pn
+  pvNoRev
+  tarballName
+  mh
+  key =
+    withSystemTempDirectory "mndz-vendor-out-" $ \outDir -> do
+      mhStatus mh key "vendoring"
+      built <-
+        buildVendorTarball
+          (aeVendorOps env)
+          owner
+          repo
+          prefix
+          pvNoRev
+          mSub
+          outDir
+          tarballName
+      case built of
+        Left err -> pure $ ApplyHardFail key err False False
+        Right VendorResult {vrTarballPath = tarballPath, vrGoModVersion = mGoVer} -> do
+          mhStep mh key "vendoring"
+          digests <- hashFile tarballPath
+          let sp = sidecarPaths assetsRoot category pn tarballName
+              relSidecars =
+                [ T.unpack category </> T.unpack pn </> tarballName <> ext
+                | ext <- [".sha256", ".sha512", ".b3"]
+                ]
+          createDirectoryIfMissing True (takeDirectory (spSha256 sp))
+          writeSidecars
+            tarballPath
+            digests
+            (spSha256 sp)
+            (spSha512 sp)
+            (spB3 sp)
+          let msg = commitMessage category pn (renderPV targetVer)
+          mhStatus mh key "publishing assets"
+          pubResult <-
+            withMVar (aeAssetsLock env) $ \() -> do
+              committed <-
+                goAddAndCommit
+                  (aeGitOps env)
+                  assetsRoot
+                  relSidecars
+                  msg
+              case committed of
+                Left err -> pure (Left err)
+                Right () -> do
+                  pushed <- goPush (aeGitOps env) assetsRoot
+                  case pushed of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                      let meta =
+                            ReleaseMeta
+                              { rmOwner = aeAssetsOwner env,
+                                rmRepo = aeAssetsRepo env,
+                                rmTag = releaseTag pn pvNoRev,
+                                rmName = releaseName category pn pvNoRev,
+                                rmBody = msg,
+                                rmTargetCommitish = "main"
+                              }
+                      createReleaseWithAsset token meta tarballPath
+          case pubResult of
+            Left err ->
+              pure $
+                ApplyHardFail
+                  key
+                  ("assets publish failed: " <> err)
+                  False
+                  False
+            Right () -> do
+              mhStep mh key "publishing assets"
+              mhStatus mh key "regenerating manifest"
+              outcome <-
+                overlayAfterAssets
+                  env
+                  overlayRoot
+                  entry
+                  keywords
+                  lines_
+                  targetVer
                   digests
-                  (spSha256 sp)
-                  (spSha512 sp)
-                  (spB3 sp)
-                let msg = commitMessage category pn (renderPV targetVer)
-                mhStatus mh key "publishing assets"
-                pubResult <-
-                  withMVar (aeAssetsLock env) $ \() -> do
-                    committed <-
-                      goAddAndCommit
-                        (aeGitOps env)
-                        assetsRoot
-                        relSidecars
-                        msg
-                    case committed of
-                      Left err -> pure (Left err)
-                      Right () -> do
-                        pushed <- goPush (aeGitOps env) assetsRoot
-                        case pushed of
-                          Left err -> pure (Left err)
-                          Right () -> do
-                            let meta =
-                                  ReleaseMeta
-                                    { rmOwner = aeAssetsOwner env,
-                                      rmRepo = aeAssetsRepo env,
-                                      rmTag = releaseTag pn pvNoRev,
-                                      rmName = releaseName category pn pvNoRev,
-                                      rmBody = msg,
-                                      rmTargetCommitish = "main"
-                                    }
-                            createReleaseWithAsset token meta tarballPath
-                case pubResult of
-                  Left err ->
-                    pure $
-                      ApplyHardFail
-                        key
-                        ("assets publish failed: " <> err)
-                        False
-                        False
-                  Right () -> do
-                    mhStep mh key "publishing assets"
-                    mhStatus mh key "regenerating manifest"
-                    outcome <-
-                      overlayAfterAssets
-                        env
-                        overlayRoot
-                        entry
-                        keywords
-                        lines_
-                        targetVer
-                        digests
-                        tarballName
-                        mGoVer
-                    case outcome of
-                      ApplySuccess {} -> mhStep mh key "regenerating manifest"
-                      _ -> pure ()
-                    pure outcome
+                  tarballName
+                  mGoVer
+              case outcome of
+                ApplySuccess {} -> mhStep mh key "regenerating manifest"
+                _ -> pure ()
+              pure outcome
+
+-- | Overlay-only path: download existing release asset, verify, rewrite ebuild.
+reuseReleaseAsset ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  [Text] ->
+  [SuccessLine] ->
+  EbuildVersion ->
+  FilePath ->
+  Text ->
+  Text ->
+  Text ->
+  FilePath ->
+  Text ->
+  IO ApplyOutcome
+reuseReleaseAsset
+  env
+  overlayRoot
+  entry
+  owner
+  repo
+  prefix
+  mSub
+  keywords
+  lines_
+  targetVer
+  assetsRoot
+  category
+  pn
+  pvNoRev
+  tarballName
+  downloadUrl = do
+    let key = peKey entry
+        mh = aeMulti env
+        reusedLines = markSuccessLinesReused lines_
+    withSystemTempDirectory "mndz-reuse-asset-" $ \tmpDir -> do
+      let dest = tmpDir </> tarballName
+      mhStatus mh key "reusing release assets"
+      dl <- roDownloadAsset (aeReleaseOps env) downloadUrl dest
+      case dl of
+        Left err ->
+          pure $
+            ApplyHardFail
+              key
+              ("download of existing release asset failed: " <> err)
+              False
+              True
+        Right () -> do
+          digests <- hashFile dest
+          mhStep mh key "reusing release assets"
+          mhStatus mh key "verifying vendor asset"
+          sideCheck <-
+            checkSidecarSha512IfPresent
+              assetsRoot
+              category
+              pn
+              tarballName
+              (digestSHA512 digests)
+          case sideCheck of
+            Left err -> pure $ ApplyHardFail key err False True
+            Right () -> do
+              mGoVer <- fetchGoModVersion env owner repo prefix pvNoRev mSub
+              mhStep mh key "verifying vendor asset"
+              mhStatus mh key "regenerating manifest"
+              outcome <-
+                overlayAfterAssets
+                  env
+                  overlayRoot
+                  entry
+                  keywords
+                  reusedLines
+                  targetVer
+                  digests
+                  tarballName
+                  mGoVer
+              case outcome of
+                ApplySuccess k sls paths -> do
+                  mhStep mh key "regenerating manifest"
+                  pure (ApplySuccess k sls paths)
+                other -> pure other
+
+-- | Optional assets-repo sidecar SHA512 cross-check (only when file exists).
+checkSidecarSha512IfPresent ::
+  FilePath ->
+  Text ->
+  Text ->
+  FilePath ->
+  Text ->
+  IO (Either Text ())
+checkSidecarSha512IfPresent assetsRoot category pn tarballName expectedSha = do
+  let sp = sidecarPaths assetsRoot category pn tarballName
+      path = spSha512 sp
+  exists <- doesFileExist path
+  if not exists
+    then pure (Right ())
+    else do
+      text <- TIO.readFile path
+      case T.words (T.strip text) of
+        (hex : _)
+          | T.toLower hex == T.toLower expectedSha -> pure (Right ())
+          | otherwise ->
+              pure $
+                Left
+                  ( "assets-repo sidecar SHA512 disagrees with GitHub release asset for "
+                      <> T.pack tarballName
+                      <> " (assets repo and release are out of sync)"
+                  )
+        _ ->
+          pure $
+            Left
+              ( "could not parse assets-repo SHA512 sidecar for "
+                  <> T.pack tarballName
+              )
+
+-- | go.mod @go@ directive for BDEPEND without a vendor clone (reuse path).
+fetchGoModVersion ::
+  ApplyEnv ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  IO (Maybe Text)
+fetchGoModVersion env owner repo prefix pvNoRev mSub = do
+  let tag = versionTag prefix pvNoRev
+      key =
+        GoModKey
+          { gmkOwner = owner,
+            gmkRepo = repo,
+            gmkTag = tag,
+            gmkSubdir = mSub
+          }
+  eres <- poFetchGoMod (aePlanOps env) key
+  pure $ case eres of
+    Right body -> parseGoReqFromMod body
+    Left _ -> Nothing
 
 overlayAfterAssets ::
   ApplyEnv ->
@@ -883,7 +1147,7 @@ commitSuccesses gitOps step overlayRoot = mapM commitOne
     commitOne (ApplySuccess key lines_ paths) = do
       shStep step (packageKeyText key)
       let verText = case lines_ of
-            (SuccessLine _ to _ : _) -> renderPV to
+            (SuccessLine _ to _ _ : _) -> renderPV to
             [] -> "update"
           msg = packageKeyText key <> ": " <> verText
       result <- goAddAndCommit gitOps overlayRoot paths msg

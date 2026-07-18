@@ -17,6 +17,8 @@ import CLI.Progress
     MultiHandle (..),
     MultiState (..),
     multiHandle,
+    noopMultiHandle,
+    noopStepHandle,
     planDraw,
     renderMulti,
   )
@@ -28,7 +30,10 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently)
 import Control.Concurrent.MVar (newMVar)
 import Control.Monad (unless, void)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.Aeson (eitherDecodeStrict')
+import Data.Aeson.Types (parseMaybe)
+import Data.ByteString qualified as BS
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
@@ -59,25 +64,41 @@ import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import Update.Apply
-  ( foldExitHardFail,
+  ( ApplyEnv (..),
+    contentFixNeeded,
+    foldExitHardFail,
+    goPublishAndOverlay,
+    markSuccessLinesReused,
     newEbuildFileName,
     renderPVNoRev,
   )
-import Update.Assets.Hash (FileDigests (..), hashBytes, sidecarLine)
+import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
+import Update.Assets.Layout (vendorTarballName)
+import Update.Assets.Release
+  ( ReleaseAsset (..),
+    ReleaseInfo (..),
+    ReleaseOps (..),
+    findAssetByName,
+    lookupNamedAsset,
+    parseReleaseInfo,
+  )
 import Update.Auth (resolveGitHubTokenWith)
 import Update.Check (PackageEntry (..), groupNewest)
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
     ebuildHasDevLangGoBdepend,
+    ebuildNeedsContentFix,
     ensureGoBdepend,
     goBdependAtom,
     goBdependMatches,
     keywordsMatch,
+    manifestHasVendorDist,
     nextRevisionVersion,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
     setKeywords,
   )
+import Update.Git (GitOps (..))
 import Update.GitHub (stripAndParse)
 import Update.Go.Lanes
   ( GapLine (..),
@@ -217,6 +238,10 @@ main = do
   testGoStripAndParseList
   testSetKeywords
   testGoPlanIntegrationMocked
+  testReleaseLookup
+  testContentFixManifest
+  testReuseVsFullPublish
+  testMarkSuccessLinesReused
   putStrLn "All tests passed."
 
 assertEq :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -540,7 +565,8 @@ checkWithFakeResolve fetch = mapM go
                         [ OutdatedLine
                             { olFrom = local,
                               olTo = remote,
-                              olLabel = Nothing
+                              olLabel = Nothing,
+                              olAssetsReusable = False
                             }
                         ]
                     Just EQ -> Ok local
@@ -662,7 +688,8 @@ testFoldExitHardFail = do
                  [ SuccessLine
                      { slFrom = parseEbuildVersion "1.0",
                        slTo = parseEbuildVersion "1.1",
-                       slLabel = Nothing
+                       slLabel = Nothing,
+                       slAssetsReused = False
                      }
                  ]
                  ["g/h/g-h-1.1.ebuild"]
@@ -745,6 +772,12 @@ testEbuildEdit = do
     "manifest sha512"
     (Just "abcdef0123456789")
     (parseManifestVendorSHA512 man "dolt-2.1.6-vendor.tar.xz")
+  assertTrue
+    "manifest has vendor dist"
+    (manifestHasVendorDist man "dolt-2.1.6-vendor.tar.xz")
+  assertTrue
+    "manifest missing other dist"
+    (not (manifestHasVendorDist man "crush-0.84.0-vendor.tar.xz"))
 
 testGoVersionParse :: IO ()
 testGoVersionParse = do
@@ -1725,3 +1758,352 @@ assertPlanInvariants label prev plan = do
     (dpMoveBack plan)
     (dpClearExtra plan)
   assertEq (label <> " move-up is prev") prev (dpMoveUp plan)
+
+------------------------------------------------------------------------
+-- Release lookup / reuse / Manifest content-fix
+------------------------------------------------------------------------
+
+testReleaseLookup :: IO ()
+testReleaseLookup = do
+  let jsonFound =
+        encodeUtf8
+          "{\"id\":42,\"tag_name\":\"beads-1.0.5\",\"assets\":[{\"name\":\"beads-1.0.5-vendor.tar.xz\",\"browser_download_url\":\"https://example/a\"},{\"name\":\"other.bin\",\"browser_download_url\":\"https://example/b\"}]}"
+      jsonWrongAsset =
+        encodeUtf8
+          "{\"id\":1,\"tag_name\":\"crush-0.84.0\",\"assets\":[{\"name\":\"notes.txt\",\"browser_download_url\":\"https://example/n\"}]}"
+  info <- case eitherDecodeStrict' jsonFound of
+    Left err -> do
+      hPutStrLn stderr ("decode release json: " <> err)
+      exitFailure
+    Right val ->
+      case parseMaybe parseReleaseInfo val of
+        Nothing -> do
+          hPutStrLn stderr "parseReleaseInfo failed"
+          exitFailure
+        Just i -> pure i
+  assertEq "tag" "beads-1.0.5" (riTag info)
+  assertEq
+    "find asset"
+    (Just "https://example/a")
+    (raBrowserDownloadUrl <$> findAssetByName info "beads-1.0.5-vendor.tar.xz")
+  assertEq
+    "missing asset name"
+    Nothing
+    (findAssetByName info "nope.tar.xz")
+  info2 <- case eitherDecodeStrict' jsonWrongAsset of
+    Left err -> do
+      hPutStrLn stderr ("decode release json2: " <> err)
+      exitFailure
+    Right val ->
+      case parseMaybe parseReleaseInfo val of
+        Nothing -> do
+          hPutStrLn stderr "parseReleaseInfo2 failed"
+          exitFailure
+        Just i -> pure i
+  assertEq
+    "wrong asset name is nothing"
+    Nothing
+    (findAssetByName info2 "crush-0.84.0-vendor.tar.xz")
+  -- Injectable ops: found / missing tag / missing asset name
+  let opsFound =
+        ReleaseOps
+          { roGetReleaseByTag = \_ _ tag ->
+              pure $
+                if tag == "beads-1.0.5"
+                  then Right (Just info)
+                  else Right Nothing,
+            roDownloadAsset = \_ _ -> pure (Right ())
+          }
+  found <- lookupNamedAsset opsFound "o" "r" "beads-1.0.5" "beads-1.0.5-vendor.tar.xz"
+  assertEq "lookup found" (Right (Just "https://example/a")) found
+  missingTag <- lookupNamedAsset opsFound "o" "r" "beads-9.9.9" "beads-1.0.5-vendor.tar.xz"
+  assertEq "lookup missing tag" (Right Nothing) missingTag
+  missingAsset <- lookupNamedAsset opsFound "o" "r" "beads-1.0.5" "wrong-name.tar.xz"
+  assertEq "lookup missing asset" (Right Nothing) missingAsset
+
+testContentFixManifest :: IO ()
+testContentFixManifest =
+  withSystemTempDirectory "mndz-content-fix-" $ \tmp -> do
+    let pkgDir = tmp </> "app-misc" </> "crush"
+        pn = "crush" :: T.Text
+        pv = parseEbuildVersion "0.84.0"
+        ebuildName = "crush-0.84.0.ebuild"
+        ebuildBody =
+          T.unlines
+            [ "EAPI=8",
+              "inherit go-module",
+              "BDEPEND=\">=dev-lang/go-1.26.5:=\"",
+              "KEYWORDS=\"~amd64\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+            ]
+        plan =
+          GoLanePlan
+            { glpLanes = [],
+              glpEbuilds =
+                [ PlannedEbuild
+                    { pePV = pv,
+                      peKeywords = ["~amd64"],
+                      peLanes = []
+                    }
+                ],
+              glpUniquePVs = [pv]
+            }
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile (pkgDir </> ebuildName) ebuildBody
+    -- No Manifest → needs work
+    fix1 <- contentFixNeeded pkgDir pn plan
+    assertEq "missing Manifest needs work" [pv] fix1
+    -- Manifest without vendor DIST → needs work
+    TIO.writeFile (pkgDir </> "Manifest") "DIST crush-0.84.0.tar.gz 1 SHA512 deadbeef\n"
+    fix2 <- contentFixNeeded pkgDir pn plan
+    assertEq "missing vendor DIST needs work" [pv] fix2
+    -- Complete Manifest + good ebuild → no content fix
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST crush-0.84.0-vendor.tar.xz 123 BLAKE2B aa SHA512 abcdef0123456789\n"
+    fix3 <- contentFixNeeded pkgDir pn plan
+    assertEq "complete Manifest no content fix" [] fix3
+    assertTrue
+      "ebuild content ok"
+      ( not
+          ( ebuildNeedsContentFix
+              ["~amd64"]
+              ebuildBody
+          )
+      )
+
+testMarkSuccessLinesReused :: IO ()
+testMarkSuccessLinesReused = do
+  let sl =
+        SuccessLine
+          { slFrom = parseEbuildVersion "0.80.0",
+            slTo = parseEbuildVersion "0.84.0",
+            slLabel = Just "(dev-lang/go ~amd64)",
+            slAssetsReused = False
+          }
+      marked = markSuccessLinesReused [sl]
+  assertEq "flag set" True (all slAssetsReused marked)
+  case marked of
+    (m : _) -> assertEq "from preserved" (slFrom sl) (slFrom m)
+    [] -> do
+      hPutStrLn stderr "expected non-empty marked success lines"
+      exitFailure
+
+testReuseVsFullPublish :: IO ()
+testReuseVsFullPublish =
+  withSystemTempDirectory "mndz-reuse-pub-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "app-misc" </> "crush"
+        pn = "crush" :: T.Text
+        pv = parseEbuildVersion "0.84.0"
+        ebuildName = "crush-0.84.0.ebuild"
+        ebuildBody =
+          T.unlines
+            [ "EAPI=8",
+              "inherit go-module",
+              "BDEPEND=\">=dev-lang/go-1.26.5:=\"",
+              "KEYWORDS=\"~amd64\"",
+              "SRC_URI=\"https://example/a-${PV}.tar.gz\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+            ]
+        tarballName = vendorTarballName pn "0.84.0"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "app-misc" "crush",
+              pePN = pn,
+              peLocal = pv,
+              pePath = pkgDir </> ebuildName
+            }
+        gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    vendorCallRef <- newIORef (0 :: Int)
+    createDirectoryIfMissing True pkgDir
+    createDirectoryIfMissing True assetsRoot
+    TIO.writeFile (pkgDir </> ebuildName) ebuildBody
+    -- Seed a known asset body for download + Manifest hash match.
+    let assetBytes = encodeUtf8 "vendor-tarball-bytes-for-reuse-test"
+        digests0 = hashBytes assetBytes
+        ebuildRunnerWrong _pkg _name = do
+          -- Write Manifest with wrong SHA512 to force hard-fail path later.
+          TIO.writeFile
+            (pkgDir </> "Manifest")
+            ( "DIST "
+                <> T.pack tarballName
+                <> " 1 SHA512 "
+                <> ("0" <> T.replicate 127 "1")
+                <> "\n"
+            )
+          pure (Right ())
+        ebuildRunnerOk _pkg _name = do
+          TIO.writeFile
+            (pkgDir </> "Manifest")
+            ( "DIST "
+                <> T.pack tarballName
+                <> " 1 SHA512 "
+                <> digestSHA512 digests0
+                <> "\n"
+            )
+          pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ ->
+                pure (Right "module x\ngo 1.26.5\n"),
+              poWorkBudget = error "unused budget",
+              poCeilingsCache = error "unused ceilings"
+            }
+    budget <- newWorkBudget 2
+    ceilingsCache <- newMVar Nothing
+    let planOps' =
+          planOps
+            { poWorkBudget = budget,
+              poCeilingsCache = ceilingsCache
+            }
+        vendorOps =
+          VendorOps
+            { voClone = \_ _ _ -> do
+                atomicModifyIORef' vendorCallRef (\n -> (n + 1, ()))
+                pure (Left "vendor should not run on reuse"),
+              voHostGoVersion = pure (Right "1.26.5"),
+              voGoModDownload = \_ -> pure (Left "vendor should not run on reuse"),
+              voTarXz = \_ _ _ -> pure (Left "vendor should not run on reuse")
+            }
+        mkEnv releaseOps ebuildRun =
+          ApplyEnv
+            { aeFetcher = \_ -> pure (Left "unused"),
+              aeGitOps = gitOps,
+              aeEbuildRunner = ebuildRun,
+              aeVendorOps = vendorOps,
+              aeReleaseOps = releaseOps,
+              aeAssetsRoot = Just assetsRoot,
+              aeGitHubToken = Just "tok",
+              aeAssetsOwner = "0x6d6e647a",
+              aeAssetsRepo = "mndz-overlay-assets",
+              aeAssetsLock = error "lock unused on reuse",
+              aeJobs = 1,
+              aeMulti = noopMultiHandle,
+              aeCommitStep = noopStepHandle,
+              aePlanOps = planOps'
+            }
+        lines_ =
+          [ SuccessLine
+              { slFrom = parseEbuildVersion "0.80.0",
+                slTo = pv,
+                slLabel = Just "(dev-lang/go ~amd64)",
+                slAssetsReused = False
+              }
+          ]
+        releaseFound =
+          ReleaseOps
+            { roGetReleaseByTag = \_ _ _ ->
+                pure $
+                  Right $
+                    Just
+                      ReleaseInfo
+                        { riId = 1,
+                          riTag = "crush-0.84.0",
+                          riAssets =
+                            [ ReleaseAsset
+                                { raName = T.pack tarballName,
+                                  raBrowserDownloadUrl = "https://example/vendor"
+                                }
+                            ]
+                        },
+              roDownloadAsset = \_url dest -> do
+                BS.writeFile dest assetBytes
+                pure (Right ())
+            }
+        releaseMissing =
+          ReleaseOps
+            { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
+              roDownloadAsset = \_ _ -> pure (Left "should not download")
+            }
+    -- Reuse path: no vendor calls; success with assets reused; Manifest matches.
+    writeIORef vendorCallRef 0
+    outcomeReuse <-
+      goPublishAndOverlay
+        (mkEnv releaseFound ebuildRunnerOk)
+        overlayRoot
+        entry
+        "charmbracelet"
+        "crush"
+        "v"
+        Nothing
+        ["~amd64"]
+        lines_
+        pv
+    case outcomeReuse of
+      ApplySuccess _ sls _ -> do
+        assertTrue "reuse marks lines" (all slAssetsReused sls)
+        n <- readIORef vendorCallRef
+        assertEq "reuse skips vendor" 0 n
+      other -> do
+        hPutStrLn stderr ("expected reuse success, got: " <> show other)
+        exitFailure
+    -- Manifest mismatch hard-fails on reuse.
+    outcomeBad <-
+      goPublishAndOverlay
+        (mkEnv releaseFound ebuildRunnerWrong)
+        overlayRoot
+        entry
+        "charmbracelet"
+        "crush"
+        "v"
+        Nothing
+        ["~amd64"]
+        lines_
+        pv
+    case outcomeBad of
+      ApplyHardFail _ msg _ _ ->
+        assertTrue
+          "manifest mismatch message"
+          ("Manifest SHA512" `T.isInfixOf` msg)
+      other -> do
+        hPutStrLn stderr ("expected hard fail, got: " <> show other)
+        exitFailure
+    -- Not-found → full path (vendor called). Use lock for full path.
+    lock <- newMVar ()
+    let vendorOpsFull =
+          VendorOps
+            { voClone = \_ _ dest -> do
+                atomicModifyIORef' vendorCallRef (\n -> (n + 1, ()))
+                createDirectoryIfMissing True dest
+                TIO.writeFile (dest </> "go.mod") "module x\ngo 1.26.5\n"
+                pure (Right ()),
+              voHostGoVersion = pure (Right "1.26.5"),
+              voGoModDownload = \_ -> pure (Right ()),
+              voTarXz = \_vendorDir outDir name -> do
+                let p = outDir </> name
+                BS.writeFile p assetBytes
+                pure (Right ())
+            }
+    -- full path also calls createReleaseWithAsset (live HTTP) — we cannot easily
+    -- inject that. Instead assert lookup not-found leads to vendor being invoked
+    -- (fails later on create-release without network is ok if vendor ran first).
+    writeIORef vendorCallRef 0
+    let envFull =
+          (mkEnv releaseMissing ebuildRunnerOk)
+            { aeVendorOps = vendorOpsFull,
+              aeAssetsLock = lock
+            }
+    _ <-
+      goPublishAndOverlay
+        envFull
+        overlayRoot
+        entry
+        "charmbracelet"
+        "crush"
+        "v"
+        Nothing
+        ["~amd64"]
+        lines_
+        pv
+    nFull <- readIORef vendorCallRef
+    assertTrue "not-found uses full vendor path" (nFull > 0)

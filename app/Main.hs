@@ -23,7 +23,7 @@ import CLI.Progress
     withMultiProgress,
     withStepProgress,
   )
-import Colog (LogAction, Message, WithLog, logError, logWarning, usingLoggerT)
+import Colog (LogAction, Message, WithLog, logError, logInfo, logWarning, usingLoggerT)
 import Config.Loader (configErrorMessage, loadConfig)
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent.MVar (newMVar)
@@ -37,7 +37,7 @@ import Options.Applicative (execParser)
 import Overlay.Discovery (collectEbuilds, discoveryErrorMessage)
 import Overlay.Types (Ebuild, ebuildAtom)
 import Overlay.Validation (OverlayError (..), validateOverlay)
-import Overlay.Version (prettyVersion)
+import Overlay.Version (EbuildVersion (..), prettyVersion)
 import System.Exit (ExitCode (..), exitWith)
 import Update.Apply
   ( ApplyEnv (..),
@@ -45,6 +45,7 @@ import Update.Apply
     foldExitHardFail,
     productionEbuildRunner,
   )
+import Update.Assets.Release (ReleaseOps (..), productionReleaseOps)
 import Update.Auth (resolveGitHubToken)
 import Update.Check
   ( PackageEntry (..),
@@ -172,12 +173,21 @@ runUpdate rt pkgArgs = do
             lock <- newMVar ()
             fetch <- productionFetcherWithToken token
             planOps <- productionPlanOps token (rtJobs rt)
+            releaseOps <- case token of
+              Just t -> productionReleaseOps t
+              Nothing ->
+                pure
+                  ReleaseOps
+                    { roGetReleaseByTag = \_ _ _ -> pure (Left "GitHub token required"),
+                      roDownloadAsset = \_ _ -> pure (Left "GitHub token required")
+                    }
             let env =
                   ApplyEnv
                     { aeFetcher = fetch,
                       aeGitOps = productionGitOps gpg,
                       aeEbuildRunner = productionEbuildRunner,
                       aeVendorOps = productionVendorOps,
+                      aeReleaseOps = releaseOps,
                       aeAssetsRoot = assetsRoot,
                       aeGitHubToken = token,
                       aeAssetsOwner = "0x6d6e647a",
@@ -257,9 +267,21 @@ entryNeedsAssets e =
 
 emitOutcome :: (WithLog env Message m, MonadIO m) => ApplyOutcome -> m ()
 emitOutcome = \case
-  ApplySuccess key lines_ _paths ->
+  ApplySuccess key lines_ _paths -> do
     liftIO $
       mapM_ (T.putStrLn . formatSuccessLine key) lines_
+    mapM_
+      ( \sl ->
+          when (slAssetsReused sl) $
+            logInfo $
+              packageKeyText key
+                <> ": reused release assets for "
+                <> prettyVersion (slTo sl)
+                <> " (tag/asset "
+                <> packageAssetLabel key (slTo sl)
+                <> "); verify complete"
+      )
+      lines_
   ApplySoftSkip key reason ->
     logWarning $ packageKeyText key <> ": " <> reason
   ApplyHardFail key msg halfApplied assetsPublished -> do
@@ -277,6 +299,20 @@ emitOutcome = \case
         packageKeyText key
           <> ": assets release may already be published but the overlay update did not complete"
 
+-- | @{pn}-{pv} / {pn}-{pv}-vendor.tar.xz@ for deferred reuse logs.
+packageAssetLabel :: PackageKey -> EbuildVersion -> T.Text
+packageAssetLabel key ver =
+  let pn = case T.breakOnEnd "/" (packageKeyText key) of
+        (_, rest) | not (T.null rest) -> rest
+        _ -> packageKeyText key
+      pn' = T.dropWhile (== '/') pn
+      -- Release tags use PV without leading @v@ and without @-rN@.
+      pv = case ver of
+        Numeric comps _ ->
+          T.intercalate "." (map (T.pack . show) comps)
+        Raw t -> t
+   in pn' <> "-" <> pv <> " / " <> pn' <> "-" <> pv <> "-vendor.tar.xz"
+
 formatSuccessLine :: PackageKey -> SuccessLine -> T.Text
 formatSuccessLine key sl =
   packageKeyText key
@@ -287,6 +323,7 @@ formatSuccessLine key sl =
     <> case slLabel sl of
       Nothing -> ""
       Just lab -> " " <> lab
+    <> if slAssetsReused sl then " [assets reused]" else ""
 
 loadValidatedEbuilds ::
   (WithLog env Message m, MonadIO m) =>
@@ -356,6 +393,7 @@ formatOutdatedLine key ol =
     <> case olLabel ol of
       Nothing -> ""
       Just lab -> " " <> lab
+    <> if olAssetsReusable ol then " [assets reusable]" else ""
 
 loadConfigOrDie :: (WithLog env Message m, MonadIO m) => Maybe FilePath -> m OverlayConfig
 loadConfigOrDie override = do

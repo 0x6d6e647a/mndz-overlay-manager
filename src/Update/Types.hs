@@ -66,7 +66,9 @@ data OutdatedLine = OutdatedLine
   { olFrom :: EbuildVersion,
     olTo :: EbuildVersion,
     -- | e.g. @Just "(dev-lang/go amd64)"@ for Go tree-lane lines.
-    olLabel :: Maybe Text
+    olLabel :: Maybe Text,
+    -- | Same-PV overlay/Manifest content fix (apply may reuse release assets).
+    olAssetsReusable :: Bool
   }
   deriving (Eq, Show)
 
@@ -90,7 +92,9 @@ data UpdateReport = UpdateReport
 data SuccessLine = SuccessLine
   { slFrom :: EbuildVersion,
     slTo :: EbuildVersion,
-    slLabel :: Maybe Text
+    slLabel :: Maybe Text,
+    -- | PV was materialized via reuse of an existing release vendor asset.
+    slAssetsReused :: Bool
   }
   deriving (Eq, Show)
 
