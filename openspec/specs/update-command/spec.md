@@ -24,7 +24,7 @@ The CLI SHALL provide an `update` subcommand that loads configuration, resolves 
 
 Before any package mutation, `update` SHALL verify that `git`, `ebuild`, and `gpg` are available on `PATH`. If any is missing, the program SHALL log an error naming the missing tool(s) and exit with status `1` without renaming ebuilds, regenerating Manifests, or creating commits. Signing SHALL NOT be optional: `update` SHALL NOT proceed without `gpg`.
 
-When at least one selected package will attempt a `GoVendorAndAssets` apply (including same-PV SRC_URI/revision fixes), `update` SHALL additionally verify that `go` and `xz` are available on `PATH`, that `mndz-overlay-assets-path` is configured and names a git work tree, and that a GitHub token can be resolved. Missing conditional requirements SHALL log an error and exit with status `1` before package mutation. When no selected package needs `GoVendorAndAssets`, the program SHALL NOT fail preflight solely because `go`, `xz`, assets path, or token are missing.
+When at least one selected package will attempt a `GoVendorAndAssets` apply (including same-PV SRC_URI/revision fixes), `update` SHALL additionally verify that `go` and `xz` are available on `PATH`, that `assets-path` is configured and names a git work tree, and that a GitHub token can be resolved. Missing conditional requirements SHALL log an error and exit with status `1` before package mutation. When no selected package needs `GoVendorAndAssets`, the program SHALL NOT fail preflight solely because `go`, `xz`, assets path, or token are missing.
 
 #### Scenario: Missing ebuild on PATH
 
@@ -53,7 +53,7 @@ When at least one selected package will attempt a `GoVendorAndAssets` apply (inc
 
 #### Scenario: Assets path required for Go update
 
-- **WHEN** the user runs `update` for a `GoVendorAndAssets` package and `mndz-overlay-assets-path` is unset
+- **WHEN** the user runs `update` for a `GoVendorAndAssets` package and `assets-path` is unset
 - **THEN** the program logs an error about the missing assets path and exits with status `1` before package mutation
 
 ### Requirement: Update package targets

@@ -10,8 +10,8 @@ import GHC.Generics (Generic)
 import Toml.Schema (FromValue (..), optKey, parseTableFromValue, reqKey)
 
 data OverlayConfig = OverlayConfig
-  { mndzOverlayPath :: FilePath,
-    mndzOverlayAssetsPath :: Maybe FilePath,
+  { overlayPath :: FilePath,
+    assetsPath :: Maybe FilePath,
     githubToken :: Maybe Text
   }
   deriving (Eq, Show, Generic)
@@ -20,6 +20,6 @@ instance FromValue OverlayConfig where
   fromValue =
     parseTableFromValue $
       OverlayConfig
-        <$> reqKey "mndz-overlay-path"
-        <*> optKey "mndz-overlay-assets-path"
+        <$> reqKey "overlay-path"
+        <*> optKey "assets-path"
         <*> optKey "github-token"

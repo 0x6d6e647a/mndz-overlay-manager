@@ -55,14 +55,14 @@ validateAssetsPath = \case
   Nothing ->
     pure $
       Left
-        "mndz-overlay-assets-path is required for packages that publish vendor/deps assets"
+        "assets-path is required for packages that publish vendor/deps assets"
   Just path -> do
     exists <- doesDirectoryExist path
     if not exists
-      then pure $ Left ("mndz-overlay-assets-path is not a directory: " <> T.pack path)
+      then pure $ Left ("assets-path is not a directory: " <> T.pack path)
       else do
         isGit <- isGitWorkTree path
         pure $
           if isGit
             then Right path
-            else Left ("mndz-overlay-assets-path is not a git work tree: " <> T.pack path)
+            else Left ("assets-path is not a git work tree: " <> T.pack path)

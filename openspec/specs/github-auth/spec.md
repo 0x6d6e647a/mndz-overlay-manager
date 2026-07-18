@@ -40,5 +40,5 @@ The configuration schema SHALL accept an optional `github-token` string key. Abs
 
 #### Scenario: Config without token loads
 
-- **WHEN** the config file defines `mndz-overlay-path` but omits `github-token`
+- **WHEN** the config file defines `overlay-path` but omits `github-token`
 - **THEN** config load succeeds for commands that do not require a token

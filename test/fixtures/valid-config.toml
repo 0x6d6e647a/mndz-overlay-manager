@@ -1,1 +1,1 @@
-mndz-overlay-path = "test/fixtures/populated-overlay"
+overlay-path = "test/fixtures/populated-overlay"

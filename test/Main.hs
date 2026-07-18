@@ -195,6 +195,7 @@ main = do
   testConfigLoadSuccess
   testConfigLoadMissing
   testConfigLoadMissingKey
+  testConfigLegacyKeysRejected
   testConfigOptionalKeys
   testEmptyInventoryIsEmptyList
   testValidatePopulated
@@ -336,15 +337,15 @@ testDiscoveryPackageMismatch = do
 testConfigLoadSuccess :: IO ()
 testConfigLoadSuccess = do
   cfg <- assertRight "valid config" =<< loadConfig (Just "test/fixtures/valid-config.toml")
-  assertEq "path key" "test/fixtures/populated-overlay" (mndzOverlayPath cfg)
-  assertEq "assets optional absent" Nothing (mndzOverlayAssetsPath cfg)
+  assertEq "path key" "test/fixtures/populated-overlay" (overlayPath cfg)
+  assertEq "assets optional absent" Nothing (assetsPath cfg)
   assertEq "token optional absent" Nothing (githubToken cfg)
 
 testConfigOptionalKeys :: IO ()
 testConfigOptionalKeys = do
   cfg <- assertRight "full config" =<< loadConfig (Just "test/fixtures/full-config.toml")
-  assertEq "path" "/tmp/overlay" (mndzOverlayPath cfg)
-  assertEq "assets" (Just "/tmp/assets") (mndzOverlayAssetsPath cfg)
+  assertEq "path" "/tmp/overlay" (overlayPath cfg)
+  assertEq "assets" (Just "/tmp/assets") (assetsPath cfg)
   assertEq "token" (Just "secret-token") (githubToken cfg)
 
 testConfigLoadMissing :: IO ()
@@ -362,9 +363,21 @@ testConfigLoadMissingKey = do
   err <- assertLeft "missing key" =<< loadConfig (Just "test/fixtures/missing-key-config.toml")
   case err of
     DecodeError msg ->
-      assertTrue "mentions mndz-overlay-path" ("mndz-overlay-path" `elem` words msg || "mndz-overlay-path" `T.isInfixOf` T.pack msg)
+      assertTrue "mentions overlay-path" ("overlay-path" `elem` words msg || "overlay-path" `T.isInfixOf` T.pack msg)
     other -> do
       hPutStrLn stderr $ "expected DecodeError, got " <> show other
+      exitFailure
+
+testConfigLegacyKeysRejected :: IO ()
+testConfigLegacyKeysRejected = do
+  err <- assertLeft "legacy keys" =<< loadConfig (Just "test/fixtures/legacy-key-config.toml")
+  case err of
+    DecodeError msg ->
+      assertTrue
+        "legacy config fails without overlay-path"
+        ("overlay-path" `elem` words msg || "overlay-path" `T.isInfixOf` T.pack msg)
+    other -> do
+      hPutStrLn stderr $ "expected DecodeError for legacy keys, got " <> show other
       exitFailure
 
 testEmptyInventoryIsEmptyList :: IO ()

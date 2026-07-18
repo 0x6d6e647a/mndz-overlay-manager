@@ -159,7 +159,7 @@ runUpdate rt pkgArgs = do
       assetsRoot <-
         if needAssets
           then
-            liftIO (validateAssetsPath (mndzOverlayAssetsPath cfg)) >>= \case
+            liftIO (validateAssetsPath (assetsPath cfg)) >>= \case
               Left err -> dieError (T.unpack err)
               Right p -> pure (Just p)
           else pure Nothing
@@ -347,16 +347,17 @@ loadValidatedEbuildsFull ::
   m (OverlayConfig, FilePath, [Ebuild])
 loadValidatedEbuildsFull opts = do
   cfg <- loadConfigOrDie (optConfig opts)
-  let overlayPath = case optOverlayPath opts of
+  -- Local name must not shadow the OverlayConfig field accessor `overlayPath`.
+  let resolvedOverlay = case optOverlayPath opts of
         Just p -> p
-        Nothing -> mndzOverlayPath cfg
-  liftIO (validateOverlay overlayPath) >>= \case
+        Nothing -> overlayPath cfg
+  liftIO (validateOverlay resolvedOverlay) >>= \case
     Left err -> dieError (overlayErrorMessage err)
     Right () -> pure ()
-  liftIO (collectEbuilds overlayPath) >>= \case
+  liftIO (collectEbuilds resolvedOverlay) >>= \case
     Left err -> dieError (discoveryErrorMessage err)
-    Right [] -> dieError ("no ebuilds found in overlay: " <> overlayPath)
-    Right ebuilds -> pure (cfg, overlayPath, ebuilds)
+    Right [] -> dieError ("no ebuilds found in overlay: " <> resolvedOverlay)
+    Right ebuilds -> pure (cfg, resolvedOverlay, ebuilds)
 
 emitReport :: (WithLog env Message m, MonadIO m) => UpdateReport -> m ()
 emitReport report =

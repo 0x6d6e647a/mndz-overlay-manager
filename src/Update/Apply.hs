@@ -693,7 +693,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
       pure $
         ApplyHardFail
           key
-          "mndz-overlay-assets-path is required for Go vendor packages"
+          "assets-path is required for Go vendor packages"
           False
           False
     (_, Nothing) ->

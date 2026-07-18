@@ -1,10 +1,4 @@
-# overlay-path-resolution Specification
-
-## Purpose
-
-Define how non-help commands load configuration, resolve the overlay path (including CLI override), and gate work on overlay validation.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Config is loaded for every non-help invocation
 
@@ -51,21 +45,6 @@ The CLI SHALL provide a top-level `--overlay-path` option. For non-help commands
 
 - **WHEN** the user runs a non-help command without `--overlay-path`
 - **THEN** the program uses `overlay-path` from the loaded config as the effective overlay path
-
-### Requirement: Overlay validation gates non-help commands
-
-After resolving the effective overlay path, the program SHALL run overlay validation (existence of required Gentoo layout entries and `repo_name` equal to `mndz`). Validation failure SHALL produce an error-level log and exit status `1`. Help invocations SHALL NOT require config load or overlay validation.
-
-#### Scenario: Invalid overlay after path resolution
-
-- **WHEN** the effective overlay path fails validation
-- **THEN** the program logs an error describing the validation failure
-- **AND** the program exits with status `1`
-
-#### Scenario: Help skips config and validation
-
-- **WHEN** the user runs `help` or `--help`
-- **THEN** the program shows help without requiring a valid config file or overlay path
 
 ### Requirement: Assets path available from config when set
 
