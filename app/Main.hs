@@ -8,7 +8,7 @@ import CLI.Parser
     parserInfo,
     resolveColorMode,
     resolveJobs,
-    showHelp,
+    showTopLevelHelpExit1,
   )
 import CLI.Parser qualified as Cmd
 import CLI.Progress
@@ -111,12 +111,14 @@ main = do
             rtHold = hold,
             rtProgress = pcfg
           }
-  usingLoggerT logger $
-    case optCommand opts of
-      Cmd.Help -> liftIO showHelp
-      Cmd.List -> runList rt
-      Cmd.Outdated -> runOutdated rt
-      Cmd.Update pkgs -> runUpdate rt pkgs
+  case optCommand opts of
+    Nothing -> showTopLevelHelpExit1
+    Just cmd ->
+      usingLoggerT logger $
+        case cmd of
+          Cmd.List -> runList rt
+          Cmd.Outdated -> runOutdated rt
+          Cmd.Update pkgs -> runUpdate rt pkgs
 
 runList :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runList rt = do

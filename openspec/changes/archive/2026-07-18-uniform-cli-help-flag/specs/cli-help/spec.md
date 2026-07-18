@@ -1,26 +1,4 @@
-# cli-help Specification
-
-## Purpose
-
-Define how the CLI exposes usage/help text via `--help` / `-h` (top-level and per-command), including bare-invocation behaviour. Help is flag-only; there is no `help` subcommand.
-
-## Requirements
-
-### Requirement: Help flag renders usage text
-
-The CLI SHALL render its top-level usage/help text when invoked with the `--help` flag (or its `-h` short form), writing to standard output and exiting with status `0`. Top-level help SHALL present a brief catalog: global options and one-line descriptions of available work commands. Detailed argument and behaviour text for a single command SHALL appear on that command’s `--help`, not as a wall of detail at top level.
-
-#### Scenario: User requests help via flag
-
-- **WHEN** the user runs the program with `--help`
-- **THEN** the program writes the top-level usage text to standard output
-- **AND** the program exits with status `0`
-
-#### Scenario: User requests help via short flag
-
-- **WHEN** the user runs the program with `-h`
-- **THEN** the program writes the top-level usage text to standard output
-- **AND** the program exits with status `0`
+## ADDED Requirements
 
 ### Requirement: Bare invocation shows top-level help and fails
 
@@ -87,6 +65,24 @@ Top-level usage/help text SHALL list the work subcommands `list`, `outdated`, an
 - **THEN** the usage text includes `list`, `outdated`, and `update`
 - **AND** the usage text does not list `help` as an available command
 
+## MODIFIED Requirements
+
+### Requirement: Help flag renders usage text
+
+The CLI SHALL render its top-level usage/help text when invoked with the `--help` flag (or its `-h` short form), writing to standard output and exiting with status `0`. Top-level help SHALL present a brief catalog: global options and one-line descriptions of available work commands. Detailed argument and behaviour text for a single command SHALL appear on that command’s `--help`, not as a wall of detail at top level.
+
+#### Scenario: User requests help via flag
+
+- **WHEN** the user runs the program with `--help`
+- **THEN** the program writes the top-level usage text to standard output
+- **AND** the program exits with status `0`
+
+#### Scenario: User requests help via short flag
+
+- **WHEN** the user runs the program with `-h`
+- **THEN** the program writes the top-level usage text to standard output
+- **AND** the program exits with status `0`
+
 ### Requirement: Help enumerates outdated subcommand
 
 The top-level usage/help text SHALL list the `outdated` subcommand among available commands so users can discover update checking alongside `list` and `update`.
@@ -127,3 +123,11 @@ The top-level usage/help text SHALL document the global option `--jobs` includin
 
 - **WHEN** the user runs the program with `--help`
 - **THEN** the usage text includes `--jobs`
+
+## REMOVED Requirements
+
+### Requirement: Help subcommand has parity with help flag
+
+**Reason**: Positional `help` collides with free-form command arguments (e.g. `update PACKAGE...`) and teaches a dual help API. Help is flag-only (`--help` / `-h`).
+
+**Migration**: Use `mndz-overlay-manager --help` (or `-h`) instead of `mndz-overlay-manager help`. Use `mndz-overlay-manager <command> --help` for command-scoped help.

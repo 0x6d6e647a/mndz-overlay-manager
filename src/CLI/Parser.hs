@@ -7,7 +7,7 @@ module CLI.Parser
     Verbosity (..),
     ColorMode (..),
     parserInfo,
-    showHelp,
+    showTopLevelHelpExit1,
     resolveVerbosity,
     resolveColorMode,
     resolveJobs,
@@ -16,7 +16,8 @@ where
 
 import GHC.Conc (getNumProcessors)
 import Options.Applicative
-import System.Environment (lookupEnv)
+import System.Environment (getProgName, lookupEnv)
+import System.Exit (ExitCode (..), exitWith)
 
 data Verbosity
   = Error
@@ -32,8 +33,7 @@ data ColorMode
   deriving (Eq, Show)
 
 data Command
-  = Help
-  | List
+  = List
   | Outdated
   | Update [String]
   deriving (Eq, Show)
@@ -45,9 +45,16 @@ data Options = Options
     optJobs :: Maybe Int,
     optNoProgress :: Bool,
     optNoColor :: Bool,
-    optCommand :: Command
+    -- | 'Nothing' when no subcommand was given (bare / globals-only).
+    optCommand :: Maybe Command
   }
   deriving (Eq, Show)
+
+-- | Shared footer for command-scoped help: globals live before the subcommand.
+globalsFooter :: String
+globalsFooter =
+  "Global options (e.g. --config, --overlay-path, --jobs) are accepted before \
+  \the subcommand. See mndz-overlay-manager --help for the full list."
 
 -- | Map @-v@ count to verbosity starting from 'Warn'.
 -- Each flag steps Warn → Info → Debug (capped).
@@ -141,24 +148,65 @@ updateParser =
     <$> many
       ( strArgument
           ( metavar "PACKAGE..."
-              <> help "Package targets (category/package or unambiguous package name); omit to update all outdated"
+              <> help
+                "Package targets as category/package or an unambiguous package \
+                \name; omit to update all packages that need work"
           )
       )
 
-commandParser :: Parser Command
-commandParser =
-  hsubparser
-    ( command "help" (info (pure Help) (progDesc "Show this help message"))
-        <> command "list" (info (pure List) (progDesc "List all ebuilds in the overlay"))
-        <> command "outdated" (info (pure Outdated) (progDesc "Report packages with newer upstream versions"))
-        <> command
-          "update"
-          ( info
-              updateParser
-              (progDesc "Update outdated packages (GitMvAndManifest) with signed commits")
+listInfo :: ParserInfo Command
+listInfo =
+  info
+    (pure List)
+    ( fullDesc
+        <> progDesc "List all ebuilds in the overlay"
+        <> footer
+          ( "Print one package atom per line (category/package-version) for each \
+            \discovered ebuild. Empty inventory is an error. No subcommand-local \
+            \flags. "
+              <> globalsFooter
           )
-        <> metavar "COMMAND"
     )
+
+outdatedInfo :: ParserInfo Command
+outdatedInfo =
+  info
+    (pure Outdated)
+    ( fullDesc
+        <> progDesc "Report packages with newer upstream versions"
+        <> footer
+          ( "Check each discovered package against its update source and print \
+            \outdated lines to stdout. Empty inventory is an error. No \
+            \subcommand-local flags. "
+              <> globalsFooter
+          )
+    )
+
+updateInfo :: ParserInfo Command
+updateInfo =
+  info
+    updateParser
+    ( fullDesc
+        <> progDesc "Update outdated packages with signed commits"
+        <> footer
+          ( "Bump ebuilds, regenerate Manifests, and create signed git commits \
+            \for packages that need work. PACKAGE may be category/package or an \
+            \unambiguous package name. With no PACKAGE arguments, update all \
+            \packages that need work (outdated non-Go packages and Go packages \
+            \with tree-lane gaps). "
+              <> globalsFooter
+          )
+    )
+
+commandParser :: Parser (Maybe Command)
+commandParser =
+  optional $
+    hsubparser
+      ( command "list" listInfo
+          <> command "outdated" outdatedInfo
+          <> command "update" updateInfo
+          <> metavar "COMMAND"
+      )
 
 optionsParser :: Parser Options
 optionsParser = do
@@ -176,18 +224,22 @@ parserInfo =
   info
     (optionsParser <**> helper)
     ( fullDesc
-        <> progDesc "mndz-overlay-mgr - Gentoo overlay management tool"
-        <> header "mndz-overlay-mgr - manage your mndz Gentoo overlay"
+        <> progDesc "mndz-overlay-manager - Gentoo overlay management tool"
+        <> header "mndz-overlay-manager - manage your mndz Gentoo overlay"
     )
 
--- | Render the top-level help text, identical to the @--help@ flag.
+-- | Print full top-level help (same body as @--help@) and exit with status 1.
 --
--- Reuses the same failure/render path that @helper@ triggers, so output,
--- stdout routing, and exit code match @--help@ exactly. Never returns.
-showHelp :: IO a
-showHelp =
-  handleParseResult . Failure $
-    parserFailure defaultPrefs parserInfo (ShowHelpText Nothing) mempty
+-- Used when no subcommand is given. Explicit @--help@ still exits 0 via the
+-- library helper path.
+showTopLevelHelpExit1 :: IO a
+showTopLevelHelpExit1 = do
+  prog <- getProgName
+  let failure = parserFailure defaultPrefs parserInfo (ShowHelpText Nothing) mempty
+      (msg, _) = renderFailure failure prog
+  -- renderFailure omits a trailing newline; --help via handleParseResult adds one.
+  putStrLn msg
+  exitWith (ExitFailure 1)
 
 -- | Resolve color mode from @--no-color@ and non-empty @NO_COLOR@.
 resolveColorMode :: Bool -> IO ColorMode

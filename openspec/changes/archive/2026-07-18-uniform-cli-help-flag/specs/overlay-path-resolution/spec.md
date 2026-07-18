@@ -1,10 +1,4 @@
-# overlay-path-resolution Specification
-
-## Purpose
-
-Define how work subcommands load configuration, resolve the overlay path (including CLI override), and gate work on overlay validation. Help-only paths skip config and validation.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Config is loaded for every non-help invocation
 
@@ -75,17 +69,3 @@ When `assets-path` is present in the loaded config, the program SHALL expose tha
 
 - **WHEN** config sets `assets-path` to `/home/user/mndz-overlay-assets`
 - **THEN** update logic that needs assets can read that path from the loaded configuration
-
-### Requirement: Assets path validation when required
-
-When `update` will attempt assets publish for at least one selected package, the program SHALL verify that `assets-path` is set, names an existing directory that is inside a git work tree, and fail the spine with exit status `1` if validation fails. User-visible error text about the missing or invalid path SHALL name the config key `assets-path`.
-
-#### Scenario: Missing assets path when Go update selected
-
-- **WHEN** `update` selects a `GoVendorAndAssets` package that will apply and assets path is unset
-- **THEN** the program logs an error and exits with status `1` before package mutation
-
-#### Scenario: Assets path not a git worktree
-
-- **WHEN** `assets-path` points at a directory that is not a git work tree and assets publish is required
-- **THEN** the program logs an error and exits with status `1` before package mutation
