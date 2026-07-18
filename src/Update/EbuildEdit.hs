@@ -121,11 +121,20 @@ manifestHasVendorDist manifestContent distfile =
         (T.lines manifestContent)
 
 -- | True when ebuild content needs overlay fix (SRC_URI / BDEPEND / KEYWORDS).
-ebuildNeedsContentFix :: [Text] -> Text -> Bool
-ebuildNeedsContentFix keywords content =
+--
+-- When @mRequiredGo@ is @Just ver@, BDEPEND adequacy requires the exact atom
+-- @>=dev-lang\/go-\<ver\>:@= (not mere presence of @dev-lang\/go@). When
+-- unknown (@Nothing@), only a missing @dev-lang\/go@ atom counts as needs-work.
+ebuildNeedsContentFix :: [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsContentFix keywords content mRequiredGo =
   not (assetsSrcUriParameterized content)
-    || not (ebuildHasDevLangGoBdepend content)
     || not (keywordsMatch keywords content)
+    || bdependNeedsFix mRequiredGo content
+
+-- | BDEPEND adequacy vs optional known go.mod language version.
+bdependNeedsFix :: Maybe Text -> Text -> Bool
+bdependNeedsFix (Just ver) content = not (goBdependMatches ver content)
+bdependNeedsFix Nothing content = not (ebuildHasDevLangGoBdepend content)
 
 -- | Portage atom for a go.mod language version (e.g. @"1.26.5"@).
 goBdependAtom :: Text -> Text

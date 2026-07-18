@@ -16,7 +16,6 @@ import CLI.Progress
     StepHandle (..),
     mkProgressConfig,
     noopMultiHandle,
-    noopStepHandle,
     pauseActivePanel,
     progressEnabled,
     resumeActivePanel,
@@ -172,7 +171,8 @@ runUpdate rt pkgArgs = do
               "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
           Just _ -> pure ()
       let runApply gpg = do
-            lock <- newMVar ()
+            assetsLock <- newMVar ()
+            overlayLock <- newMVar ()
             fetch <- productionFetcherWithToken token
             planOps <- productionPlanOps token (rtJobs rt)
             releaseOps <- case token of
@@ -194,10 +194,10 @@ runUpdate rt pkgArgs = do
                       aeGitHubToken = token,
                       aeAssetsOwner = "0x6d6e647a",
                       aeAssetsRepo = "mndz-overlay-assets",
-                      aeAssetsLock = lock,
+                      aeAssetsLock = assetsLock,
+                      aeOverlayLock = overlayLock,
                       aeJobs = rtJobs rt,
                       aeMulti = noopMultiHandle,
-                      aeCommitStep = noopStepHandle,
                       aePlanOps = planOps
                     }
             applyOverlay (rtProgress rt) env overlayPath entries mFilter

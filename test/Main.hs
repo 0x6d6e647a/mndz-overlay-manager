@@ -18,7 +18,6 @@ import CLI.Progress
     MultiState (..),
     multiHandle,
     noopMultiHandle,
-    noopStepHandle,
     planDraw,
     renderMulti,
   )
@@ -28,13 +27,13 @@ import Config.Loader (ConfigError (..), loadConfig)
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently)
-import Control.Concurrent.MVar (newMVar)
+import Control.Concurrent.MVar (MVar, newMVar)
 import Control.Monad (unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
-import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (sort)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (nub, sort)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -58,19 +57,23 @@ import Overlay.Version
     parseEbuildVersion,
     prettyVersion,
   )
-import System.Directory (createDirectoryIfMissing, makeAbsolute)
+import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import Update.Apply
   ( ApplyEnv (..),
+    EbuildRunner,
+    applyPackagePhase1,
     contentFixNeeded,
     foldExitHardFail,
     goPublishAndOverlay,
     markSuccessLinesReused,
+    materializePlan,
     newEbuildFileName,
     renderPVNoRev,
+    signedOverlayCommit,
   )
 import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
 import Update.Assets.Layout (vendorTarballName)
@@ -243,6 +246,12 @@ main = do
   testContentFixManifest
   testReuseVsFullPublish
   testMarkSuccessLinesReused
+  testGitMvCommitsOnSuccess
+  testGoMultiPvSequentialCommits
+  testGoMultiPvStopOnHardFail
+  testOverlayCommitLock
+  testBdependMismatchNeedsFix
+  testBdependMissingNeedsFix
   putStrLn "All tests passed."
 
 assertEq :: (Eq a, Show a) => String -> a -> a -> IO ()
@@ -1834,6 +1843,51 @@ testReleaseLookup = do
   missingAsset <- lookupNamedAsset opsFound "o" "r" "beads-1.0.5" "wrong-name.tar.xz"
   assertEq "lookup missing asset" (Right Nothing) missingAsset
 
+-- | Minimal ApplyEnv for content-fix / unit-apply tests.
+mkTestApplyEnv ::
+  GitOps ->
+  PlanOps ->
+  EbuildRunner ->
+  ReleaseOps ->
+  VendorOps ->
+  Maybe FilePath ->
+  MVar () ->
+  MVar () ->
+  ApplyEnv
+mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLock overlayLock =
+  ApplyEnv
+    { aeFetcher = \_ -> pure (Left "unused"),
+      aeGitOps = gitOps,
+      aeEbuildRunner = ebuildRun,
+      aeVendorOps = vendorOps,
+      aeReleaseOps = releaseOps,
+      aeAssetsRoot = assetsRoot,
+      aeGitHubToken = Just "tok",
+      aeAssetsOwner = "0x6d6e647a",
+      aeAssetsRepo = "mndz-overlay-assets",
+      aeAssetsLock = assetsLock,
+      aeOverlayLock = overlayLock,
+      aeJobs = 1,
+      aeMulti = noopMultiHandle,
+      aePlanOps = planOps
+    }
+
+unusedVendorOps :: VendorOps
+unusedVendorOps =
+  VendorOps
+    { voClone = \_ _ _ -> pure (Left "unused"),
+      voHostGoVersion = pure (Right "1.26.5"),
+      voGoModDownload = \_ -> pure (Left "unused"),
+      voTarXz = \_ _ _ -> pure (Left "unused")
+    }
+
+unusedReleaseOps :: ReleaseOps
+unusedReleaseOps =
+  ReleaseOps
+    { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
+      roDownloadAsset = \_ _ -> pure (Left "unused")
+    }
+
 testContentFixManifest :: IO ()
 testContentFixManifest =
   withSystemTempDirectory "mndz-content-fix-" $ \tmp -> do
@@ -1861,20 +1915,54 @@ testContentFixManifest =
                 ],
               glpUniquePVs = [pv]
             }
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
+              poWorkBudget = error "unused budget",
+              poCeilingsCache = error "unused ceilings"
+            }
+        gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 2
+    ceilingsCache <- newMVar Nothing
+    let planOps' =
+          planOps
+            { poWorkBudget = budget,
+              poCeilingsCache = ceilingsCache
+            }
+        env =
+          mkTestApplyEnv
+            gitOps
+            planOps'
+            (\_ _ -> pure (Right ()))
+            unusedReleaseOps
+            unusedVendorOps
+            Nothing
+            assetsLock
+            overlayLock
     createDirectoryIfMissing True pkgDir
     TIO.writeFile (pkgDir </> ebuildName) ebuildBody
     -- No Manifest → needs work
-    fix1 <- contentFixNeeded pkgDir pn plan
+    fix1 <- contentFixNeeded env "charmbracelet" "crush" "v" Nothing pkgDir pn plan
     assertEq "missing Manifest needs work" [pv] fix1
     -- Manifest without vendor DIST → needs work
     TIO.writeFile (pkgDir </> "Manifest") "DIST crush-0.84.0.tar.gz 1 SHA512 deadbeef\n"
-    fix2 <- contentFixNeeded pkgDir pn plan
+    fix2 <- contentFixNeeded env "charmbracelet" "crush" "v" Nothing pkgDir pn plan
     assertEq "missing vendor DIST needs work" [pv] fix2
     -- Complete Manifest + good ebuild → no content fix
     TIO.writeFile
       (pkgDir </> "Manifest")
       "DIST crush-0.84.0-vendor.tar.xz 123 BLAKE2B aa SHA512 abcdef0123456789\n"
-    fix3 <- contentFixNeeded pkgDir pn plan
+    fix3 <- contentFixNeeded env "charmbracelet" "crush" "v" Nothing pkgDir pn plan
     assertEq "complete Manifest no content fix" [] fix3
     assertTrue
       "ebuild content ok"
@@ -1882,6 +1970,7 @@ testContentFixManifest =
           ( ebuildNeedsContentFix
               ["~amd64"]
               ebuildBody
+              (Just "1.26.5")
           )
       )
 
@@ -1988,23 +2077,15 @@ testReuseVsFullPublish =
               voGoModDownload = \_ -> pure (Left "vendor should not run on reuse"),
               voTarXz = \_ _ _ -> pure (Left "vendor should not run on reuse")
             }
+        -- Partially applied: locks supplied at call sites.
         mkEnv releaseOps ebuildRun =
-          ApplyEnv
-            { aeFetcher = \_ -> pure (Left "unused"),
-              aeGitOps = gitOps,
-              aeEbuildRunner = ebuildRun,
-              aeVendorOps = vendorOps,
-              aeReleaseOps = releaseOps,
-              aeAssetsRoot = Just assetsRoot,
-              aeGitHubToken = Just "tok",
-              aeAssetsOwner = "0x6d6e647a",
-              aeAssetsRepo = "mndz-overlay-assets",
-              aeAssetsLock = error "lock unused on reuse",
-              aeJobs = 1,
-              aeMulti = noopMultiHandle,
-              aeCommitStep = noopStepHandle,
-              aePlanOps = planOps'
-            }
+          mkTestApplyEnv
+            gitOps
+            planOps'
+            ebuildRun
+            releaseOps
+            vendorOps
+            (Just assetsRoot)
         lines_ =
           [ SuccessLine
               { slFrom = parseEbuildVersion "0.80.0",
@@ -2038,11 +2119,13 @@ testReuseVsFullPublish =
             { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
               roDownloadAsset = \_ _ -> pure (Left "should not download")
             }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
     -- Reuse path: no vendor calls; success with assets reused; Manifest matches.
     writeIORef vendorCallRef 0
     outcomeReuse <-
       goPublishAndOverlay
-        (mkEnv releaseFound ebuildRunnerOk)
+        (mkEnv releaseFound ebuildRunnerOk assetsLock overlayLock)
         overlayRoot
         entry
         "charmbracelet"
@@ -2063,7 +2146,7 @@ testReuseVsFullPublish =
     -- Manifest mismatch hard-fails on reuse.
     outcomeBad <-
       goPublishAndOverlay
-        (mkEnv releaseFound ebuildRunnerWrong)
+        (mkEnv releaseFound ebuildRunnerWrong assetsLock overlayLock)
         overlayRoot
         entry
         "charmbracelet"
@@ -2082,7 +2165,6 @@ testReuseVsFullPublish =
         hPutStrLn stderr ("expected hard fail, got: " <> show other)
         exitFailure
     -- Not-found → full path (vendor called). Use lock for full path.
-    lock <- newMVar ()
     let vendorOpsFull =
           VendorOps
             { voClone = \_ _ dest -> do
@@ -2102,9 +2184,8 @@ testReuseVsFullPublish =
     -- (fails later on create-release without network is ok if vendor ran first).
     writeIORef vendorCallRef 0
     let envFull =
-          (mkEnv releaseMissing ebuildRunnerOk)
-            { aeVendorOps = vendorOpsFull,
-              aeAssetsLock = lock
+          (mkEnv releaseMissing ebuildRunnerOk assetsLock overlayLock)
+            { aeVendorOps = vendorOpsFull
             }
     _ <-
       goPublishAndOverlay
@@ -2120,3 +2201,464 @@ testReuseVsFullPublish =
         pv
     nFull <- readIORef vendorCallRef
     assertTrue "not-found uses full vendor path" (nFull > 0)
+
+-- | GitMv success signs/commits before returning ApplySuccess (no barrier).
+testGitMvCommitsOnSuccess :: IO ()
+testGitMvCommitsOnSuccess =
+  withSystemTempDirectory "mndz-gitmv-commit-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        pkgDir = overlayRoot </> "dev-util" </> "grok-build-bin"
+        oldName = "grok-build-bin-0.2.99.ebuild"
+        local = parseEbuildVersion "0.2.99"
+        remote = parseEbuildVersion "0.2.101"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "grok-build-bin",
+              pePN = "grok-build-bin",
+              peLocal = local,
+              pePath = pkgDir </> oldName
+            }
+    commitCount <- newIORef (0 :: Int)
+    commitMsgs <- newIORef ([] :: [T.Text])
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile (pkgDir </> oldName) "EAPI=8\n"
+    TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_root paths msg -> do
+                atomicModifyIORef' commitCount (\n -> (n + 1, ()))
+                atomicModifyIORef' commitMsgs (\ms -> (msg : ms, ()))
+                assertTrue "stages paths" (not (null paths))
+                pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        ebuildRun _pkg name = do
+          -- Simulate ebuild manifest creating Manifest after rename.
+          TIO.writeFile (pkgDir </> "Manifest") ("DIST " <> T.pack name <> " 1\n")
+          pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Left "unused"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 1
+    ceilingsCache <- newMVar Nothing
+    let env0 =
+          mkTestApplyEnv
+            gitOps
+            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+            ebuildRun
+            unusedReleaseOps
+            unusedVendorOps
+            Nothing
+            assetsLock
+            overlayLock
+        env = env0 {aeFetcher = \_ -> pure (Right remote)}
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    case outcomes of
+      [ApplySuccess _ _ paths] -> do
+        n <- readIORef commitCount
+        assertEq "exactly one signed commit" 1 n
+        msgs <- readIORef commitMsgs
+        assertTrue
+          "commit message format"
+          ("dev-util/grok-build-bin: 0.2.101" `elem` msgs)
+        assertTrue "paths recorded" (not (null paths))
+      other -> do
+        hPutStrLn stderr ("expected single ApplySuccess, got: " <> show other)
+        exitFailure
+
+-- | Two Go PVs: commit after first; second dirty check sees clean tree; two commits.
+testGoMultiPvSequentialCommits :: IO ()
+testGoMultiPvSequentialCommits =
+  withSystemTempDirectory "mndz-multi-pv-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "crush"
+        pn = "crush" :: T.Text
+        pv1 = parseEbuildVersion "0.82.0"
+        pv2 = parseEbuildVersion "0.84.0"
+        tip = parseEbuildVersion "0.80.0"
+        ebuildBody goAtom =
+          T.unlines
+            [ "EAPI=8",
+              "inherit go-module",
+              "BDEPEND=\"" <> goAtom <> "\"",
+              "KEYWORDS=\"~amd64\"",
+              "SRC_URI=\"https://example/a-${PV}.tar.gz\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+            ]
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "crush",
+              pePN = pn,
+              peLocal = tip,
+              pePath = pkgDir </> "crush-0.80.0.ebuild"
+            }
+        plan =
+          GoLanePlan
+            { glpLanes = [],
+              glpEbuilds =
+                [ PlannedEbuild {pePV = pv1, peKeywords = ["~amd64"], peLanes = []},
+                  PlannedEbuild {pePV = pv2, peKeywords = ["~amd64"], peLanes = []}
+                ],
+              -- Include tip so prune does not add a third commit in this test.
+              glpUniquePVs = [tip, pv1, pv2]
+            }
+        assetBytes = encodeUtf8 "vendor-bytes-multi-pv"
+        digests0 = hashBytes assetBytes
+    commitMsgs <- newIORef ([] :: [T.Text])
+    -- After each commit, paths are clean (simulate HEAD includes them).
+    dirtyPaths <- newIORef ([] :: [FilePath])
+    createDirectoryIfMissing True pkgDir
+    createDirectoryIfMissing True assetsRoot
+    TIO.writeFile (pkgDir </> "crush-0.80.0.ebuild") (ebuildBody ">=dev-lang/go-1.26.5:=")
+    TIO.writeFile (pkgDir </> "Manifest") "DIST crush-0.80.0.tar.gz 1 SHA512 aa\n"
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ paths -> do
+                dirty <- readIORef dirtyPaths
+                pure (Right (any (`elem` dirty) paths)),
+              goAddAndCommit = \_root paths msg -> do
+                atomicModifyIORef' commitMsgs (\ms -> (msg : ms, ()))
+                -- Commit clears dirt for those paths.
+                modifyIORef' dirtyPaths (filter (`notElem` paths))
+                pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        ebuildRun _pkg name = do
+          let tarball =
+                if "0.82.0" `T.isInfixOf` T.pack name
+                  then "crush-0.82.0-vendor.tar.xz"
+                  else "crush-0.84.0-vendor.tar.xz"
+          TIO.writeFile
+            (pkgDir </> "Manifest")
+            ( "DIST "
+                <> T.pack tarball
+                <> " 1 SHA512 "
+                <> digestSHA512 digests0
+                <> "\n"
+            )
+          -- Mutating Manifest dirties it until commit.
+          atomicModifyIORef'
+            dirtyPaths
+            (\d -> (nub ("dev-util/crush/Manifest" : d), ()))
+          pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+        releaseOps =
+          ReleaseOps
+            { roGetReleaseByTag = \_ _ tag ->
+                pure $
+                  Right $
+                    Just
+                      ReleaseInfo
+                        { riId = 1,
+                          riTag = tag,
+                          riAssets =
+                            [ ReleaseAsset
+                                { raName =
+                                    if "0.82.0" `T.isInfixOf` tag
+                                      then "crush-0.82.0-vendor.tar.xz"
+                                      else "crush-0.84.0-vendor.tar.xz",
+                                  raBrowserDownloadUrl = "https://example/v"
+                                }
+                            ]
+                        },
+              roDownloadAsset = \_url dest -> do
+                BS.writeFile dest assetBytes
+                pure (Right ())
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 2
+    ceilingsCache <- newMVar Nothing
+    let env =
+          mkTestApplyEnv
+            gitOps
+            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+            ebuildRun
+            releaseOps
+            unusedVendorOps
+            (Just assetsRoot)
+            assetsLock
+            overlayLock
+    outcomes <-
+      materializePlan
+        env
+        overlayRoot
+        entry
+        "charmbracelet"
+        "crush"
+        "v"
+        Nothing
+        plan
+        [tip]
+        [] -- contentFix empty; missing targets drive need
+        0
+    let successes = [o | o@ApplySuccess {} <- outcomes]
+    assertEq "two PV successes" 2 (length successes)
+    msgs <- reverse <$> readIORef commitMsgs
+    assertEq "two overlay commits" 2 (length msgs)
+    assertTrue
+      "first PV commit"
+      ("dev-util/crush: 0.82.0" `elem` msgs)
+    assertTrue
+      "second PV commit"
+      ("dev-util/crush: 0.84.0" `elem` msgs)
+
+-- | First PV commits; second hard-fails; no prune; later PVs not started.
+testGoMultiPvStopOnHardFail :: IO ()
+testGoMultiPvStopOnHardFail =
+  withSystemTempDirectory "mndz-multi-pv-fail-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "crush"
+        pn = "crush" :: T.Text
+        pv1 = parseEbuildVersion "0.82.0"
+        pv2 = parseEbuildVersion "0.84.0"
+        pv3 = parseEbuildVersion "0.86.0"
+        tip = parseEbuildVersion "0.80.0"
+        extraName = "crush-0.70.0.ebuild"
+        ebuildBody =
+          T.unlines
+            [ "EAPI=8",
+              "inherit go-module",
+              "BDEPEND=\">=dev-lang/go-1.26.5:=\"",
+              "KEYWORDS=\"~amd64\"",
+              "SRC_URI=\"https://example/a-${PV}.tar.gz\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+            ]
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "crush",
+              pePN = pn,
+              peLocal = tip,
+              pePath = pkgDir </> "crush-0.80.0.ebuild"
+            }
+        plan =
+          GoLanePlan
+            { glpLanes = [],
+              glpEbuilds =
+                [ PlannedEbuild {pePV = pv1, peKeywords = ["~amd64"], peLanes = []},
+                  PlannedEbuild {pePV = pv2, peKeywords = ["~amd64"], peLanes = []},
+                  PlannedEbuild {pePV = pv3, peKeywords = ["~amd64"], peLanes = []}
+                ],
+              glpUniquePVs = [pv1, pv2, pv3]
+            }
+        assetBytes = encodeUtf8 "vendor-bytes-fail-test"
+        digests0 = hashBytes assetBytes
+    commitCount <- newIORef (0 :: Int)
+    materializeCount <- newIORef (0 :: Int)
+    createDirectoryIfMissing True pkgDir
+    createDirectoryIfMissing True assetsRoot
+    TIO.writeFile (pkgDir </> "crush-0.80.0.ebuild") ebuildBody
+    TIO.writeFile (pkgDir </> extraName) ebuildBody -- would be pruned only on full success
+    TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> do
+                atomicModifyIORef' commitCount (\n -> (n + 1, ()))
+                pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        ebuildRun _pkg _name = do
+          atomicModifyIORef' materializeCount (\n -> (n + 1, ()))
+          n <- readIORef materializeCount
+          if n >= 2
+            then pure (Left "simulated ebuild manifest failure")
+            else do
+              TIO.writeFile
+                (pkgDir </> "Manifest")
+                ( "DIST crush-0.82.0-vendor.tar.xz 1 SHA512 "
+                    <> digestSHA512 digests0
+                    <> "\n"
+                )
+              pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+        releaseOps =
+          ReleaseOps
+            { roGetReleaseByTag = \_ _ tag ->
+                pure $
+                  Right $
+                    Just
+                      ReleaseInfo
+                        { riId = 1,
+                          riTag = tag,
+                          riAssets =
+                            [ ReleaseAsset
+                                { raName = T.pack (T.unpack tag <> "-vendor.tar.xz"),
+                                  raBrowserDownloadUrl = "https://example/v"
+                                }
+                            ]
+                        },
+              roDownloadAsset = \_url dest -> do
+                BS.writeFile dest assetBytes
+                pure (Right ())
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 2
+    ceilingsCache <- newMVar Nothing
+    let env =
+          mkTestApplyEnv
+            gitOps
+            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+            ebuildRun
+            releaseOps
+            unusedVendorOps
+            (Just assetsRoot)
+            assetsLock
+            overlayLock
+    outcomes <-
+      materializePlan
+        env
+        overlayRoot
+        entry
+        "charmbracelet"
+        "crush"
+        "v"
+        Nothing
+        plan
+        [tip]
+        []
+        0
+    let successes = [o | o@ApplySuccess {} <- outcomes]
+        fails = [o | o@ApplyHardFail {} <- outcomes]
+    assertEq "one success retained" 1 (length successes)
+    assertEq "one hard fail" 1 (length fails)
+    nMat <- readIORef materializeCount
+    assertEq "stopped after second PV (no third)" 2 nMat
+    nCommit <- readIORef commitCount
+    assertEq "only first PV committed (no prune commit)" 1 nCommit
+    -- Extra ebuild still present (prune not run).
+    extraExists <- doesFileExist (pkgDir </> extraName)
+    assertTrue "prune not run" extraExists
+
+-- | Concurrent overlay commits serialize under aeOverlayLock.
+testOverlayCommitLock :: IO ()
+testOverlayCommitLock = do
+  inCritical <- newIORef (0 :: Int)
+  maxInCritical <- newIORef (0 :: Int)
+  let gitOps =
+        GitOps
+          { goIsWorkTree = \_ -> pure True,
+            goPathsDirty = \_ _ -> pure (Right False),
+            goAddAndCommit = \_ _ _ -> do
+              n <- atomicModifyIORef' inCritical (\x -> (x + 1, x + 1))
+              atomicModifyIORef' maxInCritical (\m -> (max m n, ()))
+              threadDelay 30_000
+              atomicModifyIORef' inCritical (\x -> (x - 1, ()))
+              pure (Right ()),
+            goPush = \_ -> pure (Right ())
+          }
+  assetsLock <- newMVar ()
+  overlayLock <- newMVar ()
+  budget <- newWorkBudget 2
+  ceilingsCache <- newMVar Nothing
+  let planOps =
+        PlanOps
+          { poPortageq = \_ -> pure (Left "unused"),
+            poListVersions = \_ -> pure (Left "unused"),
+            poFetchGoMod = \_ -> pure (Left "unused"),
+            poWorkBudget = budget,
+            poCeilingsCache = ceilingsCache
+          }
+      env =
+        mkTestApplyEnv
+          gitOps
+          planOps
+          (\_ _ -> pure (Right ()))
+          unusedReleaseOps
+          unusedVendorOps
+          Nothing
+          assetsLock
+          overlayLock
+  _ <-
+    mapConcurrently
+      (signedOverlayCommit env "/tmp" ["a.ebuild"])
+      ["msg-a" :: T.Text, "msg-b"]
+  peak <- readIORef maxInCritical
+  assertEq "no overlapping overlay critical section" 1 peak
+
+-- | Presence of wrong-version go BDEPEND still needs content-fix.
+testBdependMismatchNeedsFix :: IO ()
+testBdependMismatchNeedsFix = do
+  let body =
+        T.unlines
+          [ "EAPI=8",
+            "inherit go-module",
+            "BDEPEND=\">=dev-lang/go-1.24.11:=\"",
+            "KEYWORDS=\"~amd64\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+          ]
+  assertTrue
+    "presence alone does not satisfy"
+    (ebuildHasDevLangGoBdepend body)
+  assertTrue
+    "mismatch needs fix"
+    (ebuildNeedsContentFix ["~amd64"] body (Just "1.26.5"))
+  assertTrue
+    "matching does not need fix"
+    ( not
+        ( ebuildNeedsContentFix
+            ["~amd64"]
+            (T.replace "1.24.11" "1.26.5" body)
+            (Just "1.26.5")
+        )
+    )
+  assertTrue
+    "goBdependMatches rejects wrong ver"
+    (not (goBdependMatches "1.26.5" body))
+
+-- | Missing BDEPEND with known go.mod still needs-work; ensureGoBdepend still works.
+testBdependMissingNeedsFix :: IO ()
+testBdependMissingNeedsFix = do
+  let body =
+        T.unlines
+          [ "EAPI=8",
+            "inherit go-module",
+            "KEYWORDS=\"~amd64\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+          ]
+  assertTrue
+    "missing needs fix"
+    (ebuildNeedsContentFix ["~amd64"] body (Just "1.26.5"))
+  inserted <- assertRight "insert" (ensureGoBdepend "1.26.5" body)
+  assertTrue "matches after insert" (goBdependMatches "1.26.5" inserted)
+  assertTrue
+    "no longer needs fix"
+    (not (ebuildNeedsContentFix ["~amd64"] inserted (Just "1.26.5")))
+  let withOld =
+        T.unlines
+          [ "EAPI=8",
+            "inherit go-module",
+            "BDEPEND=\">=dev-lang/go-1.20:=\"",
+            "KEYWORDS=\"~amd64\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+          ]
+  replaced <- assertRight "replace" (ensureGoBdepend "1.26.5" withOld)
+  assertTrue "replace matches" (goBdependMatches "1.26.5" replaced)

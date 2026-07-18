@@ -3,7 +3,6 @@
 module Update.Apply
   ( applyOverlay,
     applyPackagePhase1,
-    commitSuccesses,
     foldExitHardFail,
     newEbuildFileName,
     renderPVNoRev,
@@ -14,6 +13,8 @@ module Update.Apply
     contentFixNeeded,
     goPublishAndOverlay,
     markSuccessLinesReused,
+    signedOverlayCommit,
+    materializePlan,
   )
 where
 
@@ -21,9 +22,7 @@ import CLI.Jobs (mapConcurrentlyN)
 import CLI.Progress
   ( MultiHandle (..),
     ProgressConfig,
-    StepHandle (..),
     withMultiProgress,
-    withStepProgress,
   )
 import Control.Concurrent.MVar (MVar, withMVar)
 import Control.Monad (when)
@@ -67,6 +66,7 @@ import Update.Assets.Release
 import Update.Check (PackageEntry (..))
 import Update.EbuildEdit
   ( ebuildFileNameWithRev,
+    ebuildHasDevLangGoBdepend,
     ebuildNeedsContentFix,
     ensureGoBdepend,
     manifestHasVendorDist,
@@ -130,11 +130,32 @@ data ApplyEnv = ApplyEnv
     aeAssetsOwner :: Text,
     aeAssetsRepo :: Text,
     aeAssetsLock :: MVar (),
+    -- | Serializes overlay @git add@ / signed @git commit@ across concurrent packages.
+    aeOverlayLock :: MVar (),
     aeJobs :: Int,
     aeMulti :: MultiHandle,
-    aeCommitStep :: StepHandle,
     aePlanOps :: PlanOps
   }
+
+-- | Stage unit paths and create a signed overlay commit under the overlay lock.
+-- GPG readiness runs inside @goAddAndCommit@ (production GitOps).
+signedOverlayCommit ::
+  ApplyEnv ->
+  FilePath ->
+  [FilePath] ->
+  Text ->
+  IO (Either Text ())
+signedOverlayCommit env overlayRoot paths msg =
+  withMVar (aeOverlayLock env) $ \() ->
+    goAddAndCommit (aeGitOps env) overlayRoot paths msg
+
+-- | Commit message for a successful apply unit: @category/package: version@.
+unitCommitMessage :: PackageKey -> Text -> Text
+unitCommitMessage key verText = packageKeyText key <> ": " <> verText
+
+-- | Prune unit commit message when extras were removed.
+pruneCommitMessage :: PackageKey -> Text
+pruneCommitMessage key = packageKeyText key <> ": prune obsolete ebuilds"
 
 needsGoAssetsApply :: [PackageEntry] -> Bool
 needsGoAssetsApply =
@@ -177,32 +198,16 @@ applyOverlay pcfg env overlayRoot entries mFilter = do
       let selected = case mFilter of
             Nothing -> entries
             Just keys -> [e | e <- entries, peKey e `elem` keys]
-      phase1Nested <-
+      -- Concurrent per-package apply; each successful unit commits under
+      -- aeOverlayLock (commit-on-unit-success). No deferred barrier phase.
+      nested <-
         withMultiProgress pcfg "Updating packages" (length selected) $ \mh ->
           let env' = env {aeMulti = mh}
            in mapConcurrentlyN
                 (aeJobs env')
                 (applyPackagePhase1Tracked env' overlayRoot)
                 selected
-      let phase1 = concat phase1Nested
-          successes =
-            sortOn
-              (packageKeyText . successKey)
-              [o | o@ApplySuccess {} <- phase1]
-          others = [o | o <- phase1, not (isSuccess o)]
-      committed <-
-        withStepProgress pcfg (length successes) $ \sh ->
-          commitSuccesses
-            (aeGitOps env)
-            sh
-            overlayRoot
-            successes
-      pure (others <> committed)
-  where
-    successKey (ApplySuccess k _ _) = k
-    successKey _ = PackageKey ""
-    isSuccess ApplySuccess {} = True
-    isSuccess _ = False
+      pure (concat nested)
 
 applyPackagePhase1Tracked ::
   ApplyEnv ->
@@ -281,8 +286,6 @@ applyGitMv env overlayRoot entry src = do
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
       pn = pePN entry
-      gitOps = aeGitOps env
-      ebuildRun = aeEbuildRunner env
       mh = aeMulti env
   mhStatus mh key "fetching"
   fetched <- aeFetcher env src
@@ -293,7 +296,7 @@ applyGitMv env overlayRoot entry src = do
       case comparePV local remote of
         Just LT -> do
           mhStatus mh key "applying"
-          gitMvDo key local remote oldPath pkgDir pn gitOps ebuildRun overlayRoot
+          gitMvDo env key local remote oldPath pkgDir pn overlayRoot
         Just EQ ->
           pure $ ApplySoftSkip key "already at latest upstream version"
         Just GT ->
@@ -319,17 +322,18 @@ applyGitMv env overlayRoot entry src = do
               False
 
 gitMvDo ::
+  ApplyEnv ->
   PackageKey ->
   EbuildVersion ->
   EbuildVersion ->
   FilePath ->
   FilePath ->
   Text ->
-  GitOps ->
-  EbuildRunner ->
   FilePath ->
   IO ApplyOutcome
-gitMvDo key local remote oldPath pkgDir pn gitOps ebuildRun overlayRoot = do
+gitMvDo env key local remote oldPath pkgDir pn overlayRoot = do
+  let gitOps = aeGitOps env
+      ebuildRun = aeEbuildRunner env
   ebuildRel <- relativeOverlayPath overlayRoot oldPath
   let manifestAbs = pkgDir </> "Manifest"
   manRel0 <- relativeOverlayPath overlayRoot manifestAbs
@@ -380,7 +384,11 @@ gitMvDo key local remote oldPath pkgDir pn gitOps ebuildRun overlayRoot = do
                           slAssetsReused = False
                         }
                     ]
-              pure $ ApplySuccess key lines_ paths
+                  msg = unitCommitMessage key (renderPV remote)
+              committed <- signedOverlayCommit env overlayRoot paths msg
+              pure $ case committed of
+                Right () -> ApplySuccess key lines_ paths
+                Left err -> ApplyHardFail key err True False
 
 ------------------------------------------------------------------------
 -- GoVendorAndAssets (tree-lane multi-PV)
@@ -408,7 +416,16 @@ applyGoVendorLanes env overlayRoot entry src mSub = do
         Right plan -> do
           let pkgDir = takeDirectory (pePath entry)
           localPVs <- listLocalNonLivePVs pkgDir (pePN entry)
-          contentFix <- contentFixNeeded pkgDir (pePN entry) plan
+          contentFix <-
+            contentFixNeeded
+              env
+              owner
+              repo
+              prefix
+              mSub
+              pkgDir
+              (pePN entry)
+              plan
           if not (planNeedsWork localPVs contentFix plan)
             then pure [ApplySoftSkip key "already matches Go tree-lane plan"]
             else do
@@ -467,14 +484,26 @@ listLocalNonLivePVs pkgDir pn = do
         ]
   pure vers
 
-contentFixNeeded :: FilePath -> Text -> GoLanePlan -> IO [EbuildVersion]
-contentFixNeeded pkgDir pn plan =
+-- | Present planned PVs whose ebuild content, BDEPEND, or Manifest needs fix.
+-- Obtains go.mod version via the plan probe cache when possible.
+contentFixNeeded ::
+  ApplyEnv ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  FilePath ->
+  Text ->
+  GoLanePlan ->
+  IO [EbuildVersion]
+contentFixNeeded env owner repo prefix mSub pkgDir pn plan =
   concat <$> mapM checkPlanned (glpEbuilds plan)
   where
     checkPlanned pe = do
       let name = ebuildFileNameWithRev pn (pePV pe)
           path = pkgDir </> name
-          tarball = vendorTarballName pn (renderPVNoRev (pePV pe))
+          pvNoRev = renderPVNoRev (pePV pe)
+          tarball = vendorTarballName pn pvNoRev
       -- Also try without revision suffix variants by scanning dir.
       exists <- doesFileExist path
       paths <-
@@ -494,8 +523,9 @@ contentFixNeeded pkgDir pn plan =
         (p : _) -> do
           content <- TIO.readFile p
           manMissing <- vendorManifestMissing pkgDir tarball
+          mGoVer <- fetchGoModVersion env owner repo prefix pvNoRev mSub
           let bad =
-                ebuildNeedsContentFix (peKeywords pe) content || manMissing
+                ebuildNeedsContentFix (peKeywords pe) content mGoVer || manMissing
           pure [pePV pe | bad]
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
@@ -545,13 +575,14 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
   -- Extend step total so apply phases continue the same package row bar.
   when (applySteps > 0) $
     mhSteps mh key (planDone + applySteps)
-  results <- mapM (materializeOne env overlayRoot entry owner repo prefix mSub localPVs plan) sortedPlanned
+  -- Sequential PVs; stop further materializations after first hard-fail.
+  results <- materializeUntilFail sortedPlanned
   let failures = [o | o@ApplyHardFail {} <- results]
       successes = [o | o@ApplySuccess {} <- results]
   if not (null failures)
     then pure (successes <> failures)
     else do
-      -- Prune only after all targets materialized.
+      -- Prune only after all needed PVs succeeded (and committed).
       pruneResult <- pruneExtras env overlayRoot entry plan
       case pruneResult of
         Left err ->
@@ -559,22 +590,48 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
             ( successes
                 <> [ApplyHardFail key err True False]
             )
-        Right extraPaths ->
-          pure $
-            case reverse successes of
-              [] ->
-                -- Prune-only / keywords-only with no materialize (shouldn't happen often)
-                if null extraPaths
+        Right extraPaths
+          | null extraPaths ->
+              pure $
+                if null successes
                   then [ApplySoftSkip key "already matches Go tree-lane plan"]
-                  else
-                    let lines_ = gapSuccessLines localPVs needPVs plan
-                     in [ApplySuccess key lines_ extraPaths]
-              (ApplySuccess k sls paths : rest) ->
-                reverse rest
-                  <> [ApplySuccess k sls (nub (paths <> extraPaths))]
-              _ -> successes
+                  else successes
+          | otherwise -> do
+              committed <-
+                signedOverlayCommit
+                  env
+                  overlayRoot
+                  extraPaths
+                  (pruneCommitMessage key)
+              pure $ case committed of
+                Left err ->
+                  successes <> [ApplyHardFail key err True False]
+                Right ()
+                  | null successes ->
+                      let lines_ = gapSuccessLines localPVs needPVs plan
+                       in [ApplySuccess key lines_ extraPaths]
+                  | otherwise -> successes
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
+    materializeUntilFail [] = pure []
+    materializeUntilFail (pe : rest) = do
+      r <-
+        materializeOne
+          env
+          overlayRoot
+          entry
+          owner
+          repo
+          prefix
+          mSub
+          localPVs
+          plan
+          pe
+      case r of
+        ApplyHardFail {} -> pure [r]
+        _ -> do
+          more <- materializeUntilFail rest
+          pure (r : more)
 
 gapSuccessLines :: [EbuildVersion] -> [EbuildVersion] -> GoLanePlan -> [SuccessLine]
 gapSuccessLines localPVs needs plan =
@@ -1065,8 +1122,13 @@ overlayAfterAssets env overlayRoot entry keywords lines_ targetVer digests tarba
       let parameterized = parameterizeAssetsSrcUri pn content
           withKw = setKeywords keywords parameterized
       contentFixed <- case mGoVer of
-        Nothing -> pure (Right withKw)
         Just goVer -> pure (ensureGoBdepend goVer withKw)
+        Nothing
+          | ebuildHasDevLangGoBdepend withKw -> pure (Right withKw)
+          | otherwise ->
+              pure $
+                Left
+                  "could not obtain go.mod version required for BDEPEND alignment"
       case contentFixed of
         Left err -> pure $ ApplyHardFail key err False orphan
         Right fixed -> do
@@ -1111,7 +1173,11 @@ overlayAfterAssets env overlayRoot entry keywords lines_ targetVer digests tarba
                             nub $
                               [newRel, manRel]
                                 <> [ebuildRel | removedTemplate || templatePath /= newPath]
-                      pure $ ApplySuccess key lines_ paths
+                          msg = unitCommitMessage key (renderPV targetVer)
+                      committed <- signedOverlayCommit env overlayRoot paths msg
+                      pure $ case committed of
+                        Right () -> ApplySuccess key lines_ paths
+                        Left err -> ApplyHardFail key err True orphan
                   | otherwise ->
                       pure $
                         ApplyHardFail
@@ -1135,23 +1201,3 @@ findTemplate pkgDir pn targetVer fallback = do
   pure $ case same of
     (p : _) -> p
     [] -> fallback
-
-commitSuccesses ::
-  GitOps ->
-  StepHandle ->
-  FilePath ->
-  [ApplyOutcome] ->
-  IO [ApplyOutcome]
-commitSuccesses gitOps step overlayRoot = mapM commitOne
-  where
-    commitOne (ApplySuccess key lines_ paths) = do
-      shStep step (packageKeyText key)
-      let verText = case lines_ of
-            (SuccessLine _ to _ _ : _) -> renderPV to
-            [] -> "update"
-          msg = packageKeyText key <> ": " <> verText
-      result <- goAddAndCommit gitOps overlayRoot paths msg
-      pure $ case result of
-        Right () -> ApplySuccess key lines_ paths
-        Left err -> ApplyHardFail key err False False
-    commitOne other = pure other

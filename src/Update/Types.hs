@@ -123,7 +123,8 @@ data PackagePolicy = PackagePolicy
 
 -- | Result of attempting to update one package (or one PV commit unit).
 data ApplyOutcome
-  = -- | success lines (stdout), paths relative to overlay root for git add
+  = -- | Success means the unit is already signed-committed in overlay HEAD.
+    -- Path list is for tests/logging only (not a deferred-commit contract).
     ApplySuccess PackageKey [SuccessLine] [FilePath]
   | ApplySoftSkip PackageKey Text
   | -- | message, half-applied (overlay mutated), assets already published

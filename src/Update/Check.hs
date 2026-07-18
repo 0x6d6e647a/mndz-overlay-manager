@@ -43,13 +43,15 @@ import Update.Go.Lanes
     missingTargets,
     planNeedsWork,
   )
+import Update.Go.ModFetch (GoModKey (..), parseGoReqFromMod)
 import Update.Go.Plan
-  ( PlanOps,
+  ( PlanOps (..),
     PlanProgress (..),
     localNonLivePVs,
     planGoPackageWithProgress,
     productionPlanOps,
   )
+import Update.Go.Vendor (versionTag)
 import Update.Hardcoded (lookupPolicy)
 import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
@@ -227,7 +229,7 @@ checkPackageGo mh planOps entry locals src mSub = do
       pure UpdateReport {reportKey = key, reportStatus = FetchError err}
     Right plan -> do
       let localPVs = localNonLivePVs locals
-      contentFix <- contentFixPVs locals plan
+      contentFix <- contentFixPVs planOps src mSub locals plan
       let missing = missingTargets localPVs plan
           needsWork = missing <> contentFix
           gaps =
@@ -276,9 +278,16 @@ goPlanProgress mh key =
       ppOnProbeDone = mhStep mh key "probing go.mod"
     }
 
--- | Local PVs present in plan but needing content/KEYWORDS/Manifest fix.
-contentFixPVs :: [Ebuild] -> GoLanePlan -> IO [EbuildVersion]
-contentFixPVs locals plan = do
+-- | Local PVs present in plan but needing content/KEYWORDS/Manifest/BDEPEND fix.
+-- BDEPEND adequacy uses probed go.mod (shared cache with planning) when available.
+contentFixPVs ::
+  PlanOps ->
+  UpdateSource ->
+  Maybe FilePath ->
+  [Ebuild] ->
+  GoLanePlan ->
+  IO [EbuildVersion]
+contentFixPVs planOps src mSub locals plan = do
   let planned = glpEbuilds plan
   concat <$> mapM (checkOneEbuild locals) planned
   where
@@ -300,10 +309,8 @@ contentFixPVs locals plan = do
               content <- TIO.readFile (ebuildPath e)
               let pkgDir = takeDirectory (ebuildPath e)
                   pn = ebuildPackage e
-                  tarball =
-                    vendorTarballName
-                      pn
-                      (renderPVNoRev (pePV pe))
+                  pvNoRev = renderPVNoRev (pePV pe)
+                  tarball = vendorTarballName pn pvNoRev
                   manPath = pkgDir </> "Manifest"
               manMissing <- do
                 manExists <- doesFileExist manPath
@@ -312,10 +319,35 @@ contentFixPVs locals plan = do
                   else do
                     manText <- TIO.readFile manPath
                     pure (not (manifestHasVendorDist manText tarball))
+              mGoVer <- fetchGoModForPV planOps src mSub pvNoRev
               let bad =
-                    ebuildNeedsContentFix (peKeywords pe) content || manMissing
+                    ebuildNeedsContentFix (peKeywords pe) content mGoVer
+                      || manMissing
               pure [pePV pe | bad]
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
+
+fetchGoModForPV ::
+  PlanOps ->
+  UpdateSource ->
+  Maybe FilePath ->
+  Text ->
+  IO (Maybe Text)
+fetchGoModForPV planOps src mSub pvNoRev =
+  case src of
+    GitHub owner repo prefix -> do
+      let tag = versionTag prefix pvNoRev
+          key =
+            GoModKey
+              { gmkOwner = owner,
+                gmkRepo = repo,
+                gmkTag = tag,
+                gmkSubdir = mSub
+              }
+      eres <- poFetchGoMod planOps key
+      pure $ case eres of
+        Right body -> parseGoReqFromMod body
+        Left _ -> Nothing
+    _ -> pure Nothing
 
 statusFromCompare :: EbuildVersion -> EbuildVersion -> UpdateStatus
 statusFromCompare local remote =

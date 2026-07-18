@@ -1,48 +1,4 @@
-# update-apply Specification
-
-## Purpose
-
-Package policy (hardcoded source + technique), applying updates (`GitMvAndManifest` and `GoVendorAndAssets`), dirty checks, assets publish coordination, and creating isolated GPG-signed commits in the overlay work tree.
-
-## Requirements
-
-### Requirement: Package policy model
-
-The library SHALL model a package policy that binds a package key `category/package` to an update source and an update technique. The technique SHALL be one of: `GitMvAndManifest`; `GoVendorAndAssets` with an optional go.mod subdirectory; or `Unsupported` with a human-readable reason. Policy lookup SHALL use a hardcoded map only.
-
-#### Scenario: Supported GitMv technique entry
-
-- **WHEN** policy is looked up for a package configured as `GitMvAndManifest` with a GitHub source
-- **THEN** apply logic receives both the source (for version fetch) and the `GitMvAndManifest` technique
-
-#### Scenario: Supported GoVendor technique entry
-
-- **WHEN** policy is looked up for a package configured as `GoVendorAndAssets` with a go.mod subdirectory option
-- **THEN** apply logic receives both the source and the `GoVendorAndAssets` technique including the subdirectory option
-
-#### Scenario: Unsupported technique entry
-
-- **WHEN** policy is looked up for a package configured as `Unsupported` with reason text
-- **THEN** apply logic can soft-skip without attempting rename or manifest regeneration
-
-### Requirement: Hardcoded policy covers known overlay packages
-
-The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay at the time of this change, each with both a source and a technique. At minimum, `dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, and `dev-util/opencode-bin` SHALL use `GitMvAndManifest`. At minimum, `dev-db/dolt`, `dev-util/beads`, and `dev-util/crush` SHALL use `GoVendorAndAssets`. Packages that still require npm deps tarballs or cargo CRATES regeneration SHALL use `Unsupported`.
-
-#### Scenario: Simple binary package is GitMvAndManifest
-
-- **WHEN** policy is resolved for `dev-util/opencode-bin`
-- **THEN** the technique is `GitMvAndManifest`
-
-#### Scenario: Go package is GoVendorAndAssets
-
-- **WHEN** policy is resolved for `dev-util/beads`
-- **THEN** the technique is `GoVendorAndAssets`
-
-#### Scenario: Cargo package is Unsupported
-
-- **WHEN** policy is resolved for `dev-util/mise`
-- **THEN** the technique is `Unsupported`
+## MODIFIED Requirements
 
 ### Requirement: GitMvAndManifest apply steps
 
@@ -149,29 +105,6 @@ When a unit hard-fails after the ebuild was renamed or rewritten but before a su
 - **WHEN** rename succeeds and `ebuild … manifest` fails
 - **THEN** the program logs an error for the failure and a warning that the package tree may be dirty
 
-### Requirement: Overlay is a git worktree for update
-
-The `update` apply path SHALL require the overlay path to be inside a git work tree. If it is not, the program SHALL hard-fail on the spine or at the start of apply with an error (no partial updates).
-
-#### Scenario: Non-git overlay fails
-
-- **WHEN** the configured overlay path is not a git work tree
-- **THEN** the program logs an error and does not apply package updates
-
-### Requirement: GoVendorAndAssets is a first-class apply technique
-
-Packages with technique `GoVendorAndAssets` SHALL be applied via the Go vendor and assets publish path and the Go tree-lane multi-PV planner, not soft-skipped as unsupported. Target version selection SHALL use tree-lane plan PVs rather than solely the single latest remote version. Behavior of the vendor/assets pipeline is defined by the `go-vendor-assets` and `assets-publish` capabilities; lane planning by `go-tree-lanes`.
-
-#### Scenario: Outdated Go package is not soft-skipped as unsupported
-
-- **WHEN** `dev-util/crush` is outdated and policy technique is `GoVendorAndAssets`
-- **THEN** the program attempts the Go vendor assets apply path rather than soft-skipping with an unsupported reason
-
-#### Scenario: Outdated Go package uses vendor path
-
-- **WHEN** a `GoVendorAndAssets` package has a tree-lane gap and is selected for update
-- **THEN** apply uses the Go vendor/assets path for each needed planned PV rather than soft-skipping as unsupported
-
 ### Requirement: GoVendorAndAssets multi-lane apply
 
 For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and, for each unique planned PV that needs materialization, perform either the **full** vendor-and-assets + overlay path or the **reuse** overlay-only path defined by `go-vendor-assets` (probe existing release asset first; reuse when present; full path when absent). The full path remains: clone tag, host Go gate, vendor tarball, assets publish, BDEPEND from that tag’s go.mod, assets SRC_URI rules. The reuse path SHALL complete overlay ebuild mutation and Manifest verification without re-publishing assets. Ebuild KEYWORDS SHALL be set to the planned `~arch` membership for that PV. After each planned PV unit successfully completes overlay mutation and verification, apply SHALL create a signed overlay commit for that PV’s paths with message `category/package: version` (version = PV without leading `v`, including `-rN` when the filename carries a revision) **before** starting the next planned PV for the same package. When two lanes share one PV and a single write satisfies both, the program SHALL produce one commit for that PV rather than two empty commits. After all planned PVs that needed materialization succeed, apply SHALL prune non-live versioned ebuilds not in the planned set per exact-set rules and SHALL create a signed overlay commit for prune pathspecs when any extras were removed. If any planned PV unit hard-fails, apply SHALL NOT prune, SHALL NOT start further planned PVs for that package after that failure, and SHALL retain any earlier successful PV commits. Sibling packages continue on hard-fail of one package’s unit.
@@ -208,30 +141,3 @@ For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and,
 
 - **WHEN** all needed planned PVs for a package materialize and commit successfully and extras exist outside the planned set
 - **THEN** the program removes those extras and creates a signed overlay commit including the deletions and updated Manifest
-
-### Requirement: Reuse path does not take assets publish critical section
-
-When a planned PV is materialized via the reuse path (existing release asset), the program SHALL NOT hold the assets-repo git critical section solely for that PV’s materialization. Full-path publish for other packages or other PVs SHALL continue to serialize assets git/push/release as specified by `assets-publish`.
-
-#### Scenario: Reuse while another package publishes
-
-- **WHEN** package A reuses an existing release asset and package B needs a full assets publish
-- **THEN** package A’s reuse work does not block on the assets git lock for commit/push/release of A’s PV
-
-### Requirement: GitMvAndManifest leaves other versions
-
-`GitMvAndManifest` apply behavior for non-selected ebuild versions in the package directory SHALL remain as today (other versions left in place). Exact-set pruning applies only to `GoVendorAndAssets` tree-lane apply.
-
-#### Scenario: Binary update does not delete siblings
-
-- **WHEN** a `GitMvAndManifest` package directory has two ebuild versions and newest is renamed to a new remote PV
-- **THEN** the non-selected older ebuild is left in place by that technique
-
-### Requirement: Assets publish failure does not cancel sibling packages
-
-A hard failure during assets commit, push, or release for one package SHALL NOT abort in-progress or pending apply attempts for other packages. Only that package’s overlay mutation SHALL be skipped.
-
-#### Scenario: One assets failure others continue
-
-- **WHEN** package A fails assets push and package B is still applying
-- **THEN** package B may still complete successfully and the program continues until all selected packages are processed
