@@ -1,131 +1,117 @@
 # mndz-overlay-manager
 
-Haskell CLI for managing a Gentoo overlay layout: list ebuilds, check for outdated packages, and related workflow.
-
-**Stack:** Cabal · GHC 9.10.x · [hk](https://github.com/jdx/hk) for git hooks
+Haskell CLI for managing a Gentoo overlay: list ebuilds, check for outdated packages, and apply updates with Manifest regeneration and GPG-signed commits.
 
 ## Prerequisites
 
-| Tool | Notes |
-|------|--------|
-| [GHC](https://www.haskell.org/ghc/) + [cabal-install](https://www.haskell.org/cabal/) | Project targets GHC **9.10.x** (see `ghc --version`) |
-| [hk](https://hk.jdx.dev/) | Git hook runner (system install; not vendored in the repo) |
-| Network | First-time tool install pulls from Hackage |
+### Build requirements
 
-Optional: [GHCup](https://www.haskell.org/ghcup/) to install GHC and Cabal.
+This project targets **GHC 9.10.x** and needs a matching **cabal-install**. The recommended way to install both is [GHCup](https://www.haskell.org/ghcup/): install GHCup, then select (or install) a 9.10 series GHC and Cabal so `ghc --version` reports 9.10.x before you build.
+
+### Runtime requirements
+
+| When | Tools on `PATH` |
+|------|------------------|
+| `update` (always) | `git`, `ebuild` (Portage), `gpg` |
+| `update` of packages that publish Go vendor/deps assets | additionally `go`, `xz` |
+
+`list` and `outdated` only need a readable overlay and a valid config; they do not require Portage or GPG. Help (`--help`) does not load configuration and needs no overlay.
 
 ## Build and run
 
 ```bash
 cabal build all
 cabal run mndz-overlay-manager -- --help
-cabal test all
 ```
 
-## Development bootstrap (quality tools + hooks)
+Use `cabal run mndz-overlay-manager -- COMMAND --help` for subcommand help. After a successful build you can also run the installed binary name the same way if you have it on `PATH` via Cabal.
 
-Quality tools are **not** on your global PATH for hooks. They live under **`.tools/bin`**, installed via Cabal (strict policy: missing tools fail the hook; nothing auto-installs).
+## Configuration
 
-### 1. Install project quality tools
+Default config path (XDG):
 
-From the repository root:
+- `$XDG_CONFIG_HOME/mndz/overlay-manager.toml` when `XDG_CONFIG_HOME` is set
+- otherwise `~/.config/mndz/overlay-manager.toml`
+
+Override with `--config FILE.toml`. Work subcommands always load the config file; `--overlay-path` overrides only the overlay root after load.
+
+### Keys
+
+| Key | Required | Purpose |
+|-----|----------|---------|
+| `overlay-path` | yes | Root of the Gentoo overlay (must be a git work tree for `update`) |
+| `assets-path` | no | Git work tree for vendor/deps asset sidecars (required when `update` will publish assets) |
+| `github-token` | no | GitHub API token for authenticated fetch / release publish |
+
+**Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then `github-token` in the config. Prefer env vars in shared environments; the program never logs the raw token.
+
+### Example
+
+```toml
+overlay-path = "/path/to/mndz-overlay"
+assets-path = "/path/to/mndz-overlay-assets"
+# github-token = "ghp_..."   # optional; prefer GITHUB_TOKEN / GH_TOKEN
+```
+
+## Commands
+
+Global options apply **before** the subcommand (for example `mndz-overlay-manager --jobs 4 outdated`). Help-only paths do not require a config file.
+
+### Global options
+
+| Option | Purpose |
+|--------|---------|
+| `--config` / `-c FILE.toml` | Config path (overrides the XDG default) |
+| `--overlay-path DIR` | Use this overlay root instead of `overlay-path` from config |
+| `--jobs N` | Max concurrent package jobs (default: host CPU count); mainly affects `outdated` and `update` |
+| `-v` / `--verbose` | Increase log verbosity from warn (repeatable: `-v` → info, `-vv` → debug) |
+| `--log-level LEVEL` | Set log level (`error` \| `warn` \| `info` \| `debug`); overrides `-v` when set |
+| `--no-progress` | Disable interactive activity indicators (useful for CI or plain logs) |
+| `--no-color` | Disable ANSI colors in logs and indicators (also honors non-empty `NO_COLOR`) |
+
+### `list`
+
+Inventory every ebuild in the configured overlay. Prints one package atom per line in the form `category/package-version` to standard output. Useful for scripting or a quick check that the overlay path and discovery look right. There are no subcommand-local flags; empty inventory is an error.
 
 ```bash
-./scripts/install-dev-tools
+cabal run mndz-overlay-manager -- list
+cabal run mndz-overlay-manager -- --overlay-path /path/to/overlay list
 ```
 
-This installs pinned versions of **ormolu**, **hlint**, **stan**, and **weeder** into `.tools/bin`.
+### `outdated`
 
-- First run can take several minutes (`ghc-lib-parser` and friends are large).
-- The script sets `TMPDIR=.tools/tmp` so builds do not fill a small `/tmp` tmpfs.
-- Re-run after changing version pins in `cabal.project` / `scripts/install-dev-tools`.
-
-### 2. Enable git hooks
+Compare each discovered package to its configured update source and report packages that have a newer upstream version. Outdated lines go to standard output; warnings (unmapped packages, fetch failures, local ahead of remote) go to the log on stderr. No subcommand-local flags. Soft failures do not by themselves force a non-zero exit; spine failures (missing config, invalid overlay, empty inventory) do.
 
 ```bash
-hk install
-# or (hk’s recommended machine-wide setup):
-hk install --global
+cabal run mndz-overlay-manager -- outdated
+cabal run mndz-overlay-manager -- -v --jobs 4 outdated
 ```
 
-With a global install, repos **without** `hk.pkl` are a no-op; this repo has `hk.pkl`, so hooks run here.
+### `update`
 
-### 3. Confirm the pipeline
+Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, and create GPG-signed git commits in the overlay. For packages that use Go vendor assets, it may also build vendor tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token and the extra runtime tools above).
+
+**Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every package that needs work is selected (outdated non-Go packages and Go packages with tree-lane gaps). Explicit targets that do not need work are soft-skipped.
 
 ```bash
-hk check
+# All packages that need work
+cabal run mndz-overlay-manager -- update
+
+# One or more packages
+cabal run mndz-overlay-manager -- update dev-util/crush
+cabal run mndz-overlay-manager -- update crush dolt
+
+# Common operator flags
+cabal run mndz-overlay-manager -- --jobs 2 -v update
+cabal run mndz-overlay-manager -- --no-progress update category/package
 ```
 
-All steps must pass before you commit (pre-commit runs the same gates, with ormolu allowed to fix).
+Before mutating anything, `update` checks that required tools are on `PATH` and, when assets publish is needed, that `assets-path` is a git work tree and a GitHub token can be resolved. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
 
-## Quality workflow
+## Development
 
-### What runs (all blocking)
-
-| Step | Role |
-|------|------|
-| **tools-preflight** | Ensures `.tools/bin/{ormolu,hlint,stan,weeder}` are executable |
-| **ormolu** | Format check (pre-commit / `hk fix` can rewrite) |
-| **cabal-test** | `cabal build all && cabal test all` (also emits HIE under `.hie/`) |
-| **hlint** | Lint suggestions must be clean |
-| **stan** | Static analysis on HIE (see `.stan.toml` for baseline excludes) |
-| **weeder** | Dead-code analysis (see `weeder.toml`) |
-
-### Day-to-day commands
-
-```bash
-hk check          # full gate (same as pre-commit, check-oriented)
-hk fix            # preflight + ormolu inplace only
-hk run pre-commit # exercise the pre-commit hook without committing
-
-# After editing pin versions:
-./scripts/install-dev-tools
-```
-
-### If a hook fails
-
-| Symptom | What to do |
-|---------|------------|
-| `missing project tool: .tools/bin/...` | Run `./scripts/install-dev-tools` |
-| ormolu wants a reformat | `hk fix` or `.tools/bin/ormolu --mode inplace path/to/File.hs` |
-| tests / build fail | Fix compile/test errors; `cabal test all` locally |
-| hlint hints | Apply suggestions or adjust code; default hlint must be clean |
-| stan observations | Fix or update `.stan.toml` only with intent |
-| weeder weeds | Remove dead code or adjust `weeder.toml` roots / `root-modules` |
-
-### Tool pins
-
-Versions are listed in:
-
-- `cabal.project` (`constraints:`)
-- `scripts/install-dev-tools` (`CONSTRAINTS` array)
-
-**Keep those two in sync** when bumping tools.
-
-Current pins (verified on GHC 9.10.3): ormolu `0.8.1.1`, hlint `3.10`, stan `0.2.1.0`, weeder `2.10.0`.
-
-### Generated / local-only paths (gitignored)
-
-| Path | Purpose |
-|------|---------|
-| `.tools/` | Installed tool binaries + install temp dir |
-| `.hie/` | HIE files for stan/weeder |
-| `dist-newstyle/` | Cabal build tree |
-
-## Project layout (short)
-
-```
-app/                 executable
-src/                 library
-test/                tests + fixtures
-scripts/install-dev-tools
-hk.pkl               hook configuration
-weeder.toml          weeder roots
-.stan.toml           stan baseline checks
-cabal.project        package + tool pins
-CONTRIBUTING.md      contributing notes
-AGENTS.md            guidance for AI coding agents
-```
+Contributing, quality gates, and developer bootstrap: **[CONTRIBUTING.md](CONTRIBUTING.md)**.  
+AI coding agents: **[AGENTS.md](AGENTS.md)**.
 
 ## License
 
