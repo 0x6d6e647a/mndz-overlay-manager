@@ -13,8 +13,8 @@ module Update.Go.Plan
 where
 
 import CLI.Jobs (WorkBudget, newWorkBudget, withWorkSlot)
-import Control.Concurrent.Async (mapConcurrently)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (newManager)
@@ -24,6 +24,7 @@ import Overlay.Version (EbuildVersion (..), parseEbuildVersion)
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
   ( GoLanePlan,
+    LaneTarget (..),
     VersionCandidate (..),
     planFromTargets,
     selectAllLaneTargets,
@@ -56,13 +57,17 @@ data PlanOps = PlanOps
   }
 
 -- | Optional progress hooks for long Go planning pipelines.
+--
+-- Production UI uses three coarse steps: ceilings, version list, and one
+-- go.mod probe walk (not one step per tag).
 data PlanProgress = PlanProgress
   { ppOnCeilingsStart :: IO (),
     ppOnCeilingsDone :: IO (),
     ppOnListStart :: IO (),
-    -- | Called after version list succeeds with the version count so callers
-    -- can set step total to @2 + n@ (ceilings + list + one probe each).
+    -- | Called after version list succeeds. The @Int@ is the listed version
+    -- count (for tests/diagnostics); step total is no longer @2 + n@.
     ppOnListDone :: Int -> IO (),
+    -- | Called once when the go.mod probe walk finishes (early exit or end).
     ppOnProbeDone :: IO ()
   }
 
@@ -140,7 +145,7 @@ planGoPackage ::
   IO (Either Text GoLanePlan)
 planGoPackage ops = planGoPackageWithProgress ops noopPlanProgress
 
--- | Full plan: ceilings → version list → go_req probe → lane targets.
+-- | Full plan: ceilings → version list → newest-first go_req probe with early exit.
 planGoPackageWithProgress ::
   PlanOps ->
   PlanProgress ->
@@ -168,6 +173,7 @@ planGoPackageWithProgress ops progress src mSub =
                 buildVersionCandidatesWithProgress
                   ops
                   progress
+                  ceilings
                   owner
                   repo
                   prefix
@@ -177,22 +183,38 @@ planGoPackageWithProgress ops progress src mSub =
               pure (Right (planFromTargets targets))
     _ -> pure (Left "Go tree-lane planning requires a GitHub update source")
 
+-- | True when every lane that has a Go ceiling already has a package target.
+allCeilingedLanesFilled :: GoCeilings -> [VersionCandidate] -> Bool
+allCeilingedLanesFilled ceilings candidates =
+  all laneOk (selectAllLaneTargets ceilings candidates)
+  where
+    laneOk t = case ltCeiling t of
+      Nothing -> True
+      Just _ -> isJust (ltPackagePV t)
+
+-- | Newest-first sequential go.mod probes with early exit when all ceilinged
+-- lanes have targets. Each probe is gated by the work budget.
 buildVersionCandidatesWithProgress ::
   PlanOps ->
   PlanProgress ->
+  GoCeilings ->
   Text ->
   Text ->
   Text ->
   Maybe FilePath ->
   [EbuildVersion] ->
   IO [VersionCandidate]
-buildVersionCandidatesWithProgress ops progress owner repo prefix mSub =
-  mapConcurrently probe
+buildVersionCandidatesWithProgress ops progress ceilings owner repo prefix mSub versions = do
+  candidates <- walk [] versions
+  ppOnProbeDone progress
+  pure candidates
   where
-    probe pv = do
-      vc <- withWorkSlot (poWorkBudget ops) (one pv)
-      ppOnProbeDone progress
-      pure vc
+    walk acc [] = pure (reverse acc)
+    walk acc (pv : rest)
+      | allCeilingedLanesFilled ceilings acc = pure (reverse acc)
+      | otherwise = do
+          vc <- withWorkSlot (poWorkBudget ops) (one pv)
+          walk (vc : acc) rest
     one pv = do
       let tag = versionTag prefix (renderPVNoRev pv)
           key =

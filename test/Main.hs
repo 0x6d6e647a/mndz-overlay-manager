@@ -32,7 +32,7 @@ import Control.Monad (unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
-import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sort)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
@@ -122,7 +122,13 @@ import Update.Go.Lanes
     selectAllLaneTargets,
   )
 import Update.Go.ModFetch (GoModKey (..), withGoModCache)
-import Update.Go.Plan (PlanOps (..), planGoPackage)
+import Update.Go.Plan
+  ( PlanOps (..),
+    PlanProgress (..),
+    noopPlanProgress,
+    planGoPackage,
+    planGoPackageWithProgress,
+  )
 import Update.Go.Tree
   ( GoArch (..),
     GoCeilings (..),
@@ -242,6 +248,11 @@ main = do
   testGoStripAndParseList
   testSetKeywords
   testGoPlanIntegrationMocked
+  testGoModProbeEarlyExitTipFillsAll
+  testGoModProbeEarlyExitPlainOlder
+  testGoModProbeEarlyExitMatchesFullProbe
+  testGoModProbeEarlyExitSkipsUnparseableTip
+  testGoPlanProgressCoarseSteps
   testReleaseLookup
   testContentFixManifest
   testReuseVsFullPublish
@@ -1561,11 +1572,12 @@ testGoPlanIntegrationMocked = do
     let planOps =
           PlanOps
             { poPortageq = portageq,
+              -- Newest-first (production listGitHubVersionsWith order).
               poListVersions = \_ ->
                 pure $
                   Right
-                    [ parseEbuildVersion "0.82.0",
-                      parseEbuildVersion "0.84.0"
+                    [ parseEbuildVersion "0.84.0",
+                      parseEbuildVersion "0.82.0"
                     ],
               poFetchGoMod = \key ->
                 pure $
@@ -1587,6 +1599,231 @@ testGoPlanIntegrationMocked = do
     assertTrue
       "has 0.84"
       (parseEbuildVersion "0.84.0" `elem` glpUniquePVs plan)
+
+------------------------------------------------------------------------
+-- go.mod probe early exit
+------------------------------------------------------------------------
+
+-- | Shared ceilings: plain 1.26.3, tilde 1.26.5 (both arches).
+earlyExitCeilings :: GoCeilings
+earlyExitCeilings =
+  GoCeilings
+    { gcAmd64Plain = Just (parseEbuildVersion "1.26.3"),
+      gcAmd64Tilde = Just (parseEbuildVersion "1.26.5"),
+      gcArm64Plain = Just (parseEbuildVersion "1.26.3"),
+      gcArm64Tilde = Just (parseEbuildVersion "1.26.5")
+    }
+
+-- | Mock plan ops that record go.mod fetch tags (newest-first version list).
+mkEarlyExitPlanOps ::
+  [EbuildVersion] ->
+  (T.Text -> Either T.Text T.Text) ->
+  IO (PlanOps, IORef [T.Text])
+mkEarlyExitPlanOps versions fetchBody = do
+  budget <- newWorkBudget 2
+  ceilingsCache <- newMVar (Just earlyExitCeilings)
+  fetchTags <- newIORef ([] :: [T.Text])
+  let planOps =
+        PlanOps
+          { poPortageq = \_ -> pure (Left "unused"),
+            poListVersions = \_ -> pure (Right versions),
+            poFetchGoMod = \key -> do
+              atomicModifyIORef' fetchTags (\ts -> (gmkTag key : ts, ()))
+              pure (fetchBody (gmkTag key)),
+            poWorkBudget = budget,
+            poCeilingsCache = ceilingsCache
+          }
+  pure (planOps, fetchTags)
+
+lanePV :: GoLanePlan -> LaneId -> Maybe EbuildVersion
+lanePV plan lid =
+  case [ltPackagePV t | t <- glpLanes plan, ltLane t == lid] of
+    (m : _) -> m
+    [] -> Nothing
+
+-- | Tip go_req under every ceiling → one go.mod fetch; all lanes tip.
+testGoModProbeEarlyExitTipFillsAll :: IO ()
+testGoModProbeEarlyExitTipFillsAll = do
+  let versions =
+        [ parseEbuildVersion "0.90.0",
+          parseEbuildVersion "0.84.0",
+          parseEbuildVersion "0.82.0"
+        ]
+      fetchBody = \case
+        "v0.90.0" -> Right "module x\ngo 1.26.3\n"
+        "v0.84.0" -> Right "module x\ngo 1.26.5\n"
+        "v0.82.0" -> Right "module x\ngo 1.26.3\n"
+        _ -> Left "missing"
+  (planOps, fetchTags) <- mkEarlyExitPlanOps versions fetchBody
+  plan <-
+    assertRight "tip fills all"
+      =<< planGoPackage planOps (GitHub "o" "r" "v") Nothing
+  tags <- reverse <$> readIORef fetchTags
+  assertEq "only tip probed" ["v0.90.0"] tags
+  assertEq "unique tip" [parseEbuildVersion "0.90.0"] (glpUniquePVs plan)
+  assertEq
+    "plain tip"
+    (Just (parseEbuildVersion "0.90.0"))
+    (lanePV plan LaneAmd64Plain)
+  assertEq
+    "tilde tip"
+    (Just (parseEbuildVersion "0.90.0"))
+    (lanePV plan LaneAmd64Tilde)
+
+-- | Tilde takes newer PV; plain needs older; no probes older than plain target.
+testGoModProbeEarlyExitPlainOlder :: IO ()
+testGoModProbeEarlyExitPlainOlder = do
+  let versions =
+        [ parseEbuildVersion "0.86.0",
+          parseEbuildVersion "0.84.0",
+          parseEbuildVersion "0.82.0",
+          parseEbuildVersion "0.80.0"
+        ]
+      fetchBody = \case
+        "v0.86.0" -> Right "module x\ngo 1.26.5\n"
+        "v0.84.0" -> Right "module x\ngo 1.26.4\n"
+        "v0.82.0" -> Right "module x\ngo 1.26.3\n"
+        "v0.80.0" -> Right "module x\ngo 1.26.0\n"
+        _ -> Left "missing"
+  (planOps, fetchTags) <- mkEarlyExitPlanOps versions fetchBody
+  plan <-
+    assertRight "plain older"
+      =<< planGoPackage planOps (GitHub "o" "r" "v") Nothing
+  tags <- reverse <$> readIORef fetchTags
+  assertEq
+    "stop after plain filled"
+    ["v0.86.0", "v0.84.0", "v0.82.0"]
+    tags
+  assertTrue "did not probe older than plain" ("v0.80.0" `notElem` tags)
+  assertEq
+    "tilde 0.86"
+    (Just (parseEbuildVersion "0.86.0"))
+    (lanePV plan LaneAmd64Tilde)
+  assertEq
+    "plain 0.82"
+    (Just (parseEbuildVersion "0.82.0"))
+    (lanePV plan LaneAmd64Plain)
+
+-- | Early-exit lane targets equal full-probe + selectAllLaneTargets.
+testGoModProbeEarlyExitMatchesFullProbe :: IO ()
+testGoModProbeEarlyExitMatchesFullProbe = do
+  let versions =
+        [ parseEbuildVersion "0.86.0",
+          parseEbuildVersion "0.84.0",
+          parseEbuildVersion "0.82.0",
+          parseEbuildVersion "0.80.0"
+        ]
+      goReqFor = \case
+        "v0.86.0" -> Just "1.26.5"
+        "v0.84.0" -> Just "1.26.4"
+        "v0.82.0" -> Just "1.26.3"
+        "v0.80.0" -> Just "1.26.0"
+        _ -> Nothing
+      fetchBody tag =
+        case goReqFor tag of
+          Just req -> Right ("module x\ngo " <> req <> "\n")
+          Nothing -> Left "missing"
+      fullCandidates =
+        [ VersionCandidate
+            { vcPV = pv,
+              vcGoReq = goReqFor ("v" <> renderPVNoRev pv)
+            }
+        | pv <- versions
+        ]
+      expectedTargets = selectAllLaneTargets earlyExitCeilings fullCandidates
+  (planOps, _) <- mkEarlyExitPlanOps versions fetchBody
+  plan <-
+    assertRight "early exit matches full"
+      =<< planGoPackage planOps (GitHub "o" "r" "v") Nothing
+  assertEq
+    "lane targets match full probe"
+    expectedTargets
+    (glpLanes plan)
+
+-- | Unparseable tip is skipped; older parseable version used.
+testGoModProbeEarlyExitSkipsUnparseableTip :: IO ()
+testGoModProbeEarlyExitSkipsUnparseableTip = do
+  let versions =
+        [ parseEbuildVersion "0.90.0",
+          parseEbuildVersion "0.84.0",
+          parseEbuildVersion "0.82.0"
+        ]
+      fetchBody = \case
+        "v0.90.0" -> Right "module x\n" -- no go directive
+        "v0.84.0" -> Right "module x\ngo 1.26.3\n"
+        "v0.82.0" -> Right "module x\ngo 1.26.3\n"
+        _ -> Left "missing"
+  (planOps, fetchTags) <- mkEarlyExitPlanOps versions fetchBody
+  plan <-
+    assertRight "skip unparseable tip"
+      =<< planGoPackage planOps (GitHub "o" "r" "v") Nothing
+  tags <- reverse <$> readIORef fetchTags
+  assertTrue "probed tip" ("v0.90.0" `elem` tags)
+  assertTrue "probed next" ("v0.84.0" `elem` tags)
+  assertEq
+    "only tip then fill"
+    ["v0.90.0", "v0.84.0"]
+    tags
+  assertEq "unique 0.84" [parseEbuildVersion "0.84.0"] (glpUniquePVs plan)
+  assertEq
+    "plain 0.84"
+    (Just (parseEbuildVersion "0.84.0"))
+    (lanePV plan LaneAmd64Plain)
+
+-- | Progress reports three coarse steps; probe done once.
+testGoPlanProgressCoarseSteps :: IO ()
+testGoPlanProgressCoarseSteps = do
+  let versions =
+        [ parseEbuildVersion "0.90.0",
+          parseEbuildVersion "0.84.0",
+          parseEbuildVersion "0.82.0"
+        ]
+      fetchBody = \case
+        "v0.90.0" -> Right "module x\ngo 1.26.3\n"
+        tag -> Right ("module x\ngo 1.26.5\n" <> tag)
+  (planOps, _) <- mkEarlyExitPlanOps versions fetchBody
+  events <- newIORef ([] :: [T.Text])
+  listCount <- newIORef (0 :: Int)
+  probeCount <- newIORef (0 :: Int)
+  let logEv e = atomicModifyIORef' events (\es -> (e : es, ()))
+      progress =
+        PlanProgress
+          { ppOnCeilingsStart = logEv "ceilings-start",
+            ppOnCeilingsDone = logEv "ceilings-done",
+            ppOnListStart = logEv "list-start",
+            ppOnListDone = \n -> do
+              writeIORef listCount n
+              logEv "list-done",
+            ppOnProbeDone = do
+              atomicModifyIORef' probeCount (\c -> (c + 1, ()))
+              logEv "probe-done"
+          }
+  _ <-
+    assertRight "plan with progress"
+      =<< planGoPackageWithProgress planOps progress (GitHub "o" "r" "v") Nothing
+  evs <- reverse <$> readIORef events
+  nList <- readIORef listCount
+  nProbe <- readIORef probeCount
+  assertEq
+    "coarse event order"
+    [ "ceilings-start",
+      "ceilings-done",
+      "list-start",
+      "list-done",
+      "probe-done"
+    ]
+    evs
+  assertEq "list reports version count" 3 nList
+  assertEq "probe done once" 1 nProbe
+  -- Hooks optional path still works.
+  _ <-
+    assertRight "noop progress"
+      =<< planGoPackageWithProgress
+        planOps
+        noopPlanProgress
+        (GitHub "o" "r" "v")
+        Nothing
+  pure ()
 
 ------------------------------------------------------------------------
 -- Richer activity progress / work budget / go.mod cache

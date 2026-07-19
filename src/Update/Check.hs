@@ -263,18 +263,16 @@ checkPackageGo mh planOps entry locals src mSub = do
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
--- | Progress hooks: ceilings + list + one step per go.mod probe.
+-- | Progress hooks: three coarse steps (ceilings, list, go.mod probe walk).
 goPlanProgress :: MultiHandle -> PackageKey -> PlanProgress
 goPlanProgress mh key =
   PlanProgress
     { ppOnCeilingsStart = do
-        mhSteps mh key 2
+        mhSteps mh key 3
         mhStatus mh key "discovering go ceilings",
       ppOnCeilingsDone = mhStep mh key "discovering go ceilings",
       ppOnListStart = mhStatus mh key "listing versions",
-      ppOnListDone = \n -> do
-        mhSteps mh key (2 + n)
-        mhStep mh key "listing versions",
+      ppOnListDone = \_n -> mhStep mh key "listing versions",
       ppOnProbeDone = mhStep mh key "probing go.mod"
     }
 

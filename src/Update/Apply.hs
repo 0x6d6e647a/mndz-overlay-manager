@@ -451,19 +451,18 @@ applyGoVendorLanes env overlayRoot entry src mSub = do
             False
         ]
 
--- | Planning progress during update apply (same step model as outdated).
+-- | Planning progress during update apply (same 3-step model as outdated).
 goApplyPlanProgress :: MultiHandle -> PackageKey -> IORef Int -> PlanProgress
 goApplyPlanProgress mh key doneRef =
   PlanProgress
     { ppOnCeilingsStart = do
-        mhSteps mh key 2
+        mhSteps mh key 3
         mhStatus mh key "discovering go ceilings",
       ppOnCeilingsDone = do
         atomicModifyIORef' doneRef (\n -> (n + 1, ()))
         mhStep mh key "discovering go ceilings",
       ppOnListStart = mhStatus mh key "listing versions",
-      ppOnListDone = \n -> do
-        mhSteps mh key (2 + n)
+      ppOnListDone = \_n -> do
         atomicModifyIORef' doneRef (\d -> (d + 1, ()))
         mhStep mh key "listing versions",
       ppOnProbeDone = do
