@@ -25,19 +25,19 @@ The library SHALL provide an ebuild version type that represents either a numeri
 - **WHEN** a version string cannot be parsed as numeric components with optional revision
 - **THEN** the library represents it as a raw version preserving the original string
 
-### Requirement: Pretty render with leading v
+### Requirement: Pretty render as PV form
 
-The library SHALL provide a pretty-render function for display that prefixes a successful numeric (or raw) version with `v` and includes `-rN` when a revision is present (e.g. `v1.5.3-r2`). The leading `v` is display-only and SHALL NOT be required in stored or compared PV form.
+The library SHALL provide a pretty-render function for display that renders a version in PV form: numeric components joined by `.`, with `-rN` when a revision is present, and without a leading `v` (e.g. `1.5.3-r2`). Raw versions SHALL be rendered as their original string without adding a `v` prefix. Display form SHALL match stored/compared PV render for the same value.
 
 #### Scenario: Render local version with revision
 
 - **WHEN** a numeric version `1.5.3` with revision `2` is pretty-rendered
-- **THEN** the result is `v1.5.3-r2`
+- **THEN** the result is `1.5.3-r2`
 
 #### Scenario: Render version without revision
 
 - **WHEN** a numeric version `2.1.10` without revision is pretty-rendered
-- **THEN** the result is `v2.1.10`
+- **THEN** the result is `2.1.10`
 
 ### Requirement: PV comparison for updates
 

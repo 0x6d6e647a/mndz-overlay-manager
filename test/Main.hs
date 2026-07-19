@@ -424,11 +424,11 @@ testVersionRender :: IO ()
 testVersionRender = do
   assertEq
     "pretty with rev"
-    "v1.5.3-r2"
+    "1.5.3-r2"
     (prettyVersion (Numeric [1, 5, 3] (Just 2)))
   assertEq
     "pretty no rev"
-    "v2.1.10"
+    "2.1.10"
     (prettyVersion (Numeric [2, 1, 10] Nothing))
 
 testVersionCompare :: IO ()

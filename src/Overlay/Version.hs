@@ -60,11 +60,12 @@ parseNumeric s = do
       | all isDigit xs = Just (fromInteger (read xs :: Integer))
       | otherwise = Nothing
 
--- | Pretty-render with leading @v@ and optional @-rN@.
+-- | Pretty-render for display as PV form (optional @-rN@, no leading @v@).
+-- Currently identical to 'renderPV'; kept as a named display hook.
 prettyVersion :: EbuildVersion -> Text
-prettyVersion = ("v" <>) . renderPV
+prettyVersion = renderPV
 
--- | Render without leading @v@ (stored/compared PV form).
+-- | Render stored/compared PV form (optional @-rN@, no leading @v@).
 renderPV :: EbuildVersion -> Text
 renderPV (Raw t) = t
 renderPV (Numeric comps mrev) =
