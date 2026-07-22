@@ -16,19 +16,28 @@ import CLI.Progress
     JobRow (..),
     MultiHandle (..),
     MultiState (..),
+    PanelIO (..),
+    ProgressConfig,
+    defaultPanelIO,
+    mkProgressConfig,
     multiHandle,
     noopMultiHandle,
+    pauseActivePanel,
     planDraw,
     renderMulti,
+    resumeActivePanel,
+    withMultiProgressIO,
+    withStepProgressIO,
   )
-import Colog (Msg (..))
+import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
 import Config.Loader (ConfigError (..), loadConfig)
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (mapConcurrently)
+import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
-import Control.Monad (unless, void)
+import Control.Exception (SomeException, throwIO, try)
+import Control.Monad (forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
@@ -41,6 +50,7 @@ import Data.Text.IO qualified as TIO
 import GHC.Stack (callStack)
 import Logging.Bootstrap
   ( fmtMessageColored,
+    mkLogHold,
     showSeverityColored,
     verbosityToSeverity,
   )
@@ -240,6 +250,13 @@ main = do
   testWorkBudgetBound
   testMultiProgressState
   testPlanDraw
+  testMultiProgressDrawThrowNoHang
+  testMultiProgressBodyThrowNoHang
+  testMultiProgressPanelFailSuccess
+  testStepProgressDrawThrowNoHang
+  testStepProgressBodyThrowNoHang
+  testStepProgressPanelFailSuccess
+  testPauseClearThrowLockNotStuck
   testGoTreeCeilings
   testGoKeywordsAssembly
   testGoLaneSelection
@@ -2017,6 +2034,147 @@ assertPlanInvariants label prev plan = do
     (dpMoveBack plan)
     (dpClearExtra plan)
   assertEq (label <> " move-up is prev") prev (dpMoveUp plan)
+
+------------------------------------------------------------------------
+-- Progress host no-hang (injectable PanelIO; no TTY required)
+------------------------------------------------------------------------
+
+-- | Bound for host teardown in no-hang tests (≫ 300ms grace + one tick).
+hostNoHangBoundMicros :: Int
+hostNoHangBoundMicros = 2_000_000
+
+silentLogger :: LogAction IO Message
+silentLogger = LogAction (\_ -> pure ())
+
+mkEnabledProgressConfig :: IO ProgressConfig
+mkEnabledProgressConfig = do
+  hold <- mkLogHold
+  mkProgressConfig True ColorOff hold silentLogger
+
+drawBombIO :: PanelIO
+drawBombIO =
+  defaultPanelIO
+    { pioDrawFrame = \_ _ _ -> throwIO (userError "draw bomb"),
+      pioClearLines = \_ _ -> pure (),
+      pioDelay = \_ -> pure ()
+    }
+
+-- | Draw blocks until cancelled (forces cancel-after-grace path).
+stuckDrawIO :: PanelIO
+stuckDrawIO =
+  defaultPanelIO
+    { pioDrawFrame = \_ _ _ -> forever (threadDelay 100_000),
+      pioClearLines = \_ _ -> pure (),
+      pioDelay = \_ -> pure ()
+    }
+
+clearBombIO :: PanelIO
+clearBombIO =
+  defaultPanelIO
+    { pioDrawFrame = \_ _ _ -> pure 0,
+      pioClearLines = \_ _ -> throwIO (userError "clear bomb"),
+      pioDelay = threadDelay
+    }
+
+assertFinishesWithin :: String -> IO a -> IO a
+assertFinishesWithin label action = do
+  raced <- race (threadDelay hostNoHangBoundMicros) action
+  case raced of
+    Left () -> do
+      hPutStrLn stderr $ label <> ": host did not finish within bound (hang)"
+      exitFailure
+    Right a -> pure a
+
+testMultiProgressDrawThrowNoHang :: IO ()
+testMultiProgressDrawThrowNoHang = do
+  cfg <- mkEnabledProgressConfig
+  void $
+    assertFinishesWithin "multi draw throw" $
+      withMultiProgressIO drawBombIO cfg "Checking" 1 $
+        \_ -> pure ()
+
+testMultiProgressBodyThrowNoHang :: IO ()
+testMultiProgressBodyThrowNoHang = do
+  cfg <- mkEnabledProgressConfig
+  er <-
+    assertFinishesWithin "multi body throw" $
+      try @SomeException $
+        withMultiProgressIO defaultPanelIO cfg "Checking" 1 $ \_ ->
+          throwIO (userError "body boom")
+  case er of
+    Left _ -> pure ()
+    Right () -> do
+      hPutStrLn stderr "multi body throw: expected exception to propagate"
+      exitFailure
+
+testMultiProgressPanelFailSuccess :: IO ()
+testMultiProgressPanelFailSuccess = do
+  cfg <- mkEnabledProgressConfig
+  -- Panel dies on first draw; body still succeeds.
+  r1 <-
+    assertFinishesWithin "multi panel fail success" $
+      withMultiProgressIO drawBombIO cfg "Checking" 1 $
+        \_ -> pure (42 :: Int)
+  assertEq "multi panel fail returns body" 42 r1
+  -- Stuck draw forces cancel-after-grace; body result preserved.
+  r2 <-
+    assertFinishesWithin "multi panel cancel success" $
+      withMultiProgressIO stuckDrawIO cfg "Checking" 1 $
+        \_ -> pure (7 :: Int)
+  assertEq "multi panel cancel returns body" 7 r2
+
+testStepProgressDrawThrowNoHang :: IO ()
+testStepProgressDrawThrowNoHang = do
+  cfg <- mkEnabledProgressConfig
+  void $
+    assertFinishesWithin "step draw throw" $
+      withStepProgressIO drawBombIO cfg 1 $
+        \_ -> pure ()
+
+testStepProgressBodyThrowNoHang :: IO ()
+testStepProgressBodyThrowNoHang = do
+  cfg <- mkEnabledProgressConfig
+  er <-
+    assertFinishesWithin "step body throw" $
+      try @SomeException $
+        withStepProgressIO defaultPanelIO cfg 1 $ \_ ->
+          throwIO (userError "body boom")
+  case er of
+    Left _ -> pure ()
+    Right () -> do
+      hPutStrLn stderr "step body throw: expected exception to propagate"
+      exitFailure
+
+testStepProgressPanelFailSuccess :: IO ()
+testStepProgressPanelFailSuccess = do
+  cfg <- mkEnabledProgressConfig
+  r1 <-
+    assertFinishesWithin "step panel fail success" $
+      withStepProgressIO drawBombIO cfg 1 $
+        \_ -> pure ("ok" :: String)
+  assertEq "step panel fail returns body" "ok" r1
+  r2 <-
+    assertFinishesWithin "step panel cancel success" $
+      withStepProgressIO stuckDrawIO cfg 1 $
+        \_ -> pure ("ok2" :: String)
+  assertEq "step panel cancel returns body" "ok2" r2
+
+testPauseClearThrowLockNotStuck :: IO ()
+testPauseClearThrowLockNotStuck = do
+  cfg <- mkEnabledProgressConfig
+  void $
+    assertFinishesWithin "pause clear throw" $
+      withMultiProgressIO clearBombIO cfg "Checking" 1 $ \_ -> do
+        -- Clear under pause throws, but withDrawLock must release.
+        er <- try @SomeException (pauseActivePanel cfg)
+        case er of
+          Left _ -> pure ()
+          Right () -> do
+            hPutStrLn stderr "pause clear throw: expected clear bomb"
+            exitFailure
+        -- Resume must not block indefinitely on an abandoned draw lock.
+        resumeActivePanel cfg
+        pure ()
 
 ------------------------------------------------------------------------
 -- Release lookup / reuse / Manifest content-fix

@@ -14,6 +14,11 @@ module CLI.Progress
     withUiSuspended,
     pauseActivePanel,
     resumeActivePanel,
+    -- Test seam (production entry points wrap defaultPanelIO)
+    PanelIO (..),
+    defaultPanelIO,
+    withMultiProgressIO,
+    withStepProgressIO,
     -- Pure multi-progress state (for tests)
     ActiveJob (..),
     JobRow (..),
@@ -28,10 +33,11 @@ where
 
 import CLI.Parser (ColorMode (..))
 import Colog (LogAction, Message)
-import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryTakeMVar)
-import Control.Exception (bracket, bracket_, finally)
-import Control.Monad (when)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (Async, cancel, race, waitCatch, withAsync)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, tryPutMVar, tryTakeMVar, withMVar)
+import Control.Exception (bracket_, finally)
+import Control.Monad (unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sortOn)
@@ -148,6 +154,48 @@ withUiSuspended cfg =
   bracket_ (pauseActivePanel cfg) (resumeActivePanel cfg)
 
 ------------------------------------------------------------------------
+-- Injectable panel IO (test seam)
+------------------------------------------------------------------------
+
+-- | Side effects used by the progress panel host.
+--
+-- Production uses 'defaultPanelIO'. Tests inject draw/clear/delay failures
+-- to prove teardown cannot hang on progress-internal MVars.
+data PanelIO = PanelIO
+  { pioDrawFrame :: Handle -> Int -> String -> IO Int,
+    pioClearLines :: Handle -> Int -> IO (),
+    pioDelay :: Int -> IO ()
+  }
+
+-- | Production panel IO: ANSI draw/clear on the handle and 'threadDelay'.
+defaultPanelIO :: PanelIO
+defaultPanelIO =
+  PanelIO
+    { pioDrawFrame = drawFrame,
+      pioClearLines = clearLines,
+      pioDelay = threadDelay
+    }
+
+-- | Grace period for cooperative panel stop before cancel (300ms).
+panelStopGraceMicros :: Int
+panelStopGraceMicros = 300_000
+
+-- | Exception-safe draw mutex: always release on throw.
+withDrawLock :: MVar () -> IO a -> IO a
+withDrawLock lock action = withMVar lock (const action)
+
+-- | Cooperative stop, grace wait, then cancel + reap. Swallows panel failures.
+reapPanel :: Async () -> MVar () -> IO ()
+reapPanel panel stopVar = do
+  void (tryPutMVar stopVar ())
+  raced <- race (waitCatch panel) (threadDelay panelStopGraceMicros)
+  case raced of
+    Left _ -> pure ()
+    Right () -> do
+      cancel panel
+      void (waitCatch panel)
+
+------------------------------------------------------------------------
 -- Multi-progress
 ------------------------------------------------------------------------
 
@@ -180,7 +228,17 @@ withMultiProgress ::
   Int ->
   (MultiHandle -> IO a) ->
   IO a
-withMultiProgress cfg label total action
+withMultiProgress = withMultiProgressIO defaultPanelIO
+
+-- | Multi-progress host with injectable panel IO (for tests).
+withMultiProgressIO ::
+  PanelIO ->
+  ProgressConfig ->
+  Text ->
+  Int ->
+  (MultiHandle -> IO a) ->
+  IO a
+withMultiProgressIO pio cfg label total action
   | not (pcEnabled cfg) || total <= 0 = action noopMultiHandle
   | otherwise = do
       beginLogHold (pcLogHold cfg)
@@ -194,7 +252,6 @@ withMultiProgress cfg label total action
               msTick = 0
             }
       stopVar <- newEmptyMVar
-      doneVar <- newEmptyMVar
       drawLock <- newMVar ()
       pausedRef <- newIORef False
       lineCountRef <- newIORef 0
@@ -203,19 +260,17 @@ withMultiProgress cfg label total action
           handle = multiHandle stateRef
           ctrl =
             PanelController
-              { panelPause = pausePanel drawLock pausedRef lineCountRef h,
+              { panelPause = pausePanel pio drawLock pausedRef lineCountRef h,
                 panelResume = resumePanel drawLock pausedRef
               }
       writeIORef (pcPanelCtrl cfg) (Just ctrl)
-      bracket
-        (forkIO (multiPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef))
-        ( \_ -> do
-            putMVar stopVar ()
-            takeMVar doneVar
+      withAsync
+        (multiPanelLoop pio h color stateRef stopVar drawLock pausedRef lineCountRef)
+        $ \panel ->
+          action handle `finally` do
+            reapPanel panel stopVar
             writeIORef (pcPanelCtrl cfg) Nothing
             flushLogHold (pcLogHold cfg) (pcLogger cfg)
-        )
-        (\_ -> action handle)
 
 multiHandle :: IORef MultiState -> MultiHandle
 multiHandle stateRef =
@@ -307,48 +362,37 @@ multiHandle stateRef =
     }
 
 multiPanelLoop ::
+  PanelIO ->
   Handle ->
   ColorMode ->
   IORef MultiState ->
   MVar () ->
   MVar () ->
-  MVar () ->
   IORef Bool ->
   IORef Int ->
   IO ()
-multiPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef = do
-  let cleanup = do
-        takeMVar drawLock
-        clearLines h =<< readIORef lineCountRef
-        writeIORef lineCountRef 0
-        putMVar drawLock ()
-        putMVar doneVar ()
+multiPanelLoop pio h color stateRef stopVar drawLock pausedRef lineCountRef = do
+  let cleanup =
+        withDrawLock drawLock $ do
+          pioClearLines pio h =<< readIORef lineCountRef
+          writeIORef lineCountRef 0
       tickLoop = do
         stopped <- tryTakeMVar stopVar
-        takeMVar drawLock
-        paused <- readIORef pausedRef
-        if paused
-          then do
-            putMVar drawLock ()
-            case stopped of
-              Just () -> pure ()
-              Nothing -> do
-                threadDelay 80_000
-                tickLoop
-          else do
+        withDrawLock drawLock $ do
+          paused <- readIORef pausedRef
+          unless paused $ do
             s0 <- readIORef stateRef
             let s = s0 {msTick = msTick s0 + 1}
             writeIORef stateRef s
             let frame = renderMulti color s
             prev <- readIORef lineCountRef
-            store <- drawFrame h prev frame
+            store <- pioDrawFrame pio h prev frame
             writeIORef lineCountRef store
-            putMVar drawLock ()
-            case stopped of
-              Just () -> pure ()
-              Nothing -> do
-                threadDelay 80_000
-                tickLoop
+        case stopped of
+          Just () -> pure ()
+          Nothing -> do
+            pioDelay pio 80_000
+            tickLoop
   tickLoop `finally` cleanup
 
 renderMulti :: ColorMode -> MultiState -> String
@@ -431,7 +475,16 @@ withStepProgress ::
   Int ->
   (StepHandle -> IO a) ->
   IO a
-withStepProgress cfg total action
+withStepProgress = withStepProgressIO defaultPanelIO
+
+-- | Step-progress host with injectable panel IO (for tests).
+withStepProgressIO ::
+  PanelIO ->
+  ProgressConfig ->
+  Int ->
+  (StepHandle -> IO a) ->
+  IO a
+withStepProgressIO pio cfg total action
   | not (pcEnabled cfg) || total <= 0 = action noopStepHandle
   | otherwise = do
       beginLogHold (pcLogHold cfg)
@@ -444,7 +497,6 @@ withStepProgress cfg total action
               ssTick = 0
             }
       stopVar <- newEmptyMVar
-      doneVar <- newEmptyMVar
       drawLock <- newMVar ()
       pausedRef <- newIORef False
       lineCountRef <- newIORef 0
@@ -460,63 +512,50 @@ withStepProgress cfg total action
               }
           ctrl =
             PanelController
-              { panelPause = pausePanel drawLock pausedRef lineCountRef h,
+              { panelPause = pausePanel pio drawLock pausedRef lineCountRef h,
                 panelResume = resumePanel drawLock pausedRef
               }
       writeIORef (pcPanelCtrl cfg) (Just ctrl)
-      bracket
-        (forkIO (stepPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef))
-        ( \_ -> do
-            putMVar stopVar ()
-            takeMVar doneVar
+      withAsync
+        (stepPanelLoop pio h color stateRef stopVar drawLock pausedRef lineCountRef)
+        $ \panel ->
+          action handle `finally` do
+            reapPanel panel stopVar
             writeIORef (pcPanelCtrl cfg) Nothing
             flushLogHold (pcLogHold cfg) (pcLogger cfg)
-        )
-        (\_ -> action handle)
 
 stepPanelLoop ::
+  PanelIO ->
   Handle ->
   ColorMode ->
   IORef StepState ->
   MVar () ->
   MVar () ->
-  MVar () ->
   IORef Bool ->
   IORef Int ->
   IO ()
-stepPanelLoop h color stateRef stopVar doneVar drawLock pausedRef lineCountRef = do
-  let cleanup = do
-        takeMVar drawLock
-        clearLines h =<< readIORef lineCountRef
-        writeIORef lineCountRef 0
-        putMVar drawLock ()
-        putMVar doneVar ()
+stepPanelLoop pio h color stateRef stopVar drawLock pausedRef lineCountRef = do
+  let cleanup =
+        withDrawLock drawLock $ do
+          pioClearLines pio h =<< readIORef lineCountRef
+          writeIORef lineCountRef 0
       tickLoop = do
         stopped <- tryTakeMVar stopVar
-        takeMVar drawLock
-        paused <- readIORef pausedRef
-        if paused
-          then do
-            putMVar drawLock ()
-            case stopped of
-              Just () -> pure ()
-              Nothing -> do
-                threadDelay 80_000
-                tickLoop
-          else do
+        withDrawLock drawLock $ do
+          paused <- readIORef pausedRef
+          unless paused $ do
             s0 <- readIORef stateRef
             let s = s0 {ssTick = ssTick s0 + 1}
             writeIORef stateRef s
             let frame = renderStep color s
             prev <- readIORef lineCountRef
-            store <- drawFrame h prev frame
+            store <- pioDrawFrame pio h prev frame
             writeIORef lineCountRef store
-            putMVar drawLock ()
-            case stopped of
-              Just () -> pure ()
-              Nothing -> do
-                threadDelay 80_000
-                tickLoop
+        case stopped of
+          Just () -> pure ()
+          Nothing -> do
+            pioDelay pio 80_000
+            tickLoop
   tickLoop `finally` cleanup
 
 renderStep :: ColorMode -> StepState -> String
@@ -541,19 +580,17 @@ renderStep color StepState {..} =
 -- Panel pause + stderr frame drawing
 ------------------------------------------------------------------------
 
-pausePanel :: MVar () -> IORef Bool -> IORef Int -> Handle -> IO ()
-pausePanel drawLock pausedRef lineCountRef h = do
-  takeMVar drawLock
-  clearLines h =<< readIORef lineCountRef
-  writeIORef lineCountRef 0
-  writeIORef pausedRef True
-  putMVar drawLock ()
+pausePanel :: PanelIO -> MVar () -> IORef Bool -> IORef Int -> Handle -> IO ()
+pausePanel pio drawLock pausedRef lineCountRef h =
+  withDrawLock drawLock $ do
+    pioClearLines pio h =<< readIORef lineCountRef
+    writeIORef lineCountRef 0
+    writeIORef pausedRef True
 
 resumePanel :: MVar () -> IORef Bool -> IO ()
-resumePanel drawLock pausedRef = do
-  takeMVar drawLock
-  writeIORef pausedRef False
-  putMVar drawLock ()
+resumePanel drawLock pausedRef =
+  withDrawLock drawLock $
+    writeIORef pausedRef False
 
 -- | Pure plan for one multi-line panel redraw.
 --
