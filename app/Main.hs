@@ -192,7 +192,8 @@ runUpdate rt pkgArgs = do
                 pure
                   ReleaseOps
                     { roGetReleaseByTag = \_ _ _ -> pure (Left "GitHub token required"),
-                      roDownloadAsset = \_ _ -> pure (Left "GitHub token required")
+                      roDownloadAsset = \_ _ -> pure (Left "GitHub token required"),
+                      roCreateReleaseWithAsset = \_ _ -> pure (Left "GitHub token required")
                     }
             let env =
                   ApplyEnv

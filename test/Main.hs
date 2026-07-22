@@ -78,11 +78,15 @@ import Update.Apply
     applyPackagePhase1,
     contentFixNeeded,
     foldExitHardFail,
+    fullPathMaterializeSteps,
     goPublishAndOverlay,
     markSuccessLinesReused,
     materializePlan,
+    materializeStepTotalUpper,
     newEbuildFileName,
     renderPVNoRev,
+    reusePathMaterializeSteps,
+    reviseMaterializeStepTotal,
     signedOverlayCommit,
   )
 import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
@@ -155,8 +159,10 @@ import Update.Go.Tree
   )
 import Update.Go.Vendor
   ( VendorOps (..),
+    VendorProgress (..),
     VendorResult (..),
     buildVendorTarball,
+    noopVendorProgress,
   )
 import Update.Go.Version
   ( compareGoVersions,
@@ -297,6 +303,10 @@ main = do
   testReleaseLookup
   testContentFixManifest
   testReuseVsFullPublish
+  testVendorProgressEventOrder
+  testFullPathApplyProgressSequence
+  testReusePathApplyProgressSequence
+  testMaterializeStepBudget
   testMarkSuccessLinesReused
   testGitMvCommitsOnSuccess
   testGoMultiPvSequentialCommits
@@ -1025,7 +1035,17 @@ testVendorGoVersionGate = do
           }
   -- Older host: fail before download
   atomicModifyIORef' downloadCalls (const (0, ()))
-  older <- buildVendorTarball (ops "1.26.4") "o" "r" "v" "0.1.0" Nothing "/tmp" "pkg-0.1.0-vendor.tar.xz"
+  older <-
+    buildVendorTarball
+      (ops "1.26.4")
+      noopVendorProgress
+      "o"
+      "r"
+      "v"
+      "0.1.0"
+      Nothing
+      "/tmp"
+      "pkg-0.1.0-vendor.tar.xz"
   case older of
     Left msg -> do
       assertTrue "names host" ("1.26.4" `T.isInfixOf` msg)
@@ -1041,6 +1061,7 @@ testVendorGoVersionGate = do
     ok <-
       buildVendorTarball
         (ops "1.26.5")
+        noopVendorProgress
         "o"
         "r"
         "v"
@@ -2394,7 +2415,8 @@ testReleaseLookup = do
                 if tag == "beads-1.0.5"
                   then Right (Just info)
                   else Right Nothing,
-            roDownloadAsset = \_ _ -> pure (Right ())
+            roDownloadAsset = \_ _ -> pure (Right ()),
+            roCreateReleaseWithAsset = \_ _ -> pure (Left "unused create")
           }
   found <- lookupNamedAsset opsFound "o" "r" "beads-1.0.5" "beads-1.0.5-vendor.tar.xz"
   assertEq "lookup found" (Right (Just "https://example/a")) found
@@ -2483,7 +2505,8 @@ unusedReleaseOps :: ReleaseOps
 unusedReleaseOps =
   ReleaseOps
     { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
-      roDownloadAsset = \_ _ -> pure (Left "unused")
+      roDownloadAsset = \_ _ -> pure (Left "unused"),
+      roCreateReleaseWithAsset = \_ _ -> pure (Left "unused")
     }
 
 testContentFixManifest :: IO ()
@@ -2710,17 +2733,20 @@ testReuseVsFullPublish =
                         },
               roDownloadAsset = \_url dest -> do
                 BS.writeFile dest assetBytes
-                pure (Right ())
+                pure (Right ()),
+              roCreateReleaseWithAsset = \_ _ -> pure (Left "should not create on reuse")
             }
         releaseMissing =
           ReleaseOps
             { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
-              roDownloadAsset = \_ _ -> pure (Left "should not download")
+              roDownloadAsset = \_ _ -> pure (Left "should not download"),
+              roCreateReleaseWithAsset = \_ _ -> pure (Right ())
             }
     assetsLock <- newMVar ()
     overlayLock <- newMVar ()
     -- Reuse path: no vendor calls; success with assets reused; Manifest matches.
     writeIORef vendorCallRef 0
+    stepsDoneReuse <- newIORef (0 :: Int)
     outcomeReuse <-
       goPublishAndOverlay
         (mkEnv releaseFound ebuildRunnerOk assetsLock overlayLock)
@@ -2733,6 +2759,8 @@ testReuseVsFullPublish =
         ["~amd64"]
         lines_
         pv
+        stepsDoneReuse
+        1
     case outcomeReuse of
       ApplySuccess _ sls _ -> do
         assertTrue "reuse marks lines" (all slAssetsReused sls)
@@ -2742,6 +2770,7 @@ testReuseVsFullPublish =
         hPutStrLn stderr ("expected reuse success, got: " <> show other)
         exitFailure
     -- Manifest mismatch hard-fails on reuse.
+    stepsDoneBad <- newIORef (0 :: Int)
     outcomeBad <-
       goPublishAndOverlay
         (mkEnv releaseFound ebuildRunnerWrong assetsLock overlayLock)
@@ -2754,6 +2783,8 @@ testReuseVsFullPublish =
         ["~amd64"]
         lines_
         pv
+        stepsDoneBad
+        1
     case outcomeBad of
       ApplyHardFail _ msg _ _ ->
         assertTrue
@@ -2772,15 +2803,12 @@ testReuseVsFullPublish =
                 pure (Right ()),
               voHostGoVersion = pure (Right "1.26.5"),
               voGoModDownload = \_ -> pure (Right ()),
-              voTarXz = \_vendorDir outDir name -> do
-                let p = outDir </> name
-                BS.writeFile p assetBytes
+              voTarXz = \_goDir _entry outPath -> do
+                BS.writeFile outPath assetBytes
                 pure (Right ())
             }
-    -- full path also calls createReleaseWithAsset (live HTTP) — we cannot easily
-    -- inject that. Instead assert lookup not-found leads to vendor being invoked
-    -- (fails later on create-release without network is ok if vendor ran first).
     writeIORef vendorCallRef 0
+    stepsDoneFull <- newIORef (0 :: Int)
     let envFull =
           (mkEnv releaseMissing ebuildRunnerOk assetsLock overlayLock)
             { aeVendorOps = vendorOpsFull
@@ -2797,6 +2825,8 @@ testReuseVsFullPublish =
         ["~amd64"]
         lines_
         pv
+        stepsDoneFull
+        1
     nFull <- readIORef vendorCallRef
     assertTrue "not-found uses full vendor path" (nFull > 0)
 
@@ -2990,7 +3020,8 @@ testGoMultiPvSequentialCommits =
                         },
               roDownloadAsset = \_url dest -> do
                 BS.writeFile dest assetBytes
-                pure (Right ())
+                pure (Right ()),
+              roCreateReleaseWithAsset = \_ _ -> pure (Left "should not create on reuse")
             }
     assetsLock <- newMVar ()
     overlayLock <- newMVar ()
@@ -3137,7 +3168,8 @@ testGoMultiPvStopOnHardFail =
                         },
               roDownloadAsset = \_url dest -> do
                 BS.writeFile dest assetBytes
-                pure (Right ())
+                pure (Right ()),
+              roCreateReleaseWithAsset = \_ _ -> pure (Left "should not create on reuse")
             }
     assetsLock <- newMVar ()
     overlayLock <- newMVar ()
@@ -3177,6 +3209,441 @@ testGoMultiPvStopOnHardFail =
     -- Extra ebuild still present (prune not run).
     extraExists <- doesFileExist (pkgDir </> extraName)
     assertTrue "prune not run" extraExists
+
+-- | Vendor progress fires clone → download → compress start/done in order.
+testVendorProgressEventOrder :: IO ()
+testVendorProgressEventOrder =
+  withSystemTempDirectory "mndz-vendor-progress-" $ \outDir -> do
+    events <- newIORef ([] :: [T.Text])
+    let logEv e = atomicModifyIORef' events (\es -> (e : es, ()))
+        progress =
+          VendorProgress
+            { vpOnCloneStart = logEv "clone-start",
+              vpOnCloneDone = logEv "clone-done",
+              vpOnDownloadStart = logEv "download-start",
+              vpOnDownloadDone = logEv "download-done",
+              vpOnCompressStart = logEv "compress-start",
+              vpOnCompressDone = logEv "compress-done"
+            }
+        ops =
+          VendorOps
+            { voClone = \_ _ dest -> do
+                createDirectoryIfMissing True dest
+                TIO.writeFile (dest </> "go.mod") "module x\ngo 1.26.5\n"
+                pure (Right ()),
+              voHostGoVersion = pure (Right "1.26.5"),
+              voGoModDownload = \_ -> pure (Right ()),
+              voTarXz = \_goDir _entry outPath -> do
+                writeFile outPath "fake-tarball"
+                pure (Right ())
+            }
+    result <-
+      buildVendorTarball
+        ops
+        progress
+        "o"
+        "r"
+        "v"
+        "0.1.0"
+        Nothing
+        outDir
+        "pkg-0.1.0-vendor.tar.xz"
+    case result of
+      Left err -> do
+        hPutStrLn stderr ("expected vendor success, got: " <> T.unpack err)
+        exitFailure
+      Right _ -> pure ()
+    evs <- reverse <$> readIORef events
+    assertEq
+      "vendor progress order"
+      [ "clone-start",
+        "clone-done",
+        "download-start",
+        "download-done",
+        "compress-start",
+        "compress-done"
+      ]
+      evs
+    -- No-op progress still succeeds.
+    void $
+      buildVendorTarball
+        ops
+        noopVendorProgress
+        "o"
+        "r"
+        "v"
+        "0.1.0"
+        Nothing
+        outDir
+        "pkg-0.1.0-vendor-noop.tar.xz"
+
+-- | Full-path apply advances fine-grained status/step events in order.
+testFullPathApplyProgressSequence :: IO ()
+testFullPathApplyProgressSequence =
+  withSystemTempDirectory "mndz-full-progress-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "app-misc" </> "crush"
+        pn = "crush" :: T.Text
+        pv = parseEbuildVersion "0.84.0"
+        ebuildName = "crush-0.84.0.ebuild"
+        ebuildBody =
+          T.unlines
+            [ "EAPI=8",
+              "inherit go-module",
+              "BDEPEND=\">=dev-lang/go-1.26.5:=\"",
+              "KEYWORDS=\"~amd64\"",
+              "SRC_URI=\"https://example/a-${PV}.tar.gz\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+            ]
+        tarballName = vendorTarballName pn "0.84.0"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "app-misc" "crush",
+              pePN = pn,
+              peLocal = pv,
+              pePath = pkgDir </> ebuildName
+            }
+        assetBytes = encodeUtf8 "vendor-tarball-bytes-for-full-progress"
+        digests0 = hashBytes assetBytes
+        lines_ =
+          [ SuccessLine
+              { slFrom = parseEbuildVersion "0.80.0",
+                slTo = pv,
+                slLabel = Just "(dev-lang/go ~amd64)",
+                slAssetsReused = False
+              }
+          ]
+    events <- newIORef ([] :: [T.Text])
+    createDirectoryIfMissing True pkgDir
+    createDirectoryIfMissing True assetsRoot
+    TIO.writeFile (pkgDir </> ebuildName) ebuildBody
+    TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+    writeMatchingCachesForPackage overlayRoot "app-misc" pn pkgDir
+    let logEv e = atomicModifyIORef' events (\es -> (e : es, ()))
+        mh =
+          MultiHandle
+            { mhStart = \_ -> pure (),
+              mhStatus = \_ name -> logEv ("status:" <> name),
+              mhSteps = \_ n -> logEv ("steps:" <> T.pack (show n)),
+              mhStep = \_ name -> logEv ("step:" <> name),
+              mhSuccess = \_ -> pure (),
+              mhFail = \_ _ -> pure ()
+            }
+        gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        ebuildRun _pkg _name = do
+          TIO.writeFile
+            (pkgDir </> "Manifest")
+            ( "DIST "
+                <> T.pack tarballName
+                <> " 1 SHA512 "
+                <> digestSHA512 digests0
+                <> "\n"
+            )
+          pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+        releaseOps =
+          ReleaseOps
+            { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
+              roDownloadAsset = \_ _ -> pure (Left "should not download"),
+              roCreateReleaseWithAsset = \_ _ -> pure (Right ())
+            }
+        vendorOps =
+          VendorOps
+            { voClone = \_ _ dest -> do
+                createDirectoryIfMissing True dest
+                TIO.writeFile (dest </> "go.mod") "module x\ngo 1.26.5\n"
+                pure (Right ()),
+              voHostGoVersion = pure (Right "1.26.5"),
+              voGoModDownload = \_ -> pure (Right ()),
+              voTarXz = \_goDir _entry outPath -> do
+                BS.writeFile outPath assetBytes
+                pure (Right ())
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 2
+    ceilingsCache <- newMVar Nothing
+    stepsDone <- newIORef (0 :: Int)
+    let env0 =
+          mkTestApplyEnv
+            gitOps
+            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+            ebuildRun
+            releaseOps
+            vendorOps
+            (Just assetsRoot)
+            assetsLock
+            overlayLock
+        env = env0 {aeMulti = mh}
+    outcome <-
+      goPublishAndOverlay
+        env
+        overlayRoot
+        entry
+        "charmbracelet"
+        "crush"
+        "v"
+        Nothing
+        ["~amd64"]
+        lines_
+        pv
+        stepsDone
+        1
+    case outcome of
+      ApplySuccess {} -> pure ()
+      other -> do
+        hPutStrLn stderr ("expected full-path success, got: " <> show other)
+        exitFailure
+    evs <- reverse <$> readIORef events
+    let statuses = [e | e <- evs, "status:" `T.isPrefixOf` e]
+        steps = [e | e <- evs, "step:" `T.isPrefixOf` e]
+    assertEq
+      "full-path status sequence"
+      [ "status:probing release asset",
+        "status:cloning upstream",
+        "status:go mod download",
+        "status:compressing tarball",
+        "status:committing assets",
+        "status:pushing assets",
+        "status:uploading release asset",
+        "status:regenerating manifest"
+      ]
+      statuses
+    assertEq
+      "full-path step sequence"
+      [ "step:cloning upstream",
+        "step:go mod download",
+        "step:compressing tarball",
+        "step:committing assets",
+        "step:pushing assets",
+        "step:uploading release asset",
+        "step:regenerating manifest"
+      ]
+      steps
+    assertTrue
+      "no coarse vendoring label"
+      (not (any ("vendoring" `T.isInfixOf`) evs))
+    assertTrue
+      "no coarse publishing assets label"
+      (not (any ("publishing assets" `T.isInfixOf`) evs))
+    done <- readIORef stepsDone
+    assertEq "full path marks 7 steps done" fullPathMaterializeSteps done
+
+-- | Reuse-path apply uses reuse step names only.
+testReusePathApplyProgressSequence :: IO ()
+testReusePathApplyProgressSequence =
+  withSystemTempDirectory "mndz-reuse-progress-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "app-misc" </> "crush"
+        pn = "crush" :: T.Text
+        pv = parseEbuildVersion "0.84.0"
+        ebuildName = "crush-0.84.0.ebuild"
+        ebuildBody =
+          T.unlines
+            [ "EAPI=8",
+              "inherit go-module",
+              "BDEPEND=\">=dev-lang/go-1.26.5:=\"",
+              "KEYWORDS=\"~amd64\"",
+              "SRC_URI=\"https://example/a-${PV}.tar.gz\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+            ]
+        tarballName = vendorTarballName pn "0.84.0"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "app-misc" "crush",
+              pePN = pn,
+              peLocal = pv,
+              pePath = pkgDir </> ebuildName
+            }
+        assetBytes = encodeUtf8 "vendor-tarball-bytes-for-reuse-progress"
+        digests0 = hashBytes assetBytes
+        lines_ =
+          [ SuccessLine
+              { slFrom = parseEbuildVersion "0.80.0",
+                slTo = pv,
+                slLabel = Just "(dev-lang/go ~amd64)",
+                slAssetsReused = False
+              }
+          ]
+    events <- newIORef ([] :: [T.Text])
+    createDirectoryIfMissing True pkgDir
+    createDirectoryIfMissing True assetsRoot
+    TIO.writeFile (pkgDir </> ebuildName) ebuildBody
+    TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+    writeMatchingCachesForPackage overlayRoot "app-misc" pn pkgDir
+    let logEv e = atomicModifyIORef' events (\es -> (e : es, ()))
+        mh =
+          MultiHandle
+            { mhStart = \_ -> pure (),
+              mhStatus = \_ name -> logEv ("status:" <> name),
+              mhSteps = \_ n -> logEv ("steps:" <> T.pack (show n)),
+              mhStep = \_ name -> logEv ("step:" <> name),
+              mhSuccess = \_ -> pure (),
+              mhFail = \_ _ -> pure ()
+            }
+        gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        ebuildRun _pkg _name = do
+          TIO.writeFile
+            (pkgDir </> "Manifest")
+            ( "DIST "
+                <> T.pack tarballName
+                <> " 1 SHA512 "
+                <> digestSHA512 digests0
+                <> "\n"
+            )
+          pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+        releaseOps =
+          ReleaseOps
+            { roGetReleaseByTag = \_ _ _ ->
+                pure $
+                  Right $
+                    Just
+                      ReleaseInfo
+                        { riId = 1,
+                          riTag = "crush-0.84.0",
+                          riAssets =
+                            [ ReleaseAsset
+                                { raName = T.pack tarballName,
+                                  raBrowserDownloadUrl = "https://example/vendor"
+                                }
+                            ]
+                        },
+              roDownloadAsset = \_url dest -> do
+                BS.writeFile dest assetBytes
+                pure (Right ()),
+              roCreateReleaseWithAsset = \_ _ -> pure (Left "should not create on reuse")
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 2
+    ceilingsCache <- newMVar Nothing
+    stepsDone <- newIORef (0 :: Int)
+    let env0 =
+          mkTestApplyEnv
+            gitOps
+            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+            ebuildRun
+            releaseOps
+            unusedVendorOps
+            (Just assetsRoot)
+            assetsLock
+            overlayLock
+        env = env0 {aeMulti = mh}
+    outcome <-
+      goPublishAndOverlay
+        env
+        overlayRoot
+        entry
+        "charmbracelet"
+        "crush"
+        "v"
+        Nothing
+        ["~amd64"]
+        lines_
+        pv
+        stepsDone
+        1
+    case outcome of
+      ApplySuccess _ sls _ ->
+        assertTrue "reuse marks lines" (all slAssetsReused sls)
+      other -> do
+        hPutStrLn stderr ("expected reuse success, got: " <> show other)
+        exitFailure
+    evs <- reverse <$> readIORef events
+    let statuses = [e | e <- evs, "status:" `T.isPrefixOf` e]
+        steps = [e | e <- evs, "step:" `T.isPrefixOf` e]
+        forbidden =
+          [ "vendoring",
+            "publishing assets",
+            "cloning upstream",
+            "go mod download",
+            "compressing tarball",
+            "committing assets",
+            "pushing assets",
+            "uploading release asset"
+          ]
+    assertEq
+      "reuse status sequence"
+      [ "status:probing release asset",
+        "status:reusing release assets",
+        "status:verifying vendor asset",
+        "status:regenerating manifest"
+      ]
+      statuses
+    assertEq
+      "reuse step sequence"
+      [ "step:reusing release assets",
+        "step:verifying vendor asset",
+        "step:regenerating manifest"
+      ]
+      steps
+    assertTrue
+      "no full-path / coarse names on reuse"
+      (not (any (\bad -> any (bad `T.isInfixOf`) evs) forbidden))
+    done <- readIORef stepsDone
+    assertEq "reuse path marks 3 steps done" reusePathMaterializeSteps done
+
+-- | Step-total upper bound and revise-after-probe math for full vs reuse.
+testMaterializeStepBudget :: IO ()
+testMaterializeStepBudget = do
+  assertEq "full path step count" 7 fullPathMaterializeSteps
+  assertEq "reuse path step count" 3 reusePathMaterializeSteps
+  assertEq
+    "upper bound planDone=3 n=2"
+    17
+    (materializeStepTotalUpper 3 2)
+  assertEq
+    "single full path total"
+    7
+    (reviseMaterializeStepTotal 0 fullPathMaterializeSteps 0)
+  assertEq
+    "single reuse path total"
+    3
+    (reviseMaterializeStepTotal 0 reusePathMaterializeSteps 0)
+  -- Mixed: planDone=3, first PV reuses (3), one PV remains at full upper bound.
+  assertEq
+    "reuse first of two"
+    (3 + 3 + 7)
+    (reviseMaterializeStepTotal 3 reusePathMaterializeSteps 1)
+  -- After first full path (7), second reuses:
+  assertEq
+    "reuse second after full"
+    (3 + 7 + 3)
+    (reviseMaterializeStepTotal (3 + 7) reusePathMaterializeSteps 0)
+  -- After first reuse (3), second full:
+  assertEq
+    "full second after reuse"
+    (3 + 3 + 7)
+    (reviseMaterializeStepTotal (3 + 3) fullPathMaterializeSteps 0)
 
 -- | Concurrent overlay commits serialize under aeOverlayLock.
 testOverlayCommitLock :: IO ()

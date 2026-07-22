@@ -2,8 +2,10 @@
 
 module Update.Go.Vendor
   ( VendorOps (..),
+    VendorProgress (..),
     VendorResult (..),
     productionVendorOps,
+    noopVendorProgress,
     buildVendorTarball,
     githubCloneUrl,
     versionTag,
@@ -43,6 +45,31 @@ data VendorOps = VendorOps
     voTarXz :: FilePath -> FilePath -> FilePath -> IO (Either Text ())
   }
 
+-- | Progress callbacks for long vendor sub-phases (UI-free; mirror @PlanProgress@).
+--
+-- Host Go version gating runs under the download phase (no separate hooks).
+-- Done hooks fire only after the phase succeeds; failures leave the active phase
+-- without a done event so the caller can surface the current step name.
+data VendorProgress = VendorProgress
+  { vpOnCloneStart :: IO (),
+    vpOnCloneDone :: IO (),
+    vpOnDownloadStart :: IO (),
+    vpOnDownloadDone :: IO (),
+    vpOnCompressStart :: IO (),
+    vpOnCompressDone :: IO ()
+  }
+
+noopVendorProgress :: VendorProgress
+noopVendorProgress =
+  VendorProgress
+    { vpOnCloneStart = pure (),
+      vpOnCloneDone = pure (),
+      vpOnDownloadStart = pure (),
+      vpOnDownloadDone = pure (),
+      vpOnCompressStart = pure (),
+      vpOnCompressDone = pure ()
+    }
+
 productionVendorOps :: VendorOps
 productionVendorOps =
   VendorOps
@@ -63,6 +90,7 @@ versionTag prefix pv = prefix <> pv
 -- produce vendor tarball in @outDir@ as @tarballName@.
 buildVendorTarball ::
   VendorOps ->
+  VendorProgress ->
   Text ->
   Text ->
   Text ->
@@ -71,17 +99,19 @@ buildVendorTarball ::
   FilePath ->
   FilePath ->
   IO (Either Text VendorResult)
-buildVendorTarball ops owner repo prefix pv mSubdir outDir tarballName = do
+buildVendorTarball ops progress owner repo prefix pv mSubdir outDir tarballName = do
   createDirectoryIfMissing True outDir
   let tag = versionTag prefix pv
       url = githubCloneUrl owner repo
       outPath = outDir </> tarballName
   withSystemTempDirectory "mndz-go-vendor-" $ \tmp -> do
     let cloneDir = tmp </> "src"
+    vpOnCloneStart progress
     cloned <- voClone ops url tag cloneDir
     case cloned of
       Left err -> pure (Left err)
       Right () -> do
+        vpOnCloneDone progress
         let goDir = case mSubdir of
               Nothing -> cloneDir
               Just sub -> cloneDir </> sub
@@ -91,6 +121,8 @@ buildVendorTarball ops owner repo prefix pv mSubdir outDir tarballName = do
           else do
             modText <- TIO.readFile (goDir </> "go.mod")
             let mReq = parseGoModGoDirective modText
+            -- Host Go gate + go mod download share the download progress phase.
+            vpOnDownloadStart progress
             gated <- gateHostGo ops mReq
             case gated of
               Left err -> pure (Left err)
@@ -99,15 +131,19 @@ buildVendorTarball ops owner repo prefix pv mSubdir outDir tarballName = do
                 case downloaded of
                   Left err -> pure (Left err)
                   Right () -> do
+                    vpOnDownloadDone progress
+                    vpOnCompressStart progress
                     tared <- voTarXz ops goDir "go-mod" outPath
-                    pure $ case tared of
-                      Left err -> Left err
-                      Right () ->
-                        Right
-                          VendorResult
-                            { vrTarballPath = outPath,
-                              vrGoModVersion = mReq
-                            }
+                    case tared of
+                      Left err -> pure (Left err)
+                      Right () -> do
+                        vpOnCompressDone progress
+                        pure $
+                          Right
+                            VendorResult
+                              { vrTarballPath = outPath,
+                                vrGoModVersion = mReq
+                              }
 
 -- | If go.mod has a parseable @go@ line, require host Go >= that version.
 gateHostGo :: VendorOps -> Maybe Text -> IO (Either Text ())

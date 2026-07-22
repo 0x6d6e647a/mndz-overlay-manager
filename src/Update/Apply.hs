@@ -16,6 +16,11 @@ module Update.Apply
     signedOverlayCommit,
     egencacheAndSignedCommit,
     materializePlan,
+    -- Materialize step budget (tests / callers)
+    fullPathMaterializeSteps,
+    reusePathMaterializeSteps,
+    materializeStepTotalUpper,
+    reviseMaterializeStepTotal,
   )
 where
 
@@ -61,7 +66,6 @@ import Update.Assets.Layout
 import Update.Assets.Release
   ( ReleaseMeta (..),
     ReleaseOps (..),
-    createReleaseWithAsset,
     lookupNamedAsset,
   )
 import Update.Check (PackageEntry (..))
@@ -92,7 +96,13 @@ import Update.Go.Plan
     isLivePackageVersion,
     planGoPackageWithProgress,
   )
-import Update.Go.Vendor (VendorOps (..), VendorResult (..), buildVendorTarball, versionTag)
+import Update.Go.Vendor
+  ( VendorOps (..),
+    VendorProgress (..),
+    VendorResult (..),
+    buildVendorTarball,
+    versionTag,
+  )
 import Update.Hardcoded (lookupPolicy)
 import Update.Md5Cache
   ( EgencacheRunner,
@@ -627,13 +637,13 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
                 Raw _ -> []
           )
           planned
-      -- Per-PV: vendoring, publishing assets, regenerating manifest.
-      applySteps = length sortedPlanned * 3
-  -- Extend step total so apply phases continue the same package row bar.
-  when (applySteps > 0) $
-    mhSteps mh key (planDone + applySteps)
+      nPVs = length sortedPlanned
+  -- Upper-bound full-path budget; revised down after probe when a PV reuses.
+  when (nPVs > 0) $
+    mhSteps mh key (materializeStepTotalUpper planDone nPVs)
+  stepsDoneRef <- newIORef planDone
   -- Sequential PVs; stop further materializations after first hard-fail.
-  results <- materializeUntilFail sortedPlanned
+  results <- materializeUntilFail stepsDoneRef sortedPlanned
   let failures = [o | o@ApplyHardFail {} <- results]
       successes = [o | o@ApplySuccess {} <- results]
   if not (null failures)
@@ -671,8 +681,8 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
                   | otherwise -> successes
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
-    materializeUntilFail [] = pure []
-    materializeUntilFail (pe : rest) = do
+    materializeUntilFail _ [] = pure []
+    materializeUntilFail stepsDoneRef remaining@(pe : rest) = do
       r <-
         materializeOne
           env
@@ -685,10 +695,12 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
           localPVs
           plan
           pe
+          stepsDoneRef
+          (length remaining)
       case r of
         ApplyHardFail {} -> pure [r]
         _ -> do
-          more <- materializeUntilFail rest
+          more <- materializeUntilFail stepsDoneRef rest
           pure (r : more)
 
 gapSuccessLines :: [EbuildVersion] -> [EbuildVersion] -> GoLanePlan -> [SuccessLine]
@@ -717,8 +729,10 @@ materializeOne ::
   [EbuildVersion] ->
   GoLanePlan ->
   PlannedEbuild ->
+  IORef Int ->
+  Int ->
   IO ApplyOutcome
-materializeOne env overlayRoot entry owner repo prefix mSub localPVs plan pe = do
+materializeOne env overlayRoot entry owner repo prefix mSub localPVs plan pe stepsDoneRef remainingPVs = do
   let targetVer = case pePV pe of
         Numeric comps _ -> Numeric comps Nothing
         Raw t -> Raw t
@@ -739,6 +753,8 @@ materializeOne env overlayRoot entry owner repo prefix mSub localPVs plan pe = d
     (peKeywords pe)
     lines_
     writeVer
+    stepsDoneRef
+    remainingPVs
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
@@ -779,6 +795,40 @@ pruneExtras env overlayRoot entry plan = do
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
+-- | Full materialize path: 7 discrete multi-progress steps.
+fullPathMaterializeSteps :: Int
+fullPathMaterializeSteps = 7
+
+-- | Reuse materialize path: 3 discrete multi-progress steps.
+reusePathMaterializeSteps :: Int
+reusePathMaterializeSteps = 3
+
+-- | Upper-bound package step total after planning: @planDone + nPVs × 7@.
+materializeStepTotalUpper :: Int -> Int -> Int
+materializeStepTotalUpper planDone nPVs =
+  planDone + nPVs * fullPathMaterializeSteps
+
+-- | After path selection: @stepsDone + thisPath + remainingUnstarted × 7@.
+reviseMaterializeStepTotal :: Int -> Int -> Int -> Int
+reviseMaterializeStepTotal stepsDone thisPathSteps remainingUnstartedPVs =
+  stepsDone + thisPathSteps + remainingUnstartedPVs * fullPathMaterializeSteps
+
+markMaterializeStep :: IORef Int -> MultiHandle -> PackageKey -> Text -> IO ()
+markMaterializeStep stepsDoneRef mh key name = do
+  atomicModifyIORef' stepsDoneRef (\n -> (n + 1, ()))
+  mhStep mh key name
+
+goVendorProgress :: IORef Int -> MultiHandle -> PackageKey -> VendorProgress
+goVendorProgress stepsDoneRef mh key =
+  VendorProgress
+    { vpOnCloneStart = mhStatus mh key "cloning upstream",
+      vpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
+      vpOnDownloadStart = mhStatus mh key "go mod download",
+      vpOnDownloadDone = markMaterializeStep stepsDoneRef mh key "go mod download",
+      vpOnCompressStart = mhStatus mh key "compressing tarball",
+      vpOnCompressDone = markMaterializeStep stepsDoneRef mh key "compressing tarball"
+    }
+
 goPublishAndOverlay ::
   ApplyEnv ->
   FilePath ->
@@ -790,8 +840,10 @@ goPublishAndOverlay ::
   [Text] ->
   [SuccessLine] ->
   EbuildVersion ->
+  IORef Int ->
+  Int ->
   IO ApplyOutcome
-goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_ targetVer = do
+goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_ targetVer stepsDoneRef remainingPVs = do
   let key = peKey entry
       pn = pePN entry
       pvNoRev = renderPVNoRev targetVer
@@ -799,6 +851,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
       tag = releaseTag pn pvNoRev
       assetName = T.pack tarballName
       mh = aeMulti env
+      remainingAfter = max 0 (remainingPVs - 1)
   case (aeAssetsRoot env, aeGitHubToken env) of
     (Nothing, _) ->
       pure $
@@ -814,12 +867,13 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
           "GitHub token is required to publish assets releases"
           False
           False
-    (Just assetsRoot, Just token) ->
+    (Just assetsRoot, Just _token) ->
       case splitPackageKey key of
         Nothing ->
           pure $ ApplyHardFail key "invalid package key" False False
         Just (category, _) -> do
-          -- Probe existing release asset first (reuse short-circuit).
+          -- Non-advancing probe status before path selection.
+          mhStatus mh key "probing release asset"
           looked <-
             lookupNamedAsset
               (aeReleaseOps env)
@@ -835,7 +889,16 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
                   ("release asset lookup failed: " <> err)
                   False
                   False
-            Right (Just downloadUrl) ->
+            Right (Just downloadUrl) -> do
+              done <- readIORef stepsDoneRef
+              mhSteps
+                mh
+                key
+                ( reviseMaterializeStepTotal
+                    done
+                    reusePathMaterializeSteps
+                    remainingAfter
+                )
               reuseReleaseAsset
                 env
                 overlayRoot
@@ -853,7 +916,17 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
                 pvNoRev
                 tarballName
                 downloadUrl
-            Right Nothing ->
+                stepsDoneRef
+            Right Nothing -> do
+              done <- readIORef stepsDoneRef
+              mhSteps
+                mh
+                key
+                ( reviseMaterializeStepTotal
+                    done
+                    fullPathMaterializeSteps
+                    remainingAfter
+                )
               fullPublishAndOverlay
                 env
                 overlayRoot
@@ -866,13 +939,13 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
                 lines_
                 targetVer
                 assetsRoot
-                token
                 category
                 pn
                 pvNoRev
                 tarballName
                 mh
                 key
+                stepsDoneRef
 
 -- | Full vendor + assets publish + overlay path (release asset absent).
 fullPublishAndOverlay ::
@@ -890,10 +963,10 @@ fullPublishAndOverlay ::
   Text ->
   Text ->
   Text ->
-  Text ->
   FilePath ->
   MultiHandle ->
   PackageKey ->
+  IORef Int ->
   IO ApplyOutcome
 fullPublishAndOverlay
   env
@@ -907,18 +980,18 @@ fullPublishAndOverlay
   lines_
   targetVer
   assetsRoot
-  token
   category
   pn
   pvNoRev
   tarballName
   mh
-  key =
+  key
+  stepsDoneRef =
     withSystemTempDirectory "mndz-vendor-out-" $ \outDir -> do
-      mhStatus mh key "vendoring"
       built <-
         buildVendorTarball
           (aeVendorOps env)
+          (goVendorProgress stepsDoneRef mh key)
           owner
           repo
           prefix
@@ -927,9 +1000,10 @@ fullPublishAndOverlay
           outDir
           tarballName
       case built of
+        -- Incomplete vendor phase: do not advance mhStep (active name remains).
         Left err -> pure $ ApplyHardFail key err False False
         Right VendorResult {vrTarballPath = tarballPath, vrGoModVersion = mGoVer} -> do
-          mhStep mh key "vendoring"
+          mhStatus mh key "committing assets"
           digests <- hashFile tarballPath
           let sp = sidecarPaths assetsRoot category pn tarballName
               relSidecars =
@@ -944,7 +1018,15 @@ fullPublishAndOverlay
             (spSha512 sp)
             (spB3 sp)
           let msg = commitMessage category pn (renderPV targetVer)
-          mhStatus mh key "publishing assets"
+              meta =
+                ReleaseMeta
+                  { rmOwner = aeAssetsOwner env,
+                    rmRepo = aeAssetsRepo env,
+                    rmTag = releaseTag pn pvNoRev,
+                    rmName = releaseName category pn pvNoRev,
+                    rmBody = msg,
+                    rmTargetCommitish = "main"
+                  }
           pubResult <-
             withMVar (aeAssetsLock env) $ \() -> do
               committed <-
@@ -956,20 +1038,24 @@ fullPublishAndOverlay
               case committed of
                 Left err -> pure (Left err)
                 Right () -> do
+                  markMaterializeStep stepsDoneRef mh key "committing assets"
+                  mhStatus mh key "pushing assets"
                   pushed <- goPush (aeGitOps env) assetsRoot
                   case pushed of
                     Left err -> pure (Left err)
                     Right () -> do
-                      let meta =
-                            ReleaseMeta
-                              { rmOwner = aeAssetsOwner env,
-                                rmRepo = aeAssetsRepo env,
-                                rmTag = releaseTag pn pvNoRev,
-                                rmName = releaseName category pn pvNoRev,
-                                rmBody = msg,
-                                rmTargetCommitish = "main"
-                              }
-                      createReleaseWithAsset token meta tarballPath
+                      markMaterializeStep stepsDoneRef mh key "pushing assets"
+                      mhStatus mh key "uploading release asset"
+                      uploaded <-
+                        roCreateReleaseWithAsset
+                          (aeReleaseOps env)
+                          meta
+                          tarballPath
+                      case uploaded of
+                        Left err -> pure (Left err)
+                        Right () -> do
+                          markMaterializeStep stepsDoneRef mh key "uploading release asset"
+                          pure (Right ())
           case pubResult of
             Left err ->
               pure $
@@ -979,7 +1065,6 @@ fullPublishAndOverlay
                   False
                   False
             Right () -> do
-              mhStep mh key "publishing assets"
               mhStatus mh key "regenerating manifest"
               outcome <-
                 overlayAfterAssets
@@ -993,7 +1078,8 @@ fullPublishAndOverlay
                   tarballName
                   mGoVer
               case outcome of
-                ApplySuccess {} -> mhStep mh key "regenerating manifest"
+                ApplySuccess {} ->
+                  markMaterializeStep stepsDoneRef mh key "regenerating manifest"
                 _ -> pure ()
               pure outcome
 
@@ -1015,6 +1101,7 @@ reuseReleaseAsset ::
   Text ->
   FilePath ->
   Text ->
+  IORef Int ->
   IO ApplyOutcome
 reuseReleaseAsset
   env
@@ -1032,7 +1119,8 @@ reuseReleaseAsset
   pn
   pvNoRev
   tarballName
-  downloadUrl = do
+  downloadUrl
+  stepsDoneRef = do
     let key = peKey entry
         mh = aeMulti env
         reusedLines = markSuccessLinesReused lines_
@@ -1050,7 +1138,7 @@ reuseReleaseAsset
               True
         Right () -> do
           digests <- hashFile dest
-          mhStep mh key "reusing release assets"
+          markMaterializeStep stepsDoneRef mh key "reusing release assets"
           mhStatus mh key "verifying vendor asset"
           sideCheck <-
             checkSidecarSha512IfPresent
@@ -1060,10 +1148,11 @@ reuseReleaseAsset
               tarballName
               (digestSHA512 digests)
           case sideCheck of
+            -- Incomplete verify step: leave active name, do not mhStep.
             Left err -> pure $ ApplyHardFail key err False True
             Right () -> do
               mGoVer <- fetchGoModVersion env owner repo prefix pvNoRev mSub
-              mhStep mh key "verifying vendor asset"
+              markMaterializeStep stepsDoneRef mh key "verifying vendor asset"
               mhStatus mh key "regenerating manifest"
               outcome <-
                 overlayAfterAssets
@@ -1078,7 +1167,7 @@ reuseReleaseAsset
                   mGoVer
               case outcome of
                 ApplySuccess k sls paths -> do
-                  mhStep mh key "regenerating manifest"
+                  markMaterializeStep stepsDoneRef mh key "regenerating manifest"
                   pure (ApplySuccess k sls paths)
                 other -> pure other
 

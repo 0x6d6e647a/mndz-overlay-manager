@@ -67,12 +67,14 @@ data ReleaseInfo = ReleaseInfo
   }
   deriving (Eq, Show)
 
--- | Injectable release lookup + download (tests / production).
+-- | Injectable release lookup + download + create/upload (tests / production).
 data ReleaseOps = ReleaseOps
   { -- | @owner repo tag@ → hard error | not found | release body.
     roGetReleaseByTag :: Text -> Text -> Text -> IO (Either Text (Maybe ReleaseInfo)),
     -- | Download asset body from a browser_download_url to a local path.
-    roDownloadAsset :: Text -> FilePath -> IO (Either Text ())
+    roDownloadAsset :: Text -> FilePath -> IO (Either Text ()),
+    -- | Create a GitHub release and upload one asset (token closed over in production).
+    roCreateReleaseWithAsset :: ReleaseMeta -> FilePath -> IO (Either Text ())
   }
 
 -- | Production ops using the same Bearer token headers as create-release.
@@ -82,7 +84,8 @@ productionReleaseOps token = do
   pure
     ReleaseOps
       { roGetReleaseByTag = getReleaseByTagHttp mgr token,
-        roDownloadAsset = downloadReleaseAssetHttp mgr token
+        roDownloadAsset = downloadReleaseAssetHttp mgr token,
+        roCreateReleaseWithAsset = createReleaseWithAssetHttp mgr token
       }
 
 -- | Create a GitHub release and upload one asset. On upload failure after
