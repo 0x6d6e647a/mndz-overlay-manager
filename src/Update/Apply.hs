@@ -58,23 +58,39 @@ import Update.Assets.Hash (FileDigests (..), hashFile, writeSidecars)
 import Update.Assets.Layout
   ( SidecarPaths (..),
     commitMessage,
+    distfileKindForEcosystem,
+    distfileTarballName,
     releaseName,
     releaseTag,
     sidecarPaths,
-    vendorTarballName,
   )
 import Update.Assets.Release
   ( ReleaseMeta (..),
     ReleaseOps (..),
     lookupNamedAsset,
   )
+import Update.Bun.Cache
+  ( BunCacheOps (..),
+    BunCacheProgress (..),
+    buildBunDepsTarball,
+  )
 import Update.Check (PackageEntry (..))
+import Update.Deps.Plan
+  ( DepsPlanOps (..),
+    planDepsPackageWithProgress,
+  )
 import Update.EbuildEdit
-  ( ebuildFileNameWithRev,
+  ( bunBdependAtom,
+    ebuildFileNameWithRev,
     ebuildHasDevLangGoBdepend,
     ebuildNeedsContentFix,
+    ebuildNeedsContentFixAtom,
+    ensureBunBdepend,
     ensureGoBdepend,
+    ensureNodejsBdepend,
+    goBdependAtom,
     manifestHasVendorDist,
+    nodejsBdependAtom,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
     setKeywords,
@@ -94,7 +110,6 @@ import Update.Go.Plan
   ( PlanOps (..),
     PlanProgress (..),
     isLivePackageVersion,
-    planGoPackageWithProgress,
   )
 import Update.Go.Vendor
   ( VendorOps (..),
@@ -110,8 +125,14 @@ import Update.Md5Cache
     packageCacheGateError,
     runPackageEgencache,
   )
+import Update.Npm.Cache
+  ( NpmCacheOps (..),
+    NpmCacheProgress (..),
+    buildNpmDepsTarball,
+  )
 import Update.Types
   ( ApplyOutcome (..),
+    EcosystemSpec (..),
     Fetcher,
     PackageKey (..),
     PackagePolicy (..),
@@ -142,6 +163,8 @@ data ApplyEnv = ApplyEnv
     aeEbuildRunner :: EbuildRunner,
     aeEgencacheRunner :: EgencacheRunner,
     aeVendorOps :: VendorOps,
+    aeNpmCacheOps :: NpmCacheOps,
+    aeBunCacheOps :: BunCacheOps,
     aeReleaseOps :: ReleaseOps,
     aeAssetsRoot :: Maybe FilePath,
     aeGitHubToken :: Maybe Text,
@@ -152,7 +175,8 @@ data ApplyEnv = ApplyEnv
     aeOverlayLock :: MVar (),
     aeJobs :: Int,
     aeMulti :: MultiHandle,
-    aePlanOps :: PlanOps
+    aePlanOps :: PlanOps,
+    aeDepsPlanOps :: DepsPlanOps
   }
 
 -- | Stage unit paths and create a signed overlay commit under the overlay lock.
@@ -326,8 +350,8 @@ applyPackagePhase1 env overlayRoot entry =
             ]
         GitMvAndManifest ->
           (: []) <$> applyGitMv env overlayRoot entry (policySource policy)
-        GoVendorAndAssets mSub ->
-          applyGoVendorLanes env overlayRoot entry (policySource policy) mSub
+        DepsAndAssets eco ->
+          applyDepsAndAssets env overlayRoot entry (policySource policy) eco
 
 ------------------------------------------------------------------------
 -- GitMvAndManifest
@@ -455,88 +479,81 @@ gitMvDo env key local remote oldPath pkgDir pn overlayRoot = do
                     Left err -> ApplyHardFail key err True False
 
 ------------------------------------------------------------------------
--- GoVendorAndAssets (tree-lane multi-PV)
+-- DepsAndAssets (runtime-lane multi-PV)
 ------------------------------------------------------------------------
 
-applyGoVendorLanes ::
+applyDepsAndAssets ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
   UpdateSource ->
-  Maybe FilePath ->
+  EcosystemSpec ->
   IO [ApplyOutcome]
-applyGoVendorLanes env overlayRoot entry src mSub = do
+applyDepsAndAssets env overlayRoot entry src eco = do
   let key = peKey entry
       mh = aeMulti env
+      pkgDir = takeDirectory (pePath entry)
   planDoneRef <- newIORef (0 :: Int)
-  let progress = goApplyPlanProgress mh key planDoneRef
-  case src of
-    GitHub owner repo prefix -> do
-      planResult <-
-        planGoPackageWithProgress (aePlanOps env) progress src mSub
-      case planResult of
-        Left err ->
-          pure [ApplyHardFail key ("Go tree-lane plan failed: " <> err) False False]
-        Right plan -> do
-          let pkgDir = takeDirectory (pePath entry)
-          localPVs <- listLocalNonLivePVs pkgDir (pePN entry)
-          contentFix <-
-            contentFixNeeded
-              env
-              owner
-              repo
-              prefix
-              mSub
-              pkgDir
-              (pePN entry)
-              plan
-          if not (planNeedsWork localPVs contentFix plan)
-            then pure [ApplySoftSkip key "already matches Go tree-lane plan"]
-            else do
-              cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
-              case cacheGate of
-                Left err -> pure [ApplyHardFail key err False False]
-                Right () -> do
-                  planDone <- readIORef planDoneRef
-                  materializePlan
-                    env
-                    overlayRoot
-                    entry
-                    owner
-                    repo
-                    prefix
-                    mSub
-                    plan
-                    localPVs
-                    contentFix
-                    planDone
-    _ ->
-      pure
-        [ ApplyHardFail
-            key
-            "GoVendorAndAssets requires a GitHub update source"
-            False
-            False
-        ]
+  let progress = depsApplyPlanProgress mh key eco planDoneRef
+  localPVs <- listLocalNonLivePVs pkgDir (pePN entry)
+  planResult <-
+    planDepsPackageWithProgress
+      (aeDepsPlanOps env)
+      progress
+      eco
+      src
+      localPVs
+  case planResult of
+    Left err ->
+      pure [ApplyHardFail key ("runtime-lane plan failed: " <> err) False False]
+    Right plan -> do
+      contentFix <- contentFixNeededEnv env eco src pkgDir (pePN entry) plan
+      if not (planNeedsWork localPVs contentFix plan)
+        then pure [ApplySoftSkip key "already matches runtime-lane plan"]
+        else do
+          cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
+          case cacheGate of
+            Left err -> pure [ApplyHardFail key err False False]
+            Right () -> do
+              planDone <- readIORef planDoneRef
+              materializeDepsPlan
+                env
+                overlayRoot
+                entry
+                src
+                eco
+                plan
+                localPVs
+                contentFix
+                planDone
 
 -- | Planning progress during update apply (same 3-step model as outdated).
-goApplyPlanProgress :: MultiHandle -> PackageKey -> IORef Int -> PlanProgress
-goApplyPlanProgress mh key doneRef =
-  PlanProgress
-    { ppOnCeilingsStart = do
-        mhSteps mh key 3
-        mhStatus mh key "discovering go ceilings",
-      ppOnCeilingsDone = do
-        atomicModifyIORef' doneRef (\n -> (n + 1, ()))
-        mhStep mh key "discovering go ceilings",
-      ppOnListStart = mhStatus mh key "listing versions",
-      ppOnListDone = \_n -> do
-        atomicModifyIORef' doneRef (\d -> (d + 1, ()))
-        mhStep mh key "listing versions",
-      ppOnProbeDone = do
-        atomicModifyIORef' doneRef (\n -> (n + 1, ()))
-        mhStep mh key "probing go.mod"
-    }
+depsApplyPlanProgress ::
+  MultiHandle -> PackageKey -> EcosystemSpec -> IORef Int -> PlanProgress
+depsApplyPlanProgress mh key eco doneRef =
+  let ceilLabel = case eco of
+        Go _ -> "discovering go ceilings"
+        NpmEco -> "discovering nodejs ceilings"
+        Bun -> "discovering bun-bin ceilings"
+      probeLabel = case eco of
+        Go _ -> "probing go.mod"
+        NpmEco -> "probing engines.node"
+        Bun -> "probing engines.bun"
+   in PlanProgress
+        { ppOnCeilingsStart = do
+            mhSteps mh key 3
+            mhStatus mh key ceilLabel,
+          ppOnCeilingsDone = do
+            atomicModifyIORef' doneRef (\n -> (n + 1, ()))
+            mhStep mh key ceilLabel,
+          ppOnListStart = mhStatus mh key "listing versions",
+          ppOnListDone = \_n -> do
+            atomicModifyIORef' doneRef (\d -> (d + 1, ()))
+            mhStep mh key "listing versions",
+          ppOnProbeDone = do
+            atomicModifyIORef' doneRef (\n -> (n + 1, ()))
+            mhStep mh key probeLabel
+        }
 
 listLocalNonLivePVs :: FilePath -> Text -> IO [EbuildVersion]
 listLocalNonLivePVs pkgDir pn = do
@@ -552,26 +569,23 @@ listLocalNonLivePVs pkgDir pn = do
   pure vers
 
 -- | Present planned PVs whose ebuild content, BDEPEND, or Manifest needs fix.
--- Obtains go.mod version via the plan probe cache when possible.
-contentFixNeeded ::
+contentFixNeededEnv ::
   ApplyEnv ->
-  Text ->
-  Text ->
-  Text ->
-  Maybe FilePath ->
+  EcosystemSpec ->
+  UpdateSource ->
   FilePath ->
   Text ->
   GoLanePlan ->
   IO [EbuildVersion]
-contentFixNeeded env owner repo prefix mSub pkgDir pn plan =
+contentFixNeededEnv env eco src pkgDir pn plan =
   concat <$> mapM checkPlanned (glpEbuilds plan)
   where
+    kind = distfileKindForEcosystem eco
     checkPlanned pe = do
       let name = ebuildFileNameWithRev pn (pePV pe)
           path = pkgDir </> name
           pvNoRev = renderPVNoRev (pePV pe)
-          tarball = vendorTarballName pn pvNoRev
-      -- Also try without revision suffix variants by scanning dir.
+          tarball = distfileTarballName kind pn pvNoRev
       exists <- doesFileExist path
       paths <-
         if exists
@@ -590,11 +604,59 @@ contentFixNeeded env owner repo prefix mSub pkgDir pn plan =
         (p : _) -> do
           content <- TIO.readFile p
           manMissing <- vendorManifestMissing pkgDir tarball
-          mGoVer <- fetchGoModVersion env owner repo prefix pvNoRev mSub
-          let bad =
+          bad <- case eco of
+            Go mSub -> do
+              mGoVer <- case src of
+                GitHub owner repo prefix ->
+                  fetchGoModVersion env owner repo prefix pvNoRev mSub
+                _ -> pure Nothing
+              pure $
                 ebuildNeedsContentFix (peKeywords pe) content mGoVer || manMissing
+            _ -> do
+              mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
+              pure $
+                ebuildNeedsContentFixAtom (peKeywords pe) content mAtom || manMissing
           pure [pePV pe | bad]
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
+
+-- | Full required BDEPEND atom for a planned PV, when obtainable.
+fetchRequiredBdependAtom ::
+  ApplyEnv ->
+  EcosystemSpec ->
+  UpdateSource ->
+  Text ->
+  IO (Maybe Text)
+fetchRequiredBdependAtom env eco src pvNoRev =
+  case (eco, src) of
+    (Go mSub, GitHub owner repo prefix) -> do
+      mGo <- fetchGoModVersion env owner repo prefix pvNoRev mSub
+      pure (goBdependAtom <$> mGo)
+    (NpmEco, Npm npmPkg) -> do
+      eres <- dpoFetchNpmEngines (aeDepsPlanOps env) npmPkg pvNoRev
+      pure $ case eres of
+        Right ver -> Just (nodejsBdependAtom ver)
+        Left _ -> Nothing
+    (Bun, GitHub owner repo prefix) -> do
+      eres <-
+        dpoFetchBunEngines (aeDepsPlanOps env) owner repo prefix pvNoRev
+      pure $ case eres of
+        Right ver -> Just (bunBdependAtom ver)
+        Left _ -> Nothing
+    _ -> pure Nothing
+
+-- | Legacy Go-only content fix (tests).
+contentFixNeeded ::
+  ApplyEnv ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  FilePath ->
+  Text ->
+  GoLanePlan ->
+  IO [EbuildVersion]
+contentFixNeeded env owner repo prefix mSub =
+  contentFixNeededEnv env (Go mSub) (GitHub owner repo prefix)
 
 -- | True when package Manifest lacks a DIST line for the vendor tarball.
 vendorManifestMissing :: FilePath -> FilePath -> IO Bool
@@ -607,20 +669,18 @@ vendorManifestMissing pkgDir tarballName = do
       manText <- TIO.readFile manPath
       pure (not (manifestHasVendorDist manText tarballName))
 
-materializePlan ::
+materializeDepsPlan ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
-  Text ->
-  Text ->
-  Text ->
-  Maybe FilePath ->
+  UpdateSource ->
+  EcosystemSpec ->
   GoLanePlan ->
   [EbuildVersion] ->
   [EbuildVersion] ->
   Int ->
   IO [ApplyOutcome]
-materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs contentFix planDone = do
+materializeDepsPlan env overlayRoot entry src eco plan localPVs contentFix planDone = do
   let key = peKey entry
       mh = aeMulti env
       needPVs =
@@ -638,18 +698,15 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
           )
           planned
       nPVs = length sortedPlanned
-  -- Upper-bound full-path budget; revised down after probe when a PV reuses.
   when (nPVs > 0) $
     mhSteps mh key (materializeStepTotalUpper planDone nPVs)
   stepsDoneRef <- newIORef planDone
-  -- Sequential PVs; stop further materializations after first hard-fail.
   results <- materializeUntilFail stepsDoneRef sortedPlanned
   let failures = [o | o@ApplyHardFail {} <- results]
       successes = [o | o@ApplySuccess {} <- results]
   if not (null failures)
     then pure (successes <> failures)
     else do
-      -- Prune only after all needed PVs succeeded (and committed).
       pruneResult <- pruneExtras env overlayRoot entry plan
       case pruneResult of
         Left err ->
@@ -661,7 +718,7 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
           | null extraPaths ->
               pure $
                 if null successes
-                  then [ApplySoftSkip key "already matches Go tree-lane plan"]
+                  then [ApplySoftSkip key "already matches runtime-lane plan"]
                   else successes
           | otherwise -> do
               committed <-
@@ -684,14 +741,12 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
     materializeUntilFail _ [] = pure []
     materializeUntilFail stepsDoneRef remaining@(pe : rest) = do
       r <-
-        materializeOne
+        materializeOneDeps
           env
           overlayRoot
           entry
-          owner
-          repo
-          prefix
-          mSub
+          src
+          eco
           localPVs
           plan
           pe
@@ -702,6 +757,28 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
         _ -> do
           more <- materializeUntilFail stepsDoneRef rest
           pure (r : more)
+
+-- | Legacy Go-only entry used by tests.
+materializePlan ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  GoLanePlan ->
+  [EbuildVersion] ->
+  [EbuildVersion] ->
+  Int ->
+  IO [ApplyOutcome]
+materializePlan env overlayRoot entry owner repo prefix mSub =
+  materializeDepsPlan
+    env
+    overlayRoot
+    entry
+    (GitHub owner repo prefix)
+    (Go mSub)
 
 gapSuccessLines :: [EbuildVersion] -> [EbuildVersion] -> GoLanePlan -> [SuccessLine]
 gapSuccessLines localPVs needs plan =
@@ -718,38 +795,33 @@ gapSuccessLines localPVs needs plan =
 markSuccessLinesReused :: [SuccessLine] -> [SuccessLine]
 markSuccessLinesReused = map (\sl -> sl {slAssetsReused = True})
 
-materializeOne ::
+materializeOneDeps ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
-  Text ->
-  Text ->
-  Text ->
-  Maybe FilePath ->
+  UpdateSource ->
+  EcosystemSpec ->
   [EbuildVersion] ->
   GoLanePlan ->
   PlannedEbuild ->
   IORef Int ->
   Int ->
   IO ApplyOutcome
-materializeOne env overlayRoot entry owner repo prefix mSub localPVs plan pe stepsDoneRef remainingPVs = do
+materializeOneDeps env overlayRoot entry src eco localPVs plan pe stepsDoneRef remainingPVs = do
   let targetVer = case pePV pe of
         Numeric comps _ -> Numeric comps Nothing
         Raw t -> Raw t
-      -- Same-PV content fix: bump from highest local revision (bare → -r1 → -r2).
       writeVer = writeVersionForPlannedPV targetVer localPVs
       lines_ =
         filter
           (\sl -> samePV (slTo sl) targetVer)
           (gapSuccessLines localPVs [targetVer] plan)
-  goPublishAndOverlay
+  depsPublishAndOverlay
     env
     overlayRoot
     entry
-    owner
-    repo
-    prefix
-    mSub
+    src
+    eco
     (peKeywords pe)
     lines_
     writeVer
@@ -829,25 +901,24 @@ goVendorProgress stepsDoneRef mh key =
       vpOnCompressDone = markMaterializeStep stepsDoneRef mh key "compressing tarball"
     }
 
-goPublishAndOverlay ::
+depsPublishAndOverlay ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
-  Text ->
-  Text ->
-  Text ->
-  Maybe FilePath ->
+  UpdateSource ->
+  EcosystemSpec ->
   [Text] ->
   [SuccessLine] ->
   EbuildVersion ->
   IORef Int ->
   Int ->
   IO ApplyOutcome
-goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_ targetVer stepsDoneRef remainingPVs = do
+depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer stepsDoneRef remainingPVs = do
   let key = peKey entry
       pn = pePN entry
       pvNoRev = renderPVNoRev targetVer
-      tarballName = vendorTarballName pn pvNoRev
+      kind = distfileKindForEcosystem eco
+      tarballName = distfileTarballName kind pn pvNoRev
       tag = releaseTag pn pvNoRev
       assetName = T.pack tarballName
       mh = aeMulti env
@@ -857,7 +928,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
       pure $
         ApplyHardFail
           key
-          "assets-path is required for Go vendor packages"
+          "assets-path is required for DepsAndAssets packages"
           False
           False
     (_, Nothing) ->
@@ -872,7 +943,6 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
         Nothing ->
           pure $ ApplyHardFail key "invalid package key" False False
         Just (category, _) -> do
-          -- Non-advancing probe status before path selection.
           mhStatus mh key "probing release asset"
           looked <-
             lookupNamedAsset
@@ -899,14 +969,12 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
                     reusePathMaterializeSteps
                     remainingAfter
                 )
-              reuseReleaseAsset
+              reuseDepsReleaseAsset
                 env
                 overlayRoot
                 entry
-                owner
-                repo
-                prefix
-                mSub
+                src
+                eco
                 keywords
                 lines_
                 targetVer
@@ -927,14 +995,12 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
                     fullPathMaterializeSteps
                     remainingAfter
                 )
-              fullPublishAndOverlay
+              fullDepsPublishAndOverlay
                 env
                 overlayRoot
                 entry
-                owner
-                repo
-                prefix
-                mSub
+                src
+                eco
                 keywords
                 lines_
                 targetVer
@@ -947,8 +1013,7 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub keywords lines_
                 key
                 stepsDoneRef
 
--- | Full vendor + assets publish + overlay path (release asset absent).
-fullPublishAndOverlay ::
+goPublishAndOverlay ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
@@ -956,6 +1021,26 @@ fullPublishAndOverlay ::
   Text ->
   Text ->
   Maybe FilePath ->
+  [Text] ->
+  [SuccessLine] ->
+  EbuildVersion ->
+  IORef Int ->
+  Int ->
+  IO ApplyOutcome
+goPublishAndOverlay env overlayRoot entry owner repo prefix mSub =
+  depsPublishAndOverlay
+    env
+    overlayRoot
+    entry
+    (GitHub owner repo prefix)
+    (Go mSub)
+
+fullDepsPublishAndOverlay ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  UpdateSource ->
+  EcosystemSpec ->
   [Text] ->
   [SuccessLine] ->
   EbuildVersion ->
@@ -968,14 +1053,12 @@ fullPublishAndOverlay ::
   PackageKey ->
   IORef Int ->
   IO ApplyOutcome
-fullPublishAndOverlay
+fullDepsPublishAndOverlay
   env
   overlayRoot
   entry
-  owner
-  repo
-  prefix
-  mSub
+  src
+  eco
   keywords
   lines_
   targetVer
@@ -987,22 +1070,11 @@ fullPublishAndOverlay
   mh
   key
   stepsDoneRef =
-    withSystemTempDirectory "mndz-vendor-out-" $ \outDir -> do
-      built <-
-        buildVendorTarball
-          (aeVendorOps env)
-          (goVendorProgress stepsDoneRef mh key)
-          owner
-          repo
-          prefix
-          pvNoRev
-          mSub
-          outDir
-          tarballName
+    withSystemTempDirectory "mndz-deps-out-" $ \outDir -> do
+      built <- materializeDistfile env eco src pvNoRev outDir tarballName stepsDoneRef mh key
       case built of
-        -- Incomplete vendor phase: do not advance mhStep (active name remains).
         Left err -> pure $ ApplyHardFail key err False False
-        Right VendorResult {vrTarballPath = tarballPath, vrGoModVersion = mGoVer} -> do
+        Right (tarballPath, mReqVer) -> do
           mhStatus mh key "committing assets"
           digests <- hashFile tarballPath
           let sp = sidecarPaths assetsRoot category pn tarballName
@@ -1071,27 +1143,121 @@ fullPublishAndOverlay
                   env
                   overlayRoot
                   entry
+                  eco
                   keywords
                   lines_
                   targetVer
                   digests
                   tarballName
-                  mGoVer
+                  mReqVer
               case outcome of
                 ApplySuccess {} ->
                   markMaterializeStep stepsDoneRef mh key "regenerating manifest"
                 _ -> pure ()
               pure outcome
 
--- | Overlay-only path: download existing release asset, verify, rewrite ebuild.
-reuseReleaseAsset ::
+-- | Build vendor or deps tarball; returns path and optional runtime version for BDEPEND.
+materializeDistfile ::
+  ApplyEnv ->
+  EcosystemSpec ->
+  UpdateSource ->
+  Text ->
+  FilePath ->
+  FilePath ->
+  IORef Int ->
+  MultiHandle ->
+  PackageKey ->
+  IO (Either Text (FilePath, Maybe Text))
+materializeDistfile env eco src pvNoRev outDir tarballName stepsDoneRef mh key =
+  case (eco, src) of
+    (Go mSub, GitHub owner repo prefix) -> do
+      built <-
+        buildVendorTarball
+          (aeVendorOps env)
+          (goVendorProgress stepsDoneRef mh key)
+          owner
+          repo
+          prefix
+          pvNoRev
+          mSub
+          outDir
+          tarballName
+      pure $ case built of
+        Left err -> Left err
+        Right VendorResult {vrTarballPath = p, vrGoModVersion = mGo} ->
+          Right (p, mGo)
+    (NpmEco, Npm npmPkg) -> do
+      -- Require engines for host gate: fetch first
+      eng <- dpoFetchNpmEngines (aeDepsPlanOps env) npmPkg pvNoRev
+      case eng of
+        Left err -> pure (Left err)
+        Right nodeReq -> do
+          let progress = npmCacheProgress stepsDoneRef mh key
+          built <-
+            buildNpmDepsTarball
+              (aeNpmCacheOps env)
+              progress
+              npmPkg
+              pvNoRev
+              nodeReq
+              outDir
+              tarballName
+          pure $ case built of
+            Left err -> Left err
+            Right p -> Right (p, Just nodeReq)
+    (Bun, GitHub owner repo prefix) -> do
+      eng <-
+        dpoFetchBunEngines (aeDepsPlanOps env) owner repo prefix pvNoRev
+      case eng of
+        Left err -> pure (Left err)
+        Right bunReq -> do
+          let progress = bunCacheProgress stepsDoneRef mh key
+          built <-
+            buildBunDepsTarball
+              (aeBunCacheOps env)
+              progress
+              owner
+              repo
+              prefix
+              pvNoRev
+              bunReq
+              outDir
+              tarballName
+          pure $ case built of
+            Left err -> Left err
+            Right p -> Right (p, Just bunReq)
+    (Go _, _) -> pure (Left "DepsAndAssets Go requires a GitHub update source")
+    (NpmEco, _) -> pure (Left "DepsAndAssets Npm requires an Npm update source")
+    (Bun, _) -> pure (Left "DepsAndAssets Bun requires a GitHub update source")
+
+npmCacheProgress :: IORef Int -> MultiHandle -> PackageKey -> NpmCacheProgress
+npmCacheProgress stepsDoneRef mh key =
+  NpmCacheProgress
+    { ncpOnPackStart = mhStatus mh key "npm pack",
+      ncpOnPackDone = markMaterializeStep stepsDoneRef mh key "npm pack",
+      ncpOnInstallStart = mhStatus mh key "npm cache install",
+      ncpOnInstallDone = markMaterializeStep stepsDoneRef mh key "npm cache install",
+      ncpOnCompressStart = mhStatus mh key "compressing tarball",
+      ncpOnCompressDone = markMaterializeStep stepsDoneRef mh key "compressing tarball"
+    }
+
+bunCacheProgress :: IORef Int -> MultiHandle -> PackageKey -> BunCacheProgress
+bunCacheProgress stepsDoneRef mh key =
+  BunCacheProgress
+    { bcpOnCloneStart = mhStatus mh key "cloning upstream",
+      bcpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
+      bcpOnInstallStart = mhStatus mh key "bun install",
+      bcpOnInstallDone = markMaterializeStep stepsDoneRef mh key "bun install",
+      bcpOnCompressStart = mhStatus mh key "compressing tarball",
+      bcpOnCompressDone = markMaterializeStep stepsDoneRef mh key "compressing tarball"
+    }
+
+reuseDepsReleaseAsset ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
-  Text ->
-  Text ->
-  Text ->
-  Maybe FilePath ->
+  UpdateSource ->
+  EcosystemSpec ->
   [Text] ->
   [SuccessLine] ->
   EbuildVersion ->
@@ -1103,14 +1269,12 @@ reuseReleaseAsset ::
   Text ->
   IORef Int ->
   IO ApplyOutcome
-reuseReleaseAsset
+reuseDepsReleaseAsset
   env
   overlayRoot
   entry
-  owner
-  repo
-  prefix
-  mSub
+  src
+  eco
   keywords
   lines_
   targetVer
@@ -1124,6 +1288,9 @@ reuseReleaseAsset
     let key = peKey entry
         mh = aeMulti env
         reusedLines = markSuccessLinesReused lines_
+        verifyLabel = case eco of
+          Go _ -> "verifying vendor asset"
+          _ -> "verifying deps asset"
     withSystemTempDirectory "mndz-reuse-asset-" $ \tmpDir -> do
       let dest = tmpDir </> tarballName
       mhStatus mh key "reusing release assets"
@@ -1139,7 +1306,7 @@ reuseReleaseAsset
         Right () -> do
           digests <- hashFile dest
           markMaterializeStep stepsDoneRef mh key "reusing release assets"
-          mhStatus mh key "verifying vendor asset"
+          mhStatus mh key verifyLabel
           sideCheck <-
             checkSidecarSha512IfPresent
               assetsRoot
@@ -1148,23 +1315,37 @@ reuseReleaseAsset
               tarballName
               (digestSHA512 digests)
           case sideCheck of
-            -- Incomplete verify step: leave active name, do not mhStep.
             Left err -> pure $ ApplyHardFail key err False True
             Right () -> do
-              mGoVer <- fetchGoModVersion env owner repo prefix pvNoRev mSub
-              markMaterializeStep stepsDoneRef mh key "verifying vendor asset"
+              mReq <- case eco of
+                Go mSub -> case src of
+                  GitHub owner repo prefix ->
+                    fetchGoModVersion env owner repo prefix pvNoRev mSub
+                  _ -> pure Nothing
+                _ -> do
+                  mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
+                  pure $ case mAtom of
+                    Just atom
+                      | "nodejs-" `T.isInfixOf` atom ->
+                          Just (T.takeWhile (/= '[') (T.drop (T.length (">=net-libs/nodejs-" :: Text)) atom))
+                      | "bun-bin-" `T.isInfixOf` atom ->
+                          Just (T.drop (T.length (">=dev-lang/bun-bin-" :: Text)) atom)
+                      | otherwise -> Nothing
+                    Nothing -> Nothing
+              markMaterializeStep stepsDoneRef mh key verifyLabel
               mhStatus mh key "regenerating manifest"
               outcome <-
                 overlayAfterAssets
                   env
                   overlayRoot
                   entry
+                  eco
                   keywords
                   reusedLines
                   targetVer
                   digests
                   tarballName
-                  mGoVer
+                  mReq
               case outcome of
                 ApplySuccess k sls paths -> do
                   markMaterializeStep stepsDoneRef mh key "regenerating manifest"
@@ -1222,7 +1403,7 @@ fetchGoModVersion env owner repo prefix pvNoRev mSub = do
             gmkTag = tag,
             gmkSubdir = mSub
           }
-  eres <- poFetchGoMod (aePlanOps env) key
+  eres <- dpoFetchGoMod (aeDepsPlanOps env) key
   pure $ case eres of
     Right body -> parseGoReqFromMod body
     Left _ -> Nothing
@@ -1231,6 +1412,7 @@ overlayAfterAssets ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
+  EcosystemSpec ->
   [Text] ->
   [SuccessLine] ->
   EbuildVersion ->
@@ -1238,7 +1420,7 @@ overlayAfterAssets ::
   FilePath ->
   Maybe Text ->
   IO ApplyOutcome
-overlayAfterAssets env overlayRoot entry keywords lines_ targetVer digests tarballName mGoVer = do
+overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer digests tarballName mReqVer = do
   let key = peKey entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
@@ -1246,7 +1428,6 @@ overlayAfterAssets env overlayRoot entry keywords lines_ targetVer digests tarba
       gitOps = aeGitOps env
       ebuildRun = aeEbuildRunner env
       orphan = True
-  -- Prefer an existing ebuild for this PV as template; else newest tip.
   templatePath <- findTemplate pkgDir pn targetVer oldPath
   ebuildRel <- relativeOverlayPath overlayRoot templatePath
   manRel0 <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
@@ -1264,26 +1445,29 @@ overlayAfterAssets env overlayRoot entry keywords lines_ targetVer digests tarba
       content <- TIO.readFile templatePath
       let parameterized = parameterizeAssetsSrcUri pn content
           withKw = setKeywords keywords parameterized
-      contentFixed <- case mGoVer of
-        Just goVer -> pure (ensureGoBdepend goVer withKw)
-        Nothing
+      contentFixed <- case (eco, mReqVer) of
+        (Go _, Just goVer) -> pure (ensureGoBdepend goVer withKw)
+        (Go _, Nothing)
           | ebuildHasDevLangGoBdepend withKw -> pure (Right withKw)
           | otherwise ->
               pure $
                 Left
                   "could not obtain go.mod version required for BDEPEND alignment"
+        (NpmEco, Just ver) -> pure (ensureNodejsBdepend ver withKw)
+        (NpmEco, Nothing) ->
+          pure (Left "could not obtain engines.node for BDEPEND alignment")
+        (Bun, Just ver) -> pure (ensureBunBdepend ver withKw)
+        (Bun, Nothing) ->
+          pure (Left "could not obtain engines.bun for BDEPEND alignment")
       case contentFixed of
         Left err -> pure $ ApplyHardFail key err False orphan
         Right fixed -> do
           let newName = ebuildFileNameWithRev pn targetVer
               newPath = pkgDir </> newName
-          -- Writing same path is fine; different existing path for same PV is replace.
           TIO.writeFile newPath fixed
           removedTemplate <-
             if templatePath /= newPath && takeFileName templatePath /= newName
               then do
-                -- Only remove template when it was a different version file we are replacing
-                -- as part of rename from newest tip. For multi-PV, keep other versions.
                 let templateIsTarget =
                       case parseEbuildFileName (takeFileName templatePath) of
                         Just (_, verStr) ->
@@ -1305,7 +1489,7 @@ overlayAfterAssets env overlayRoot entry keywords lines_ targetVer digests tarba
                   pure $
                     ApplyHardFail
                       key
-                      "could not parse vendor SHA512 from Manifest after ebuild manifest"
+                      "could not parse distfile SHA512 from Manifest after ebuild manifest"
                       True
                       orphan
                 Just manSha
@@ -1331,7 +1515,7 @@ overlayAfterAssets env overlayRoot entry keywords lines_ targetVer digests tarba
                       pure $
                         ApplyHardFail
                           key
-                          "Manifest SHA512 does not match published vendor tarball"
+                          "Manifest SHA512 does not match published distfile"
                           True
                           orphan
 

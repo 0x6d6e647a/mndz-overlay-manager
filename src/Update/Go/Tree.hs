@@ -1,27 +1,45 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.Go.Tree
-  ( GoArch (..),
+  ( Arch,
     KeywordTier (..),
-    GoCeilingLane (..),
-    GoCeilings (..),
-    GoEbuildMeta (..),
+    CeilingLane (..),
+    ArchCeilings (..),
+    RuntimeCeilings (..),
+    GoCeilings,
+    RuntimeEbuildMeta (..),
+    GoEbuildMeta,
     PortageqRunner,
     productionPortageqRunner,
     gentooRepoPath,
     goPackageDir,
+    nodejsPackageDir,
+    bunBinPackageDir,
     parseKeywordsField,
     keywordsHasBare,
     keywordsHasTildeOrBare,
+    isLiveRuntimeVersion,
     isLiveGoVersion,
+    parseRuntimeEbuildMeta,
     parseGoEbuildMeta,
+    discoverArches,
     computeCeilings,
-    discoverGoCeilingsWith,
     emptyCeilings,
     ceilingFor,
+    allCeilingLanes,
+    discoverRuntimeCeilingsInDir,
+    discoverGoCeilingsWith,
+    discoverNodejsCeilingsWith,
+    discoverBunBinCeilings,
+    goRuntimeAtom,
+    nodejsRuntimeAtom,
+    bunBinRuntimeAtom,
   )
 where
 
+import Data.List (nub, sort)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -33,51 +51,76 @@ import System.Exit (ExitCode (..))
 import System.FilePath (takeFileName, (</>))
 import System.Process (readProcessWithExitCode)
 
--- | Arches supported by the tree-lane planner.
-data GoArch = Amd64 | Arm64
-  deriving (Eq, Ord, Show, Enum, Bounded)
+-- | Architecture token without leading @~@ (e.g. @"amd64"@, @"loong"@).
+type Arch = Text
 
--- | Plain (stable) vs tilde (~) keyword tier for dev-lang/go.
+-- | Plain (stable) vs tilde (~) keyword tier.
 data KeywordTier = Plain | Tilde
   deriving (Eq, Ord, Show, Enum, Bounded)
 
--- | One of the four Go ceiling lanes.
-data GoCeilingLane = GoCeilingLane
-  { gclArch :: GoArch,
-    gclTier :: KeywordTier
+-- | One runtime ceiling lane: arch × tier.
+data CeilingLane = CeilingLane
+  { clArch :: Arch,
+    clTier :: KeywordTier
   }
   deriving (Eq, Ord, Show)
 
--- | Four ceilings; 'Nothing' means no matching non-live go ebuild.
-data GoCeilings = GoCeilings
-  { gcAmd64Plain :: Maybe EbuildVersion,
-    gcAmd64Tilde :: Maybe EbuildVersion,
-    gcArm64Plain :: Maybe EbuildVersion,
-    gcArm64Tilde :: Maybe EbuildVersion
+-- | Plain and tilde ceilings for one arch.
+data ArchCeilings = ArchCeilings
+  { acPlain :: Maybe EbuildVersion,
+    acTilde :: Maybe EbuildVersion
   }
   deriving (Eq, Show)
 
-emptyCeilings :: GoCeilings
-emptyCeilings =
-  GoCeilings
-    { gcAmd64Plain = Nothing,
-      gcAmd64Tilde = Nothing,
-      gcArm64Plain = Nothing,
-      gcArm64Tilde = Nothing
-    }
-
-ceilingFor :: GoCeilings -> GoCeilingLane -> Maybe EbuildVersion
-ceilingFor c (GoCeilingLane Amd64 Plain) = gcAmd64Plain c
-ceilingFor c (GoCeilingLane Amd64 Tilde) = gcAmd64Tilde c
-ceilingFor c (GoCeilingLane Arm64 Plain) = gcArm64Plain c
-ceilingFor c (GoCeilingLane Arm64 Tilde) = gcArm64Tilde c
-
--- | Parsed non-live go ebuild metadata.
-data GoEbuildMeta = GoEbuildMeta
-  { gemPV :: EbuildVersion,
-    gemKeywords :: [Text]
+-- | Runtime ceilings discovered from a runtime package's KEYWORDS (all arches).
+data RuntimeCeilings = RuntimeCeilings
+  { -- | Runtime package atom for labels, e.g. @"dev-lang/go"@.
+    rcAtom :: Text,
+    -- | Per-arch plain/tilde ceilings.
+    rcByArch :: Map Arch ArchCeilings
   }
   deriving (Eq, Show)
+
+-- | Historical alias used by Go planning paths.
+type GoCeilings = RuntimeCeilings
+
+goRuntimeAtom :: Text
+goRuntimeAtom = "dev-lang/go"
+
+nodejsRuntimeAtom :: Text
+nodejsRuntimeAtom = "net-libs/nodejs"
+
+bunBinRuntimeAtom :: Text
+bunBinRuntimeAtom = "dev-lang/bun-bin"
+
+emptyCeilings :: Text -> RuntimeCeilings
+emptyCeilings atom = RuntimeCeilings {rcAtom = atom, rcByArch = Map.empty}
+
+ceilingFor :: RuntimeCeilings -> CeilingLane -> Maybe EbuildVersion
+ceilingFor c (CeilingLane arch tier) =
+  case Map.lookup arch (rcByArch c) of
+    Nothing -> Nothing
+    Just ac -> case tier of
+      Plain -> acPlain ac
+      Tilde -> acTilde ac
+
+-- | All lanes that have a defined ceiling (non-Nothing).
+allCeilingLanes :: RuntimeCeilings -> [CeilingLane]
+allCeilingLanes c =
+  concatMap lanesFor (Map.toAscList (rcByArch c))
+  where
+    lanesFor (arch, ac) =
+      [CeilingLane arch Plain | Just _ <- [acPlain ac]]
+        <> [CeilingLane arch Tilde | Just _ <- [acTilde ac]]
+
+-- | Parsed non-live runtime ebuild metadata.
+data RuntimeEbuildMeta = RuntimeEbuildMeta
+  { remPV :: EbuildVersion,
+    remKeywords :: [Text]
+  }
+  deriving (Eq, Show)
+
+type GoEbuildMeta = RuntimeEbuildMeta
 
 -- | Injectable @portageq@ runner: args → stdout or error.
 type PortageqRunner = [String] -> IO (Either Text Text)
@@ -109,6 +152,12 @@ gentooRepoPath run = do
 goPackageDir :: FilePath -> FilePath
 goPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "go"
 
+nodejsPackageDir :: FilePath -> FilePath
+nodejsPackageDir gentooRoot = gentooRoot </> "net-libs" </> "nodejs"
+
+bunBinPackageDir :: FilePath -> FilePath
+bunBinPackageDir overlayRoot = overlayRoot </> "dev-lang" </> "bun-bin"
+
 -- | Parse KEYWORDS=... from ebuild body into token list.
 parseKeywordsField :: Text -> [Text]
 parseKeywordsField content =
@@ -138,107 +187,154 @@ parseKeywordsField content =
       | otherwise = t
 
 -- | True when KEYWORDS contain the bare arch token (exact word, not @~arch@).
-keywordsHasBare :: GoArch -> [Text] -> Bool
-keywordsHasBare arch toks = archToken arch `elem` toks
+keywordsHasBare :: Arch -> [Text] -> Bool
+keywordsHasBare arch toks = arch `elem` toks
 
 -- | True when KEYWORDS contain @~arch@ or bare @arch@.
-keywordsHasTildeOrBare :: GoArch -> [Text] -> Bool
+keywordsHasTildeOrBare :: Arch -> [Text] -> Bool
 keywordsHasTildeOrBare arch toks =
-  let bare = archToken arch
-      tilde = "~" <> bare
-   in bare `elem` toks || tilde `elem` toks
+  let tilde = "~" <> arch
+   in arch `elem` toks || tilde `elem` toks
 
-archToken :: GoArch -> Text
-archToken Amd64 = "amd64"
-archToken Arm64 = "arm64"
-
--- | Live / unversioned go ebuilds are ignored for ceilings.
-isLiveGoVersion :: EbuildVersion -> Bool
-isLiveGoVersion (Numeric [9999] _) = True
-isLiveGoVersion (Numeric comps _)
+-- | Live / unversioned ebuilds are ignored for ceilings.
+isLiveRuntimeVersion :: EbuildVersion -> Bool
+isLiveRuntimeVersion (Numeric [9999] _) = True
+isLiveRuntimeVersion (Numeric comps _)
   | comps == [9999] = True
   | otherwise = False
-isLiveGoVersion (Raw t) =
+isLiveRuntimeVersion (Raw t) =
   T.strip t == "9999" || "9999" `T.isPrefixOf` t
 
--- | Parse PV + KEYWORDS from a go ebuild path and content.
-parseGoEbuildMeta :: FilePath -> Text -> Maybe GoEbuildMeta
-parseGoEbuildMeta path content =
+isLiveGoVersion :: EbuildVersion -> Bool
+isLiveGoVersion = isLiveRuntimeVersion
+
+-- | Discover arch names from KEYWORDS (strip @~@; ignore @-*@).
+discoverArches :: [RuntimeEbuildMeta] -> [Arch]
+discoverArches metas =
+  sort $
+    nub
+      [ arch
+      | m <- metas,
+        tok <- remKeywords m,
+        Just arch <- [normalizeArchToken tok]
+      ]
+
+normalizeArchToken :: Text -> Maybe Arch
+normalizeArchToken tok
+  | tok == "-*" = Nothing
+  | tok == "*" = Nothing
+  | "-" `T.isPrefixOf` tok = Nothing
+  | "~" `T.isPrefixOf` tok =
+      let arch = T.drop 1 tok
+       in if T.null arch then Nothing else Just arch
+  | otherwise = Just tok
+
+-- | Parse PV + KEYWORDS from a runtime ebuild path and content.
+parseRuntimeEbuildMeta :: FilePath -> Text -> Maybe RuntimeEbuildMeta
+parseRuntimeEbuildMeta path content =
   case parseEbuildFileName (takeFileName path) of
     Nothing -> Nothing
     Just (_pn, verStr) ->
       let pv = parseEbuildVersion (T.pack verStr)
-       in if isLiveGoVersion pv
+       in if isLiveRuntimeVersion pv
             then Nothing
             else
               Just
-                GoEbuildMeta
-                  { gemPV = pv,
-                    gemKeywords = parseKeywordsField content
+                RuntimeEbuildMeta
+                  { remPV = pv,
+                    remKeywords = parseKeywordsField content
                   }
 
--- | Compute four ceilings from already-parsed go ebuild metadata.
-computeCeilings :: [GoEbuildMeta] -> GoCeilings
-computeCeilings =
-  foldl' acc emptyCeilings
-  where
-    acc c m =
-      let pv = gemPV m
-          kws = gemKeywords m
-          bump f =
-            case f c of
-              Nothing -> Just pv
-              Just old ->
-                case comparePV old pv of
-                  Just LT -> Just pv
-                  _ -> Just old
-       in c
-            { gcAmd64Plain =
-                if keywordsHasBare Amd64 kws
-                  then bump gcAmd64Plain
-                  else gcAmd64Plain c,
-              gcAmd64Tilde =
-                if keywordsHasTildeOrBare Amd64 kws
-                  then bump gcAmd64Tilde
-                  else gcAmd64Tilde c,
-              gcArm64Plain =
-                if keywordsHasBare Arm64 kws
-                  then bump gcArm64Plain
-                  else gcArm64Plain c,
-              gcArm64Tilde =
-                if keywordsHasTildeOrBare Arm64 kws
-                  then bump gcArm64Tilde
-                  else gcArm64Tilde c
-            }
+parseGoEbuildMeta :: FilePath -> Text -> Maybe GoEbuildMeta
+parseGoEbuildMeta = parseRuntimeEbuildMeta
 
--- | Discover ceilings with injectable portageq; scans @dev-lang/go@ under the repo.
-discoverGoCeilingsWith :: PortageqRunner -> IO (Either Text GoCeilings)
+-- | Compute ceilings from already-parsed runtime ebuild metadata.
+computeCeilings :: Text -> [RuntimeEbuildMeta] -> RuntimeCeilings
+computeCeilings atom metas =
+  let arches = discoverArches metas
+      byArch =
+        Map.fromList
+          [ (arch, ceilingsForArch arch metas)
+          | arch <- arches
+          ]
+   in RuntimeCeilings {rcAtom = atom, rcByArch = byArch}
+
+ceilingsForArch :: Arch -> [RuntimeEbuildMeta] -> ArchCeilings
+ceilingsForArch arch metas =
+  ArchCeilings
+    { acPlain = maxPV [remPV m | m <- metas, keywordsHasBare arch (remKeywords m)],
+      acTilde = maxPV [remPV m | m <- metas, keywordsHasTildeOrBare arch (remKeywords m)]
+    }
+
+maxPV :: [EbuildVersion] -> Maybe EbuildVersion
+maxPV [] = Nothing
+maxPV (x : xs) = Just (foldl' maxOne x xs)
+  where
+    maxOne a b =
+      case comparePV a b of
+        Just LT -> b
+        _ -> a
+
+-- | Scan a package directory of @*.ebuild@ files for ceilings.
+discoverRuntimeCeilingsInDir ::
+  Text ->
+  FilePath ->
+  -- | Optional filename prefix filter (e.g. @"go-"@); Nothing = all ebuilds.
+  Maybe Text ->
+  IO (Either Text RuntimeCeilings)
+discoverRuntimeCeilingsInDir atom pkgDir mPrefix = do
+  exists <- doesDirectoryExist pkgDir
+  if not exists
+    then
+      pure $
+        Left
+          ( atom
+              <> " directory not found: "
+              <> T.pack pkgDir
+          )
+    else do
+      names <- listDirectory pkgDir
+      let ebuildNames =
+            [ n
+            | n <- names,
+              ".ebuild" `T.isSuffixOf` T.pack n,
+              case mPrefix of
+                Nothing -> True
+                Just p -> p `T.isPrefixOf` T.pack n
+            ]
+      metas <- mapM (readMeta pkgDir) ebuildNames
+      pure $ Right (computeCeilings atom (catMaybes metas))
+  where
+    readMeta dir name = do
+      let path = dir </> name
+      content <- TIO.readFile path
+      pure (parseRuntimeEbuildMeta path content)
+
+-- | Discover Go ceilings with injectable portageq; scans @dev-lang/go@.
+discoverGoCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)
 discoverGoCeilingsWith run = do
   pathResult <- gentooRepoPath run
   case pathResult of
     Left err -> pure (Left err)
-    Right gentooRoot -> do
-      let pkgDir = goPackageDir gentooRoot
-      exists <- doesDirectoryExist pkgDir
-      if not exists
-        then
-          pure $
-            Left
-              ( "gentoo dev-lang/go directory not found: "
-                  <> T.pack pkgDir
-              )
-        else do
-          names <- listDirectory pkgDir
-          let ebuildNames =
-                [ n
-                | n <- names,
-                  ".ebuild" `T.isSuffixOf` T.pack n,
-                  "go-" `T.isPrefixOf` T.pack n
-                ]
-          metas <- mapM (readMeta pkgDir) ebuildNames
-          pure $ Right (computeCeilings (catMaybes metas))
-  where
-    readMeta pkgDir name = do
-      let path = pkgDir </> name
-      content <- TIO.readFile path
-      pure (parseGoEbuildMeta path content)
+    Right gentooRoot ->
+      discoverRuntimeCeilingsInDir goRuntimeAtom (goPackageDir gentooRoot) (Just "go-")
+
+-- | Discover nodejs ceilings from gentoo @net-libs/nodejs@.
+discoverNodejsCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)
+discoverNodejsCeilingsWith run = do
+  pathResult <- gentooRepoPath run
+  case pathResult of
+    Left err -> pure (Left err)
+    Right gentooRoot ->
+      discoverRuntimeCeilingsInDir
+        nodejsRuntimeAtom
+        (nodejsPackageDir gentooRoot)
+        (Just "nodejs-")
+
+-- | Discover bun-bin ceilings from the overlay package directory.
+discoverBunBinCeilings :: FilePath -> IO (Either Text RuntimeCeilings)
+discoverBunBinCeilings overlayRoot =
+  discoverRuntimeCeilingsInDir
+    bunBinRuntimeAtom
+    (bunBinPackageDir overlayRoot)
+    (Just "bun-bin-")

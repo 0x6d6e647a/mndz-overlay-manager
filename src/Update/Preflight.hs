@@ -2,11 +2,17 @@
 
 module Update.Preflight
   ( updateRequiredTools,
+    assetsRequiredTools,
+    goRequiredTools,
+    npmRequiredTools,
+    bunRequiredTools,
     goAssetsRequiredTools,
     checkToolsOnPath,
     preflightUpdate,
     preflightUpdateWith,
+    preflightUpdateTools,
     validateAssetsPath,
+    AssetsPreflight (..),
   )
 where
 
@@ -20,9 +26,31 @@ import Update.Git (isGitWorkTree)
 updateRequiredTools :: [String]
 updateRequiredTools = ["git", "ebuild", "egencache", "gpg"]
 
--- | Additional tools when a Go/assets technique will apply.
+-- | Tools always required when any DepsAndAssets assets work is in scope.
+assetsRequiredTools :: [String]
+assetsRequiredTools = ["xz"]
+
+goRequiredTools :: [String]
+goRequiredTools = ["go"]
+
+npmRequiredTools :: [String]
+npmRequiredTools = ["npm"]
+
+bunRequiredTools :: [String]
+bunRequiredTools = ["bun"]
+
+-- | Legacy combined Go + xz tools (full-path Go materialize).
 goAssetsRequiredTools :: [String]
-goAssetsRequiredTools = ["go", "xz"]
+goAssetsRequiredTools = goRequiredTools <> assetsRequiredTools
+
+-- | Which language tools and assets extras to require.
+data AssetsPreflight = AssetsPreflight
+  { apNeedAssets :: Bool,
+    apNeedGo :: Bool,
+    apNeedNpm :: Bool,
+    apNeedBun :: Bool
+  }
+  deriving (Eq, Show)
 
 -- | Check that each tool name is findable on PATH.
 -- Returns missing tool names (empty list means success).
@@ -31,16 +59,30 @@ checkToolsOnPath findTool tools = do
   results <- mapM (\t -> (t,) <$> findTool t) tools
   pure [name | (name, path) <- results, isNothing path]
 
--- | Production preflight for @update@ without Go assets extras.
+-- | Production preflight for @update@ without assets extras.
 preflightUpdate :: IO (Either Text ())
 preflightUpdate = preflightUpdateWith False
 
--- | Preflight with optional Go/assets tool requirements.
+-- | Preflight with optional combined Go/assets tool requirements (legacy Bool).
 preflightUpdateWith :: Bool -> IO (Either Text ())
-preflightUpdateWith needGoAssets = do
+preflightUpdateWith needGoAssets =
+  preflightUpdateTools
+    AssetsPreflight
+      { apNeedAssets = needGoAssets,
+        apNeedGo = needGoAssets,
+        apNeedNpm = False,
+        apNeedBun = False
+      }
+
+-- | Preflight with per-ecosystem tool requirements.
+preflightUpdateTools :: AssetsPreflight -> IO (Either Text ())
+preflightUpdateTools ap = do
   let tools =
         updateRequiredTools
-          <> if needGoAssets then goAssetsRequiredTools else []
+          <> [t | apNeedAssets ap, t <- assetsRequiredTools]
+          <> [t | apNeedGo ap, t <- goRequiredTools]
+          <> [t | apNeedNpm ap, t <- npmRequiredTools]
+          <> [t | apNeedBun ap, t <- bunRequiredTools]
   missing <- checkToolsOnPath findExecutable tools
   pure $ case missing of
     [] -> Right ()

@@ -80,8 +80,11 @@ library
       , Update.Assets.Layout
       , Update.Assets.Release
       , Update.Auth
+      , Update.Bun.Cache
       , Update.Check
+      , Update.Deps.Plan
       , Update.EbuildEdit
+      , Update.Engines
       , Update.Git
       , Update.GitHub
       , Update.Go.Lanes
@@ -94,6 +97,7 @@ library
       , Update.Http
       , Update.Md5Cache
       , Update.Npm
+      , Update.Npm.Cache
       , Update.Preflight
       , Update.Resolve
       , Update.GpgAgent

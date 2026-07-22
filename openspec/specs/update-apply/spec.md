@@ -8,17 +8,22 @@ Package policy (hardcoded source + technique), applying updates (`GitMvAndManife
 
 ### Requirement: Package policy model
 
-The library SHALL model a package policy that binds a package key `category/package` to an update source and an update technique. The technique SHALL be one of: `GitMvAndManifest`; `GoVendorAndAssets` with an optional go.mod subdirectory; or `Unsupported` with a human-readable reason. Policy lookup SHALL use a hardcoded map only.
+The library SHALL model a package policy that binds a package key `category/package` to an update source and an update technique. The technique SHALL be one of: `GitMvAndManifest`; `DepsAndAssets` with an ecosystem specification (`Go` with optional go.mod subdirectory, `Npm`, or `Bun`); or `Unsupported` with a human-readable reason. Policy lookup SHALL use a hardcoded map only. The former technique constructor `GoVendorAndAssets` SHALL NOT remain as a distinct technique alternative.
 
 #### Scenario: Supported GitMv technique entry
 
 - **WHEN** policy is looked up for a package configured as `GitMvAndManifest` with a GitHub source
 - **THEN** apply logic receives both the source (for version fetch) and the `GitMvAndManifest` technique
 
-#### Scenario: Supported GoVendor technique entry
+#### Scenario: Supported DepsAndAssets Go technique entry
 
-- **WHEN** policy is looked up for a package configured as `GoVendorAndAssets` with a go.mod subdirectory option
-- **THEN** apply logic receives both the source and the `GoVendorAndAssets` technique including the subdirectory option
+- **WHEN** policy is looked up for a package configured as `DepsAndAssets` with ecosystem `Go` and a go.mod subdirectory option
+- **THEN** apply logic receives both the source and the `DepsAndAssets` technique including the Go subdirectory option
+
+#### Scenario: Supported DepsAndAssets Npm technique entry
+
+- **WHEN** policy is looked up for a package configured as `DepsAndAssets Npm`
+- **THEN** apply logic receives the `DepsAndAssets` technique with ecosystem `Npm`
 
 #### Scenario: Unsupported technique entry
 
@@ -27,17 +32,22 @@ The library SHALL model a package policy that binds a package key `category/pack
 
 ### Requirement: Hardcoded policy covers known overlay packages
 
-The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay at the time of this change, each with both a source and a technique. At minimum, `dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, and `dev-util/opencode-bin` SHALL use `GitMvAndManifest`. At minimum, `dev-db/dolt`, `dev-util/beads`, and `dev-util/crush` SHALL use `GoVendorAndAssets`. Packages that still require npm deps tarballs or cargo CRATES regeneration SHALL use `Unsupported`.
+The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay at the time of this change, each with both a source and a technique. At minimum, `dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, and `dev-util/opencode-bin` SHALL use `GitMvAndManifest`. At minimum, `dev-db/dolt`, `dev-util/beads`, and `dev-util/crush` SHALL use `DepsAndAssets` with ecosystem `Go`. At minimum, `dev-util/openspec` SHALL use `DepsAndAssets Npm` and `dev-util/ralph-tui` SHALL use `DepsAndAssets Bun`. Packages that still require cargo CRATES regeneration SHALL use `Unsupported`.
 
 #### Scenario: Simple binary package is GitMvAndManifest
 
 - **WHEN** policy is resolved for `dev-util/opencode-bin`
 - **THEN** the technique is `GitMvAndManifest`
 
-#### Scenario: Go package is GoVendorAndAssets
+#### Scenario: Go package is DepsAndAssets Go
 
 - **WHEN** policy is resolved for `dev-util/beads`
-- **THEN** the technique is `GoVendorAndAssets`
+- **THEN** the technique is `DepsAndAssets` with ecosystem `Go`
+
+#### Scenario: openspec is DepsAndAssets Npm
+
+- **WHEN** policy is resolved for `dev-util/openspec`
+- **THEN** the technique is `DepsAndAssets Npm`
 
 #### Scenario: Cargo package is Unsupported
 
@@ -170,60 +180,21 @@ The `update` apply path SHALL require the overlay path to be inside a git work t
 
 ### Requirement: GoVendorAndAssets is a first-class apply technique
 
-Packages with technique `GoVendorAndAssets` SHALL be applied via the Go vendor and assets publish path and the Go tree-lane multi-PV planner, not soft-skipped as unsupported. Target version selection SHALL use tree-lane plan PVs rather than solely the single latest remote version. Behavior of the vendor/assets pipeline is defined by the `go-vendor-assets` and `assets-publish` capabilities; lane planning by `go-tree-lanes`.
+`DepsAndAssets` SHALL be a first-class apply technique for Go, Npm, and Bun ecosystems. Apply SHALL plan via runtime lanes, materialize or reuse distfiles, publish assets on the full path, rewrite overlay ebuilds, verify Manifest digests, and commit per successful PV unit as specified by `deps-assets`, `runtime-lanes`, `go-vendor-assets`, `npm-deps-assets`, and `bun-deps-assets`. Soft-skip solely for “unsupported vendor/deps assets” SHALL NOT apply to packages configured with `DepsAndAssets`.
 
-#### Scenario: Outdated Go package is not soft-skipped as unsupported
+#### Scenario: DepsAndAssets package is not soft-skipped as unsupported
 
-- **WHEN** `dev-util/crush` is outdated and policy technique is `GoVendorAndAssets`
-- **THEN** the program attempts the Go vendor assets apply path rather than soft-skipping with an unsupported reason
-
-#### Scenario: Outdated Go package uses vendor path
-
-- **WHEN** a `GoVendorAndAssets` package has a tree-lane gap and is selected for update
-- **THEN** apply uses the Go vendor/assets path for each needed planned PV rather than soft-skipping as unsupported
+- **WHEN** apply runs for a package with technique `DepsAndAssets` that needs work
+- **THEN** the program does not soft-skip solely because vendor or deps assets are required
 
 ### Requirement: GoVendorAndAssets multi-lane apply
 
-For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and, for each unique planned PV that needs materialization, perform either the **full** vendor-and-assets + overlay path or the **reuse** overlay-only path defined by `go-vendor-assets` (probe existing release asset first; reuse when present; full path when absent). Before the first mutation for the package in the run, apply SHALL verify complete matching md5-cache for all non-live ebuilds in the package directory as specified by `md5-cache`. The full path remains: clone tag, host Go gate, vendor tarball, assets publish, BDEPEND from that tag’s go.mod, assets SRC_URI rules. The reuse path SHALL complete overlay ebuild mutation and Manifest verification without re-publishing assets. Ebuild KEYWORDS SHALL be set to the planned per-arch bare/`~` membership for that PV as defined by `go-tree-lanes` (including bare arch tokens when plain lanes target the PV). After each planned PV unit successfully completes overlay mutation, Manifest verification, and package-scoped egencache, apply SHALL create a signed overlay commit for that PV’s paths (including affected `metadata/md5-cache/` paths) with message `category/package: version` (version = PV without leading `v`, including `-rN` when the filename carries a revision) **before** starting the next planned PV for the same package. When two lanes share one PV and a single write satisfies both, the program SHALL produce one commit for that PV rather than two empty commits. After all planned PVs that needed materialization succeed, apply SHALL prune non-live versioned ebuilds not in the planned set per exact-set rules, regenerate Manifest and package md5-cache as needed, and SHALL create a signed overlay commit for prune pathspecs (including md5-cache) when any extras were removed. If any planned PV unit hard-fails, apply SHALL NOT prune, SHALL NOT start further planned PVs for that package after that failure, and SHALL retain any earlier successful PV commits. Sibling packages continue on hard-fail of one package’s unit.
+For packages with technique `DepsAndAssets`, apply SHALL use the runtime-lane planner for the package’s ecosystem to obtain the planned set of PVs and KEYWORDS, materialize each PV that needs work (full or reuse path), commit each successful unit before the next, and perform exact-set prune of non-live ebuilds after all planned PVs succeed. Multi-PV ordering and failure isolation SHALL match existing Go multi-unit behavior (later unit failure does not roll back earlier committed units).
 
-#### Scenario: Two PVs two commits
+#### Scenario: Multiple planned PVs
 
-- **WHEN** the plan needs distinct PVs `0.82.0` and `0.84.0` and both materialize successfully
-- **THEN** the program creates two signed overlay commits (one per PV) before the package storm finishes
-- **AND** each commit includes that unit’s md5-cache path updates
-- **AND** the second PV’s dirty check does not fail solely because the first PV updated `Manifest`
-
-#### Scenario: Shared PV one commit
-
-- **WHEN** two lanes select the same PV and one ebuild write satisfies both
-- **THEN** the program creates a single signed commit for that PV for those lanes
-
-#### Scenario: KEYWORDS follow plain vs tilde membership
-
-- **WHEN** a planned ebuild is written for plain amd64 membership only
-- **THEN** KEYWORDS contain bare `amd64` and do not contain `~amd64`
-
-#### Scenario: KEYWORDS tilde-only when plan has no plain membership
-
-- **WHEN** a planned ebuild is written for tilde-only amd64 membership
-- **THEN** KEYWORDS contain `~amd64` and do not contain bare `amd64`
-
-#### Scenario: Orphan after publish resumes via reuse
-
-- **WHEN** a prior run published release `crush-0.84.0` with the vendor asset but overlay Manifest for that PV is incomplete, and the operator re-runs `update`
-- **THEN** apply materializes that PV via the reuse path (no create-release) and completes overlay Manifest, egencache, and signed commit when dirty checks and md5-cache gate allow
-
-#### Scenario: Partial multi-PV success keeps earlier commits
-
-- **WHEN** planned PV `0.82.0` commits successfully and planned PV `0.84.0` hard-fails
-- **THEN** the overlay retains the signed commit for `0.82.0`
-- **AND** the program does not prune unplanned ebuilds for that package in that run
-- **AND** later planned PVs for that package are not started after the hard-fail
-
-#### Scenario: Prune only after full package success
-
-- **WHEN** all needed planned PVs for a package materialize and commit successfully and extras exist outside the planned set
-- **THEN** the program removes those extras, regenerates Manifest and md5-cache, and creates a signed overlay commit including the deletions, updated Manifest, and md5-cache paths
+- **WHEN** the plan contains two distinct PVs that both need materialization and both succeed
+- **THEN** the first PV’s overlay commit exists in HEAD before the second PV’s mutation begins
 
 ### Requirement: Reuse path does not take assets publish critical section
 

@@ -10,7 +10,8 @@ where
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Update.Types
-  ( PackageKey (..),
+  ( EcosystemSpec (..),
+    PackageKey (..),
     PackagePolicy (..),
     UpdateSource (..),
     UpdateTechnique (..),
@@ -45,23 +46,23 @@ hardcodedPolicies =
       policy
         "dev-db/dolt"
         (GitHub "dolthub" "dolt" "v")
-        (GoVendorAndAssets (Just "go")),
+        (DepsAndAssets (Go (Just "go"))),
       policy
         "dev-util/beads"
         (GitHub "gastownhall" "beads" "v")
-        (GoVendorAndAssets Nothing),
+        (DepsAndAssets (Go Nothing)),
       policy
         "dev-util/crush"
         (GitHub "charmbracelet" "crush" "v")
-        (GoVendorAndAssets Nothing),
+        (DepsAndAssets (Go Nothing)),
       policy
         "dev-util/openspec"
         (Npm "@fission-ai/openspec")
-        (Unsupported "npm deps assets"),
+        (DepsAndAssets NpmEco),
       policy
         "dev-util/ralph-tui"
         (GitHub "subsy" "ralph-tui" "v")
-        (Unsupported "deps assets"),
+        (DepsAndAssets Bun),
       policy
         "dev-util/hk"
         (GitHub "jdx" "hk" "v")

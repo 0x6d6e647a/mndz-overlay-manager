@@ -46,14 +46,15 @@ import Update.Apply
   )
 import Update.Assets.Release (ReleaseOps (..), productionReleaseOps)
 import Update.Auth (resolveGitHubToken)
+import Update.Bun.Cache (productionBunCacheOps)
 import Update.Check
   ( PackageEntry (..),
-    checkOverlayWithPlan,
+    checkOverlayWithDepsPlan,
     groupNewest,
     productionFetcherWithToken,
   )
+import Update.Deps.Plan (productionDepsPlanOps, toGoPlanOps)
 import Update.Git (isGitWorkTree, productionGitOps)
-import Update.Go.Plan (productionPlanOps)
 import Update.Go.Vendor (productionVendorOps)
 import Update.GpgAgent
   ( newGpgHandle,
@@ -67,8 +68,10 @@ import Update.Md5Cache
     preflightGencache,
     productionEgencacheRunner,
   )
+import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight
-  ( preflightUpdateWith,
+  ( AssetsPreflight (..),
+    preflightUpdateTools,
     validateAssetsPath,
   )
 import Update.SshAgent
@@ -79,11 +82,13 @@ import Update.SshAgent
 import Update.Targets (resolveTargets, targetErrorMessage)
 import Update.Types
   ( ApplyOutcome (..),
+    EcosystemSpec (..),
     OutdatedLine (..),
     PackageKey (..),
     PackagePolicy (..),
     SuccessLine (..),
     UpdateReport (..),
+    UpdateTechnique (..),
     packageKeyText,
     techniqueNeedsAssets,
   )
@@ -136,12 +141,12 @@ runOutdated rt = do
   (cfg, ebuilds) <- loadValidatedEbuildsWithConfig (rtOptions rt)
   token <- liftIO (resolveGitHubToken cfg)
   fetch <- liftIO (productionFetcherWithToken token)
-  planOps <- liftIO (productionPlanOps token (rtJobs rt))
+  depsOps <- liftIO (productionDepsPlanOps token (rtJobs rt) (Just (overlayPath cfg)))
   let total = length (groupNewest ebuilds)
   reports <-
     liftIO $
       withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
-        checkOverlayWithPlan (rtJobs rt) mh fetch planOps ebuilds
+        checkOverlayWithDepsPlan (rtJobs rt) mh fetch depsOps ebuilds
   mapM_ emitReport reports
 
 runUpdate :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> m ()
@@ -159,7 +164,17 @@ runUpdate rt pkgArgs = do
             Nothing -> entries
             Just ks -> [e | e <- entries, peKey e `elem` ks]
           needAssets = any entryNeedsAssets selected
-      preflightOk <- liftIO $ runPreflightSteps (rtProgress rt) needAssets
+          needGo = any (entryNeedsEco ecosystemIsGo) selected
+          needNpm = any (entryNeedsEco ecosystemIsNpm) selected
+          needBun = any (entryNeedsEco ecosystemIsBun) selected
+          assetsPf =
+            AssetsPreflight
+              { apNeedAssets = needAssets,
+                apNeedGo = needGo,
+                apNeedNpm = needNpm,
+                apNeedBun = needBun
+              }
+      preflightOk <- liftIO $ runPreflightSteps (rtProgress rt) assetsPf
       case preflightOk of
         Left err -> dieError (T.unpack err)
         Right () -> pure ()
@@ -185,7 +200,8 @@ runUpdate rt pkgArgs = do
             assetsLock <- newMVar ()
             overlayLock <- newMVar ()
             fetch <- productionFetcherWithToken token
-            planOps <- productionPlanOps token (rtJobs rt)
+            depsOps <- productionDepsPlanOps token (rtJobs rt) (Just overlayPath)
+            let planOps = toGoPlanOps depsOps
             releaseOps <- case token of
               Just t -> productionReleaseOps t
               Nothing ->
@@ -202,6 +218,8 @@ runUpdate rt pkgArgs = do
                       aeEbuildRunner = productionEbuildRunner,
                       aeEgencacheRunner = productionEgencacheRunner,
                       aeVendorOps = productionVendorOps,
+                      aeNpmCacheOps = productionNpmCacheOps,
+                      aeBunCacheOps = productionBunCacheOps,
                       aeReleaseOps = releaseOps,
                       aeAssetsRoot = assetsRoot,
                       aeGitHubToken = token,
@@ -211,7 +229,8 @@ runUpdate rt pkgArgs = do
                       aeOverlayLock = overlayLock,
                       aeJobs = rtJobs rt,
                       aeMulti = noopMultiHandle,
-                      aePlanOps = planOps
+                      aePlanOps = planOps,
+                      aeDepsPlanOps = depsOps
                     }
             applyOverlay (rtProgress rt) env overlayPath entries mFilter
       let pcfg = rtProgress rt
@@ -256,9 +275,10 @@ runUpdate rt pkgArgs = do
               exitWith (ExitFailure 1)
 
 -- | Sequential preflight step bar covering tool checks (and counting conditional steps).
-runPreflightSteps :: ProgressConfig -> Bool -> IO (Either T.Text ())
-runPreflightSteps pcfg needAssets = do
-  let stepDescs =
+runPreflightSteps :: ProgressConfig -> AssetsPreflight -> IO (Either T.Text ())
+runPreflightSteps pcfg ap = do
+  let needAssets = apNeedAssets ap
+      stepDescs =
         ["Checking required tools"]
           <> ["Validating assets path" | needAssets]
           <> ["Resolving GitHub credentials" | needAssets]
@@ -266,11 +286,10 @@ runPreflightSteps pcfg needAssets = do
       total = length stepDescs
   withStepProgress pcfg total $ \step -> do
     shStep step "Checking required tools"
-    tools <- preflightUpdateWith needAssets
+    tools <- preflightUpdateTools ap
     case tools of
       Left err -> pure (Left err)
       Right () -> do
-        -- Remaining steps are informational markers; real work runs after return.
         mapM_ (shStep step) (drop 1 stepDescs)
         pure (Right ())
 
@@ -279,6 +298,24 @@ entryNeedsAssets e =
   case lookupPolicy (peKey e) of
     Just p -> techniqueNeedsAssets (policyTechnique p)
     Nothing -> False
+
+entryNeedsEco :: (EcosystemSpec -> Bool) -> PackageEntry -> Bool
+entryNeedsEco ecoPred e =
+  case lookupPolicy (peKey e) of
+    Just (PackagePolicy _ (DepsAndAssets eco)) -> ecoPred eco
+    _ -> False
+
+ecosystemIsGo :: EcosystemSpec -> Bool
+ecosystemIsGo (Go _) = True
+ecosystemIsGo _ = False
+
+ecosystemIsNpm :: EcosystemSpec -> Bool
+ecosystemIsNpm NpmEco = True
+ecosystemIsNpm _ = False
+
+ecosystemIsBun :: EcosystemSpec -> Bool
+ecosystemIsBun Bun = True
+ecosystemIsBun _ = False
 
 emitOutcome :: (WithLog env Message m, MonadIO m) => ApplyOutcome -> m ()
 emitOutcome = \case

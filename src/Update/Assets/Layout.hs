@@ -4,7 +4,11 @@ module Update.Assets.Layout
   ( SidecarPaths (..),
     sidecarPaths,
     packageAssetsDir,
+    DistfileKind (..),
+    distfileKindForEcosystem,
+    distfileTarballName,
     vendorTarballName,
+    depsTarballName,
     releaseTag,
     releaseName,
     commitMessage,
@@ -14,6 +18,7 @@ where
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.FilePath ((</>))
+import Update.Types (EcosystemSpec (..))
 
 -- | Absolute (or assets-root-relative) paths for the three sidecars.
 data SidecarPaths = SidecarPaths
@@ -37,9 +42,33 @@ sidecarPaths assetsRoot category package distfile =
           spB3 = dir </> distfile <> ".b3"
         }
 
+-- | Distfile kind for assets release basenames.
+data DistfileKind
+  = VendorDist
+  | DepsDist
+  deriving (Eq, Show)
+
+distfileKindForEcosystem :: EcosystemSpec -> DistfileKind
+distfileKindForEcosystem (Go _) = VendorDist
+distfileKindForEcosystem NpmEco = DepsDist
+distfileKindForEcosystem Bun = DepsDist
+
+-- | @{pn}-{pv}-vendor.tar.xz@ or @{pn}-{pv}-deps.tar.xz@ (overlay PN, never npm scope).
+distfileTarballName :: DistfileKind -> Text -> Text -> FilePath
+distfileTarballName kind pn pv =
+  T.unpack pn <> "-" <> T.unpack pv <> suffix
+  where
+    suffix = case kind of
+      VendorDist -> "-vendor.tar.xz"
+      DepsDist -> "-deps.tar.xz"
+
+-- | Go vendor distfile basename (always overlay PN).
 vendorTarballName :: Text -> Text -> FilePath
-vendorTarballName pn pv =
-  T.unpack pn <> "-" <> T.unpack pv <> "-vendor.tar.xz"
+vendorTarballName = distfileTarballName VendorDist
+
+-- | npm/Bun deps distfile basename (always overlay PN).
+depsTarballName :: Text -> Text -> FilePath
+depsTarballName = distfileTarballName DepsDist
 
 releaseTag :: Text -> Text -> Text
 releaseTag pn pv = pn <> "-" <> pv

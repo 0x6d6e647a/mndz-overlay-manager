@@ -10,6 +10,7 @@ module Update.Types
     UpdateStatus (..),
     UpdateReport (..),
     Fetcher,
+    EcosystemSpec (..),
     UpdateTechnique (..),
     PackagePolicy (..),
     SuccessLine (..),
@@ -17,6 +18,9 @@ module Update.Types
     outcomeIsHardFail,
     outcomeIsSuccess,
     techniqueNeedsAssets,
+    ecosystemIsGo,
+    ecosystemIsNpm,
+    ecosystemIsBun,
   )
 where
 
@@ -61,11 +65,11 @@ splitPackageKey (PackageKey t) =
           Just (cat, pkg)
     _ -> Nothing
 
--- | One outdated report line (optional Go tree-lane label).
+-- | One outdated report line (optional runtime-lane label).
 data OutdatedLine = OutdatedLine
   { olFrom :: EbuildVersion,
     olTo :: EbuildVersion,
-    -- | e.g. @Just "(dev-lang/go amd64)"@ for Go tree-lane lines.
+    -- | e.g. @Just "(dev-lang/go amd64)"@ for runtime-lane lines.
     olLabel :: Maybe Text,
     -- | Same-PV overlay/Manifest content fix (apply may reuse release assets).
     olAssetsReusable :: Bool
@@ -73,7 +77,7 @@ data OutdatedLine = OutdatedLine
   deriving (Eq, Show)
 
 data UpdateStatus
-  = -- | One or more outdated transitions (non-Go: single unlabeled line).
+  = -- | One or more outdated transitions (non-deps: single unlabeled line).
     Outdated [OutdatedLine]
   | Ok EbuildVersion
   | -- | local, remote
@@ -93,7 +97,7 @@ data SuccessLine = SuccessLine
   { slFrom :: EbuildVersion,
     slTo :: EbuildVersion,
     slLabel :: Maybe Text,
-    -- | PV was materialized via reuse of an existing release vendor asset.
+    -- | PV was materialized via reuse of an existing release asset.
     slAssetsReused :: Bool
   }
   deriving (Eq, Show)
@@ -101,18 +105,37 @@ data SuccessLine = SuccessLine
 -- | Injectable fetch function for tests and production.
 type Fetcher = UpdateSource -> IO (Either Text EbuildVersion)
 
+-- | Language-deps ecosystem under 'DepsAndAssets'.
+data EcosystemSpec
+  = -- | Optional subdirectory containing go.mod relative to repo root.
+    Go (Maybe FilePath)
+  | NpmEco
+  | Bun
+  deriving (Eq, Show)
+
 -- | How (or whether) to apply a version bump in the overlay.
 data UpdateTechnique
   = GitMvAndManifest
-  | -- | Optional subdirectory containing go.mod relative to repo root.
-    GoVendorAndAssets (Maybe FilePath)
+  | DepsAndAssets EcosystemSpec
   | Unsupported Text
   deriving (Eq, Show)
 
 -- | True when the technique publishes to mndz-overlay-assets.
 techniqueNeedsAssets :: UpdateTechnique -> Bool
-techniqueNeedsAssets (GoVendorAndAssets _) = True
+techniqueNeedsAssets (DepsAndAssets _) = True
 techniqueNeedsAssets _ = False
+
+ecosystemIsGo :: EcosystemSpec -> Bool
+ecosystemIsGo (Go _) = True
+ecosystemIsGo _ = False
+
+ecosystemIsNpm :: EcosystemSpec -> Bool
+ecosystemIsNpm NpmEco = True
+ecosystemIsNpm _ = False
+
+ecosystemIsBun :: EcosystemSpec -> Bool
+ecosystemIsBun Bun = True
+ecosystemIsBun _ = False
 
 -- | Hardcoded per-package source and apply technique.
 data PackagePolicy = PackagePolicy

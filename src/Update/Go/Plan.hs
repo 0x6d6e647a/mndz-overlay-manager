@@ -7,6 +7,8 @@ module Update.Go.Plan
     productionPlanOps,
     planGoPackage,
     planGoPackageWithProgress,
+    planGoPackageWithLocals,
+    planGoPackageWithLocalsProgress,
     localNonLivePVs,
     isLivePackageVersion,
   )
@@ -14,20 +16,23 @@ where
 
 import CLI.Jobs (WorkBudget, newWorkBudget, withWorkSlot)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
+import Data.List (sortBy)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
-import Overlay.Version (EbuildVersion (..), parseEbuildVersion)
+import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
-  ( GoLanePlan,
+  ( GoLanePlan (..),
     LaneTarget (..),
     VersionCandidate (..),
-    planFromTargets,
+    filterCandidateVersions,
+    planFromTargetsWithAtom,
     selectAllLaneTargets,
+    zeroPlannedPVsError,
   )
 import Update.Go.ModFetch
   ( GoModFetcher,
@@ -37,8 +42,8 @@ import Update.Go.ModFetch
     withGoModCache,
   )
 import Update.Go.Tree
-  ( GoCeilings,
-    PortageqRunner,
+  ( PortageqRunner,
+    RuntimeCeilings (..),
     discoverGoCeilingsWith,
     productionPortageqRunner,
   )
@@ -53,13 +58,10 @@ data PlanOps = PlanOps
     poWorkBudget :: WorkBudget,
     -- | Process-wide successful ceiling cache for one command run.
     -- 'Nothing' = uncached; failures are not stored as success.
-    poCeilingsCache :: MVar (Maybe GoCeilings)
+    poCeilingsCache :: MVar (Maybe RuntimeCeilings)
   }
 
 -- | Optional progress hooks for long Go planning pipelines.
---
--- Production UI uses three coarse steps: ceilings, version list, and one
--- go.mod probe walk (not one step per tag).
 data PlanProgress = PlanProgress
   { ppOnCeilingsStart :: IO (),
     ppOnCeilingsDone :: IO (),
@@ -82,8 +84,6 @@ noopPlanProgress =
     }
 
 -- | Production plan ops with go.mod cache, work budget, and ceiling cache.
---
--- @jobs@ is the resolved package job limit; work budget capacity is @2 * jobs@.
 productionPlanOps :: Maybe Text -> Int -> IO PlanOps
 productionPlanOps mToken jobs = do
   mgr <- newManager tlsManagerSettings
@@ -115,7 +115,7 @@ localNonLivePVs es =
   ]
 
 -- | Discover ceilings with process cache; work slot only on real discovery.
-discoverCeilingsCached :: PlanOps -> IO (Either Text GoCeilings)
+discoverCeilingsCached :: PlanOps -> IO (Either Text RuntimeCeilings)
 discoverCeilingsCached ops = do
   cached <- readMVar (poCeilingsCache ops)
   case cached of
@@ -131,13 +131,13 @@ discoverCeilingsCached ops = do
             pure $ case m of
               Just existing -> Just existing
               Nothing -> Just c
-          -- Prefer first successful insert if racing.
           final <- readMVar (poCeilingsCache ops)
           pure $ case final of
             Just c' -> Right c'
             Nothing -> Right c
 
--- | Full plan without progress hooks.
+-- | Full plan without progress hooks (no local-PV filter; all listed versions).
+-- Prefer 'planGoPackageWithLocals' for production candidate-set rules.
 planGoPackage ::
   PlanOps ->
   UpdateSource ->
@@ -145,7 +145,6 @@ planGoPackage ::
   IO (Either Text GoLanePlan)
 planGoPackage ops = planGoPackageWithProgress ops noopPlanProgress
 
--- | Full plan: ceilings → version list → newest-first go_req probe with early exit.
 planGoPackageWithProgress ::
   PlanOps ->
   PlanProgress ->
@@ -153,6 +152,30 @@ planGoPackageWithProgress ::
   Maybe FilePath ->
   IO (Either Text GoLanePlan)
 planGoPackageWithProgress ops progress src mSub =
+  -- Without local PVs, treat listed upstream as the full candidate set
+  -- (tests that mock listVersions only). Production apply/check pass locals.
+  planGoPackageWithLocalsProgress ops progress src mSub Nothing
+
+-- | Plan with optional local non-live PVs for the candidate-set rule.
+-- When @Just locals@ is empty, hard-fails (first import not supported).
+-- When @Nothing@, does not apply the local∪newer filter (test/legacy path).
+planGoPackageWithLocals ::
+  PlanOps ->
+  UpdateSource ->
+  Maybe FilePath ->
+  Maybe [EbuildVersion] ->
+  IO (Either Text GoLanePlan)
+planGoPackageWithLocals ops =
+  planGoPackageWithLocalsProgress ops noopPlanProgress
+
+planGoPackageWithLocalsProgress ::
+  PlanOps ->
+  PlanProgress ->
+  UpdateSource ->
+  Maybe FilePath ->
+  Maybe [EbuildVersion] ->
+  IO (Either Text GoLanePlan)
+planGoPackageWithLocalsProgress ops progress src mSub mLocals =
   case src of
     GitHub owner repo prefix -> do
       ppOnCeilingsStart progress
@@ -169,22 +192,47 @@ planGoPackageWithProgress ops progress src mSub =
             Left err -> pure (Left ("list versions failed: " <> err))
             Right versions -> do
               ppOnListDone progress (length versions)
-              candidates <-
-                buildVersionCandidatesWithProgress
-                  ops
-                  progress
-                  ceilings
-                  owner
-                  repo
-                  prefix
-                  mSub
-                  versions
-              let targets = selectAllLaneTargets ceilings candidates
-              pure (Right (planFromTargets targets))
-    _ -> pure (Left "Go tree-lane planning requires a GitHub update source")
+              let candidateFilter = case mLocals of
+                    Nothing -> Right versions
+                    Just locals -> filterCandidateVersions locals versions
+              case candidateFilter of
+                Left err -> pure (Left err)
+                Right candidatePVs -> do
+                  -- Newest-first for early-exit probing.
+                  let ordered = sortNewestFirst candidatePVs
+                  candidates <-
+                    buildVersionCandidatesWithProgress
+                      ops
+                      progress
+                      ceilings
+                      owner
+                      repo
+                      prefix
+                      mSub
+                      ordered
+                  let targets = selectAllLaneTargets ceilings candidates
+                      plan =
+                        planFromTargetsWithAtom
+                          (rcAtom ceilings)
+                          targets
+                  if null (glpUniquePVs plan)
+                    then pure (Left zeroPlannedPVsError)
+                    else pure (Right plan)
+    _ -> pure (Left "DepsAndAssets Go planning requires a GitHub update source")
 
--- | True when every lane that has a Go ceiling already has a package target.
-allCeilingedLanesFilled :: GoCeilings -> [VersionCandidate] -> Bool
+sortNewestFirst :: [EbuildVersion] -> [EbuildVersion]
+sortNewestFirst =
+  sortBy
+    ( \a b ->
+        case comparePV a b of
+          Just LT -> GT
+          Just GT -> LT
+          Just EQ -> EQ
+          Nothing -> compare (show b) (show a)
+    )
+
+-- | True when every lane that has a runtime ceiling already has a package target.
+allCeilingedLanesFilled :: RuntimeCeilings -> [VersionCandidate] -> Bool
 allCeilingedLanesFilled ceilings candidates =
   all laneOk (selectAllLaneTargets ceilings candidates)
   where
@@ -197,7 +245,7 @@ allCeilingedLanesFilled ceilings candidates =
 buildVersionCandidatesWithProgress ::
   PlanOps ->
   PlanProgress ->
-  GoCeilings ->
+  RuntimeCeilings ->
   Text ->
   Text ->
   Text ->
@@ -237,3 +285,5 @@ buildVersionCandidatesWithProgress ops progress ceilings owner repo prefix mSub 
     renderPVNoRev (Numeric comps _) =
       T.intercalate "." (map (T.pack . show) comps)
     renderPVNoRev (Raw t) = t
+
+-- Silence unused export of atom constant if needed.

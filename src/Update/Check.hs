@@ -7,7 +7,9 @@ module Update.Check
     checkOverlay,
     checkOverlayWith,
     checkOverlayWithPlan,
+    checkOverlayWithDepsPlan,
     checkPackage,
+    checkPackageDeps,
     checkPackageGo,
     productionFetcher,
     productionFetcherWithToken,
@@ -29,10 +31,18 @@ import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import System.Directory (doesFileExist)
 import System.FilePath (takeDirectory, (</>))
-import Update.Assets.Layout (vendorTarballName)
+import Update.Assets.Layout (distfileKindForEcosystem, distfileTarballName)
+import Update.Deps.Plan
+  ( DepsPlanOps (..),
+    planDepsPackageWithProgress,
+    productionDepsPlanOps,
+  )
 import Update.EbuildEdit
-  ( ebuildNeedsContentFix,
+  ( bunBdependAtom,
+    ebuildNeedsContentFix,
+    ebuildNeedsContentFixAtom,
     manifestHasVendorDist,
+    nodejsBdependAtom,
   )
 import Update.GitHub (fetchGitHubWith)
 import Update.Go.Lanes
@@ -48,8 +58,6 @@ import Update.Go.Plan
   ( PlanOps (..),
     PlanProgress (..),
     localNonLivePVs,
-    planGoPackageWithProgress,
-    productionPlanOps,
   )
 import Update.Go.Vendor (versionTag)
 import Update.Hardcoded (lookupPolicy)
@@ -57,7 +65,8 @@ import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
 import Update.Resolve (resolveSource)
 import Update.Types
-  ( Fetcher,
+  ( EcosystemSpec (..),
+    Fetcher,
     OutdatedLine (..),
     PackageKey (..),
     PackagePolicy (..),
@@ -144,8 +153,8 @@ checkOverlayWith ::
   [Ebuild] ->
   IO [UpdateReport]
 checkOverlayWith jobs mh fetch ebuilds = do
-  planOps <- productionPlanOps Nothing jobs
-  checkOverlayWithPlan jobs mh fetch planOps ebuilds
+  depsOps <- productionDepsPlanOps Nothing jobs Nothing
+  checkOverlayWithDepsPlan jobs mh fetch depsOps ebuilds
 
 -- | Like 'checkOverlayWith' with injectable Go plan ops (token-aware list/mod).
 checkOverlayWithPlan ::
@@ -156,24 +165,44 @@ checkOverlayWithPlan ::
   [Ebuild] ->
   IO [UpdateReport]
 checkOverlayWithPlan jobs mh fetch planOps ebuilds = do
+  -- Wrap PlanOps into a minimal DepsPlanOps for Go-only paths.
+  depsOps <- productionDepsPlanOps Nothing jobs Nothing
+  let depsOps' =
+        depsOps
+          { dpoPortageq = poPortageq planOps,
+            dpoListVersions = poListVersions planOps,
+            dpoFetchGoMod = poFetchGoMod planOps,
+            dpoWorkBudget = poWorkBudget planOps,
+            dpoGoCeilingsCache = poCeilingsCache planOps
+          }
+  checkOverlayWithDepsPlan jobs mh fetch depsOps' ebuilds
+
+checkOverlayWithDepsPlan ::
+  Int ->
+  MultiHandle ->
+  Fetcher ->
+  DepsPlanOps ->
+  [Ebuild] ->
+  IO [UpdateReport]
+checkOverlayWithDepsPlan jobs mh fetch depsOps ebuilds = do
   let entries = sortOn (packageKeyText . peKey) (groupNewest ebuilds)
       byPkg = groupByPackage ebuilds
-  mapConcurrentlyN jobs (checkOne mh fetch planOps byPkg) entries
+  mapConcurrentlyN jobs (checkOne mh fetch depsOps byPkg) entries
 
 checkOne ::
   MultiHandle ->
   Fetcher ->
-  PlanOps ->
+  DepsPlanOps ->
   Map.Map PackageKey [Ebuild] ->
   PackageEntry ->
   IO UpdateReport
-checkOne mh fetch planOps byPkg entry = do
+checkOne mh fetch depsOps byPkg entry = do
   let key = peKey entry
   mhStart mh key
   let locals = Map.findWithDefault [] key byPkg
   report <- case lookupPolicy key of
-    Just (PackagePolicy src (GoVendorAndAssets mSub)) ->
-      checkPackageGo mh planOps entry locals src mSub
+    Just (PackagePolicy src (DepsAndAssets eco)) ->
+      checkPackageDeps mh depsOps entry locals src eco
     _ -> do
       mhStatus mh key "fetching"
       checkPackage fetch entry
@@ -211,32 +240,32 @@ checkPackage fetch entry = do
               reportStatus = statusFromCompare local remote
             }
 
--- | Go tree-lane outdated check with multi-step progress.
-checkPackageGo ::
+-- | Runtime-lane outdated check for DepsAndAssets packages.
+checkPackageDeps ::
   MultiHandle ->
-  PlanOps ->
+  DepsPlanOps ->
   PackageEntry ->
   [Ebuild] ->
   UpdateSource ->
-  Maybe FilePath ->
+  EcosystemSpec ->
   IO UpdateReport
-checkPackageGo mh planOps entry locals src mSub = do
+checkPackageDeps mh depsOps entry locals src eco = do
   let key = peKey entry
-      progress = goPlanProgress mh key
-  planResult <- planGoPackageWithProgress planOps progress src mSub
+      progress = depsPlanProgress mh key eco
+      localPVs = localNonLivePVs locals
+  planResult <-
+    planDepsPackageWithProgress depsOps progress eco src localPVs
   case planResult of
     Left err ->
       pure UpdateReport {reportKey = key, reportStatus = FetchError err}
     Right plan -> do
-      let localPVs = localNonLivePVs locals
-      contentFix <- contentFixPVs planOps src mSub locals plan
+      contentFix <- contentFixPVs depsOps eco src locals plan
       let missing = missingTargets localPVs plan
           needsWork = missing <> contentFix
           gaps =
             if planNeedsWork localPVs contentFix plan
               then buildGapLines localPVs needsWork plan
               else []
-          -- Same-PV overlay/Manifest fix: local ebuild for target already exists.
           contentFixSet = contentFix
           isContentOnly toPV =
             any (samePV toPV) contentFixSet
@@ -263,32 +292,59 @@ checkPackageGo mh planOps entry locals src mSub = do
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
--- | Progress hooks: three coarse steps (ceilings, list, go.mod probe walk).
-goPlanProgress :: MultiHandle -> PackageKey -> PlanProgress
-goPlanProgress mh key =
-  PlanProgress
-    { ppOnCeilingsStart = do
-        mhSteps mh key 3
-        mhStatus mh key "discovering go ceilings",
-      ppOnCeilingsDone = mhStep mh key "discovering go ceilings",
-      ppOnListStart = mhStatus mh key "listing versions",
-      ppOnListDone = \_n -> mhStep mh key "listing versions",
-      ppOnProbeDone = mhStep mh key "probing go.mod"
-    }
-
--- | Local PVs present in plan but needing content/KEYWORDS/Manifest/BDEPEND fix.
--- BDEPEND adequacy uses probed go.mod (shared cache with planning) when available.
-contentFixPVs ::
+-- | Go-only entry (tests).
+checkPackageGo ::
+  MultiHandle ->
   PlanOps ->
+  PackageEntry ->
+  [Ebuild] ->
   UpdateSource ->
   Maybe FilePath ->
+  IO UpdateReport
+checkPackageGo mh planOps entry locals src mSub = do
+  depsOps <- productionDepsPlanOps Nothing 2 Nothing
+  let depsOps' =
+        depsOps
+          { dpoPortageq = poPortageq planOps,
+            dpoListVersions = poListVersions planOps,
+            dpoFetchGoMod = poFetchGoMod planOps,
+            dpoWorkBudget = poWorkBudget planOps,
+            dpoGoCeilingsCache = poCeilingsCache planOps
+          }
+  checkPackageDeps mh depsOps' entry locals src (Go mSub)
+
+depsPlanProgress :: MultiHandle -> PackageKey -> EcosystemSpec -> PlanProgress
+depsPlanProgress mh key eco =
+  let ceilLabel = case eco of
+        Go _ -> "discovering go ceilings"
+        NpmEco -> "discovering nodejs ceilings"
+        Bun -> "discovering bun-bin ceilings"
+      probeLabel = case eco of
+        Go _ -> "probing go.mod"
+        NpmEco -> "probing engines.node"
+        Bun -> "probing engines.bun"
+   in PlanProgress
+        { ppOnCeilingsStart = do
+            mhSteps mh key 3
+            mhStatus mh key ceilLabel,
+          ppOnCeilingsDone = mhStep mh key ceilLabel,
+          ppOnListStart = mhStatus mh key "listing versions",
+          ppOnListDone = \_n -> mhStep mh key "listing versions",
+          ppOnProbeDone = mhStep mh key probeLabel
+        }
+
+contentFixPVs ::
+  DepsPlanOps ->
+  EcosystemSpec ->
+  UpdateSource ->
   [Ebuild] ->
   GoLanePlan ->
   IO [EbuildVersion]
-contentFixPVs planOps src mSub locals plan = do
+contentFixPVs depsOps eco src locals plan = do
   let planned = glpEbuilds plan
   concat <$> mapM (checkOneEbuild locals) planned
   where
+    kind = distfileKindForEcosystem eco
     checkOneEbuild es pe = do
       let matches =
             [ e
@@ -308,7 +364,7 @@ contentFixPVs planOps src mSub locals plan = do
               let pkgDir = takeDirectory (ebuildPath e)
                   pn = ebuildPackage e
                   pvNoRev = renderPVNoRev (pePV pe)
-                  tarball = vendorTarballName pn pvNoRev
+                  tarball = distfileTarballName kind pn pvNoRev
                   manPath = pkgDir </> "Manifest"
               manMissing <- do
                 manExists <- doesFileExist manPath
@@ -317,20 +373,32 @@ contentFixPVs planOps src mSub locals plan = do
                   else do
                     manText <- TIO.readFile manPath
                     pure (not (manifestHasVendorDist manText tarball))
-              mGoVer <- fetchGoModForPV planOps src mSub pvNoRev
-              let bad =
+              bad <- case eco of
+                Go mSub -> do
+                  mGoVer <- fetchGoModForPV depsOps src mSub pvNoRev
+                  pure $
                     ebuildNeedsContentFix (peKeywords pe) content mGoVer
+                      || manMissing
+                NpmEco -> do
+                  mAtom <- fetchNpmAtom depsOps src pvNoRev
+                  pure $
+                    ebuildNeedsContentFixAtom (peKeywords pe) content mAtom
+                      || manMissing
+                Bun -> do
+                  mAtom <- fetchBunAtom depsOps src pvNoRev
+                  pure $
+                    ebuildNeedsContentFixAtom (peKeywords pe) content mAtom
                       || manMissing
               pure [pePV pe | bad]
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 fetchGoModForPV ::
-  PlanOps ->
+  DepsPlanOps ->
   UpdateSource ->
   Maybe FilePath ->
   Text ->
   IO (Maybe Text)
-fetchGoModForPV planOps src mSub pvNoRev =
+fetchGoModForPV depsOps src mSub pvNoRev =
   case src of
     GitHub owner repo prefix -> do
       let tag = versionTag prefix pvNoRev
@@ -341,9 +409,29 @@ fetchGoModForPV planOps src mSub pvNoRev =
                 gmkTag = tag,
                 gmkSubdir = mSub
               }
-      eres <- poFetchGoMod planOps key
+      eres <- dpoFetchGoMod depsOps key
       pure $ case eres of
         Right body -> parseGoReqFromMod body
+        Left _ -> Nothing
+    _ -> pure Nothing
+
+fetchNpmAtom :: DepsPlanOps -> UpdateSource -> Text -> IO (Maybe Text)
+fetchNpmAtom depsOps src pvNoRev =
+  case src of
+    Npm npmPkg -> do
+      eres <- dpoFetchNpmEngines depsOps npmPkg pvNoRev
+      pure $ case eres of
+        Right ver -> Just (nodejsBdependAtom ver)
+        Left _ -> Nothing
+    _ -> pure Nothing
+
+fetchBunAtom :: DepsPlanOps -> UpdateSource -> Text -> IO (Maybe Text)
+fetchBunAtom depsOps src pvNoRev =
+  case src of
+    GitHub owner repo prefix -> do
+      eres <- dpoFetchBunEngines depsOps owner repo prefix pvNoRev
+      pure $ case eres of
+        Right ver -> Just (bunBdependAtom ver)
         Left _ -> Nothing
     _ -> pure Nothing
 

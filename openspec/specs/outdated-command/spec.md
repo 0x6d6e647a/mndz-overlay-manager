@@ -45,59 +45,40 @@ When a package has no hardcoded policy (or no source), the outdated check SHALL 
 
 ### Requirement: Outdated stdout format
 
-For each non-Go package whose local PV is strictly less than the fetched remote PV, the program SHALL write exactly one line to standard output of the form `category/package LOCAL -> REMOTE`, where `LOCAL` and `REMOTE` are pretty-rendered ebuild versions in PV form (no leading `v`, optional `-rN` on local when present). For `GoVendorAndAssets` packages, stdout lines SHALL follow the Go tree-lane outdated reporting requirement (possibly multiple lines and lane labels) instead of a single latest-only comparison. Packages that are up to date under their applicable rules SHALL NOT produce a stdout line.
+For each non-`DepsAndAssets` package whose local PV is strictly less than the fetched remote PV, the program SHALL write exactly one line to standard output of the form `category/package LOCAL -> REMOTE`, where `LOCAL` and `REMOTE` are pretty-rendered ebuild versions in PV form (no leading `v`, optional `-rN` on local when present). For `DepsAndAssets` packages, stdout lines SHALL follow the runtime-lane outdated reporting requirement (possibly multiple lines and lane labels) instead of a single latest-only comparison. Packages that are up to date under their applicable rules SHALL NOT produce a stdout line.
 
-#### Scenario: Package behind upstream
+#### Scenario: GitMv outdated single line
 
-- **WHEN** local newest PV is `2.1.6` and remote is `2.1.10` for a non-Go package that uses latest-only checking
-- **THEN** stdout contains the line `category/package 2.1.6 -> 2.1.10` for that package
-
-#### Scenario: Package up to date is silent on stdout
-
-- **WHEN** a package is fully up to date under its applicable outdated rules
-- **THEN** the program writes no stdout line for that package
+- **WHEN** a GitMv package is outdated from `1.0` to `1.1`
+- **THEN** stdout contains one unlabeled `LOCAL -> REMOTE` line
 
 ### Requirement: Go tree-lane outdated reporting
 
-For each package whose technique is `GoVendorAndAssets`, the `outdated` check SHALL use the Go tree-lane planner (Gentoo `dev-lang/go` ceilings, upstream candidates, per-lane target PVs) instead of comparing only newest local PV to a single latest remote. For each lane that has a target PV and is not already satisfied by a local non-live ebuild at that PV with adequate content for that tip (ebuild present; content-fix rules for assets URI / BDEPEND matching the PV’s known `go.mod` requirement / KEYWORDS; and Manifest vendor DIST present for that PV’s vendor tarball as defined by `go-vendor-assets`), the program SHALL write a stdout line of the form `category/package FROM -> TO (dev-lang/go …)` using the lane label from `go-tree-lanes`. Split and converge mapping SHALL follow: when one local version maps to multiple new targets, emit one line per target with the same `FROM`; when multiple locals converge to one target, emit one line per local `FROM` to that `TO`. Versions in these lines SHALL be pretty-rendered in PV form (no leading `v`). Packages that are fully satisfied for all lanes with targets SHALL NOT produce outdated lines for those lanes.
-
-Content-fix adequacy for BDEPEND SHALL use the go.mod probe for that planned PV’s tag (shared cache with planning) when available: missing `dev-lang/go` atom or an atom that does not exactly match `>=dev-lang/go-<go.mod version>:=` SHALL count as unsatisfied. Mere presence of any `dev-lang/go` string SHALL NOT count as adequate when the required version is known.
-
-When the reason a present planned PV is still unsatisfied is **only** overlay content or Manifest incompleteness (the local ebuild for that PV already exists) rather than a missing PV ebuild, the program SHALL append the token ` [assets reusable]` to that outdated line so operators can see that apply may complete without re-vendoring if the release asset already exists. Missing planned PV ebuilds SHALL use the normal line without requiring a GitHub probe during `outdated`.
+For each package whose technique is `DepsAndAssets`, the `outdated` check SHALL use the runtime-lane planner for that ecosystem (runtime package ceilings, candidate set, per-lane target PVs) instead of comparing only newest local PV to a single latest remote. For each lane that has a target PV and is not already satisfied by a local non-live ebuild at that PV with adequate content for that tip (ebuild present; content-fix rules for assets URI / BDEPEND matching the PV’s known requirement / KEYWORDS; and Manifest distfile DIST present for that PV’s vendor or deps tarball as defined by the ecosystem specs), the program SHALL write a stdout line of the form `category/package FROM -> TO (…)` using the lane label from `runtime-lanes` (e.g. `(dev-lang/go amd64)`, `(net-libs/nodejs ~amd64)`, `(dev-lang/bun-bin ~arm64)`). Split and converge mapping SHALL follow: when one local version maps to multiple new targets, emit one line per target with the same `FROM`; when multiple locals converge to one target, emit one line per local `FROM` to that `TO`. Versions in these lines SHALL use PV pretty form without a leading `v`. When a gap is overlay-only for a PV that already has a reusable release asset, the line MAY include ` [assets reusable]` as specified for Go reuse signaling, generalized to deps distfiles.
 
 #### Scenario: Uncollapsed two-lane gap
 
 - **WHEN** local has only `0.80.0` and the plan targets `0.82.0` for `(dev-lang/go amd64)` and `0.84.0` for `(dev-lang/go ~amd64)` (other lanes satisfied or absent)
-- **THEN** stdout includes `… 0.80.0 -> 0.82.0 (dev-lang/go amd64)` and `… 0.80.0 -> 0.84.0 (dev-lang/go ~amd64)`
+- **THEN** stdout includes both transitions with the corresponding lane labels
 
-#### Scenario: Converge report shape
+#### Scenario: Npm package lane line
 
-- **WHEN** locals are `0.80.0` and `0.82.0` and the plan collapses to a single target `0.84.0` for remaining lanes
-- **THEN** stdout includes lines mapping `0.80.0 -> 0.84.0` and `0.82.0 -> 0.84.0` with appropriate lane labels
+- **WHEN** `dev-util/openspec` has a runtime-lane gap for nodejs
+- **THEN** stdout includes a labeled line naming the nodejs runtime lane rather than a single unlabeled latest-only comparison only
 
-#### Scenario: Fully planned package is silent
+#### Scenario: Bun package lane line
 
-- **WHEN** local ebuilds exactly match the planned unique PV set and content and Manifest fixes are not required (including BDEPEND matching known go.mod requirements)
-- **THEN** the program writes no outdated stdout line for that package
-
-#### Scenario: Content-fix line marks assets reusable
-
-- **WHEN** planned PV `0.84.0` is present locally with ebuild content that still needs Manifest vendor DIST completion (or other overlay-only content fix) for a lane
-- **THEN** the outdated line for that lane includes the substring ` [assets reusable]`
-
-#### Scenario: Wrong BDEPEND is outdated
-
-- **WHEN** planned PV is present with adequate SRC_URI, KEYWORDS, and Manifest vendor DIST, but BDEPEND does not match the probed go.mod requirement for that PV
-- **THEN** the program emits an outdated line for the affected lane(s) and does not treat the package as fully up to date
+- **WHEN** `dev-util/ralph-tui` has a runtime-lane gap for bun-bin
+- **THEN** stdout includes a labeled line naming the bun-bin runtime lane
 
 ### Requirement: Non-Go outdated unchanged
 
-Packages that are not `GoVendorAndAssets` SHALL continue to use newest-local vs single fetched latest comparison and the single-line `category/package LOCAL -> REMOTE` format (PV form, no leading `v`) without Go lane labels.
+Packages that are not `DepsAndAssets` SHALL continue to use newest-local vs single fetched latest comparison and the single-line `category/package LOCAL -> REMOTE` format (PV form, no leading `v`) without runtime-lane labels.
 
-#### Scenario: Binary package single line
+#### Scenario: Binary package format
 
-- **WHEN** `dev-util/opencode-bin` local is behind latest remote
-- **THEN** stdout has exactly one line for that package without a `(dev-lang/go …)` suffix
+- **WHEN** `dev-util/opencode-bin` is outdated
+- **THEN** stdout uses a single unlabeled line
 
 ### Requirement: Soft warnings on stderr
 

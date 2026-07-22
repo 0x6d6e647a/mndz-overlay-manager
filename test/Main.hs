@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module Main (main) where
 
@@ -44,6 +45,7 @@ import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isNothing)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -90,7 +92,7 @@ import Update.Apply
     signedOverlayCommit,
   )
 import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
-import Update.Assets.Layout (vendorTarballName)
+import Update.Assets.Layout (depsTarballName, vendorTarballName)
 import Update.Assets.Release
   ( ReleaseAsset (..),
     ReleaseInfo (..),
@@ -100,22 +102,27 @@ import Update.Assets.Release
     parseReleaseInfo,
   )
 import Update.Auth (resolveGitHubTokenWith)
+import Update.Bun.Cache (productionBunCacheOps)
 import Update.Check (PackageEntry (..), groupNewest)
+import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
     ebuildHasDevLangGoBdepend,
     ebuildNeedsContentFix,
     ensureGoBdepend,
+    ensureNodejsBdepend,
     goBdependAtom,
     goBdependMatches,
     keywordsMatch,
     manifestHasVendorDist,
     nextRevisionVersion,
+    nodejsBdependMatches,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
     setKeywords,
     writeVersionForPlannedPV,
   )
+import Update.Engines (parseEnginesMinimum)
 import Update.Git (GitOps (..))
 import Update.GitHub (stripAndParse)
 import Update.Go.Lanes
@@ -129,12 +136,18 @@ import Update.Go.Lanes
     buildGapLines,
     collapsePlannedEbuilds,
     extrasToDelete,
+    filterCandidateVersions,
     laneLabel,
+    ltLane,
     maxVersionUnder,
     missingTargets,
     planFromTargets,
     planNeedsWork,
     selectAllLaneTargets,
+    pattern LaneAmd64Plain,
+    pattern LaneAmd64Tilde,
+    pattern LaneArm64Plain,
+    pattern LaneArm64Tilde,
   )
 import Update.Go.ModFetch (GoModKey (..), withGoModCache)
 import Update.Go.Plan
@@ -145,9 +158,9 @@ import Update.Go.Plan
     planGoPackageWithProgress,
   )
 import Update.Go.Tree
-  ( GoArch (..),
-    GoCeilings (..),
-    GoEbuildMeta (..),
+  ( ArchCeilings (..),
+    RuntimeCeilings (..),
+    RuntimeEbuildMeta (..),
     computeCeilings,
     discoverGoCeilingsWith,
     emptyCeilings,
@@ -202,6 +215,7 @@ import Update.Md5Cache
     packageCacheGateError,
     readCacheMd5Field,
   )
+import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
 import Update.SshAgent
@@ -214,6 +228,7 @@ import Update.SshAgent
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types
   ( ApplyOutcome (..),
+    EcosystemSpec (..),
     OutdatedLine (..),
     PackageKey (..),
     PackagePolicy (..),
@@ -266,6 +281,7 @@ main = do
   testEbuildEdit
   testGoVersionParse
   testGoBdependEdit
+  testNodejsBdependUseReplace
   testVendorGoVersionGate
   testSshAgentReuse
   testGpgSignReadiness
@@ -288,6 +304,11 @@ main = do
   testStepProgressPanelFailSuccess
   testPauseClearThrowLockNotStuck
   testGoTreeCeilings
+  testMultiArchCeilings
+  testTildeOnlyBunCeilings
+  testCandidateVersionFilter
+  testEnginesMinimumParse
+  testDepsDistfileNames
   testGoKeywordsAssembly
   testGoLaneSelection
   testGoLaneCollapse
@@ -547,14 +568,24 @@ testPolicyClassification = do
       hPutStrLn stderr $ "bun policy: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-db/dolt") of
-    Just (PackagePolicy _ (GoVendorAndAssets (Just "go"))) -> pure ()
+    Just (PackagePolicy _ (DepsAndAssets (Go (Just "go")))) -> pure ()
     other -> do
       hPutStrLn stderr $ "dolt technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/beads") of
-    Just (PackagePolicy _ (GoVendorAndAssets Nothing)) -> pure ()
+    Just (PackagePolicy _ (DepsAndAssets (Go Nothing))) -> pure ()
     other -> do
       hPutStrLn stderr $ "beads technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/openspec") of
+    Just (PackagePolicy (Npm "@fission-ai/openspec") (DepsAndAssets NpmEco)) -> pure ()
+    other -> do
+      hPutStrLn stderr $ "openspec technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/ralph-tui") of
+    Just (PackagePolicy _ (DepsAndAssets Bun)) -> pure ()
+    other -> do
+      hPutStrLn stderr $ "ralph-tui technique: " <> show other
       exitFailure
 
 testResolveMapOnly :: IO ()
@@ -1010,6 +1041,48 @@ testGoBdependEdit = do
       hPutStrLn stderr "expected Left for empty go version"
       exitFailure
 
+-- | Regression: replacing nodejs atoms must consume full [npm] USE (no [npm]npm]).
+testNodejsBdependUseReplace :: IO ()
+testNodejsBdependUseReplace = do
+  let openspecStyle =
+        T.unlines
+          [ "inherit shell-completion",
+            "RDEPEND=\">=net-libs/nodejs-20.19.0[npm]\"",
+            "BDEPEND=\"${RDEPEND}\"",
+            "DESCRIPTION=\"x\""
+          ]
+  same <- assertRight "same-version rewrite" (ensureNodejsBdepend "20.19.0" openspecStyle)
+  assertTrue
+    "exact atom present"
+    (nodejsBdependMatches "20.19.0" same)
+  assertTrue
+    "no mangled USE"
+    (not ("[npm]npm]" `T.isInfixOf` same))
+  assertTrue
+    "RDEPEND line intact form"
+    ("RDEPEND=\">=net-libs/nodejs-20.19.0[npm]\"" `T.isInfixOf` same)
+  case [ln | ln <- T.lines same, "RDEPEND=" `T.isPrefixOf` ln] of
+    (rdep : _) ->
+      assertEq "single [npm] on RDEPEND line" 1 (T.count "[npm]" rdep)
+    [] -> do
+      hPutStrLn stderr "expected RDEPEND line after rewrite"
+      exitFailure
+  let older =
+        T.unlines
+          [ "inherit shell-completion",
+            "RDEPEND=\">=net-libs/nodejs-18.0.0[npm]\"",
+            "BDEPEND=\"${RDEPEND}\""
+          ]
+  bumped <- assertRight "bump version" (ensureNodejsBdepend "20.19.0" older)
+  assertTrue "new version" (nodejsBdependMatches "20.19.0" bumped)
+  assertTrue "old version gone" (not (">=net-libs/nodejs-18.0.0" `T.isInfixOf` bumped))
+  assertTrue "no mangled USE after bump" (not ("[npm]npm]" `T.isInfixOf` bumped))
+  -- Go slot form still works via shared replacer.
+  let goLine = "BDEPEND=\">=dev-lang/go-1.24.11:= app-arch/unzip\""
+  goFixed <- assertRight "go still ok" (ensureGoBdepend "1.26.5" ("inherit go-module\n" <> goLine <> "\n"))
+  assertTrue "go atom" (goBdependMatches "1.26.5" goFixed)
+  assertTrue "unzip kept" ("app-arch/unzip" `T.isInfixOf` goFixed)
+
 testVendorGoVersionGate :: IO ()
 testVendorGoVersionGate = do
   downloadCalls <- newIORef (0 :: Int)
@@ -1435,10 +1508,10 @@ testGoTreeCeilings :: IO ()
 testGoTreeCeilings = do
   let kwPlain = parseKeywordsField "KEYWORDS=\"amd64 ~arm64\"\n"
       kwTilde = parseKeywordsField "KEYWORDS=\"~amd64 ~arm64\"\n"
-  assertTrue "bare amd64" (keywordsHasBare Amd64 kwPlain)
-  assertTrue "not bare when tilde only" (not (keywordsHasBare Amd64 kwTilde))
-  assertTrue "tilde or bare for ~amd64" (keywordsHasTildeOrBare Amd64 kwTilde)
-  assertTrue "tilde or bare for bare" (keywordsHasTildeOrBare Amd64 kwPlain)
+  assertTrue "bare amd64" (keywordsHasBare "amd64" kwPlain)
+  assertTrue "not bare when tilde only" (not (keywordsHasBare "amd64" kwTilde))
+  assertTrue "tilde or bare for ~amd64" (keywordsHasTildeOrBare "amd64" kwTilde)
+  assertTrue "tilde or bare for bare" (keywordsHasTildeOrBare "amd64" kwPlain)
   assertTrue "live 9999" (isLiveGoVersion (parseEbuildVersion "9999"))
   assertTrue "not live" (not (isLiveGoVersion (parseEbuildVersion "1.26.3")))
   case parseGoEbuildMeta "/x/go-9999.ebuild" "KEYWORDS=\"~amd64\"\n" of
@@ -1447,16 +1520,101 @@ testGoTreeCeilings = do
       hPutStrLn stderr "expected Nothing for live go ebuild"
       exitFailure
   let metas =
-        [ GoEbuildMeta (parseEbuildVersion "1.26.3") ["amd64", "arm64"],
-          GoEbuildMeta (parseEbuildVersion "1.26.4") ["~amd64", "~arm64"],
-          GoEbuildMeta (parseEbuildVersion "1.25.0") ["~amd64"]
+        [ RuntimeEbuildMeta (parseEbuildVersion "1.26.3") ["amd64", "arm64"],
+          RuntimeEbuildMeta (parseEbuildVersion "1.26.4") ["~amd64", "~arm64"],
+          RuntimeEbuildMeta (parseEbuildVersion "1.25.0") ["~amd64"]
         ]
-      ceilings = computeCeilings metas
-  assertEq "amd64 plain" (Just (parseEbuildVersion "1.26.3")) (gcAmd64Plain ceilings)
-  assertEq "amd64 tilde" (Just (parseEbuildVersion "1.26.4")) (gcAmd64Tilde ceilings)
-  assertEq "arm64 plain" (Just (parseEbuildVersion "1.26.3")) (gcArm64Plain ceilings)
-  assertEq "arm64 tilde" (Just (parseEbuildVersion "1.26.4")) (gcArm64Tilde ceilings)
-  assertEq "empty ceilings" emptyCeilings (computeCeilings [])
+      ceilings = computeCeilings "dev-lang/go" metas
+  assertEq "amd64 plain" (Just (parseEbuildVersion "1.26.3")) (acPlain (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch ceilings)))
+  assertEq "amd64 tilde" (Just (parseEbuildVersion "1.26.4")) (acTilde (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch ceilings)))
+  assertEq "arm64 plain" (Just (parseEbuildVersion "1.26.3")) (acPlain (Map.findWithDefault (ArchCeilings Nothing Nothing) "arm64" (rcByArch ceilings)))
+  assertEq "arm64 tilde" (Just (parseEbuildVersion "1.26.4")) (acTilde (Map.findWithDefault (ArchCeilings Nothing Nothing) "arm64" (rcByArch ceilings)))
+  assertEq "empty ceilings" (emptyCeilings "dev-lang/go") (computeCeilings "dev-lang/go" [])
+
+testMultiArchCeilings :: IO ()
+testMultiArchCeilings = do
+  let metas =
+        [ RuntimeEbuildMeta (parseEbuildVersion "20.0.0") ["amd64", "~loong"],
+          RuntimeEbuildMeta (parseEbuildVersion "22.0.0") ["~amd64", "~loong", "arm64"]
+        ]
+      ceilings = computeCeilings "net-libs/nodejs" metas
+  assertTrue "has loong" (Map.member "loong" (rcByArch ceilings))
+  assertTrue "has amd64" (Map.member "amd64" (rcByArch ceilings))
+  assertTrue "has arm64" (Map.member "arm64" (rcByArch ceilings))
+  assertEq
+    "loong plain absent"
+    Nothing
+    (acPlain (rcByArch ceilings Map.! "loong"))
+  assertEq
+    "loong tilde"
+    (Just (parseEbuildVersion "22.0.0"))
+    (acTilde (rcByArch ceilings Map.! "loong"))
+  assertEq
+    "arm64 plain"
+    (Just (parseEbuildVersion "22.0.0"))
+    (acPlain (rcByArch ceilings Map.! "arm64"))
+
+testTildeOnlyBunCeilings :: IO ()
+testTildeOnlyBunCeilings = do
+  let metas =
+        [ RuntimeEbuildMeta (parseEbuildVersion "1.3.6") ["~amd64", "~arm64"]
+        ]
+      ceilings = computeCeilings "dev-lang/bun-bin" metas
+      targets = selectAllLaneTargets ceilings []
+  assertTrue "no plain amd64 ceiling" (isNothing (acPlain (rcByArch ceilings Map.! "amd64")))
+  assertEq
+    "tilde amd64 ceiling"
+    (Just (parseEbuildVersion "1.3.6"))
+    (acTilde (rcByArch ceilings Map.! "amd64"))
+  -- Lanes exist for tilde only
+  assertTrue
+    "tilde lanes present"
+    (any (\t -> ltLane t == LaneAmd64Tilde) targets)
+
+testCandidateVersionFilter :: IO ()
+testCandidateVersionFilter = do
+  let local = [parseEbuildVersion "1.4.1"]
+      upstream =
+        [ parseEbuildVersion "1.4.0",
+          parseEbuildVersion "1.4.1",
+          parseEbuildVersion "1.5.0",
+          parseEbuildVersion "1.6.0"
+        ]
+  case filterCandidateVersions local upstream of
+    Left err -> do
+      hPutStrLn stderr (T.unpack err)
+      exitFailure
+    Right cs -> do
+      assertTrue "has local 1.4.1" (parseEbuildVersion "1.4.1" `elem` cs)
+      assertTrue "has 1.5.0" (parseEbuildVersion "1.5.0" `elem` cs)
+      assertTrue "has 1.6.0" (parseEbuildVersion "1.6.0" `elem` cs)
+      assertTrue "no 1.4.0" (parseEbuildVersion "1.4.0" `notElem` cs)
+  case filterCandidateVersions [] upstream of
+    Left _ -> pure ()
+    Right _ -> do
+      hPutStrLn stderr "expected hard-fail for empty local"
+      exitFailure
+
+testEnginesMinimumParse :: IO ()
+testEnginesMinimumParse = do
+  assertEq ">= form" (Just "20.19.0") (parseEnginesMinimum ">=20.19.0")
+  assertEq "bare" (Just "1.3.6") (parseEnginesMinimum "1.3.6")
+  assertEq "v prefix" (Just "1.2.3") (parseEnginesMinimum "v1.2.3")
+  assertEq "complex caret" Nothing (parseEnginesMinimum "^20.0.0")
+  assertEq "complex or" Nothing (parseEnginesMinimum ">=18 || >=20")
+  assertEq "star" Nothing (parseEnginesMinimum "*")
+  assertEq "empty" Nothing (parseEnginesMinimum "")
+
+testDepsDistfileNames :: IO ()
+testDepsDistfileNames = do
+  assertEq
+    "vendor"
+    "crush-0.84.0-vendor.tar.xz"
+    (vendorTarballName "crush" "0.84.0")
+  assertEq
+    "deps"
+    "openspec-1.4.2-deps.tar.xz"
+    (depsTarballName "openspec" "1.4.2")
 
 testGoKeywordsAssembly :: IO ()
 testGoKeywordsAssembly = do
@@ -1493,13 +1651,7 @@ testGoKeywordsAssembly = do
 
 testGoLaneSelection :: IO ()
 testGoLaneSelection = do
-  let ceilings =
-        GoCeilings
-          { gcAmd64Plain = Just (parseEbuildVersion "1.26.3"),
-            gcAmd64Tilde = Just (parseEbuildVersion "1.26.5"),
-            gcArm64Plain = Just (parseEbuildVersion "1.26.3"),
-            gcArm64Tilde = Just (parseEbuildVersion "1.26.5")
-          }
+  let ceilings = dualArchGoCeilings (Just "1.26.3") (Just "1.26.5")
       candidates =
         [ VersionCandidate (parseEbuildVersion "0.82.0") (Just "1.26.3"),
           VersionCandidate (parseEbuildVersion "0.84.0") (Just "1.26.5"),
@@ -1754,11 +1906,11 @@ testGoPlanIntegrationMocked = do
     assertEq
       "mock plain"
       (Just (parseEbuildVersion "1.26.3"))
-      (gcAmd64Plain ceilings)
+      (acPlain (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch ceilings)))
     assertEq
       "mock tilde"
       (Just (parseEbuildVersion "1.26.5"))
-      (gcAmd64Tilde ceilings)
+      (acTilde (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch ceilings)))
     budget <- newWorkBudget 2
     ceilingsCache <- newMVar Nothing
     let planOps =
@@ -1808,14 +1960,8 @@ testGoPlanIntegrationMocked = do
 ------------------------------------------------------------------------
 
 -- | Shared ceilings: plain 1.26.3, tilde 1.26.5 (both arches).
-earlyExitCeilings :: GoCeilings
-earlyExitCeilings =
-  GoCeilings
-    { gcAmd64Plain = Just (parseEbuildVersion "1.26.3"),
-      gcAmd64Tilde = Just (parseEbuildVersion "1.26.5"),
-      gcArm64Plain = Just (parseEbuildVersion "1.26.3"),
-      gcArm64Tilde = Just (parseEbuildVersion "1.26.5")
-    }
+earlyExitCeilings :: RuntimeCeilings
+earlyExitCeilings = dualArchGoCeilings (Just "1.26.3") (Just "1.26.5")
 
 -- | Mock plan ops that record go.mod fetch tags (newest-first version list).
 mkEarlyExitPlanOps ::
@@ -2425,6 +2571,17 @@ testReleaseLookup = do
   missingAsset <- lookupNamedAsset opsFound "o" "r" "beads-1.0.5" "wrong-name.tar.xz"
   assertEq "lookup missing asset" (Right Nothing) missingAsset
 
+-- | Dual-arch Go ceilings helper for tests.
+dualArchGoCeilings :: Maybe T.Text -> Maybe T.Text -> RuntimeCeilings
+dualArchGoCeilings plainTok tildeTok =
+  let plain = parseEbuildVersion <$> plainTok
+      tilde = parseEbuildVersion <$> tildeTok
+      ac = ArchCeilings {acPlain = plain, acTilde = tilde}
+   in RuntimeCeilings
+        { rcAtom = "dev-lang/go",
+          rcByArch = Map.fromList [("amd64", ac), ("arm64", ac)]
+        }
+
 -- | Minimal ApplyEnv for content-fix / unit-apply tests.
 mkTestApplyEnv ::
   GitOps ->
@@ -2435,25 +2592,38 @@ mkTestApplyEnv ::
   Maybe FilePath ->
   MVar () ->
   MVar () ->
-  ApplyEnv
-mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLock overlayLock =
-  ApplyEnv
-    { aeFetcher = \_ -> pure (Left "unused"),
-      aeGitOps = gitOps,
-      aeEbuildRunner = ebuildRun,
-      aeEgencacheRunner = mockEgencacheWriteMatching,
-      aeVendorOps = vendorOps,
-      aeReleaseOps = releaseOps,
-      aeAssetsRoot = assetsRoot,
-      aeGitHubToken = Just "tok",
-      aeAssetsOwner = "0x6d6e647a",
-      aeAssetsRepo = "mndz-overlay-assets",
-      aeAssetsLock = assetsLock,
-      aeOverlayLock = overlayLock,
-      aeJobs = 1,
-      aeMulti = noopMultiHandle,
-      aePlanOps = planOps
-    }
+  IO ApplyEnv
+mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLock overlayLock = do
+  depsBase <- productionDepsPlanOps (Just "tok") 1 Nothing
+  let depsOps =
+        depsBase
+          { dpoPortageq = poPortageq planOps,
+            dpoListVersions = poListVersions planOps,
+            dpoFetchGoMod = poFetchGoMod planOps,
+            dpoWorkBudget = poWorkBudget planOps,
+            dpoGoCeilingsCache = poCeilingsCache planOps
+          }
+  pure
+    ApplyEnv
+      { aeFetcher = \_ -> pure (Left "unused"),
+        aeGitOps = gitOps,
+        aeEbuildRunner = ebuildRun,
+        aeEgencacheRunner = mockEgencacheWriteMatching,
+        aeVendorOps = vendorOps,
+        aeNpmCacheOps = productionNpmCacheOps,
+        aeBunCacheOps = productionBunCacheOps,
+        aeReleaseOps = releaseOps,
+        aeAssetsRoot = assetsRoot,
+        aeGitHubToken = Just "tok",
+        aeAssetsOwner = "0x6d6e647a",
+        aeAssetsRepo = "mndz-overlay-assets",
+        aeAssetsLock = assetsLock,
+        aeOverlayLock = overlayLock,
+        aeJobs = 1,
+        aeMulti = noopMultiHandle,
+        aePlanOps = planOps,
+        aeDepsPlanOps = depsOps
+      }
 
 -- | Write a matching md5-dict cache file for one ebuild.
 writeMatchingCacheFile :: FilePath -> T.Text -> T.Text -> T.Text -> FilePath -> IO ()
@@ -2534,7 +2704,8 @@ testContentFixManifest =
                       peLanes = []
                     }
                 ],
-              glpUniquePVs = [pv]
+              glpUniquePVs = [pv],
+              glpRuntimeAtom = "dev-lang/go"
             }
         planOps =
           PlanOps
@@ -2560,16 +2731,16 @@ testContentFixManifest =
             { poWorkBudget = budget,
               poCeilingsCache = ceilingsCache
             }
-        env =
-          mkTestApplyEnv
-            gitOps
-            planOps'
-            (\_ _ -> pure (Right ()))
-            unusedReleaseOps
-            unusedVendorOps
-            Nothing
-            assetsLock
-            overlayLock
+    env <-
+      mkTestApplyEnv
+        gitOps
+        planOps'
+        (\_ _ -> pure (Right ()))
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
     createDirectoryIfMissing True pkgDir
     TIO.writeFile (pkgDir </> ebuildName) ebuildBody
     -- No Manifest → needs work
@@ -2747,9 +2918,10 @@ testReuseVsFullPublish =
     -- Reuse path: no vendor calls; success with assets reused; Manifest matches.
     writeIORef vendorCallRef 0
     stepsDoneReuse <- newIORef (0 :: Int)
+    envReuse <- mkEnv releaseFound ebuildRunnerOk assetsLock overlayLock
     outcomeReuse <-
       goPublishAndOverlay
-        (mkEnv releaseFound ebuildRunnerOk assetsLock overlayLock)
+        envReuse
         overlayRoot
         entry
         "charmbracelet"
@@ -2771,9 +2943,10 @@ testReuseVsFullPublish =
         exitFailure
     -- Manifest mismatch hard-fails on reuse.
     stepsDoneBad <- newIORef (0 :: Int)
+    envBad <- mkEnv releaseFound ebuildRunnerWrong assetsLock overlayLock
     outcomeBad <-
       goPublishAndOverlay
-        (mkEnv releaseFound ebuildRunnerWrong assetsLock overlayLock)
+        envBad
         overlayRoot
         entry
         "charmbracelet"
@@ -2809,10 +2982,8 @@ testReuseVsFullPublish =
             }
     writeIORef vendorCallRef 0
     stepsDoneFull <- newIORef (0 :: Int)
-    let envFull =
-          (mkEnv releaseMissing ebuildRunnerOk assetsLock overlayLock)
-            { aeVendorOps = vendorOpsFull
-            }
+    envFull0 <- mkEnv releaseMissing ebuildRunnerOk assetsLock overlayLock
+    let envFull = envFull0 {aeVendorOps = vendorOpsFull}
     _ <-
       goPublishAndOverlay
         envFull
@@ -2885,17 +3056,17 @@ testGitMvCommitsOnSuccess =
     overlayLock <- newMVar ()
     budget <- newWorkBudget 1
     ceilingsCache <- newMVar Nothing
-    let env0 =
-          mkTestApplyEnv
-            gitOps
-            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
-            ebuildRun
-            unusedReleaseOps
-            unusedVendorOps
-            Nothing
-            assetsLock
-            overlayLock
-        env = env0 {aeFetcher = \_ -> pure (Right remote)}
+    env0 <-
+      mkTestApplyEnv
+        gitOps
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        ebuildRun
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let env = env0 {aeFetcher = \_ -> pure (Right remote)}
     outcomes <- applyPackagePhase1 env overlayRoot entry
     case outcomes of
       [ApplySuccess _ _ paths] -> do
@@ -2948,7 +3119,8 @@ testGoMultiPvSequentialCommits =
                   PlannedEbuild {pePV = pv2, peKeywords = ["~amd64"], peLanes = []}
                 ],
               -- Include tip so prune does not add a third commit in this test.
-              glpUniquePVs = [tip, pv1, pv2]
+              glpUniquePVs = [tip, pv1, pv2],
+              glpRuntimeAtom = "dev-lang/go"
             }
         assetBytes = encodeUtf8 "vendor-bytes-multi-pv"
         digests0 = hashBytes assetBytes
@@ -3027,16 +3199,16 @@ testGoMultiPvSequentialCommits =
     overlayLock <- newMVar ()
     budget <- newWorkBudget 2
     ceilingsCache <- newMVar Nothing
-    let env =
-          mkTestApplyEnv
-            gitOps
-            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
-            ebuildRun
-            releaseOps
-            unusedVendorOps
-            (Just assetsRoot)
-            assetsLock
-            overlayLock
+    env <-
+      mkTestApplyEnv
+        gitOps
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        ebuildRun
+        releaseOps
+        unusedVendorOps
+        (Just assetsRoot)
+        assetsLock
+        overlayLock
     outcomes <-
       materializePlan
         env
@@ -3108,7 +3280,8 @@ testGoMultiPvStopOnHardFail =
                   PlannedEbuild {pePV = pv2, peKeywords = ["~amd64"], peLanes = []},
                   PlannedEbuild {pePV = pv3, peKeywords = ["~amd64"], peLanes = []}
                 ],
-              glpUniquePVs = [pv1, pv2, pv3]
+              glpUniquePVs = [pv1, pv2, pv3],
+              glpRuntimeAtom = "dev-lang/go"
             }
         assetBytes = encodeUtf8 "vendor-bytes-fail-test"
         digests0 = hashBytes assetBytes
@@ -3175,16 +3348,16 @@ testGoMultiPvStopOnHardFail =
     overlayLock <- newMVar ()
     budget <- newWorkBudget 2
     ceilingsCache <- newMVar Nothing
-    let env =
-          mkTestApplyEnv
-            gitOps
-            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
-            ebuildRun
-            releaseOps
-            unusedVendorOps
-            (Just assetsRoot)
-            assetsLock
-            overlayLock
+    env <-
+      mkTestApplyEnv
+        gitOps
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        ebuildRun
+        releaseOps
+        unusedVendorOps
+        (Just assetsRoot)
+        assetsLock
+        overlayLock
     outcomes <-
       materializePlan
         env
@@ -3378,17 +3551,17 @@ testFullPathApplyProgressSequence =
     budget <- newWorkBudget 2
     ceilingsCache <- newMVar Nothing
     stepsDone <- newIORef (0 :: Int)
-    let env0 =
-          mkTestApplyEnv
-            gitOps
-            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
-            ebuildRun
-            releaseOps
-            vendorOps
-            (Just assetsRoot)
-            assetsLock
-            overlayLock
-        env = env0 {aeMulti = mh}
+    env0 <-
+      mkTestApplyEnv
+        gitOps
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        ebuildRun
+        releaseOps
+        vendorOps
+        (Just assetsRoot)
+        assetsLock
+        overlayLock
+    let env = env0 {aeMulti = mh}
     outcome <-
       goPublishAndOverlay
         env
@@ -3547,17 +3720,17 @@ testReusePathApplyProgressSequence =
     budget <- newWorkBudget 2
     ceilingsCache <- newMVar Nothing
     stepsDone <- newIORef (0 :: Int)
-    let env0 =
-          mkTestApplyEnv
-            gitOps
-            planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
-            ebuildRun
-            releaseOps
-            unusedVendorOps
-            (Just assetsRoot)
-            assetsLock
-            overlayLock
-        env = env0 {aeMulti = mh}
+    env0 <-
+      mkTestApplyEnv
+        gitOps
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        ebuildRun
+        releaseOps
+        unusedVendorOps
+        (Just assetsRoot)
+        assetsLock
+        overlayLock
+    let env = env0 {aeMulti = mh}
     outcome <-
       goPublishAndOverlay
         env
@@ -3674,16 +3847,16 @@ testOverlayCommitLock = do
             poWorkBudget = budget,
             poCeilingsCache = ceilingsCache
           }
-      env =
-        mkTestApplyEnv
-          gitOps
-          planOps
-          (\_ _ -> pure (Right ()))
-          unusedReleaseOps
-          unusedVendorOps
-          Nothing
-          assetsLock
-          overlayLock
+  env <-
+    mkTestApplyEnv
+      gitOps
+      planOps
+      (\_ _ -> pure (Right ()))
+      unusedReleaseOps
+      unusedVendorOps
+      Nothing
+      assetsLock
+      overlayLock
   _ <-
     mapConcurrently
       (signedOverlayCommit env "/tmp" ["a.ebuild"])
@@ -3905,17 +4078,17 @@ testMd5CacheGateBlocksGitMv =
               poWorkBudget = budget,
               poCeilingsCache = ceilingsCache
             }
-        env0 =
-          mkTestApplyEnv
-            gitOps
-            planOps
-            (\_ _ -> pure (Right ()))
-            unusedReleaseOps
-            unusedVendorOps
-            Nothing
-            assetsLock
-            overlayLock
-        env =
+    env0 <-
+      mkTestApplyEnv
+        gitOps
+        planOps
+        (\_ _ -> pure (Right ()))
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let env =
           env0
             { aeFetcher = \_ -> pure (Right (parseEbuildVersion "1.1")),
               aeEgencacheRunner = \_ -> pure (Left "egencache should not run")

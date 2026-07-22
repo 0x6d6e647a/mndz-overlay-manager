@@ -9,17 +9,26 @@ module Update.EbuildEdit
     parseManifestVendorSHA512,
     manifestHasVendorDist,
     ebuildNeedsContentFix,
+    ebuildNeedsContentFixAtom,
     goBdependAtom,
+    nodejsBdependAtom,
+    bunBdependAtom,
     ebuildHasDevLangGoBdepend,
+    ebuildHasNodejsBdepend,
+    ebuildHasBunBinBdepend,
     goBdependMatches,
+    nodejsBdependMatches,
+    bunBdependMatches,
     ensureGoBdepend,
+    ensureNodejsBdepend,
+    ensureBunBdepend,
     parseKeywordsLine,
     setKeywords,
     keywordsMatch,
   )
 where
 
-import Data.Char (isDigit, isHexDigit)
+import Data.Char (isAlpha, isDigit, isHexDigit)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), comparePV, renderPV)
@@ -168,6 +177,16 @@ ebuildNeedsContentFix keywords content mRequiredGo =
     || not (keywordsMatch keywords content)
     || bdependNeedsFix mRequiredGo content
 
+-- | Content fix when the full required BDEPEND atom string is known.
+-- @Nothing@ means no BDEPEND check (KEYWORDS / SRC_URI only).
+ebuildNeedsContentFixAtom :: [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsContentFixAtom keywords content mAtom =
+  not (assetsSrcUriParameterized content)
+    || not (keywordsMatch keywords content)
+    || case mAtom of
+      Just atom -> not (atom `T.isInfixOf` content)
+      Nothing -> False
+
 -- | BDEPEND adequacy vs optional known go.mod language version.
 bdependNeedsFix :: Maybe Text -> Text -> Bool
 bdependNeedsFix (Just ver) content = not (goBdependMatches ver content)
@@ -177,70 +196,162 @@ bdependNeedsFix Nothing content = not (ebuildHasDevLangGoBdepend content)
 goBdependAtom :: Text -> Text
 goBdependAtom goVer = ">=dev-lang/go-" <> goVer <> ":="
 
+-- | Portage atom for engines.node minimum with npm USE.
+nodejsBdependAtom :: Text -> Text
+nodejsBdependAtom ver = ">=net-libs/nodejs-" <> ver <> "[npm]"
+
+-- | Portage atom for engines.bun minimum.
+bunBdependAtom :: Text -> Text
+bunBdependAtom ver = ">=dev-lang/bun-bin-" <> ver
+
 -- | True when the ebuild text mentions a @dev-lang/go@ dependency atom.
 ebuildHasDevLangGoBdepend :: Text -> Bool
 ebuildHasDevLangGoBdepend content =
   "dev-lang/go" `T.isInfixOf` content
+
+ebuildHasNodejsBdepend :: Text -> Bool
+ebuildHasNodejsBdepend content =
+  "net-libs/nodejs" `T.isInfixOf` content
+
+ebuildHasBunBinBdepend :: Text -> Bool
+ebuildHasBunBinBdepend content =
+  "dev-lang/bun-bin" `T.isInfixOf` content
 
 -- | True when the ebuild already has the exact required go BDEPEND atom.
 goBdependMatches :: Text -> Text -> Bool
 goBdependMatches goVer content =
   goBdependAtom goVer `T.isInfixOf` content
 
+nodejsBdependMatches :: Text -> Text -> Bool
+nodejsBdependMatches ver content =
+  nodejsBdependAtom ver `T.isInfixOf` content
+
+bunBdependMatches :: Text -> Text -> Bool
+bunBdependMatches ver content =
+  bunBdependAtom ver `T.isInfixOf` content
+
 -- | Ensure the ebuild declares @BDEPEND@ with @>=dev-lang/go-<ver>:=@.
--- Replaces existing @dev-lang/go@ atoms inside @BDEPEND@ / @BDEPEND+@ lines;
--- inserts a new @BDEPEND@ line after @inherit@ when none is present.
 ensureGoBdepend :: Text -> Text -> Either Text Text
-ensureGoBdepend goVer content
-  | T.null (T.strip goVer) = Left "empty go version for BDEPEND"
-  | not (validGoVer goVer) =
-      Left ("invalid go version for BDEPEND: " <> goVer)
-  | ebuildHasDevLangGoBdepend content =
-      Right (replaceGoAtoms (goBdependAtom goVer) content)
+ensureGoBdepend goVer =
+  ensureBdependAtom
+    "go"
+    "dev-lang/go"
+    (goBdependAtom goVer)
+    goVer
+
+-- | Ensure @>=net-libs/nodejs-<ver>[npm]@ in BDEPEND.
+ensureNodejsBdepend :: Text -> Text -> Either Text Text
+ensureNodejsBdepend ver =
+  ensureBdependAtom
+    "nodejs"
+    "net-libs/nodejs"
+    (nodejsBdependAtom ver)
+    ver
+
+-- | Ensure @>=dev-lang/bun-bin-<ver>@ in BDEPEND.
+ensureBunBdepend :: Text -> Text -> Either Text Text
+ensureBunBdepend ver =
+  ensureBdependAtom
+    "bun-bin"
+    "dev-lang/bun-bin"
+    (bunBdependAtom ver)
+    ver
+
+ensureBdependAtom ::
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  Either Text Text
+ensureBdependAtom label pkgInfix atom ver content
+  | T.null (T.strip ver) = Left ("empty " <> label <> " version for BDEPEND")
+  | not (validVer ver) =
+      Left ("invalid " <> label <> " version for BDEPEND: " <> ver)
+  | pkgInfix `T.isInfixOf` content =
+      Right (replacePkgAtoms pkgInfix atom content)
   | otherwise =
-      case insertAfterInherit (goBdependAtom goVer) content of
+      case insertAfterInherit atom content of
         Just fixed -> Right fixed
         Nothing ->
           Left "could not insert BDEPEND: no inherit line found in ebuild"
   where
-    validGoVer v =
+    validVer v =
       let parts = T.splitOn "." v
        in not (null parts)
             && all (\p -> not (T.null p) && T.all isDigit p) parts
 
--- | Replace each @dev-lang/go…@ dependency atom with the required atom.
-replaceGoAtoms :: Text -> Text -> Text
-replaceGoAtoms atom content =
+-- | Replace each @pkgInfix…@ dependency atom with the required atom.
+replacePkgAtoms :: Text -> Text -> Text -> Text
+replacePkgAtoms pkgInfix atom content =
   T.unlines (map (replaceInLine atom) (T.lines content))
   where
     replaceInLine a ln
-      | "dev-lang/go" `T.isInfixOf` ln = replaceAtomsInText a ln
+      | pkgInfix `T.isInfixOf` ln = replaceAtomsInText pkgInfix a ln
       | otherwise = ln
 
--- | Replace @>=dev-lang/go-1.x@-style tokens (optional operators, version, @:=@).
-replaceAtomsInText :: Text -> Text -> Text
-replaceAtomsInText atom = go
+-- | Replace @>=pkg-1.x@-style tokens (optional operators, version, slot, USE).
+--
+-- The old atom tail after @pkgInfix@ is dropped as: optional @-version@,
+-- optional slot (@:=@ / @:\<slot\>@ / @:\<slot\>=@), optional USE (@[\…]@).
+-- USE flag *names* (letters) must be consumed so rewrites of e.g.
+-- @>=net-libs/nodejs-20.19.0[npm]@ do not leave a dangling @npm]@.
+replaceAtomsInText :: Text -> Text -> Text -> Text
+replaceAtomsInText pkgInfix atom = go
   where
     go t =
-      case T.breakOn "dev-lang/go" t of
+      case T.breakOn pkgInfix t of
         (_, rest)
           | T.null rest -> t
         (before, rest) ->
           let prefix = T.dropWhileEnd isAtomOp before
-              afterAtom = dropGoAtom rest
+              afterAtom = dropPkgAtom rest
            in prefix <> atom <> go afterAtom
 
     isAtomOp c = c == '>' || c == '=' || c == '<' || c == '~'
 
-    -- @rest@ starts with @dev-lang/go@.
-    dropGoAtom rest =
-      let afterPkg = T.drop (T.length ("dev-lang/go" :: Text)) rest
-          -- optional -version and := / :slot
-          verPart =
-            T.takeWhile
-              (\c -> isDigit c || c == '.' || c == '-' || c == ':' || c == '=')
-              afterPkg
-       in T.drop (T.length verPart) afterPkg
+    -- @rest@ starts with @pkgInfix@.
+    dropPkgAtom rest =
+      dropUse (dropSlot (dropVersion (T.drop (T.length pkgInfix) rest)))
+
+    -- @-20.19.0@, @-1.26.5_p1@, etc.
+    dropVersion t =
+      case T.uncons t of
+        Just ('-', rs) ->
+          let (ver, rest) = T.span isVersionChar rs
+           in if T.null ver then t else rest
+        _ -> t
+
+    isVersionChar c =
+      isDigit c || c == '.' || c == '_' || isAlpha c
+
+    -- @:=@, @:0@, @:0/@, @:slot=@ — stop at USE or whitespace/quote.
+    dropSlot t =
+      case T.uncons t of
+        Just (':', rs) ->
+          let (_slotBody, rest0) = T.span isSlotChar rs
+           in case T.uncons rest0 of
+                Just ('=', r) -> r
+                _ -> rest0
+        _ -> t
+
+    isSlotChar c =
+      isDigit c
+        || c == '.'
+        || c == '+'
+        || c == '_'
+        || c == '/'
+        || isAlpha c
+
+    -- @[npm]@, @[npm(+)]@, multi-flag USE lists.
+    dropUse t =
+      case T.uncons t of
+        Just ('[', rs) ->
+          case T.break (== ']') rs of
+            (_inside, rest)
+              | Just (']', after) <- T.uncons rest -> after
+              | otherwise -> t
+        _ -> t
 
 insertAfterInherit :: Text -> Text -> Maybe Text
 insertAfterInherit atom content =

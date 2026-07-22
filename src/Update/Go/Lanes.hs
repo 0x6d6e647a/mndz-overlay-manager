@@ -1,15 +1,21 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module Update.Go.Lanes
   ( LaneId (..),
+    pattern LaneAmd64Plain,
+    pattern LaneAmd64Tilde,
+    pattern LaneArm64Plain,
+    pattern LaneArm64Tilde,
     allLaneIds,
+    lanesFromCeilings,
     laneLabel,
-    laneArch,
-    laneTier,
+    laneLabelWith,
     laneCeilingLane,
     LaneTarget (..),
     PlannedEbuild (..),
     GoLanePlan (..),
+    LanePlan,
     GapLine (..),
     VersionCandidate (..),
     selectLaneTarget,
@@ -17,62 +23,81 @@ module Update.Go.Lanes
     collapsePlannedEbuilds,
     assembleKeywords,
     planFromTargets,
+    planFromTargetsWithAtom,
     planNeedsWork,
     extrasToDelete,
     missingTargets,
     buildGapLines,
     goReqMeetsCeiling,
     maxVersionUnder,
+    filterCandidateVersions,
+    zeroPlannedPVsError,
   )
 where
 
-import Data.List (nub, sortBy)
+import Data.List (nub, sort, sortBy)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import Update.Go.Tree
-  ( GoArch (..),
-    GoCeilingLane (..),
-    GoCeilings (..),
+  ( Arch,
+    CeilingLane (..),
     KeywordTier (..),
+    RuntimeCeilings (..),
+    allCeilingLanes,
     ceilingFor,
   )
 import Update.Go.Version (compareGoVersions)
 
--- | Logical lane id matching the four tree ceilings.
-data LaneId
-  = LaneAmd64Plain
-  | LaneAmd64Tilde
-  | LaneArm64Plain
-  | LaneArm64Tilde
-  deriving (Eq, Ord, Show, Enum, Bounded)
+-- | Logical lane id: arch × plain/tilde.
+data LaneId = LaneId
+  { liArch :: Arch,
+    liTier :: KeywordTier
+  }
+  deriving (Eq, Ord, Show)
 
+-- | Pattern synonyms for dual-arch Go tests and fixtures.
+pattern LaneAmd64Plain :: LaneId
+pattern LaneAmd64Plain = LaneId "amd64" Plain
+
+pattern LaneAmd64Tilde :: LaneId
+pattern LaneAmd64Tilde = LaneId "amd64" Tilde
+
+pattern LaneArm64Plain :: LaneId
+pattern LaneArm64Plain = LaneId "arm64" Plain
+
+pattern LaneArm64Tilde :: LaneId
+pattern LaneArm64Tilde = LaneId "arm64" Tilde
+
+-- | Default four dual-arch lanes (legacy helper; prefer 'lanesFromCeilings').
 allLaneIds :: [LaneId]
-allLaneIds = [minBound .. maxBound]
+allLaneIds =
+  [ LaneAmd64Plain,
+    LaneAmd64Tilde,
+    LaneArm64Plain,
+    LaneArm64Tilde
+  ]
+
+-- | Lanes derived from discovered ceilings (only arches/tiers with a ceiling).
+-- When no ceilings are present, falls back to the four dual-arch lanes so empty
+-- discovery still yields lane slots (selection will leave them empty).
+lanesFromCeilings :: RuntimeCeilings -> [LaneId]
+lanesFromCeilings ceilings =
+  case allCeilingLanes ceilings of
+    [] -> allLaneIds
+    cls -> map (\(CeilingLane a t) -> LaneId a t) cls
 
 laneLabel :: LaneId -> Text
-laneLabel = \case
-  LaneAmd64Plain -> "(dev-lang/go amd64)"
-  LaneAmd64Tilde -> "(dev-lang/go ~amd64)"
-  LaneArm64Plain -> "(dev-lang/go arm64)"
-  LaneArm64Tilde -> "(dev-lang/go ~arm64)"
+laneLabel = laneLabelWith "dev-lang/go"
 
-laneArch :: LaneId -> GoArch
-laneArch = \case
-  LaneAmd64Plain -> Amd64
-  LaneAmd64Tilde -> Amd64
-  LaneArm64Plain -> Arm64
-  LaneArm64Tilde -> Arm64
+laneLabelWith :: Text -> LaneId -> Text
+laneLabelWith atom (LaneId arch tier) =
+  case tier of
+    Plain -> "(" <> atom <> " " <> arch <> ")"
+    Tilde -> "(" <> atom <> " ~" <> arch <> ")"
 
-laneTier :: LaneId -> KeywordTier
-laneTier = \case
-  LaneAmd64Plain -> Plain
-  LaneAmd64Tilde -> Tilde
-  LaneArm64Plain -> Plain
-  LaneArm64Tilde -> Tilde
-
-laneCeilingLane :: LaneId -> GoCeilingLane
-laneCeilingLane lid = GoCeilingLane (laneArch lid) (laneTier lid)
+laneCeilingLane :: LaneId -> CeilingLane
+laneCeilingLane (LaneId arch tier) = CeilingLane arch tier
 
 -- | Per-lane selection result.
 data LaneTarget = LaneTarget
@@ -91,13 +116,17 @@ data PlannedEbuild = PlannedEbuild
   }
   deriving (Eq, Show)
 
--- | Full plan for one GoVendorAndAssets package.
+-- | Full plan for one DepsAndAssets package (runtime lanes).
 data GoLanePlan = GoLanePlan
   { glpLanes :: [LaneTarget],
     glpEbuilds :: [PlannedEbuild],
-    glpUniquePVs :: [EbuildVersion]
+    glpUniquePVs :: [EbuildVersion],
+    -- | Runtime package atom for labels (e.g. @dev-lang/go@).
+    glpRuntimeAtom :: Text
   }
   deriving (Eq, Show)
+
+type LanePlan = GoLanePlan
 
 -- | One outdated/success report line.
 data GapLine = GapLine
@@ -107,28 +136,28 @@ data GapLine = GapLine
   }
   deriving (Eq, Show)
 
--- | Upstream version with optional go_req (Nothing = unparseable / skip).
+-- | Upstream version with optional runtime req (Nothing = unparseable / skip for selection).
 data VersionCandidate = VersionCandidate
   { vcPV :: EbuildVersion,
     vcGoReq :: Maybe Text
   }
   deriving (Eq, Show)
 
--- | Whether package go_req is ≤ Go ceiling (same rules as host gate).
+-- | Whether package runtime req is ≤ ceiling (same rules as host gate).
 goReqMeetsCeiling :: Text -> EbuildVersion -> Maybe Bool
 goReqMeetsCeiling goReq ceilingPV =
-  let ceilingTok = renderGoCeiling ceilingPV
+  let ceilingTok = renderRuntimeCeiling ceilingPV
    in case compareGoVersions goReq ceilingTok of
         Just GT -> Just False
         Just _ -> Just True
         Nothing -> Nothing
 
-renderGoCeiling :: EbuildVersion -> Text
-renderGoCeiling (Numeric comps _) =
+renderRuntimeCeiling :: EbuildVersion -> Text
+renderRuntimeCeiling (Numeric comps _) =
   T.intercalate "." (map (T.pack . show) comps)
-renderGoCeiling (Raw t) = t
+renderRuntimeCeiling (Raw t) = t
 
--- | Max package PV among candidates with parseable go_req ≤ ceiling.
+-- | Max package PV among candidates with parseable req ≤ ceiling.
 maxVersionUnder :: EbuildVersion -> [VersionCandidate] -> Maybe (EbuildVersion, Text)
 maxVersionUnder goCeiling candidates =
   let eligible =
@@ -147,7 +176,7 @@ maxVersionUnder goCeiling candidates =
         _ -> (pa, ra)
 
 -- | Select target for one lane.
-selectLaneTarget :: GoCeilings -> [VersionCandidate] -> LaneId -> LaneTarget
+selectLaneTarget :: RuntimeCeilings -> [VersionCandidate] -> LaneId -> LaneTarget
 selectLaneTarget ceilings candidates lid =
   let mCeiling = ceilingFor ceilings (laneCeilingLane lid)
       mPick = case mCeiling of
@@ -160,34 +189,25 @@ selectLaneTarget ceilings candidates lid =
           ltGoReq = snd <$> mPick
         }
 
-selectAllLaneTargets :: GoCeilings -> [VersionCandidate] -> [LaneTarget]
+selectAllLaneTargets :: RuntimeCeilings -> [VersionCandidate] -> [LaneTarget]
 selectAllLaneTargets ceilings candidates =
-  map (selectLaneTarget ceilings candidates) allLaneIds
+  map (selectLaneTarget ceilings candidates) (lanesFromCeilings ceilings)
 
 -- | KEYWORDS tokens from lane membership (plain → bare arch; tilde-only → @~arch@).
---
--- Per arch (@amd64@ then @arm64@): if any plain lane targets the PV, emit bare
--- @arch@; else if any tilde lane targets it, emit @~arch@; else omit. Never both
--- bare and tilde for the same arch (bare covers plain and tilde consumers).
 assembleKeywords :: [LaneId] -> [Text]
 assembleKeywords lanes =
   [ token
-  | arch <- [Amd64, Arm64],
+  | arch <- arches,
     Just token <- [tokenForArch arch]
   ]
   where
+    arches = sort (nub (map liArch lanes))
     tokenForArch arch
-      | any (\l -> laneArch l == arch && laneTier l == Plain) lanes =
-          Just (bareToken arch)
-      | any (\l -> laneArch l == arch && laneTier l == Tilde) lanes =
-          Just (tildeToken arch)
+      | any (\l -> liArch l == arch && liTier l == Plain) lanes =
+          Just arch
+      | any (\l -> liArch l == arch && liTier l == Tilde) lanes =
+          Just ("~" <> arch)
       | otherwise = Nothing
-    bareToken = \case
-      Amd64 -> "amd64"
-      Arm64 -> "arm64"
-    tildeToken = \case
-      Amd64 -> "~amd64"
-      Arm64 -> "~arm64"
 
 -- | Collapse lane targets to unique planned ebuilds with KEYWORDS.
 collapsePlannedEbuilds :: [LaneTarget] -> [PlannedEbuild]
@@ -213,19 +233,21 @@ collapsePlannedEbuilds targets =
         _ -> a == b
 
 planFromTargets :: [LaneTarget] -> GoLanePlan
-planFromTargets targets =
+planFromTargets = planFromTargetsWithAtom "dev-lang/go"
+
+planFromTargetsWithAtom :: Text -> [LaneTarget] -> GoLanePlan
+planFromTargetsWithAtom atom targets =
   let ebuilds = collapsePlannedEbuilds targets
    in GoLanePlan
         { glpLanes = targets,
           glpEbuilds = ebuilds,
-          glpUniquePVs = map pePV ebuilds
+          glpUniquePVs = map pePV ebuilds,
+          glpRuntimeAtom = atom
         }
 
 -- | True when local set differs from planned unique PVs or content needs work.
 planNeedsWork ::
-  -- | Local non-live numeric PVs present
   [EbuildVersion] ->
-  -- | PVs that exist but need content fix (SRC_URI / BDEPEND / KEYWORDS)
   [EbuildVersion] ->
   GoLanePlan ->
   Bool
@@ -243,7 +265,6 @@ missingTargets localPVs plan =
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
--- | Local non-live PVs not in the planned set (candidates for prune).
 extrasToDelete :: [EbuildVersion] -> GoLanePlan -> [EbuildVersion]
 extrasToDelete localPVs plan =
   [ loc
@@ -253,16 +274,8 @@ extrasToDelete localPVs plan =
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
--- | Build outdated/success gap lines from local PVs and plan.
---
--- Unsatisfied lanes emit one line each. @from@ selection:
---   * content fix (target already local): from = target
---   * single local: that local (split)
---   * multiple locals: cycle through locals not in the new set (converge),
---     falling back to all locals then newest.
 buildGapLines ::
   [EbuildVersion] ->
-  -- | Target PVs still needing work (missing or content fix)
   [EbuildVersion] ->
   GoLanePlan ->
   [GapLine]
@@ -284,10 +297,11 @@ buildGapLines localPVs needsWorkPVs plan =
           then localPVs
           else removed
       sortedPool = sortPVs fromPool
-   in zipWith (mkLine sortedPool) [0 ..] unsatisfied
+      atom = glpRuntimeAtom plan
+   in zipWith (mkLine atom sortedPool) [0 ..] unsatisfied
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
-    mkLine pool idx t =
+    mkLine atom pool idx t =
       let toPV = case ltPackagePV t of
             Just p -> p
             Nothing -> parseEbuildVersion "0"
@@ -300,7 +314,7 @@ buildGapLines localPVs needsWorkPVs plan =
        in GapLine
             { glFrom = stripRev fromPV,
               glTo = stripRev toPV,
-              glLabel = laneLabel (ltLane t)
+              glLabel = laneLabelWith atom (ltLane t)
             }
     stripRev (Numeric comps _) = Numeric comps Nothing
     stripRev r = r
@@ -311,3 +325,39 @@ buildGapLines localPVs needsWorkPVs plan =
               Just o -> o
               Nothing -> compare (show a) (show b)
         )
+
+-- | Candidate PVs = non-live local ∪ upstream strictly greater than max local.
+filterCandidateVersions ::
+  [EbuildVersion] ->
+  [EbuildVersion] ->
+  Either Text [EbuildVersion]
+filterCandidateVersions localPVs upstream =
+  case localPVs of
+    [] ->
+      Left
+        "DepsAndAssets requires at least one non-live local ebuild \
+        \(first import / empty package dirs are not supported)"
+    _ ->
+      let maxLocal = foldl1 maxVer localPVs
+          newer =
+            [ u
+            | u <- upstream,
+              case comparePV maxLocal u of
+                Just LT -> True
+                _ -> False
+            ]
+          localsBare = map stripRev localPVs
+          combined = nub (localsBare <> map stripRev newer)
+       in Right combined
+  where
+    stripRev (Numeric comps _) = Numeric comps Nothing
+    stripRev r = r
+    maxVer a b =
+      case comparePV a b of
+        Just LT -> b
+        _ -> a
+
+zeroPlannedPVsError :: Text
+zeroPlannedPVsError =
+  "runtime-lane planning produced no ebuild targets \
+  \(no candidate satisfies any runtime ceiling)"

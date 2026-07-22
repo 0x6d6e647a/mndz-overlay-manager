@@ -22,123 +22,69 @@ The CLI SHALL provide an `update` subcommand that loads configuration, resolves 
 
 ### Requirement: Update preflight requires git ebuild and gpg
 
-Before any package mutation, `update` SHALL verify that `git`, `ebuild`, `egencache`, and `gpg` are available on `PATH`. If any is missing, the program SHALL log an error naming the missing tool(s) and exit with status `1` without renaming ebuilds, regenerating Manifests or md5-cache, or creating commits. Signing SHALL NOT be optional: `update` SHALL NOT proceed without `gpg`.
+The `update` command SHALL verify that `git`, `ebuild`, `egencache`, and `gpg` are available on `PATH` before package mutation (existing spine tools).
 
-When at least one selected package will attempt a `GoVendorAndAssets` apply (including same-PV SRC_URI/revision fixes), `update` SHALL additionally verify that `go` and `xz` are available on `PATH`, that `assets-path` is configured and names a git work tree, and that a GitHub token can be resolved. Missing conditional requirements SHALL log an error and exit with status `1` before package mutation. When no selected package needs `GoVendorAndAssets`, the program SHALL NOT fail preflight solely because `go`, `xz`, assets path, or token are missing.
-
-The program SHALL also enforce the `md5-cache` layout.conf `cache-formats` gate before package mutation as specified by the `md5-cache` capability.
-
-#### Scenario: Missing ebuild on PATH
-
-- **WHEN** the user runs `update` and `ebuild` is not found on `PATH`
-- **THEN** the program logs an error indicating `ebuild` is required and exits with status `1` before package work
-
-#### Scenario: Missing egencache on PATH
-
-- **WHEN** the user runs `update` and `egencache` is not found on `PATH`
-- **THEN** the program logs an error indicating `egencache` is required and exits with status `1` before package work
-
-#### Scenario: Missing gpg on PATH
-
-- **WHEN** the user runs `update` and `gpg` is not found on `PATH`
-- **THEN** the program logs an error indicating `gpg` is required and exits with status `1` before package work
-
-#### Scenario: list and outdated do not require those tools
-
-- **WHEN** the user runs `list` or `outdated`
-- **THEN** the program does not require `git`, `ebuild`, `egencache`, or `gpg` on `PATH` for that command’s preflight
+When at least one selected package will attempt a `DepsAndAssets` apply (including same-PV content/revision fixes), `update` SHALL additionally verify that `xz` is available on `PATH`, that `assets-path` is configured and names a git work tree, and that a GitHub token can be resolved. When any such package will use the **full** materialize path for ecosystem `Go`, `go` SHALL be on `PATH`. When any will use the full path for ecosystem `Npm`, `npm` SHALL be on `PATH`. When any will use the full path for ecosystem `Bun`, `bun` SHALL be on `PATH`. Missing conditional requirements SHALL log an error and exit with status `1` before package mutation. When no selected package needs `DepsAndAssets`, the program SHALL NOT fail preflight solely because `go`, `npm`, `bun`, `xz`, assets path, or token are missing. Packages that only need the reuse path SHALL NOT require the language tool (`go`/`npm`/`bun`) solely for that reuse work.
 
 #### Scenario: Go tools required only when Go technique selected
 
-- **WHEN** the user runs `update dev-util/crush` and crush will attempt `GoVendorAndAssets`
+- **WHEN** the user runs `update dev-util/crush` and crush will attempt full-path `DepsAndAssets` Go work
 - **THEN** preflight requires `go` and `xz` on `PATH`
 
-#### Scenario: Binary-only update does not require go
+#### Scenario: npm required for openspec full path
 
-- **WHEN** the user runs `update dev-util/opencode-bin` and no Go technique package is selected
-- **THEN** preflight does not fail solely because `go` is missing from `PATH`
+- **WHEN** the user runs `update dev-util/openspec` and openspec will attempt full-path npm cache construction
+- **THEN** preflight requires `npm` and `xz` on `PATH`
 
-#### Scenario: Assets path required for Go update
+#### Scenario: bun required for ralph-tui full path
 
-- **WHEN** the user runs `update` for a `GoVendorAndAssets` package and `assets-path` is unset
+- **WHEN** the user runs `update dev-util/ralph-tui` and ralph-tui will attempt full-path bun cache construction
+- **THEN** preflight requires `bun` and `xz` on `PATH`
+
+#### Scenario: Binary package skips language tools
+
+- **WHEN** the user runs `update dev-util/opencode-bin` and no `DepsAndAssets` package is selected
+- **THEN** preflight does not fail solely because `go`, `npm`, or `bun` is missing from `PATH`
+
+#### Scenario: Assets path required for deps packages
+
+- **WHEN** the user runs `update` for a `DepsAndAssets` package and `assets-path` is unset
 - **THEN** the program logs an error about the missing assets path and exits with status `1` before package mutation
 
 ### Requirement: Update package targets
 
-The `update` subcommand SHALL accept zero or more package targets. With zero targets, the program SHALL consider all discovered packages that need work: non-Go packages that are outdated relative to their configured update source, and `GoVendorAndAssets` packages that have any Go tree-lane gap. With one or more targets, each target SHALL be either a full key `category/package` or a package name `package` that is unambiguous among discovered packages. An ambiguous bare package name SHALL be a hard failure for that token. Explicit targets that do not need work under their applicable rules SHALL be soft-skipped with a warning or informational message.
+The `update` subcommand SHALL accept zero or more package targets. With zero targets, the program SHALL consider all discovered packages that need work: non-`DepsAndAssets` packages that are outdated relative to their configured update source, and `DepsAndAssets` packages that have any runtime-lane gap. With one or more targets, each target SHALL be either a full key `category/package` or a package name `package` that is unambiguous among discovered packages. An ambiguous bare package name SHALL be a hard failure for that token. Explicit targets that do not need work under their applicable rules SHALL be soft-skipped with a warning or informational message.
 
-#### Scenario: No targets updates all outdated
+#### Scenario: Zero targets includes deps-lane gaps
 
-- **WHEN** the user runs `update` with no package arguments and multiple packages need work under their applicable rules
-- **THEN** the program attempts to update each such package according to its policy
-
-#### Scenario: Multiple explicit targets
-
-- **WHEN** the user runs `update` with arguments `dev-util/opencode-bin` and `dev-lang/deno-bin`
-- **THEN** the program limits update attempts to those packages only
-
-#### Scenario: Unambiguous bare package name
-
-- **WHEN** the user runs `update deno-bin` and exactly one discovered package has package name `deno-bin`
-- **THEN** the program resolves the target to that `category/package`
-
-#### Scenario: Ambiguous bare package name
-
-- **WHEN** the user runs `update foo` and discovered packages include both `bar/foo` and `baz/foo`
-- **THEN** the program logs an error for the ambiguous token and does not treat it as a successful target resolution
+- **WHEN** the user runs `update` with no arguments and a `DepsAndAssets` package has a lane gap while at latest single remote for GitMv purposes
+- **THEN** that package is still considered for update work
 
 ### Requirement: Update stdout for successful bumps
 
-For each non-Go package successfully updated and committed, the program SHALL write exactly one line to standard output of the form `category/package LOCAL -> REMOTE`, using the same version pretty-rendering conventions as `outdated` (PV form, no leading `v`). For `GoVendorAndAssets` packages, stdout SHALL follow the Go tree-lane update stdout requirement (possibly multiple labeled lines). Packages that are soft-skipped or hard-failed SHALL NOT produce a success stdout line.
+For each non-`DepsAndAssets` package successfully updated and committed, the program SHALL write exactly one line to standard output of the form `category/package LOCAL -> REMOTE`, using the same version pretty-rendering conventions as `outdated` (PV form, no leading `v`). For `DepsAndAssets` packages, stdout SHALL follow the runtime-lane update stdout requirement (possibly multiple labeled lines). Packages that are soft-skipped or hard-failed SHALL NOT produce a success stdout line.
 
-#### Scenario: Successful update line
+#### Scenario: GitMv single line
 
-- **WHEN** `dev-util/opencode-bin` is updated from local PV `1.17.19` to remote `1.17.20` and the signed commit succeeds
-- **THEN** stdout contains the line `dev-util/opencode-bin 1.17.19 -> 1.17.20`
+- **WHEN** a GitMv package updates from `1.0` to `1.1`
+- **THEN** stdout contains exactly one success line without a runtime-lane label
 
 ### Requirement: Go tree-lane update selection
 
-For packages with technique `GoVendorAndAssets`, `update` SHALL use the Go tree-lane planner to determine target PVs and whether the package needs work. With zero package arguments, `update` SHALL include a Go package when any lane has a gap (missing target PV ebuild, content or Manifest fix needed—including BDEPEND not matching the PV’s known `go.mod` requirement—or exact-set prune required), not only when newest local is less than upstream latest. Explicit targets that are fully satisfied under the plan (including Manifest vendor DIST completeness and BDEPEND match when the go.mod requirement is known) SHALL be soft-skipped.
+For packages with technique `DepsAndAssets`, `update` SHALL use the runtime-lane planner for that ecosystem to determine target PVs and whether the package needs work. With zero package arguments, `update` SHALL include a deps package when any lane has a gap (missing target PV ebuild, content or Manifest fix needed—including BDEPEND not matching the PV’s known requirement—or exact-set prune required), not only when newest local is less than upstream latest. Explicit targets that are fully satisfied under the plan (including Manifest distfile DIST completeness and BDEPEND match when the requirement is known) SHALL be soft-skipped.
 
-#### Scenario: Zero-arg update includes multi-lane gap
+#### Scenario: Plan-satisfied soft skip
 
-- **WHEN** the user runs `update` with no package arguments and a Go package has a tree-lane gap
-- **THEN** the program still attempts that package’s lane apply work
-
-#### Scenario: Satisfied Go package soft-skipped
-
-- **WHEN** the user runs `update crush` and crush’s package dir already matches the planned unique PV set with correct content (including BDEPEND matching known go.mod requirements) and Manifest vendor entries
-- **THEN** the package is soft-skipped without hard-fail
-
-#### Scenario: Incomplete Manifest not soft-skipped
-
-- **WHEN** planned PVs exist with ebuilds but Manifest lacks a vendor DIST for a planned PV
-- **THEN** the package is not soft-skipped solely as already matching the plan
-
-#### Scenario: BDEPEND mismatch not soft-skipped
-
-- **WHEN** planned PVs exist with ebuilds, KEYWORDS, SRC_URI, and Manifest vendor DIST adequate, but BDEPEND does not match a known go.mod requirement for a planned PV
-- **THEN** the package is not soft-skipped solely as already matching the plan
+- **WHEN** every planned PV is present with adequate content and Manifest dist entries
+- **THEN** the package may soft-skip as already matching the plan
 
 ### Requirement: Go tree-lane update stdout
 
-For each successfully applied Go tree lane (or coalesced same-PV apply that satisfies one or more lanes), the program SHALL write stdout lines of the form `category/package FROM -> TO (dev-lang/go …)` using lane labels from `go-tree-lanes`. Versions in these lines SHALL be pretty-rendered in PV form (no leading `v`). Split mapping: one local → multiple news yields one line per target with the same `FROM`. Converge mapping: multiple locals → one new yields one line per local `FROM` to that `TO`. Soft-skipped or hard-failed lanes SHALL NOT produce success lines.
+For `DepsAndAssets` packages, successful update stdout SHALL emit lane-labeled lines as defined for runtime-lane reporting (including runtime package name in the label). When a success line corresponds to a PV materialized via the **reuse** path, the program SHALL append the token ` [assets reused]` to that line. Lines for PVs materialized via the full build+publish path SHALL NOT include that token.
 
-When a success line corresponds to a PV that was materialized via the **reuse** path (existing release asset; no vendor rebuild/publish for that PV), the program SHALL append the token ` [assets reused]` to that line. Lines for PVs materialized via the full vendor+publish path SHALL NOT include that token.
+#### Scenario: Reuse token
 
-#### Scenario: Split success lines
-
-- **WHEN** a Go package had local `0.80.0` only and successfully materializes targets `0.82.0` and `0.84.0` for two lanes via the full path
-- **THEN** stdout includes `… 0.80.0 -> 0.82.0 (…)` and `… 0.80.0 -> 0.84.0 (…)` with the correct lane labels and without requiring ` [assets reused]`
-
-#### Scenario: Converge success lines
-
-- **WHEN** locals `0.80.0` and `0.82.0` successfully converge to `0.84.0`
-- **THEN** stdout includes `… 0.80.0 -> 0.84.0` and `… 0.82.0 -> 0.84.0` with appropriate labels
-
-#### Scenario: Reuse success marked
-
-- **WHEN** a planned PV is successfully completed via the reuse path
+- **WHEN** a planned PV is materialized via reuse of an existing release asset
 - **THEN** each success stdout line for that PV includes the substring ` [assets reused]`
 
 ### Requirement: Soft skips do not abort siblings
@@ -195,26 +141,21 @@ Spine preflight for `update` SHALL continue to require only that `go` is present
 
 ### Requirement: Latest upstream only
 
-For packages that are not `GoVendorAndAssets`, the `update` command SHALL upgrade to the latest version obtained from the package’s configured update source. For `GoVendorAndAssets` packages, target versions SHALL be those produced by the Go tree-lane planner (per-lane maxima under Gentoo `dev-lang/go` ceilings), which MAY be older than upstream latest when latest’s `go.mod` exceeds a ceiling. The `update` command SHALL NOT accept a user-specified target version in this change.
+For packages that are not `DepsAndAssets`, the `update` command SHALL upgrade to the latest version obtained from the package’s configured update source. For `DepsAndAssets` packages, target versions SHALL be those produced by the runtime-lane planner (per-lane maxima under runtime ceilings), which MAY be older than upstream latest when latest’s requirement exceeds a ceiling. The `update` command SHALL NOT accept a user-specified target version in this change.
 
-#### Scenario: Bumps to fetched remote version for non-Go
+#### Scenario: Lane may select older than latest
 
-- **WHEN** local PV is older than the fetched remote PV for a `GitMvAndManifest` package
-- **THEN** the applied ebuild version is that remote PV
-
-#### Scenario: Go package may stop below latest
-
-- **WHEN** upstream latest requires a Go newer than every Gentoo `dev-lang/go` ceiling and an older tag fits a ceiling
-- **THEN** `update` targets that older tag for the corresponding lane rather than hard-requiring latest
+- **WHEN** upstream latest requires a runtime newer than the plain ceiling but an older candidate fits
+- **THEN** update may target the older candidate for that lane
 
 ### Requirement: Soft skip no longer treats Go packages as unsupported
 
-Packages configured with `GoVendorAndAssets` SHALL NOT be soft-skipped with an “unsupported” reason. Soft skips for those packages remain available for not-outdated / already-fixed cases as defined by apply logic.
+Packages configured with `DepsAndAssets` (Go, Npm, or Bun) SHALL NOT be soft-skipped with an “unsupported” reason for vendor or deps assets. Soft skips for those packages remain available for not-outdated / already-fixed cases as defined by apply logic.
 
-#### Scenario: Outdated crush is attempted
+#### Scenario: openspec not unsupported
 
-- **WHEN** `dev-util/crush` is outdated and selected for `update`
-- **THEN** the program does not soft-skip it solely because vendor assets are required
+- **WHEN** the user runs `update dev-util/openspec` and the package needs a version bump with deps assets
+- **THEN** the program does not soft-skip it solely because deps assets are required
 
 ### Requirement: Update preflight progress when enabled
 
