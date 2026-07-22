@@ -46,19 +46,19 @@ The hardcoded policy map SHALL include an entry for every package known to ship 
 
 ### Requirement: GitMvAndManifest apply steps
 
-For a package with technique `GitMvAndManifest` that is outdated, the apply procedure SHALL: (1) select the newest local ebuild by PV ordering; (2) verify involved paths are clean in git; (3) rename that ebuild file so its version component equals the remote PV (without inventing a revision); (4) run Portage `ebuild` on the new ebuild file with the `manifest` command from the package directory as the working directory; (5) immediately create a signed overlay git commit for that unit’s changed paths with message `category/package: version` where `version` is the remote PV string without a leading `v`. Success for that package SHALL mean the commit is present in the overlay worktree HEAD, not that paths are deferred for a later commit phase.
+For a package with technique `GitMvAndManifest` that is outdated, the apply procedure SHALL: (1) select the newest local ebuild by PV ordering; (2) verify the package’s non-live ebuilds have complete matching md5-cache as specified by the `md5-cache` capability (hard-fail with `gencache` / `gencache --force` recovery text when not); (3) verify involved paths are clean in git; (4) rename that ebuild file so its version component equals the remote PV (without inventing a revision); (5) run Portage `ebuild` on the new ebuild file with the `manifest` command from the package directory as the working directory; (6) run package-scoped Portage `egencache` for `category/package` as specified by `md5-cache`; (7) immediately create a signed overlay git commit for that unit’s changed paths with message `category/package: version` where `version` is the remote PV string without a leading `v`. Success for that package SHALL mean the commit is present in the overlay worktree HEAD, not that paths are deferred for a later commit phase.
 
-When the ebuild filename changes, staged paths SHALL include at least: the **old** ebuild path (so the deletion is recorded), the **new** ebuild path, and the package `Manifest`. Staging only the new ebuild and Manifest without the old path is insufficient. Other ebuild versions in the same directory that were not selected as newest SHALL be left in place and SHALL NOT be staged by this update.
+When the ebuild filename changes, staged paths SHALL include at least: the **old** ebuild path (so the deletion is recorded), the **new** ebuild path, the package `Manifest`, and the affected `metadata/md5-cache/` paths for that package. Staging only the new ebuild and Manifest without the old path or without cache paths after a successful egencache is insufficient. Other ebuild versions in the same directory that were not selected as newest SHALL be left in place and SHALL NOT be staged by this update except as required for shared Manifest/cache package regeneration side effects already covered by package-scoped egencache path inclusion.
 
 #### Scenario: Rename and manifest for new PV
 
 - **WHEN** newest local ebuild is `opencode-bin-1.17.19.ebuild` and remote PV is `1.17.20`
 - **THEN** the ebuild is renamed to `opencode-bin-1.17.20.ebuild` and `ebuild ./opencode-bin-1.17.20.ebuild manifest` runs with cwd set to the package directory
 
-#### Scenario: Commit stages old ebuild deletion with new ebuild and Manifest
+#### Scenario: Commit stages old ebuild deletion with new ebuild Manifest and cache
 
-- **WHEN** a successful update renames `grok-build-bin-0.2.99-r1.ebuild` to `grok-build-bin-0.2.101.ebuild` and regenerates Manifest
-- **THEN** the signed commit for that package stages the old ebuild path (deletion), the new ebuild path, and `Manifest`
+- **WHEN** a successful update renames `grok-build-bin-0.2.99-r1.ebuild` to `grok-build-bin-0.2.101.ebuild`, regenerates Manifest, and regenerates md5-cache
+- **THEN** the signed commit for that package stages the old ebuild path (deletion), the new ebuild path, `Manifest`, and affected md5-cache paths
 - **AND** after the commit the old ebuild path is not left as an unstaged deletion in the work tree solely because it was omitted from `git add`
 
 #### Scenario: Commit message format
@@ -73,9 +73,14 @@ When the ebuild filename changes, staged paths SHALL include at least: the **old
 
 #### Scenario: GitMv success is committed immediately
 
-- **WHEN** GitMv rename and `ebuild … manifest` succeed
+- **WHEN** GitMv rename, `ebuild … manifest`, and package egencache succeed
 - **THEN** the program creates the signed overlay commit for that package before treating the package as apply success
 - **AND** it does not leave those paths pending a later package-wide commit barrier
+
+#### Scenario: Missing cache blocks GitMv before rename
+
+- **WHEN** the package would be updated but md5-cache is missing for a non-live ebuild
+- **THEN** the unit hard-fails without renaming the ebuild
 
 ### Requirement: Dirty involved paths block package update
 
@@ -98,7 +103,7 @@ Before mutating an apply unit, the program SHALL check that the unit’s involve
 
 ### Requirement: Parallel work then serial signed commits
 
-Package check, dirty verification, vendor construction, ebuild rename/rewrite, and `ebuild … manifest` work SHALL be allowed to run concurrently across packages, except that assets-repository git commit, push, and GitHub release publish for a shared assets worktree SHALL be mutually excluded, and overlay git index mutations (`git add` and `git commit`) SHALL be mutually excluded via an overlay critical section. The program SHALL create each unit’s signed overlay commit immediately after that unit’s successful overlay mutation and verification (commit-on-unit-success). The program SHALL NOT defer all overlay commits until after every selected package has finished apply work. Global ordering of overlay commits by `category/package` is NOT required under concurrent apply; each commit SHALL include only paths belonging to that unit. Each overlay and assets commit SHALL sign with GPG (`git commit` with signing enabled); the program SHALL NOT create unsigned commits as a fallback. The program SHALL NOT read or store the GPG passphrase. Immediately before each signed overlay or assets commit, the program SHALL apply GPG sign readiness for that commit’s worktree (agent cache check; ready-prompt and unlock when cold; terminal pinentry environment) as specified by the gpg-sign-readiness capability. Signing failure, including readiness or unlock failure, SHALL be a hard failure for that unit and SHALL NOT leave an unsigned commit recorded as success.
+Package check, md5-cache consistency gate, dirty verification, vendor construction, ebuild rename/rewrite, and `ebuild … manifest` work SHALL be allowed to run concurrently across packages, except that assets-repository git commit, push, and GitHub release publish for a shared assets worktree SHALL be mutually excluded, and package-scoped `egencache` together with overlay git index mutations (`git add` and `git commit`) SHALL be mutually excluded via an overlay critical section. The program SHALL create each unit’s signed overlay commit immediately after that unit’s successful overlay mutation, manifest, egencache, and verification (commit-on-unit-success). The program SHALL NOT defer all overlay commits until after every selected package has finished apply work. Global ordering of overlay commits by `category/package` is NOT required under concurrent apply; each commit SHALL include only paths belonging to that unit (including that unit’s md5-cache paths). Each overlay and assets commit SHALL sign with GPG (`git commit` with signing enabled); the program SHALL NOT create unsigned commits as a fallback. The program SHALL NOT read or store the GPG passphrase. Immediately before each signed overlay or assets commit, the program SHALL apply GPG sign readiness for that commit’s worktree (agent cache check; ready-prompt and unlock when cold; terminal pinentry environment) as specified by the gpg-sign-readiness capability. Signing failure, including readiness or unlock failure, SHALL be a hard failure for that unit and SHALL NOT leave an unsigned commit recorded as success.
 
 #### Scenario: No successful units create no overlay commits
 
@@ -123,7 +128,7 @@ Package check, dirty verification, vendor construction, ebuild rename/rewrite, a
 #### Scenario: Overlay commits serialized under lock
 
 - **WHEN** two packages finish overlay mutation concurrently and both need overlay commits
-- **THEN** only one overlay `git add`/`git commit` critical section runs at a time
+- **THEN** only one overlay `egencache`/`git add`/`git commit` critical section runs at a time
 
 #### Scenario: Readiness runs before assets signed commit
 
@@ -142,12 +147,17 @@ Package check, dirty verification, vendor construction, ebuild rename/rewrite, a
 
 ### Requirement: Half-applied package warning
 
-When a unit hard-fails after the ebuild was renamed or rewritten but before a successful signed overlay commit (for example `ebuild manifest` failure or signing failure after mutation), the program SHALL log an error and a warning that the package directory may be left dirty or half-applied so a later dirty check can explain retry failures.
+When a unit hard-fails after the ebuild was renamed or rewritten but before a successful signed overlay commit (for example `ebuild manifest` failure, `egencache` failure, or signing failure after mutation), the program SHALL log an error and a warning that the package directory may be left dirty or half-applied so a later dirty check or md5-cache consistency gate can explain retry failures, and SHALL mention that cache reconciliation may require `gencache` or `gencache --force` when ebuild and cache disagree.
 
 #### Scenario: Manifest failure after rename warns dirty
 
 - **WHEN** rename succeeds and `ebuild … manifest` fails
 - **THEN** the program logs an error for the failure and a warning that the package tree may be dirty
+
+#### Scenario: egencache failure after manifest warns cache repair
+
+- **WHEN** rename and manifest succeed and package egencache fails
+- **THEN** the program logs an error and a warning that mentions possible need for `gencache` / `gencache --force` before retry
 
 ### Requirement: Overlay is a git worktree for update
 
@@ -174,12 +184,13 @@ Packages with technique `GoVendorAndAssets` SHALL be applied via the Go vendor a
 
 ### Requirement: GoVendorAndAssets multi-lane apply
 
-For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and, for each unique planned PV that needs materialization, perform either the **full** vendor-and-assets + overlay path or the **reuse** overlay-only path defined by `go-vendor-assets` (probe existing release asset first; reuse when present; full path when absent). The full path remains: clone tag, host Go gate, vendor tarball, assets publish, BDEPEND from that tag’s go.mod, assets SRC_URI rules. The reuse path SHALL complete overlay ebuild mutation and Manifest verification without re-publishing assets. Ebuild KEYWORDS SHALL be set to the planned `~arch` membership for that PV. After each planned PV unit successfully completes overlay mutation and verification, apply SHALL create a signed overlay commit for that PV’s paths with message `category/package: version` (version = PV without leading `v`, including `-rN` when the filename carries a revision) **before** starting the next planned PV for the same package. When two lanes share one PV and a single write satisfies both, the program SHALL produce one commit for that PV rather than two empty commits. After all planned PVs that needed materialization succeed, apply SHALL prune non-live versioned ebuilds not in the planned set per exact-set rules and SHALL create a signed overlay commit for prune pathspecs when any extras were removed. If any planned PV unit hard-fails, apply SHALL NOT prune, SHALL NOT start further planned PVs for that package after that failure, and SHALL retain any earlier successful PV commits. Sibling packages continue on hard-fail of one package’s unit.
+For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and, for each unique planned PV that needs materialization, perform either the **full** vendor-and-assets + overlay path or the **reuse** overlay-only path defined by `go-vendor-assets` (probe existing release asset first; reuse when present; full path when absent). Before the first mutation for the package in the run, apply SHALL verify complete matching md5-cache for all non-live ebuilds in the package directory as specified by `md5-cache`. The full path remains: clone tag, host Go gate, vendor tarball, assets publish, BDEPEND from that tag’s go.mod, assets SRC_URI rules. The reuse path SHALL complete overlay ebuild mutation and Manifest verification without re-publishing assets. Ebuild KEYWORDS SHALL be set to the planned `~arch` membership for that PV. After each planned PV unit successfully completes overlay mutation, Manifest verification, and package-scoped egencache, apply SHALL create a signed overlay commit for that PV’s paths (including affected `metadata/md5-cache/` paths) with message `category/package: version` (version = PV without leading `v`, including `-rN` when the filename carries a revision) **before** starting the next planned PV for the same package. When two lanes share one PV and a single write satisfies both, the program SHALL produce one commit for that PV rather than two empty commits. After all planned PVs that needed materialization succeed, apply SHALL prune non-live versioned ebuilds not in the planned set per exact-set rules, regenerate Manifest and package md5-cache as needed, and SHALL create a signed overlay commit for prune pathspecs (including md5-cache) when any extras were removed. If any planned PV unit hard-fails, apply SHALL NOT prune, SHALL NOT start further planned PVs for that package after that failure, and SHALL retain any earlier successful PV commits. Sibling packages continue on hard-fail of one package’s unit.
 
 #### Scenario: Two PVs two commits
 
 - **WHEN** the plan needs distinct PVs `0.82.0` and `0.84.0` and both materialize successfully
 - **THEN** the program creates two signed overlay commits (one per PV) before the package storm finishes
+- **AND** each commit includes that unit’s md5-cache path updates
 - **AND** the second PV’s dirty check does not fail solely because the first PV updated `Manifest`
 
 #### Scenario: Shared PV one commit
@@ -195,7 +206,7 @@ For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and,
 #### Scenario: Orphan after publish resumes via reuse
 
 - **WHEN** a prior run published release `crush-0.84.0` with the vendor asset but overlay Manifest for that PV is incomplete, and the operator re-runs `update`
-- **THEN** apply materializes that PV via the reuse path (no create-release) and completes overlay Manifest and signed commit when dirty checks allow
+- **THEN** apply materializes that PV via the reuse path (no create-release) and completes overlay Manifest, egencache, and signed commit when dirty checks and md5-cache gate allow
 
 #### Scenario: Partial multi-PV success keeps earlier commits
 
@@ -207,7 +218,7 @@ For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and,
 #### Scenario: Prune only after full package success
 
 - **WHEN** all needed planned PVs for a package materialize and commit successfully and extras exist outside the planned set
-- **THEN** the program removes those extras and creates a signed overlay commit including the deletions and updated Manifest
+- **THEN** the program removes those extras, regenerates Manifest and md5-cache, and creates a signed overlay commit including the deletions, updated Manifest, and md5-cache paths
 
 ### Requirement: Reuse path does not take assets publish critical section
 

@@ -18,7 +18,7 @@ import Update.Git (isGitWorkTree)
 
 -- | External tools required on PATH for every @update@ run.
 updateRequiredTools :: [String]
-updateRequiredTools = ["git", "ebuild", "gpg"]
+updateRequiredTools = ["git", "ebuild", "egencache", "gpg"]
 
 -- | Additional tools when a Go/assets technique will apply.
 goAssetsRequiredTools :: [String]

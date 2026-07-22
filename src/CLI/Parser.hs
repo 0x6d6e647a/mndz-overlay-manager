@@ -36,6 +36,10 @@ data Command
   = List
   | Outdated
   | Update [String]
+  | Gencache
+      { gencacheTargets :: [String],
+        gencacheForce :: Bool
+      }
   deriving (Eq, Show)
 
 data Options = Options
@@ -154,6 +158,24 @@ updateParser =
           )
       )
 
+gencacheParser :: Parser Command
+gencacheParser =
+  Gencache
+    <$> many
+      ( strArgument
+          ( metavar "PACKAGE..."
+              <> help
+                "Package targets as category/package or an unambiguous package \
+                \name; omit to regenerate cache for all packages"
+          )
+      )
+    <*> switch
+      ( long "force"
+          <> help
+            "Regenerate md5-cache for every selected package even when \
+            \_md5_ already matches (required to overwrite mismatches)"
+      )
+
 listInfo :: ParserInfo Command
 listInfo =
   info
@@ -198,6 +220,23 @@ updateInfo =
           )
     )
 
+gencacheInfo :: ParserInfo Command
+gencacheInfo =
+  info
+    gencacheParser
+    ( fullDesc
+        <> progDesc "Generate or repair Portage md5-cache for the overlay"
+        <> footer
+          ( "Regenerate metadata/md5-cache (md5-dict) via Portage egencache and \
+            \create one GPG-signed overlay commit when cache paths change. \
+            \PACKAGE may be category/package or an unambiguous package name. \
+            \With no PACKAGE arguments, regenerate cache for all packages that \
+            \have ebuilds. Without --force, matching packages are skipped and \
+            \_md5_ mismatches hard-fail (use --force to overwrite). "
+              <> globalsFooter
+          )
+    )
+
 commandParser :: Parser (Maybe Command)
 commandParser =
   optional $
@@ -205,6 +244,7 @@ commandParser =
       ( command "list" listInfo
           <> command "outdated" outdatedInfo
           <> command "update" updateInfo
+          <> command "gencache" gencacheInfo
           <> metavar "COMMAND"
       )
 

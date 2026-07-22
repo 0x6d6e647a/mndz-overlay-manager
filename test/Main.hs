@@ -69,7 +69,7 @@ import Overlay.Version
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
 import System.Exit (exitFailure)
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import Update.Apply
@@ -178,6 +178,23 @@ import Update.GpgAgent
     teardownGpgHandle,
   )
 import Update.Hardcoded (lookupHardcoded, lookupPolicy)
+import Update.Md5Cache
+  ( EgencacheRequest (..),
+    GencacheAction (..),
+    PackageCacheIssue (..),
+    VersionCacheStatus (..),
+    buildRepositoriesConfiguration,
+    cacheFilePath,
+    checkLayoutCacheFormats,
+    classifyVersionCache,
+    decideGencacheAction,
+    ebuildFileMd5,
+    gencachePackages,
+    inspectPackageCache,
+    listNonLiveEbuildVersions,
+    packageCacheGateError,
+    readCacheMd5Field,
+  )
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
 import Update.SshAgent
@@ -228,6 +245,12 @@ main = do
   testCheckOverlayStatuses
   testTargetResolution
   testPreflightMissingTools
+  testMd5CacheLayoutGate
+  testMd5CacheMatchMismatchMissing
+  testMd5CacheMultiVersionCompleteness
+  testMd5CacheGencacheDecisions
+  testMd5CacheGateBlocksGitMv
+  testGencacheForceAndMismatch
   testNewEbuildFileName
   testFoldExitHardFail
   testTokenResolver
@@ -2254,6 +2277,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
     { aeFetcher = \_ -> pure (Left "unused"),
       aeGitOps = gitOps,
       aeEbuildRunner = ebuildRun,
+      aeEgencacheRunner = mockEgencacheWriteMatching,
       aeVendorOps = vendorOps,
       aeReleaseOps = releaseOps,
       aeAssetsRoot = assetsRoot,
@@ -2266,6 +2290,43 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
       aeMulti = noopMultiHandle,
       aePlanOps = planOps
     }
+
+-- | Write a matching md5-dict cache file for one ebuild.
+writeMatchingCacheFile :: FilePath -> T.Text -> T.Text -> T.Text -> FilePath -> IO ()
+writeMatchingCacheFile overlayRoot category pn verText ebuildPath = do
+  md5 <- ebuildFileMd5 ebuildPath
+  let cpath = cacheFilePath overlayRoot category pn verText
+  createDirectoryIfMissing True (takeDirectory cpath)
+  TIO.writeFile cpath ("_md5_=" <> md5 <> "\nDESCRIPTION=test\n")
+
+-- | Matching cache for every non-live ebuild under a package directory.
+writeMatchingCachesForPackage :: FilePath -> T.Text -> T.Text -> FilePath -> IO ()
+writeMatchingCachesForPackage overlayRoot category pn pkgDir = do
+  vers <- listNonLiveEbuildVersions pkgDir pn
+  mapM_ (uncurry (writeMatchingCacheFile overlayRoot category pn)) vers
+
+-- | Mock egencache: rewrite matching cache entries for requested atoms.
+mockEgencacheWriteMatching :: EgencacheRequest -> IO (Either T.Text ())
+mockEgencacheWriteMatching req = do
+  let root = erOverlayRoot req
+      atoms =
+        if null (erAtoms req)
+          then []
+          else erAtoms req
+  if null atoms
+    then pure (Right ())
+    else do
+      mapM_
+        ( \atom ->
+            case T.breakOn "/" atom of
+              (cat, rest)
+                | Just ('/', pn) <- T.uncons rest -> do
+                    let pkgDir = root </> T.unpack cat </> T.unpack pn
+                    writeMatchingCachesForPackage root cat pn pkgDir
+                | otherwise -> pure ()
+        )
+        atoms
+      pure (Right ())
 
 unusedVendorOps :: VendorOps
 unusedVendorOps =
@@ -2615,9 +2676,15 @@ testGitMvCommitsOnSuccess =
             }
     commitCount <- newIORef (0 :: Int)
     commitMsgs <- newIORef ([] :: [T.Text])
+    commitPaths <- newIORef ([] :: [[FilePath]])
     createDirectoryIfMissing True pkgDir
     TIO.writeFile (pkgDir </> oldName) "EAPI=8\n"
     TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+    writeMatchingCachesForPackage
+      overlayRoot
+      "dev-util"
+      "grok-build-bin"
+      pkgDir
     let gitOps =
           GitOps
             { goIsWorkTree = \_ -> pure True,
@@ -2625,6 +2692,7 @@ testGitMvCommitsOnSuccess =
               goAddAndCommit = \_root paths msg -> do
                 atomicModifyIORef' commitCount (\n -> (n + 1, ()))
                 atomicModifyIORef' commitMsgs (\ms -> (msg : ms, ()))
+                atomicModifyIORef' commitPaths (\ps -> (paths : ps, ()))
                 assertTrue "stages paths" (not (null paths))
                 pure (Right ()),
               goPush = \_ -> pure (Right ())
@@ -2666,6 +2734,9 @@ testGitMvCommitsOnSuccess =
           "commit message format"
           ("dev-util/grok-build-bin: 0.2.101" `elem` msgs)
         assertTrue "paths recorded" (not (null paths))
+        assertTrue
+          "commit includes md5-cache path"
+          (any (("md5-cache" `T.isInfixOf`) . T.pack) paths)
       other -> do
         hPutStrLn stderr ("expected single ApplySuccess, got: " <> show other)
         exitFailure
@@ -2716,6 +2787,7 @@ testGoMultiPvSequentialCommits =
     createDirectoryIfMissing True assetsRoot
     TIO.writeFile (pkgDir </> "crush-0.80.0.ebuild") (ebuildBody ">=dev-lang/go-1.26.5:=")
     TIO.writeFile (pkgDir </> "Manifest") "DIST crush-0.80.0.tar.gz 1 SHA512 aa\n"
+    writeMatchingCachesForPackage overlayRoot "dev-util" pn pkgDir
     let gitOps =
           GitOps
             { goIsWorkTree = \_ -> pure True,
@@ -2815,6 +2887,16 @@ testGoMultiPvSequentialCommits =
     assertTrue
       "second PV commit"
       ("dev-util/crush: 0.84.0" `elem` msgs)
+    assertTrue
+      "PV commits include md5-cache"
+      ( all
+          ( \case
+              ApplySuccess _ _ paths ->
+                any (("md5-cache" `T.isInfixOf`) . T.pack) paths
+              _ -> False
+          )
+          successes
+      )
 
 -- | First PV commits; second hard-fails; no prune; later PVs not started.
 testGoMultiPvStopOnHardFail :: IO ()
@@ -2864,6 +2946,7 @@ testGoMultiPvStopOnHardFail =
     TIO.writeFile (pkgDir </> "crush-0.80.0.ebuild") ebuildBody
     TIO.writeFile (pkgDir </> extraName) ebuildBody -- would be pruned only on full success
     TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+    writeMatchingCachesForPackage overlayRoot "dev-util" pn pkgDir
     let gitOps =
           GitOps
             { goIsWorkTree = \_ -> pure True,
@@ -3057,3 +3140,295 @@ testBdependMissingNeedsFix = do
           ]
   replaced <- assertRight "replace" (ensureGoBdepend "1.26.5" withOld)
   assertTrue "replace matches" (goBdependMatches "1.26.5" replaced)
+
+------------------------------------------------------------------------
+-- md5-cache
+------------------------------------------------------------------------
+
+testMd5CacheLayoutGate :: IO ()
+testMd5CacheLayoutGate =
+  withSystemTempDirectory "mndz-layout-gate-" $ \tmp -> do
+    createDirectoryIfMissing True (tmp </> "metadata")
+    -- Missing layout.conf
+    missing <- checkLayoutCacheFormats tmp
+    case missing of
+      Left msg ->
+        assertTrue "missing mentions layout" ("layout.conf" `T.isInfixOf` msg)
+      Right () -> do
+        hPutStrLn stderr "expected layout gate failure for missing file"
+        exitFailure
+    -- Present without md5-dict
+    TIO.writeFile (tmp </> "metadata" </> "layout.conf") "masters = gentoo\n"
+    noFmt <- checkLayoutCacheFormats tmp
+    case noFmt of
+      Left msg ->
+        assertTrue "mentions md5-dict" ("md5-dict" `T.isInfixOf` msg)
+      Right () -> do
+        hPutStrLn stderr "expected layout gate failure without cache-formats"
+        exitFailure
+    -- Explicit md5-dict
+    TIO.writeFile
+      (tmp </> "metadata" </> "layout.conf")
+      "masters = gentoo\ncache-formats = md5-dict\n"
+    ok <- checkLayoutCacheFormats tmp
+    assertRight "layout ok" ok
+    pure ()
+
+testMd5CacheMatchMismatchMissing :: IO ()
+testMd5CacheMatchMismatchMissing =
+  withSystemTempDirectory "mndz-md5-status-" $ \tmp -> do
+    let cat = "dev-lang" :: T.Text
+        pn = "haskell" :: T.Text
+        ver = "9.4.5" :: T.Text
+        pkgDir = tmp </> T.unpack cat </> T.unpack pn
+        ebuildPath = pkgDir </> "haskell-9.4.5.ebuild"
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath "EAPI=8\nDESCRIPTION=test\n"
+    missing <- classifyVersionCache tmp cat pn ver ebuildPath
+    assertEq "missing" VersionCacheMissing missing
+    writeMatchingCacheFile tmp cat pn ver ebuildPath
+    match <- classifyVersionCache tmp cat pn ver ebuildPath
+    assertEq "match" VersionCacheMatch match
+    let cpath = cacheFilePath tmp cat pn ver
+    TIO.writeFile cpath "_md5_=00000000000000000000000000000000\n"
+    mismatch <- classifyVersionCache tmp cat pn ver ebuildPath
+    assertEq "mismatch" VersionCacheMismatch mismatch
+    mField <- readCacheMd5Field cpath
+    assertEq "read field" (Just "00000000000000000000000000000000") mField
+    let conf =
+          buildRepositoriesConfiguration
+            "/var/db/repos/gentoo"
+            "/tmp/work/mndz-overlay"
+    assertTrue "repos conf has mndz" ("[mndz]" `T.isInfixOf` conf)
+    assertTrue
+      "repos conf location"
+      ("location = /tmp/work/mndz-overlay" `T.isInfixOf` conf)
+
+testMd5CacheMultiVersionCompleteness :: IO ()
+testMd5CacheMultiVersionCompleteness =
+  withSystemTempDirectory "mndz-md5-multi-" $ \tmp -> do
+    let cat = "dev-util" :: T.Text
+        pn = "crush" :: T.Text
+        pkgDir = tmp </> T.unpack cat </> T.unpack pn
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile (pkgDir </> "crush-0.82.0.ebuild") "EAPI=8\nv1\n"
+    TIO.writeFile (pkgDir </> "crush-0.84.0.ebuild") "EAPI=8\nv2\n"
+    TIO.writeFile (pkgDir </> "crush-9999.ebuild") "EAPI=8\nlive\n"
+    vers <- listNonLiveEbuildVersions pkgDir pn
+    assertEq "two non-live" 2 (length vers)
+    -- Only one cache entry
+    writeMatchingCacheFile tmp cat pn "0.82.0" (pkgDir </> "crush-0.82.0.ebuild")
+    inspected <- inspectPackageCache tmp cat pn pkgDir
+    case inspected of
+      Left (PackageCacheMissing ms) ->
+        assertTrue "missing sibling" ("0.84.0" `elem` ms)
+      other -> do
+        hPutStrLn stderr ("expected PackageCacheMissing, got " <> show other)
+        exitFailure
+    writeMatchingCacheFile tmp cat pn "0.84.0" (pkgDir </> "crush-0.84.0.ebuild")
+    ok <- inspectPackageCache tmp cat pn pkgDir
+    assertRight "complete" ok
+    pure ()
+
+testMd5CacheGencacheDecisions :: IO ()
+testMd5CacheGencacheDecisions = do
+  assertEq
+    "force always generate"
+    GencacheGenerate
+    (decideGencacheAction True (Right ()))
+  assertEq
+    "match skips"
+    GencacheSkip
+    (decideGencacheAction False (Right ()))
+  assertEq
+    "missing generates"
+    GencacheGenerate
+    (decideGencacheAction False (Left (PackageCacheMissing ["1.0"])))
+  case decideGencacheAction False (Left (PackageCacheMismatch ["1.0"])) of
+    GencacheError msg ->
+      assertTrue "mentions force" ("--force" `T.isInfixOf` msg)
+    other -> do
+      hPutStrLn stderr ("expected GencacheError, got " <> show other)
+      exitFailure
+  let key = mkPackageKey "dev-util" "crush"
+  assertTrue
+    "gate error missing"
+    ("gencache dev-util/crush" `T.isInfixOf` packageCacheGateError key (PackageCacheMissing []))
+  assertTrue
+    "gate error mismatch"
+    ( "gencache --force dev-util/crush"
+        `T.isInfixOf` packageCacheGateError key (PackageCacheMismatch [])
+    )
+
+testMd5CacheGateBlocksGitMv :: IO ()
+testMd5CacheGateBlocksGitMv =
+  withSystemTempDirectory "mndz-gate-gitmv-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        pkgDir = overlayRoot </> "dev-util" </> "opencode-bin"
+        oldName = "opencode-bin-1.0.ebuild"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "opencode-bin",
+              pePN = "opencode-bin",
+              peLocal = parseEbuildVersion "1.0",
+              pePath = pkgDir </> oldName
+            }
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile (pkgDir </> oldName) "EAPI=8\n"
+    TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+    -- Intentionally no md5-cache
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 1
+    ceilingsCache <- newMVar Nothing
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Left "unused"),
+              poWorkBudget = budget,
+              poCeilingsCache = ceilingsCache
+            }
+        env0 =
+          mkTestApplyEnv
+            gitOps
+            planOps
+            (\_ _ -> pure (Right ()))
+            unusedReleaseOps
+            unusedVendorOps
+            Nothing
+            assetsLock
+            overlayLock
+        env =
+          env0
+            { aeFetcher = \_ -> pure (Right (parseEbuildVersion "1.1")),
+              aeEgencacheRunner = \_ -> pure (Left "egencache should not run")
+            }
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    case outcomes of
+      [ApplyHardFail _ msg half _] -> do
+        assertTrue "mentions gencache" ("gencache" `T.isInfixOf` msg)
+        assertTrue "not half-applied" (not half)
+        stillThere <- doesFileExist (pkgDir </> oldName)
+        assertTrue "ebuild not renamed" stillThere
+      other -> do
+        hPutStrLn stderr ("expected gate hard-fail, got: " <> show other)
+        exitFailure
+
+testGencacheForceAndMismatch :: IO ()
+testGencacheForceAndMismatch =
+  withSystemTempDirectory "mndz-gencache-" $ \tmp -> do
+    let overlayRoot = tmp
+        cat = "dev-lang" :: T.Text
+        pn = "haskell" :: T.Text
+        pkgDir = overlayRoot </> T.unpack cat </> T.unpack pn
+        ebuildPath = pkgDir </> "haskell-9.4.5.ebuild"
+        key = mkPackageKey cat pn
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath "EAPI=8\n"
+    -- Bootstrap missing without force → generates
+    egCalls <- newIORef (0 :: Int)
+    commitCalls <- newIORef (0 :: Int)
+    let runner req = do
+          atomicModifyIORef' egCalls (\n -> (n + 1, ()))
+          mockEgencacheWriteMatching req
+        gitOps dirty =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right dirty),
+              goAddAndCommit = \_ _ _ -> do
+                atomicModifyIORef' commitCalls (\n -> (n + 1, ()))
+                pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    r1 <-
+      gencachePackages
+        runner
+        (gitOps True)
+        overlayRoot
+        [key]
+        False
+        (Just 1)
+    case r1 of
+      Right (Just _) -> pure ()
+      other -> do
+        hPutStrLn stderr ("expected commit after generate, got " <> show other)
+        exitFailure
+    nEg1 <- readIORef egCalls
+    assertEq "egencache once for missing" 1 nEg1
+    -- Now matching without force → skip, no dirty commit
+    writeIORef egCalls 0
+    writeIORef commitCalls 0
+    r2 <-
+      gencachePackages
+        runner
+        (gitOps False)
+        overlayRoot
+        [key]
+        False
+        Nothing
+    assertEq "no commit when match" (Right Nothing) r2
+    nEg2 <- readIORef egCalls
+    assertEq "skipped egencache when match" 0 nEg2
+    -- Mismatch without force → error
+    let cpath = cacheFilePath overlayRoot cat pn "9.4.5"
+    TIO.writeFile cpath "_md5_=ffffffffffffffffffffffffffffffff\n"
+    r3 <-
+      gencachePackages
+        runner
+        (gitOps False)
+        overlayRoot
+        [key]
+        False
+        Nothing
+    case r3 of
+      Left msg -> assertTrue "mismatch force" ("--force" `T.isInfixOf` msg)
+      Right _ -> do
+        hPutStrLn stderr "expected mismatch hard-fail without force"
+        exitFailure
+    -- Force regenerates mismatch
+    writeIORef egCalls 0
+    r4 <-
+      gencachePackages
+        runner
+        (gitOps True)
+        overlayRoot
+        [key]
+        True
+        Nothing
+    case r4 of
+      Right (Just _) -> pure ()
+      other -> do
+        hPutStrLn stderr ("expected force commit, got " <> show other)
+        exitFailure
+    nEg4 <- readIORef egCalls
+    assertEq "force ran egencache" 1 nEg4
+    -- Injected runner args include overlay location in request
+    reqRef <- newIORef ([] :: [EgencacheRequest])
+    let captureRunner req = do
+          atomicModifyIORef' reqRef (\rs -> (req : rs, ()))
+          pure (Right ())
+    _ <-
+      gencachePackages
+        captureRunner
+        (gitOps False)
+        "/tmp/work/mndz-overlay"
+        [key]
+        True
+        (Just 2)
+    reqs <- readIORef reqRef
+    case reqs of
+      (r : _) -> do
+        assertEq "atom" ["dev-lang/haskell"] (erAtoms r)
+        assertEq "overlay" "/tmp/work/mndz-overlay" (erOverlayRoot r)
+        assertEq "jobs" (Just 2) (erJobs r)
+      [] -> do
+        hPutStrLn stderr "expected captured egencache request"
+        exitFailure

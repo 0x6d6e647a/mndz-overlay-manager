@@ -32,6 +32,7 @@ root-modules = [
   "Update.Go.Version",
   "Update.Hardcoded",
   "Update.Http",
+  "Update.Md5Cache",
   "Update.Npm",
   "Update.Resolve",
   "Update.GpgAgent",

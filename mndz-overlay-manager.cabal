@@ -92,6 +92,7 @@ library
       , Update.Go.Version
       , Update.Hardcoded
       , Update.Http
+      , Update.Md5Cache
       , Update.Npm
       , Update.Preflight
       , Update.Resolve

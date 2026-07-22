@@ -14,6 +14,7 @@ module Update.Apply
     goPublishAndOverlay,
     markSuccessLinesReused,
     signedOverlayCommit,
+    egencacheAndSignedCommit,
     materializePlan,
   )
 where
@@ -93,6 +94,12 @@ import Update.Go.Plan
   )
 import Update.Go.Vendor (VendorOps (..), VendorResult (..), buildVendorTarball, versionTag)
 import Update.Hardcoded (lookupPolicy)
+import Update.Md5Cache
+  ( EgencacheRunner,
+    inspectPackageCache,
+    packageCacheGateError,
+    runPackageEgencache,
+  )
 import Update.Types
   ( ApplyOutcome (..),
     Fetcher,
@@ -123,6 +130,7 @@ data ApplyEnv = ApplyEnv
   { aeFetcher :: Fetcher,
     aeGitOps :: GitOps,
     aeEbuildRunner :: EbuildRunner,
+    aeEgencacheRunner :: EgencacheRunner,
     aeVendorOps :: VendorOps,
     aeReleaseOps :: ReleaseOps,
     aeAssetsRoot :: Maybe FilePath,
@@ -130,7 +138,7 @@ data ApplyEnv = ApplyEnv
     aeAssetsOwner :: Text,
     aeAssetsRepo :: Text,
     aeAssetsLock :: MVar (),
-    -- | Serializes overlay @git add@ / signed @git commit@ across concurrent packages.
+    -- | Serializes package @egencache@ + overlay @git add@ / signed @git commit@.
     aeOverlayLock :: MVar (),
     aeJobs :: Int,
     aeMulti :: MultiHandle,
@@ -148,6 +156,47 @@ signedOverlayCommit ::
 signedOverlayCommit env overlayRoot paths msg =
   withMVar (aeOverlayLock env) $ \() ->
     goAddAndCommit (aeGitOps env) overlayRoot paths msg
+
+-- | Package-scoped @egencache@ then signed commit under the overlay lock.
+-- Returns the full staged path list (unit paths plus md5-cache pathspecs).
+egencacheAndSignedCommit ::
+  ApplyEnv ->
+  FilePath ->
+  PackageKey ->
+  [FilePath] ->
+  Text ->
+  IO (Either Text [FilePath])
+egencacheAndSignedCommit env overlayRoot key unitPaths msg =
+  withMVar (aeOverlayLock env) $ \() -> do
+    cacheResult <-
+      runPackageEgencache
+        (aeEgencacheRunner env)
+        overlayRoot
+        key
+        (Just (aeJobs env))
+    case cacheResult of
+      Left err -> pure (Left err)
+      Right cachePaths -> do
+        let paths = nub (unitPaths <> cachePaths)
+        committed <- goAddAndCommit (aeGitOps env) overlayRoot paths msg
+        pure $ case committed of
+          Left err -> Left err
+          Right () -> Right paths
+
+-- | Hard-fail without mutation when package md5-cache is incomplete or mismatched.
+requirePackageMd5Cache ::
+  FilePath ->
+  PackageKey ->
+  FilePath ->
+  IO (Either Text ())
+requirePackageMd5Cache overlayRoot key pkgDir =
+  case splitPackageKey key of
+    Nothing -> pure (Left ("invalid package key: " <> packageKeyText key))
+    Just (category, pn) -> do
+      inspected <- inspectPackageCache overlayRoot category pn pkgDir
+      pure $ case inspected of
+        Right () -> Right ()
+        Left issue -> Left (packageCacheGateError key issue)
 
 -- | Commit message for a successful apply unit: @category/package: version@.
 unitCommitMessage :: PackageKey -> Text -> Text
@@ -334,61 +383,66 @@ gitMvDo ::
 gitMvDo env key local remote oldPath pkgDir pn overlayRoot = do
   let gitOps = aeGitOps env
       ebuildRun = aeEbuildRunner env
-  ebuildRel <- relativeOverlayPath overlayRoot oldPath
-  let manifestAbs = pkgDir </> "Manifest"
-  manRel0 <- relativeOverlayPath overlayRoot manifestAbs
-  dirty' <- goPathsDirty gitOps overlayRoot [ebuildRel, manRel0]
-  case dirty' of
+  cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
+  case cacheGate of
     Left err -> pure $ ApplyHardFail key err False False
-    Right True ->
-      pure $
-        ApplyHardFail
-          key
-          "involved paths are dirty (newest ebuild and/or Manifest)"
-          False
-          False
-    Right False -> do
-      let newName = newEbuildFileName pn remote
-          newPath = pkgDir </> newName
-      existsNew <- doesFileExist newPath
-      if existsNew && takeFileName oldPath /= newName
-        then
+    Right () -> do
+      ebuildRel <- relativeOverlayPath overlayRoot oldPath
+      let manifestAbs = pkgDir </> "Manifest"
+      manRel0 <- relativeOverlayPath overlayRoot manifestAbs
+      dirty' <- goPathsDirty gitOps overlayRoot [ebuildRel, manRel0]
+      case dirty' of
+        Left err -> pure $ ApplyHardFail key err False False
+        Right True ->
           pure $
             ApplyHardFail
               key
-              ("target ebuild already exists: " <> T.pack newName)
+              "involved paths are dirty (newest ebuild and/or Manifest)"
               False
               False
-        else do
-          renamed <-
-            if takeFileName oldPath == newName
-              then pure False
-              else do
-                renameFile oldPath newPath
-                pure True
-          manResult <- ebuildRun pkgDir newName
-          case manResult of
-            Left err -> pure $ ApplyHardFail key err renamed False
-            Right () -> do
-              newRel <- relativeOverlayPath overlayRoot newPath
-              manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-              let paths =
-                    if renamed
-                      then [ebuildRel, newRel, manRel]
-                      else [newRel, manRel]
-                  lines_ =
-                    [ SuccessLine
-                        { slFrom = local,
-                          slTo = remote,
-                          slLabel = Nothing,
-                          slAssetsReused = False
-                        }
-                    ]
-                  msg = unitCommitMessage key (renderPV remote)
-              committed <- signedOverlayCommit env overlayRoot paths msg
-              pure $ case committed of
-                Right () -> ApplySuccess key lines_ paths
-                Left err -> ApplyHardFail key err True False
+        Right False -> do
+          let newName = newEbuildFileName pn remote
+              newPath = pkgDir </> newName
+          existsNew <- doesFileExist newPath
+          if existsNew && takeFileName oldPath /= newName
+            then
+              pure $
+                ApplyHardFail
+                  key
+                  ("target ebuild already exists: " <> T.pack newName)
+                  False
+                  False
+            else do
+              renamed <-
+                if takeFileName oldPath == newName
+                  then pure False
+                  else do
+                    renameFile oldPath newPath
+                    pure True
+              manResult <- ebuildRun pkgDir newName
+              case manResult of
+                Left err -> pure $ ApplyHardFail key err renamed False
+                Right () -> do
+                  newRel <- relativeOverlayPath overlayRoot newPath
+                  manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+                  let unitPaths =
+                        if renamed
+                          then [ebuildRel, newRel, manRel]
+                          else [newRel, manRel]
+                      lines_ =
+                        [ SuccessLine
+                            { slFrom = local,
+                              slTo = remote,
+                              slLabel = Nothing,
+                              slAssetsReused = False
+                            }
+                        ]
+                      msg = unitCommitMessage key (renderPV remote)
+                  committed <-
+                    egencacheAndSignedCommit env overlayRoot key unitPaths msg
+                  pure $ case committed of
+                    Right paths -> ApplySuccess key lines_ paths
+                    Left err -> ApplyHardFail key err True False
 
 ------------------------------------------------------------------------
 -- GoVendorAndAssets (tree-lane multi-PV)
@@ -429,19 +483,23 @@ applyGoVendorLanes env overlayRoot entry src mSub = do
           if not (planNeedsWork localPVs contentFix plan)
             then pure [ApplySoftSkip key "already matches Go tree-lane plan"]
             else do
-              planDone <- readIORef planDoneRef
-              materializePlan
-                env
-                overlayRoot
-                entry
-                owner
-                repo
-                prefix
-                mSub
-                plan
-                localPVs
-                contentFix
-                planDone
+              cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
+              case cacheGate of
+                Left err -> pure [ApplyHardFail key err False False]
+                Right () -> do
+                  planDone <- readIORef planDoneRef
+                  materializePlan
+                    env
+                    overlayRoot
+                    entry
+                    owner
+                    repo
+                    prefix
+                    mSub
+                    plan
+                    localPVs
+                    contentFix
+                    planDone
     _ ->
       pure
         [ ApplyHardFail
@@ -597,18 +655,19 @@ materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs conte
                   else successes
           | otherwise -> do
               committed <-
-                signedOverlayCommit
+                egencacheAndSignedCommit
                   env
                   overlayRoot
+                  key
                   extraPaths
                   (pruneCommitMessage key)
               pure $ case committed of
                 Left err ->
                   successes <> [ApplyHardFail key err True False]
-                Right ()
+                Right paths
                   | null successes ->
                       let lines_ = gapSuccessLines localPVs needPVs plan
-                       in [ApplySuccess key lines_ extraPaths]
+                       in [ApplySuccess key lines_ paths]
                   | otherwise -> successes
   where
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
@@ -1168,14 +1227,20 @@ overlayAfterAssets env overlayRoot entry keywords lines_ targetVer digests tarba
                   | manSha == digestSHA512 digests -> do
                       newRel <- relativeOverlayPath overlayRoot newPath
                       manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-                      let paths =
+                      let unitPaths =
                             nub $
                               [newRel, manRel]
                                 <> [ebuildRel | removedTemplate || templatePath /= newPath]
                           msg = unitCommitMessage key (renderPV targetVer)
-                      committed <- signedOverlayCommit env overlayRoot paths msg
+                      committed <-
+                        egencacheAndSignedCommit
+                          env
+                          overlayRoot
+                          key
+                          unitPaths
+                          msg
                       pure $ case committed of
-                        Right () -> ApplySuccess key lines_ paths
+                        Right paths -> ApplySuccess key lines_ paths
                         Left err -> ApplyHardFail key err True orphan
                   | otherwise ->
                       pure $

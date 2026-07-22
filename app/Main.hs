@@ -27,7 +27,7 @@ import Config.Loader (configErrorMessage, loadConfig)
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
@@ -52,7 +52,7 @@ import Update.Check
     groupNewest,
     productionFetcherWithToken,
   )
-import Update.Git (productionGitOps)
+import Update.Git (isGitWorkTree, productionGitOps)
 import Update.Go.Plan (productionPlanOps)
 import Update.Go.Vendor (productionVendorOps)
 import Update.GpgAgent
@@ -61,6 +61,12 @@ import Update.GpgAgent
     teardownGpgHandle,
   )
 import Update.Hardcoded (lookupPolicy)
+import Update.Md5Cache
+  ( checkLayoutCacheFormats,
+    gencachePackages,
+    preflightGencache,
+    productionEgencacheRunner,
+  )
 import Update.Preflight
   ( preflightUpdateWith,
     validateAssetsPath,
@@ -118,6 +124,7 @@ main = do
           Cmd.List -> runList rt
           Cmd.Outdated -> runOutdated rt
           Cmd.Update pkgs -> runUpdate rt pkgs
+          Cmd.Gencache targets force -> runGencache rt targets force
 
 runList :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runList rt = do
@@ -156,6 +163,10 @@ runUpdate rt pkgArgs = do
       case preflightOk of
         Left err -> dieError (T.unpack err)
         Right () -> pure ()
+      layoutOk <- liftIO $ checkLayoutCacheFormats overlayPath
+      case layoutOk of
+        Left err -> dieError (T.unpack err)
+        Right () -> pure ()
       token <- liftIO (resolveGitHubToken cfg)
       assetsRoot <-
         if needAssets
@@ -188,6 +199,7 @@ runUpdate rt pkgArgs = do
                     { aeFetcher = fetch,
                       aeGitOps = productionGitOps gpg,
                       aeEbuildRunner = productionEbuildRunner,
+                      aeEgencacheRunner = productionEgencacheRunner,
                       aeVendorOps = productionVendorOps,
                       aeReleaseOps = releaseOps,
                       aeAssetsRoot = assetsRoot,
@@ -295,11 +307,62 @@ emitOutcome = \case
     when halfApplied $
       logWarning $
         packageKeyText key
-          <> ": package directory may be left dirty or half-applied; fix or restore before retrying"
+          <> ": package directory may be left dirty or half-applied; fix or restore before retrying; \
+             \if ebuild and md5-cache disagree, run gencache or gencache --force for this package"
     when assetsPublished $
       logWarning $
         packageKeyText key
           <> ": assets release may already be published but the overlay update did not complete"
+
+runGencache :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> Bool -> m ()
+runGencache rt pkgArgs force = do
+  (_cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
+  isGit <- liftIO (isGitWorkTree overlayPath)
+  unless isGit $
+    dieError ("overlay path is not a git work tree: " <> overlayPath)
+  toolsOk <- liftIO preflightGencache
+  case toolsOk of
+    Left err -> dieError (T.unpack err)
+    Right () -> pure ()
+  layoutOk <- liftIO $ checkLayoutCacheFormats overlayPath
+  case layoutOk of
+    Left err -> dieError (T.unpack err)
+    Right () -> pure ()
+  let entries = groupNewest ebuilds
+      tokens = map T.pack pkgArgs
+  case resolveTargets entries tokens of
+    Left errs -> do
+      mapM_ (logError . targetErrorMessage) errs
+      liftIO $ exitWith (ExitFailure 1)
+    Right keys -> do
+      let pcfg = rtProgress rt
+          gpgOps =
+            productionGpgAgentOps
+              (pauseActivePanel pcfg)
+              (resumeActivePanel pcfg)
+      result <-
+        liftIO $
+          bracket
+            (newGpgHandle gpgOps)
+            teardownGpgHandle
+            ( \gpg ->
+                gencachePackages
+                  productionEgencacheRunner
+                  (productionGitOps gpg)
+                  overlayPath
+                  keys
+                  force
+                  (Just (rtJobs rt))
+            )
+      case result of
+        Left err -> dieError (T.unpack err)
+        Right Nothing ->
+          logInfo "gencache: no md5-cache changes; no commit created"
+        Right (Just paths) ->
+          logInfo $
+            "gencache: signed commit of "
+              <> T.pack (show (length paths))
+              <> " cache path(s)"
 
 -- | @{pn}-{pv} / {pn}-{pv}-vendor.tar.xz@ for deferred reuse logs.
 packageAssetLabel :: PackageKey -> EbuildVersion -> T.Text
