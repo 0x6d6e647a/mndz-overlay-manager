@@ -164,15 +164,30 @@ selectAllLaneTargets :: GoCeilings -> [VersionCandidate] -> [LaneTarget]
 selectAllLaneTargets ceilings candidates =
   map (selectLaneTarget ceilings candidates) allLaneIds
 
--- | KEYWORDS tokens: only tilde forms for arches that need this PV.
-assembleKeywords :: [GoArch] -> [Text]
-assembleKeywords arches =
-  nub
-    [ case a of
-        Amd64 -> "~amd64"
-        Arm64 -> "~arm64"
-    | a <- arches
-    ]
+-- | KEYWORDS tokens from lane membership (plain → bare arch; tilde-only → @~arch@).
+--
+-- Per arch (@amd64@ then @arm64@): if any plain lane targets the PV, emit bare
+-- @arch@; else if any tilde lane targets it, emit @~arch@; else omit. Never both
+-- bare and tilde for the same arch (bare covers plain and tilde consumers).
+assembleKeywords :: [LaneId] -> [Text]
+assembleKeywords lanes =
+  [ token
+  | arch <- [Amd64, Arm64],
+    Just token <- [tokenForArch arch]
+  ]
+  where
+    tokenForArch arch
+      | any (\l -> laneArch l == arch && laneTier l == Plain) lanes =
+          Just (bareToken arch)
+      | any (\l -> laneArch l == arch && laneTier l == Tilde) lanes =
+          Just (tildeToken arch)
+      | otherwise = Nothing
+    bareToken = \case
+      Amd64 -> "amd64"
+      Arm64 -> "arm64"
+    tildeToken = \case
+      Amd64 -> "~amd64"
+      Arm64 -> "~arm64"
 
 -- | Collapse lane targets to unique planned ebuilds with KEYWORDS.
 collapsePlannedEbuilds :: [LaneTarget] -> [PlannedEbuild]
@@ -187,10 +202,9 @@ collapsePlannedEbuilds targets =
   where
     buildEbuild withPV pv =
       let lanes = [lid | (Just p, lid) <- withPV, samePV p pv]
-          arches = nub (map laneArch lanes)
        in PlannedEbuild
             { pePV = pv,
-              peKeywords = assembleKeywords arches,
+              peKeywords = assembleKeywords lanes,
               peLanes = lanes
             }
     samePV a b =

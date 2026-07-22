@@ -42,7 +42,7 @@ import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (nub, sort)
+import Data.List (nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -1409,9 +1409,36 @@ testGoTreeCeilings = do
 
 testGoKeywordsAssembly :: IO ()
 testGoKeywordsAssembly = do
-  assertEq "both arches" ["~amd64", "~arm64"] (assembleKeywords [Amd64, Arm64])
-  assertEq "amd64 only" ["~amd64"] (assembleKeywords [Amd64])
-  assertEq "arm64 only" ["~arm64"] (assembleKeywords [Arm64])
+  -- All four lanes → bare amd64 arm64 (plain membership wins; no tilde tokens)
+  assertEq
+    "all four lanes bare both arches"
+    ["amd64", "arm64"]
+    (assembleKeywords [LaneAmd64Plain, LaneAmd64Tilde, LaneArm64Plain, LaneArm64Tilde])
+  -- Tilde-only membership
+  assertEq "amd64 tilde only" ["~amd64"] (assembleKeywords [LaneAmd64Tilde])
+  assertEq "arm64 tilde only" ["~arm64"] (assembleKeywords [LaneArm64Tilde])
+  assertEq
+    "both arches tilde only"
+    ["~amd64", "~arm64"]
+    (assembleKeywords [LaneAmd64Tilde, LaneArm64Tilde])
+  -- Plain-only membership
+  assertEq "amd64 plain only" ["amd64"] (assembleKeywords [LaneAmd64Plain])
+  assertEq "arm64 plain only" ["arm64"] (assembleKeywords [LaneArm64Plain])
+  -- Plain + tilde on same arch → bare only (never both)
+  assertEq
+    "plain wins over tilde amd64"
+    ["amd64"]
+    (assembleKeywords [LaneAmd64Plain, LaneAmd64Tilde])
+  -- Deterministic order: amd64 before arm64
+  assertEq
+    "order amd64 then arm64"
+    ["amd64", "arm64"]
+    (assembleKeywords [LaneArm64Plain, LaneAmd64Plain])
+  -- Staggered: plain amd64 only + tilde amd64 on other PV is per-call; mixed tiers across arches
+  assertEq
+    "tilde amd64 + plain arm64"
+    ["~amd64", "arm64"]
+    (assembleKeywords [LaneAmd64Tilde, LaneArm64Plain, LaneArm64Tilde])
 
 testGoLaneSelection :: IO ()
 testGoLaneSelection = do
@@ -1462,8 +1489,9 @@ testGoLaneCollapse = do
   case collapsed of
     [pe] -> do
       assertEq "pv" (parseEbuildVersion "0.84.0") (pePV pe)
-      assertTrue "has ~amd64" ("~amd64" `elem` peKeywords pe)
-      assertTrue "has ~arm64" ("~arm64" `elem` peKeywords pe)
+      assertEq "bare dual keywords" ["amd64", "arm64"] (peKeywords pe)
+      assertTrue "no ~amd64" ("~amd64" `notElem` peKeywords pe)
+      assertTrue "no ~arm64" ("~arm64" `notElem` peKeywords pe)
     _ -> exitFailure
   let divergent =
         [ LaneTarget LaneAmd64Plain (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5"),
@@ -1475,10 +1503,46 @@ testGoLaneCollapse = do
   assertEq "arch divergent count" 2 (length divCollapsed)
   case [pe | pe <- divCollapsed, pePV pe == parseEbuildVersion "0.84.0"] of
     [pe] -> do
-      assertTrue "0.84 ~amd64" ("~amd64" `elem` peKeywords pe)
+      assertEq "0.84 bare amd64" ["amd64"] (peKeywords pe)
+      assertTrue "0.84 no arm64" ("arm64" `notElem` peKeywords pe)
       assertTrue "0.84 no ~arm64" ("~arm64" `notElem` peKeywords pe)
     other -> do
       hPutStrLn stderr $ "0.84 ebuild: " <> show other
+      exitFailure
+  case [pe | pe <- divCollapsed, pePV pe == parseEbuildVersion "0.82.0"] of
+    [pe] -> do
+      assertEq "0.82 bare arm64" ["arm64"] (peKeywords pe)
+      assertTrue "0.82 no amd64" ("amd64" `notElem` peKeywords pe)
+    other -> do
+      hPutStrLn stderr $ "0.82 ebuild: " <> show other
+      exitFailure
+  -- Tilde-only: only amd64 tilde lane targets PV
+  let tildeOnly =
+        [ LaneTarget LaneAmd64Tilde (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5")
+        ]
+  case collapsePlannedEbuilds tildeOnly of
+    [pe] -> assertEq "tilde-only keywords" ["~amd64"] (peKeywords pe)
+    other -> do
+      hPutStrLn stderr $ "tilde-only ebuild: " <> show other
+      exitFailure
+  -- Staggered plain vs tilde: plain amd64 → 0.75; tilde amd64 + both arm64 → 0.82
+  let staggered =
+        [ LaneTarget LaneAmd64Plain (Just (parseEbuildVersion "1.26.3")) (Just (parseEbuildVersion "0.75.0")) (Just "1.26.3"),
+          LaneTarget LaneAmd64Tilde (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.82.0")) (Just "1.26.5"),
+          LaneTarget LaneArm64Plain (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.82.0")) (Just "1.26.5"),
+          LaneTarget LaneArm64Tilde (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.82.0")) (Just "1.26.5")
+        ]
+      stagCollapsed = collapsePlannedEbuilds staggered
+  assertEq "staggered count" 2 (length stagCollapsed)
+  case [pe | pe <- stagCollapsed, pePV pe == parseEbuildVersion "0.75.0"] of
+    [pe] -> assertEq "0.75 bare amd64 only" ["amd64"] (peKeywords pe)
+    other -> do
+      hPutStrLn stderr $ "0.75 ebuild: " <> show other
+      exitFailure
+  case [pe | pe <- stagCollapsed, pePV pe == parseEbuildVersion "0.82.0"] of
+    [pe] -> assertEq "0.82 ~amd64 + bare arm64" ["~amd64", "arm64"] (peKeywords pe)
+    other -> do
+      hPutStrLn stderr $ "0.82 staggered ebuild: " <> show other
       exitFailure
   let fourDistinct =
         [ LaneTarget LaneAmd64Plain Nothing (Just (parseEbuildVersion "0.80.0")) (Just "1.0"),
@@ -1487,6 +1551,16 @@ testGoLaneCollapse = do
           LaneTarget LaneArm64Tilde Nothing (Just (parseEbuildVersion "0.83.0")) (Just "1.0")
         ]
   assertEq "four ebuilds" 4 (length (collapsePlannedEbuilds fourDistinct))
+  case collapsePlannedEbuilds fourDistinct of
+    pes ->
+      assertEq
+        "four keywords bare/tilde by lane"
+        [ ["amd64"],
+          ["~amd64"],
+          ["arm64"],
+          ["~arm64"]
+        ]
+        (map peKeywords (sortByPv pes))
   let plan = planFromTargets allSame
       locals = [parseEbuildVersion "0.80.0", parseEbuildVersion "0.82.0"]
   assertEq "missing target" [parseEbuildVersion "0.84.0"] (missingTargets locals plan)
@@ -1496,6 +1570,14 @@ testGoLaneCollapse = do
     (extrasToDelete locals plan)
   assertTrue "needs work" (planNeedsWork locals [] plan)
   assertTrue "satisfied" (not (planNeedsWork [parseEbuildVersion "0.84.0"] [] plan))
+  where
+    sortByPv =
+      sortBy
+        ( \a b ->
+            case comparePV (pePV a) (pePV b) of
+              Just o -> o
+              Nothing -> compare (show (pePV a)) (show (pePV b))
+        )
 
 testGoGapLines :: IO ()
 testGoGapLines = do
@@ -1564,17 +1646,36 @@ testSetKeywords = do
             "KEYWORDS=\"~amd64\"",
             "DESCRIPTION=\"x\""
           ]
-      fixed = setKeywords ["~amd64", "~arm64"] base
-  assertTrue "match dual" (keywordsMatch ["~amd64", "~arm64"] fixed)
-  assertTrue "no bare amd64" (not (" amd64" `T.isInfixOf` fixed || "KEYWORDS=\"amd64" `T.isInfixOf` fixed))
+      fixedTilde = setKeywords ["~amd64", "~arm64"] base
+  assertTrue "match dual tilde" (keywordsMatch ["~amd64", "~arm64"] fixedTilde)
+  -- Apply writes bare tokens when the plan includes them (plain-lane membership).
+  let fixedBare = setKeywords ["amd64", "arm64"] base
+  assertTrue "match dual bare" (keywordsMatch ["amd64", "arm64"] fixedBare)
+  assertTrue "writes bare amd64" ("KEYWORDS=\"amd64 arm64\"" `T.isInfixOf` fixedBare)
+  -- Drift: planned bare vs existing tilde needs content-fix.
+  assertTrue
+    "tilde vs bare drift"
+    (not (keywordsMatch ["amd64"] base))
+  assertTrue
+    "content-fix on ~ → bare upgrade"
+    ( ebuildNeedsContentFix
+        ["amd64"]
+        ( T.unlines
+            [ "inherit go-module",
+              "KEYWORDS=\"~amd64\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/pkg-${PV}/pkg-${PV}-vendor.tar.xz\""
+            ]
+        )
+        Nothing
+    )
   let noKw =
         T.unlines
           [ "inherit go-module",
             "",
             "DESCRIPTION=\"y\""
           ]
-      inserted = setKeywords ["~amd64"] noKw
-  assertTrue "inserted" (keywordsMatch ["~amd64"] inserted)
+      inserted = setKeywords ["amd64"] noKw
+  assertTrue "inserted bare" (keywordsMatch ["amd64"] inserted)
 
 testGoPlanIntegrationMocked :: IO ()
 testGoPlanIntegrationMocked = do
@@ -1639,6 +1740,17 @@ testGoPlanIntegrationMocked = do
     assertTrue
       "has 0.84"
       (parseEbuildVersion "0.84.0" `elem` glpUniquePVs plan)
+    -- Plain lanes → bare KEYWORDS; tilde-only lanes → ~KEYWORDS
+    case [pe | pe <- glpEbuilds plan, pePV pe == parseEbuildVersion "0.82.0"] of
+      [pe] -> assertEq "0.82 plain bare dual" ["amd64", "arm64"] (peKeywords pe)
+      other -> do
+        hPutStrLn stderr $ "plan 0.82 ebuild: " <> show other
+        exitFailure
+    case [pe | pe <- glpEbuilds plan, pePV pe == parseEbuildVersion "0.84.0"] of
+      [pe] -> assertEq "0.84 tilde dual" ["~amd64", "~arm64"] (peKeywords pe)
+      other -> do
+        hPutStrLn stderr $ "plan 0.84 ebuild: " <> show other
+        exitFailure
 
 ------------------------------------------------------------------------
 -- go.mod probe early exit

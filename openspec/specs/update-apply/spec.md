@@ -184,7 +184,7 @@ Packages with technique `GoVendorAndAssets` SHALL be applied via the Go vendor a
 
 ### Requirement: GoVendorAndAssets multi-lane apply
 
-For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and, for each unique planned PV that needs materialization, perform either the **full** vendor-and-assets + overlay path or the **reuse** overlay-only path defined by `go-vendor-assets` (probe existing release asset first; reuse when present; full path when absent). Before the first mutation for the package in the run, apply SHALL verify complete matching md5-cache for all non-live ebuilds in the package directory as specified by `md5-cache`. The full path remains: clone tag, host Go gate, vendor tarball, assets publish, BDEPEND from that tag’s go.mod, assets SRC_URI rules. The reuse path SHALL complete overlay ebuild mutation and Manifest verification without re-publishing assets. Ebuild KEYWORDS SHALL be set to the planned `~arch` membership for that PV. After each planned PV unit successfully completes overlay mutation, Manifest verification, and package-scoped egencache, apply SHALL create a signed overlay commit for that PV’s paths (including affected `metadata/md5-cache/` paths) with message `category/package: version` (version = PV without leading `v`, including `-rN` when the filename carries a revision) **before** starting the next planned PV for the same package. When two lanes share one PV and a single write satisfies both, the program SHALL produce one commit for that PV rather than two empty commits. After all planned PVs that needed materialization succeed, apply SHALL prune non-live versioned ebuilds not in the planned set per exact-set rules, regenerate Manifest and package md5-cache as needed, and SHALL create a signed overlay commit for prune pathspecs (including md5-cache) when any extras were removed. If any planned PV unit hard-fails, apply SHALL NOT prune, SHALL NOT start further planned PVs for that package after that failure, and SHALL retain any earlier successful PV commits. Sibling packages continue on hard-fail of one package’s unit.
+For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and, for each unique planned PV that needs materialization, perform either the **full** vendor-and-assets + overlay path or the **reuse** overlay-only path defined by `go-vendor-assets` (probe existing release asset first; reuse when present; full path when absent). Before the first mutation for the package in the run, apply SHALL verify complete matching md5-cache for all non-live ebuilds in the package directory as specified by `md5-cache`. The full path remains: clone tag, host Go gate, vendor tarball, assets publish, BDEPEND from that tag’s go.mod, assets SRC_URI rules. The reuse path SHALL complete overlay ebuild mutation and Manifest verification without re-publishing assets. Ebuild KEYWORDS SHALL be set to the planned per-arch bare/`~` membership for that PV as defined by `go-tree-lanes` (including bare arch tokens when plain lanes target the PV). After each planned PV unit successfully completes overlay mutation, Manifest verification, and package-scoped egencache, apply SHALL create a signed overlay commit for that PV’s paths (including affected `metadata/md5-cache/` paths) with message `category/package: version` (version = PV without leading `v`, including `-rN` when the filename carries a revision) **before** starting the next planned PV for the same package. When two lanes share one PV and a single write satisfies both, the program SHALL produce one commit for that PV rather than two empty commits. After all planned PVs that needed materialization succeed, apply SHALL prune non-live versioned ebuilds not in the planned set per exact-set rules, regenerate Manifest and package md5-cache as needed, and SHALL create a signed overlay commit for prune pathspecs (including md5-cache) when any extras were removed. If any planned PV unit hard-fails, apply SHALL NOT prune, SHALL NOT start further planned PVs for that package after that failure, and SHALL retain any earlier successful PV commits. Sibling packages continue on hard-fail of one package’s unit.
 
 #### Scenario: Two PVs two commits
 
@@ -198,10 +198,15 @@ For technique `GoVendorAndAssets`, apply SHALL run the Go tree-lane planner and,
 - **WHEN** two lanes select the same PV and one ebuild write satisfies both
 - **THEN** the program creates a single signed commit for that PV for those lanes
 
-#### Scenario: KEYWORDS tilde only
+#### Scenario: KEYWORDS follow plain vs tilde membership
 
-- **WHEN** a planned ebuild is written for amd64-only membership
-- **THEN** KEYWORDS contain `~amd64` and do not contain bare `amd64` without tilde
+- **WHEN** a planned ebuild is written for plain amd64 membership only
+- **THEN** KEYWORDS contain bare `amd64` and do not contain `~amd64`
+
+#### Scenario: KEYWORDS tilde-only when plan has no plain membership
+
+- **WHEN** a planned ebuild is written for tilde-only amd64 membership
+- **THEN** KEYWORDS contain `~amd64` and do not contain bare `amd64`
 
 #### Scenario: Orphan after publish resumes via reuse
 
