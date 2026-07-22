@@ -71,10 +71,10 @@ import Update.EbuildEdit
     ebuildNeedsContentFix,
     ensureGoBdepend,
     manifestHasVendorDist,
-    nextRevisionVersion,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
     setKeywords,
+    writeVersionForPlannedPV,
   )
 import Update.Git (GitOps (..), relativeOverlayPath)
 import Update.Go.Lanes
@@ -722,12 +722,8 @@ materializeOne env overlayRoot entry owner repo prefix mSub localPVs plan pe = d
   let targetVer = case pePV pe of
         Numeric comps _ -> Numeric comps Nothing
         Raw t -> Raw t
-      -- Content-fix same PV may need revision bump.
-      alreadyLocal = any (samePV targetVer) localPVs
-      writeVer =
-        if alreadyLocal
-          then nextRevisionVersion targetVer
-          else targetVer
+      -- Same-PV content fix: bump from highest local revision (bare → -r1 → -r2).
+      writeVer = writeVersionForPlannedPV targetVer localPVs
       lines_ =
         filter
           (\sl -> samePV (slTo sl) targetVer)

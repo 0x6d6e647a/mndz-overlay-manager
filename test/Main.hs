@@ -110,6 +110,7 @@ import Update.EbuildEdit
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
     setKeywords,
+    writeVersionForPlannedPV,
   )
 import Update.Git (GitOps (..))
 import Update.GitHub (stripAndParse)
@@ -839,6 +840,35 @@ testEbuildEdit = do
     (parameterizeAssetsSrcUri "beads" already)
   let rev1 = nextRevisionVersion (parseEbuildVersion "2.1.6")
   assertEq "r1" (Numeric [2, 1, 6] (Just 1)) rev1
+  let planned = parseEbuildVersion "2.1.6"
+      bare = Numeric [2, 1, 6] Nothing
+      r1 = Numeric [2, 1, 6] (Just 1)
+      r2 = Numeric [2, 1, 6] (Just 2)
+      other = parseEbuildVersion "2.1.7"
+  assertEq
+    "write version new PV (no local same)"
+    bare
+    (writeVersionForPlannedPV planned [])
+  assertEq
+    "write version ignores other PVs"
+    bare
+    (writeVersionForPlannedPV planned [other])
+  assertEq
+    "write version bare local → r1"
+    r1
+    (writeVersionForPlannedPV planned [bare])
+  assertEq
+    "write version local r1 → r2"
+    r2
+    (writeVersionForPlannedPV planned [r1])
+  assertEq
+    "write version max of bare and r1 is r2"
+    r2
+    (writeVersionForPlannedPV planned [bare, r1, other])
+  assertEq
+    "write version planned rev ignored when locals present"
+    r2
+    (writeVersionForPlannedPV r1 [r1])
   let man =
         "DIST dolt-2.1.6-vendor.tar.xz 123 BLAKE2B deadbeef SHA512 abcdef0123456789\n"
   assertEq

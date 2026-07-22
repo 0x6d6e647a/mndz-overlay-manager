@@ -4,6 +4,7 @@ module Update.EbuildEdit
   ( assetsSrcUriParameterized,
     parameterizeAssetsSrcUri,
     nextRevisionVersion,
+    writeVersionForPlannedPV,
     ebuildFileNameWithRev,
     parseManifestVendorSHA512,
     manifestHasVendorDist,
@@ -21,7 +22,7 @@ where
 import Data.Char (isDigit, isHexDigit)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Overlay.Version (EbuildVersion (..), renderPV)
+import Overlay.Version (EbuildVersion (..), comparePV, renderPV)
 import System.FilePath (takeFileName)
 
 assetsMarker :: Text
@@ -84,6 +85,42 @@ nextRevisionVersion :: EbuildVersion -> EbuildVersion
 nextRevisionVersion (Numeric comps Nothing) = Numeric comps (Just 1)
 nextRevisionVersion (Numeric comps (Just r)) = Numeric comps (Just (r + 1))
 nextRevisionVersion (Raw t) = Raw (t <> "-r1")
+
+-- | Filename version for a planned PV given local non-live versions.
+--
+-- When no local ebuild shares the planned PV (@comparePV@ EQ), return the
+-- bare planned PV (new materialization). When one or more locals match,
+-- return @nextRevisionVersion@ of the highest local revision (bare \< @-r1@
+-- \< @-r2@ \< …). Planned revision, if any, is ignored in favor of local max.
+writeVersionForPlannedPV :: EbuildVersion -> [EbuildVersion] -> EbuildVersion
+writeVersionForPlannedPV planned localPVs =
+  let target = barePV planned
+      same = filter (samePV target) localPVs
+   in case same of
+        [] -> target
+        (v : vs) -> nextRevisionVersion (foldl' maxRevision v vs)
+  where
+    barePV (Numeric comps _) = Numeric comps Nothing
+    barePV (Raw t) = Raw t
+    samePV a b = case comparePV a b of
+      Just EQ -> True
+      _ -> False
+
+-- | Higher Gentoo revision wins; bare is lower than any @-rN@.
+maxRevision :: EbuildVersion -> EbuildVersion -> EbuildVersion
+maxRevision a b =
+  case compareRevision a b of
+    GT -> a
+    LT -> b
+    EQ -> a
+
+compareRevision :: EbuildVersion -> EbuildVersion -> Ordering
+compareRevision (Numeric _ ra) (Numeric _ rb) = compare (revRank ra) (revRank rb)
+compareRevision a b = compare (renderPV a) (renderPV b)
+
+revRank :: Maybe Word -> Word
+revRank Nothing = 0
+revRank (Just r) = r
 
 ebuildFileNameWithRev :: Text -> EbuildVersion -> FilePath
 ebuildFileNameWithRev pn ver =
