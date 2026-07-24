@@ -9,7 +9,6 @@ module Update.GitHub
   )
 where
 
-import Control.Exception (SomeException, catch)
 import Data.Aeson (Value, eitherDecode, withArray, withObject, (.:))
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.Foldable (toList)
@@ -32,6 +31,7 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
+import Update.Http (tryHttp)
 import Update.Types (UpdateSource (..))
 
 -- | Fetch latest version from GitHub (releases/latest, then tags fallback).
@@ -244,8 +244,3 @@ httpGetJson mgr headers url = do
               Left e -> Left (T.pack e)
               Right v -> Right v
             else Left ("HTTP " <> T.pack (show code) <> " from " <> T.pack url)
-
-tryHttp :: IO a -> IO (Either Text a)
-tryHttp action =
-  (Right <$> action) `catch` \(e :: SomeException) ->
-    pure (Left (T.pack (show e)))

@@ -3,6 +3,7 @@
 module Update.Http
   ( fetchHttp,
     fetchHttpWith,
+    tryHttp,
   )
 where
 
@@ -60,6 +61,7 @@ tryUrl mgr urlText = do
                     else Right (parseEbuildVersion body)
             else Left ("HTTP " <> T.pack (show code) <> " from " <> urlText)
 
+-- | Run an HTTP (or other) IO action, mapping any exception to 'Left' with 'show'.
 tryHttp :: IO a -> IO (Either Text a)
 tryHttp action =
   (Right <$> action) `catch` \(e :: SomeException) ->

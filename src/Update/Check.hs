@@ -28,11 +28,11 @@ import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
-import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
+import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPVNoRev, samePV)
 import System.Directory (doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 import Update.Assets.Layout (distfileKindForEcosystem, distfileTarballName)
-import Update.Cargo.Msrv (normalizeRustVersion, parseRustVersionField)
+import Update.Cargo.Msrv (probeRustVersionFromCargoTomls)
 import Update.Deps.Plan
   ( DepsPlanOps (..),
     planDepsPackageWithProgress,
@@ -291,8 +291,6 @@ checkPackageDeps mh depsOps entry locals src eco = do
                     | g <- gaps
                     ]
           }
-  where
-    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 -- | Go-only entry (tests).
 checkPackageGo ::
@@ -399,7 +397,6 @@ contentFixPVs depsOps eco src locals plan = do
                     ebuildNeedsCargoContentFix (peKeywords pe) content mMsrv
                       || manMissing
               pure [pePV pe | bad]
-    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 fetchGoModForPV ::
   DepsPlanOps ->
@@ -453,19 +450,9 @@ fetchCargoMsrv ::
   IO (Maybe Text)
 fetchCargoMsrv depsOps src mLock mPkg pvNoRev =
   case src of
-    GitHub owner repo prefix -> do
-      let tryPaths = [mPkg, mLock, Nothing]
-      go tryPaths
-      where
-        go [] = pure Nothing
-        go (mSub : rest) = do
-          eres <- dpoFetchCargoToml depsOps owner repo prefix pvNoRev mSub
-          case eres of
-            Left _ -> go rest
-            Right body ->
-              case parseRustVersionField body of
-                Just ver -> pure (normalizeRustVersion ver)
-                Nothing -> go rest
+    GitHub owner repo prefix ->
+      probeRustVersionFromCargoTomls mPkg mLock $ \mSub ->
+        dpoFetchCargoToml depsOps owner repo prefix pvNoRev mSub
     _ -> pure Nothing
 
 statusFromCompare :: EbuildVersion -> EbuildVersion -> UpdateStatus
@@ -489,11 +476,6 @@ statusFromCompare local remote =
             <> " remote="
             <> T.pack (show remote)
         )
-
-renderPVNoRev :: EbuildVersion -> Text
-renderPVNoRev (Raw t) = t
-renderPVNoRev (Numeric comps _) =
-  T.intercalate "." (map (T.pack . show) comps)
 
 -- | Production fetcher dispatching to Http / GitHub / npm clients.
 productionFetcher :: IO Fetcher

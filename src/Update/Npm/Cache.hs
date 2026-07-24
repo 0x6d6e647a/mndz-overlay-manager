@@ -14,7 +14,6 @@ module Update.Npm.Cache
   )
 where
 
-import Control.Exception (SomeException, catch)
 import Data.Aeson (Value (..), eitherDecode, withObject, (.:), (.:?))
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -53,6 +52,7 @@ import Update.Go.Version
   ( compareGoVersions,
     parseGoVersionToken,
   )
+import Update.Http (tryHttp)
 
 -- | Injectable process steps for npm cache construction.
 data NpmCacheOps = NpmCacheOps
@@ -329,8 +329,3 @@ sortNewest =
           Just EQ -> EQ
           Nothing -> compare (show b) (show a)
     )
-
-tryHttp :: IO a -> IO (Either Text a)
-tryHttp action =
-  (Right <$> action) `catch` \(e :: SomeException) ->
-    pure (Left (T.pack (show e)))

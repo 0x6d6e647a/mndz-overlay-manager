@@ -105,6 +105,7 @@ library
       , Update.GpgAgent
       , Update.SshAgent
       , Update.Targets
+      , Update.TextUtil
       , Update.Types
 
     -- Modules included in this library but not exported.

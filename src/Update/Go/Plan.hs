@@ -23,7 +23,7 @@ import Data.Text qualified as T
 import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
-import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
+import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPVNoRev)
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
   ( GoLanePlan (..),
@@ -282,8 +282,5 @@ buildVersionCandidatesWithProgress ops progress ceilings owner repo prefix mSub 
           }
     stripRev (Numeric comps _) = Numeric comps Nothing
     stripRev r = r
-    renderPVNoRev (Numeric comps _) =
-      T.intercalate "." (map (T.pack . show) comps)
-    renderPVNoRev (Raw t) = t
 
 -- Silence unused export of atom constant if needed.

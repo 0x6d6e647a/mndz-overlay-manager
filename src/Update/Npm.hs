@@ -6,7 +6,6 @@ module Update.Npm
   )
 where
 
-import Control.Exception (SomeException, catch)
 import Data.Aeson (Value, eitherDecode, withObject, (.:))
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.Text (Text)
@@ -24,6 +23,7 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
+import Update.Http (tryHttp)
 import Update.Types (UpdateSource (..))
 
 -- | Fetch latest version from the npm registry.
@@ -63,8 +63,3 @@ fetchNpmWith mgr = \case
 
 parseVersion :: Value -> Parser Text
 parseVersion = withObject "npm-latest" (.: "version")
-
-tryHttp :: IO a -> IO (Either Text a)
-tryHttp action =
-  (Right <$> action) `catch` \(e :: SomeException) ->
-    pure (Left (T.pack (show e)))

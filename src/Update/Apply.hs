@@ -39,7 +39,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Overlay.Discovery (parseEbuildFileName)
-import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, prettyVersion, renderPV)
+import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, prettyVersion, renderPV, renderPVNoRev, samePV)
 import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
@@ -83,9 +83,8 @@ import Update.Cargo.Crates
   )
 import Update.Cargo.Msrv
   ( combineMsrv,
-    normalizeRustVersion,
     parseRustMinVerFromEbuild,
-    parseRustVersionField,
+    probeRustVersionFromCargoTomls,
   )
 import Update.Check (PackageEntry (..))
 import Update.Deps.Plan
@@ -264,11 +263,6 @@ needsGoAssetsApply =
     case lookupPolicy (peKey e) of
       Just p -> techniqueNeedsAssets (policyTechnique p)
       Nothing -> False
-
-renderPVNoRev :: EbuildVersion -> Text
-renderPVNoRev (Raw t) = t
-renderPVNoRev (Numeric comps _) =
-  T.intercalate "." (map (T.pack . show) comps)
 
 newEbuildFileName :: Text -> EbuildVersion -> FilePath
 newEbuildFileName pn remote =
@@ -641,7 +635,6 @@ contentFixNeededEnv env eco src pkgDir pn plan =
               pure $
                 ebuildNeedsContentFixAtom (peKeywords pe) content mAtom || manMissing
           pure [pePV pe | bad]
-    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 -- | Full required BDEPEND atom for a planned PV, when obtainable.
 fetchRequiredBdependAtom ::
@@ -681,32 +674,12 @@ fetchCargoMsrvForPV ::
 fetchCargoMsrvForPV env src mLock mPkg pvNoRev donorContent =
   case src of
     GitHub owner repo prefix -> do
-      mRoot <- fetchCargoRustVersion env owner repo prefix pvNoRev mPkg mLock
+      mRoot <-
+        probeRustVersionFromCargoTomls mPkg mLock $ \mSub ->
+          dpoFetchCargoToml (aeDepsPlanOps env) owner repo prefix pvNoRev mSub
       let mDonor = parseRustMinVerFromEbuild donorContent
       pure (combineMsrv mRoot Nothing mDonor)
     _ -> pure (parseRustMinVerFromEbuild donorContent)
-
-fetchCargoRustVersion ::
-  ApplyEnv ->
-  Text ->
-  Text ->
-  Text ->
-  Text ->
-  Maybe FilePath ->
-  Maybe FilePath ->
-  IO (Maybe Text)
-fetchCargoRustVersion env owner repo prefix pvNoRev mPkg mLock = go [mPkg, mLock, Nothing]
-  where
-    go [] = pure Nothing
-    go (mSub : rest) = do
-      eres <-
-        dpoFetchCargoToml (aeDepsPlanOps env) owner repo prefix pvNoRev mSub
-      case eres of
-        Left _ -> go rest
-        Right body ->
-          case parseRustVersionField body of
-            Just ver -> pure (normalizeRustVersion ver)
-            Nothing -> go rest
 
 -- | Legacy Go-only content fix (tests).
 contentFixNeeded ::
@@ -801,7 +774,6 @@ materializeDepsPlan env overlayRoot entry src eco plan localPVs contentFix planD
                        in [ApplySuccess key lines_ paths]
                   | otherwise -> successes
   where
-    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
     materializeUntilFail _ [] = pure []
     materializeUntilFail stepsDoneRef remaining@(pe : rest) = do
       r <-
@@ -891,8 +863,6 @@ materializeOneDeps env overlayRoot entry src eco localPVs plan pe stepsDoneRef r
     writeVer
     stepsDoneRef
     remainingPVs
-  where
-    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 pruneExtras ::
   ApplyEnv ->
@@ -928,8 +898,6 @@ pruneExtras env overlayRoot entry plan = do
         Right () -> do
           manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
           pure (Right (rels <> [manRel]))
-  where
-    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 -- | Full materialize path: 7 discrete multi-progress steps.
 fullPathMaterializeSteps :: Int

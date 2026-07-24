@@ -29,7 +29,7 @@ import Network.HTTP.Client
   )
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
-import Overlay.Version (EbuildVersion (..), comparePV)
+import Overlay.Version (EbuildVersion (..), comparePV, renderPVNoRev)
 import System.FilePath ((</>))
 import Update.Bun.Cache (parseEnginesBunFromPackageJson)
 import Update.Cargo.Msrv (parseRustVersionField)
@@ -438,11 +438,6 @@ sortNewestFirst =
 stripRev :: EbuildVersion -> EbuildVersion
 stripRev (Numeric comps _) = Numeric comps Nothing
 stripRev r = r
-
-renderPVNoRev :: EbuildVersion -> Text
-renderPVNoRev (Numeric comps _) =
-  T.intercalate "." (map (T.pack . show) comps)
-renderPVNoRev (Raw t) = t
 
 fetchBunEnginesAtTag ::
   Manager ->

@@ -57,6 +57,7 @@ import System.Directory (doesDirectoryExist, listDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeFileName, (</>))
 import System.Process (readProcessWithExitCode)
+import Update.TextUtil (stripSurroundingQuotes)
 
 -- | Architecture token without leading @~@ (e.g. @"amd64"@, @"loong"@).
 type Arch = Text
@@ -192,7 +193,7 @@ parseKeywordsField content =
 
     tokenizeKeywordsValue raw =
       let noComment = stripShellComment (T.strip raw)
-          unquoted = stripQuotes noComment
+          unquoted = stripSurroundingQuotes noComment
        in mapMaybe cleanKeywordToken (T.words unquoted)
 
     -- Drop @#…@ only when @#@ is outside a still-open quote (best-effort for one line).
@@ -203,17 +204,6 @@ parseKeywordsField content =
             | T.index t i == '#' && not inQ = T.take i t
             | otherwise = go inQ (i + 1)
        in T.strip (go False 0)
-
-    stripQuotes t
-      | T.length t >= 2,
-        T.head t == '"',
-        T.last t == '"' =
-          T.init (T.tail t)
-      | T.length t >= 2,
-        T.head t == '\'',
-        T.last t == '\'' =
-          T.init (T.tail t)
-      | otherwise = t
 
     cleanKeywordToken t =
       let t1 = T.dropWhile (== '"') (T.dropWhileEnd (== '"') (T.strip t))

@@ -38,7 +38,7 @@ where
 import Data.List (nub, sort, sortBy)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
+import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, samePV)
 import Update.Go.Tree
   ( Arch,
     CeilingLane (..),
@@ -221,16 +221,12 @@ collapsePlannedEbuilds targets =
    in map (buildEbuild withPV) pvs
   where
     buildEbuild withPV pv =
-      let lanes = [lid | (Just p, lid) <- withPV, samePV p pv]
+      let lanes = [lid | (Just p, lid) <- withPV, samePV p pv || p == pv]
        in PlannedEbuild
             { pePV = pv,
               peKeywords = assembleKeywords lanes,
               peLanes = lanes
             }
-    samePV a b =
-      case comparePV a b of
-        Just EQ -> True
-        _ -> a == b
 
 planFromTargets :: [LaneTarget] -> GoLanePlan
 planFromTargets = planFromTargetsWithAtom "dev-lang/go"
@@ -262,8 +258,6 @@ missingTargets localPVs plan =
   | pv <- glpUniquePVs plan,
     not (any (samePV pv) localPVs)
   ]
-  where
-    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 extrasToDelete :: [EbuildVersion] -> GoLanePlan -> [EbuildVersion]
 extrasToDelete localPVs plan =
@@ -271,8 +265,6 @@ extrasToDelete localPVs plan =
   | loc <- localPVs,
     not (any (samePV loc) (glpUniquePVs plan))
   ]
-  where
-    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
 buildGapLines ::
   [EbuildVersion] ->
@@ -300,7 +292,6 @@ buildGapLines localPVs needsWorkPVs plan =
       atom = glpRuntimeAtom plan
    in zipWith (mkLine atom sortedPool) [0 ..] unsatisfied
   where
-    samePV a b = case comparePV a b of Just EQ -> True; _ -> False
     mkLine atom pool idx t =
       let toPV = case ltPackagePV t of
             Just p -> p

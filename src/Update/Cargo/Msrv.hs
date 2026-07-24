@@ -7,6 +7,7 @@ module Update.Cargo.Msrv
     maxRustVersion,
     combineMsrv,
     ceilingTokenForCompare,
+    probeRustVersionFromCargoTomls,
   )
 where
 
@@ -15,6 +16,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Update.Go.Version (compareGoVersions, parseGoVersionToken)
+import Update.TextUtil (stripSurroundingQuotes)
 
 -- | Normalize a rust-version / RUST_MIN_VER token to three numeric components
 -- (@1.91@ → @1.91.0@). Returns 'Nothing' when the token is not a version.
@@ -46,19 +48,9 @@ parseRustVersionField content =
               | T.strip key == "rust-version",
                 Just ('=', val0) <- T.uncons rest ->
                   let val = T.strip val0
-                      unquoted = stripQuotes val
+                      unquoted = stripSurroundingQuotes val
                    in if T.null unquoted then Nothing else Just unquoted
               | otherwise -> Nothing
-    stripQuotes t
-      | T.length t >= 2,
-        T.head t == '"',
-        T.last t == '"' =
-          T.init (T.tail t)
-      | T.length t >= 2,
-        T.head t == '\'',
-        T.last t == '\'' =
-          T.init (T.tail t)
-      | otherwise = t
 
 -- | Parse @RUST_MIN_VER="…"@ from ebuild content.
 parseRustMinVerFromEbuild :: Text -> Maybe Text
@@ -71,19 +63,29 @@ parseRustMinVerFromEbuild content =
     lineMin ln
       | "RUST_MIN_VER=" `T.isPrefixOf` ln =
           let raw = T.drop (T.length ("RUST_MIN_VER=" :: Text)) ln
-              unquoted = stripQuotes (T.strip raw)
+              unquoted = stripSurroundingQuotes (T.strip raw)
            in if T.null unquoted then Nothing else Just unquoted
       | otherwise = Nothing
-    stripQuotes t
-      | T.length t >= 2,
-        T.head t == '"',
-        T.last t == '"' =
-          T.init (T.tail t)
-      | T.length t >= 2,
-        T.head t == '\'',
-        T.last t == '\'' =
-          T.init (T.tail t)
-      | otherwise = t
+
+-- | Try package subdir, lock subdir, then repository root for @package.rust-version@.
+-- @fetch@ receives each candidate subdirectory ('Nothing' = root) and returns the
+-- Cargo.toml body or an error; first successful parse wins.
+probeRustVersionFromCargoTomls ::
+  Maybe FilePath ->
+  Maybe FilePath ->
+  (Maybe FilePath -> IO (Either e Text)) ->
+  IO (Maybe Text)
+probeRustVersionFromCargoTomls mPkg mLock fetch = go [mPkg, mLock, Nothing]
+  where
+    go [] = pure Nothing
+    go (mSub : rest) = do
+      eres <- fetch mSub
+      case eres of
+        Left _ -> go rest
+        Right body ->
+          case parseRustVersionField body of
+            Just ver -> pure (normalizeRustVersion ver)
+            Nothing -> go rest
 
 -- | Maximum of two normalized rust versions; prefers the higher one.
 maxRustVersion :: Text -> Text -> Maybe Text

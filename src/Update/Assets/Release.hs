@@ -18,7 +18,6 @@ module Update.Assets.Release
   )
 where
 
-import Control.Exception (SomeException, catch)
 import Data.Aeson (Value, eitherDecode, encode, object, withObject, (.:), (.=))
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.ByteString.Lazy qualified as LBS
@@ -41,6 +40,7 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders, statusCode)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, takeFileName)
+import Update.Http (tryHttp)
 
 data ReleaseMeta = ReleaseMeta
   { rmOwner :: Text,
@@ -378,8 +378,3 @@ lookupNamedAsset ops owner repo tag assetName = do
     Right Nothing -> Right Nothing
     Right (Just info) ->
       Right (raBrowserDownloadUrl <$> findAssetByName info assetName)
-
-tryHttp :: IO a -> IO (Either Text a)
-tryHttp action =
-  (Right <$> action) `catch` \(e :: SomeException) ->
-    pure (Left (T.pack (show e)))

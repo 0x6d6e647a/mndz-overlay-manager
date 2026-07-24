@@ -37,9 +37,10 @@ import Data.Char (isAlpha, isDigit, isHexDigit)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Overlay.Version (EbuildVersion (..), comparePV, renderPV)
+import Overlay.Version (EbuildVersion (..), renderPV, samePV)
 import System.FilePath (takeFileName)
 import Update.Cargo.Msrv (normalizeRustVersion, parseRustMinVerFromEbuild)
+import Update.TextUtil (stripSurroundingQuotes)
 
 assetsMarker :: Text
 assetsMarker = "mndz-overlay-assets/releases/download/"
@@ -118,9 +119,6 @@ writeVersionForPlannedPV planned localPVs =
   where
     barePV (Numeric comps _) = Numeric comps Nothing
     barePV (Raw t) = Raw t
-    samePV a b = case comparePV a b of
-      Just EQ -> True
-      _ -> False
 
 -- | Higher Gentoo revision wins; bare is lower than any @-rN@.
 maxRevision :: EbuildVersion -> EbuildVersion -> EbuildVersion
@@ -609,14 +607,8 @@ parseKeywordsLine content =
             then Just (tokenize (T.drop (T.length ("KEYWORDS=" :: Text)) stripped))
             else Nothing
     tokenize raw =
-      let unquoted = stripQuotes (T.strip raw)
+      let unquoted = stripSurroundingQuotes (T.strip raw)
        in filter (not . T.null) (T.words unquoted)
-    stripQuotes t
-      | T.length t >= 2,
-        T.head t == '"',
-        T.last t == '"' =
-          T.init (T.tail t)
-      | otherwise = t
 
 -- | True when KEYWORDS tokens match exactly (order-insensitive multiset).
 keywordsMatch :: [Text] -> Text -> Bool

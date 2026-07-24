@@ -5,7 +5,9 @@ module Overlay.Version
     parseEbuildVersion,
     prettyVersion,
     renderPV,
+    renderPVNoRev,
     comparePV,
+    samePV,
   )
 where
 
@@ -74,12 +76,27 @@ renderPV (Numeric comps mrev) =
       Nothing -> ""
       Just r -> "-r" <> T.pack (show r)
 
+-- | Render bare PV without Gentoo revision (filenames, release tags, asset identity).
+-- Numeric components are joined with @.@; revision is omitted. Raw versions are
+-- returned unchanged (no leading @v@ is invented).
+renderPVNoRev :: EbuildVersion -> Text
+renderPVNoRev (Raw t) = t
+renderPVNoRev (Numeric comps _) =
+  T.intercalate "." (map (T.pack . show) comps)
+
 -- | Compare for update detection: numeric components only, revision ignored.
 -- Returns 'Nothing' if incomparable (raw involved or empty components).
 comparePV :: EbuildVersion -> EbuildVersion -> Maybe Ordering
 comparePV (Numeric a _) (Numeric b _) =
   Just (compareComponents a b)
 comparePV _ _ = Nothing
+
+-- | True when 'comparePV' reports equal (same numeric components; revision ignored).
+-- False when less, greater, or incomparable (including any 'Raw' involvement).
+samePV :: EbuildVersion -> EbuildVersion -> Bool
+samePV a b = case comparePV a b of
+  Just EQ -> True
+  _ -> False
 
 compareComponents :: [Word] -> [Word] -> Ordering
 compareComponents = go

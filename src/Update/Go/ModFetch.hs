@@ -11,7 +11,6 @@ module Update.Go.ModFetch
 where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, withMVar)
-import Control.Exception (SomeException, catch)
 import Data.ByteString.Lazy qualified as LBS
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -33,6 +32,7 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
 import System.FilePath (normalise)
 import Update.Go.Version (parseGoModGoDirective)
+import Update.Http (tryHttp)
 
 -- | Cache key for go.mod at a repository ref.
 data GoModKey = GoModKey
@@ -131,8 +131,3 @@ httpGetText mgr mToken url = do
                     (LBS.toStrict (responseBody resp))
                 )
             else Left ("HTTP " <> T.pack (show code) <> " from " <> T.pack url)
-
-tryHttp :: IO a -> IO (Either Text a)
-tryHttp action =
-  (Right <$> action) `catch` \(e :: SomeException) ->
-    pure (Left (T.pack (show e)))
