@@ -76,6 +76,11 @@ library
       , Overlay.Validation
       , Overlay.Version
       , Update.Apply
+      , Update.Apply.Commit
+      , Update.Apply.Env
+      , Update.Apply.GitMv
+      , Update.Apply.Materialize
+      , Update.Apply.OverlayWrite
       , Update.Assets.Hash
       , Update.Assets.Layout
       , Update.Assets.Release
