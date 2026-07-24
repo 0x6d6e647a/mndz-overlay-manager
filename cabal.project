@@ -1,5 +1,9 @@
 packages: .
 
+-- Always solve with the test suite so `cabal build all && cabal test all` (hk check)
+-- includes mndz-overlay-manager-test without a separate --enable-tests step.
+tests: True
+
 -- Dev quality tools installed into .tools/bin via scripts/install-dev-tools.
 -- Pins are set to versions known to build with the project GHC (see script header).
 constraints:

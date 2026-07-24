@@ -126,6 +126,17 @@ hk run pre-commit # exercise the pre-commit hook without committing
 ./scripts/install-dev-tools
 ```
 
+### Tests
+
+The test suite is a **tasty** harness under `test/` with domain modules (`test/Test/*.hs`) and a thin `test/Main.hs`. Fixtures live in `test/fixtures/`.
+
+```bash
+cabal test all                          # full suite (required gate)
+cabal test all --test-options='-p Overlay'   # tasty pattern filter (subset)
+```
+
+Tasty’s `-p` / `--pattern` accepts a pattern over test names (see [tasty’s pattern syntax](https://github.com/UnkindPartition/tasty#patterns)). Prefer the full suite before shipping; filters are for local iteration.
+
 ### Edit → verify loop
 
 1. Implement the change (prefer OpenSpec change tasks when one is active).
@@ -162,7 +173,7 @@ Product behavior is specified under OpenSpec:
 ```
 app/                 executable
 src/                 library
-test/                tests + fixtures
+test/                tasty suite: Main.hs, Test/* modules, fixtures/
 scripts/install-dev-tools
 hk.pkl               hook configuration
 weeder.toml          weeder roots
