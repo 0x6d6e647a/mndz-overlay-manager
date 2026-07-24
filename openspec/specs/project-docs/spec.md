@@ -174,3 +174,12 @@ When the test suite is organized into multiple modules under a standard harness 
 - **WHEN** a contributor reads `CONTRIBUTING.md` for quality workflows after the modular suite lands
 - **THEN** the file describes how to run the project tests as part of the quality workflow
 - **AND** if a harness filter is supported, the file mentions how to run a subset (or points at the harness’s standard filter flag)
+
+### Requirement: Document Stan baseline exclusions
+
+When Stan is configured with severity or category excludes (for example Style, Warning, or Performance), `CONTRIBUTING.md` SHALL document the current baseline intent at contributor depth: which severities or categories are intentionally deferred or enabled, so contributors know what `hk check` / stan is expected to enforce without reverse-engineering `.stan.toml` alone.
+
+#### Scenario: CONTRIBUTING mentions Stan baseline
+
+- **WHEN** a contributor reads quality-workflow documentation after Stan baseline tightening
+- **THEN** `CONTRIBUTING.md` states which Stan check classes are enforced versus deferred (or points to `.stan.toml` with a short summary of the baseline policy)

@@ -10,7 +10,7 @@ module Update.Apply.Commit
 where
 
 import Control.Concurrent.MVar (withMVar)
-import Data.List (nub)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Text (Text)
 import Update.Apply.Env (ApplyEnv (..))
 import Update.Git (GitOps (..))
@@ -49,7 +49,7 @@ egencacheAndSignedCommit env overlayRoot key unitPaths msg =
     case cacheResult of
       Left err -> pure (Left err)
       Right cachePaths -> do
-        let paths = nub (unitPaths <> cachePaths)
+        let paths = nubOrd (unitPaths <> cachePaths)
         committed <- goAddAndCommit (aeGitOps env) overlayRoot paths msg
         pure $ case committed of
           Left err -> Left err

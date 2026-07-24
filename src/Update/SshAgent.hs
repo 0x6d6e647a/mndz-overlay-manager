@@ -15,7 +15,7 @@ where
 
 import Control.Monad (filterM, unless)
 import Data.Char (isAsciiUpper, isSpace)
-import Data.List (nub)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -220,7 +220,7 @@ discoverIdentityFiles = do
       then parseIdentityFiles home <$> readFile configPath
       else pure []
   let defaults = defaultIdentityCandidates sshDir
-  filterM doesFileExist (nub (fromConfig <> defaults))
+  filterM doesFileExist (nubOrd (fromConfig <> defaults))
 
 -- | Collect @IdentityFile@ values from an OpenSSH config body.
 parseIdentityFiles :: FilePath -> String -> [FilePath]

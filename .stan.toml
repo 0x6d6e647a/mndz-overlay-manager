@@ -1,10 +1,24 @@
-# Baseline Stan config for blocking hooks.
-# Style / Warning / Performance (e.g. StrictData, catch-all _) and Infinity
-# list checks are deferred; Error-level anti-patterns stay enabled.
-# Revisit excludes as the codebase tightens.
+# Stan baseline for the blocking quality pipeline (hk check / pre-commit).
+#
+# Enforced: Error-level anti-patterns, plus Performance checks except the
+# narrow inspection excludes below (see CONTRIBUTING.md "Stan baseline").
+#
+# Deferred severities/categories (intentional noise control):
+#   - Style
+#   - Warning
+#   - Infinite (list-length / reverse family PotentialBug noise)
+#
+# Performance is enabled with justified per-inspection excludes:
+#   - STAN-0206 (non-strict fields): StrictData is applied module-scoped on
+#     hot pure records (CLI.Progress, Update.Check, Update.Go.Lanes).
+#     Package-wide StrictData is deferred (injectable PlanOps / test stubs).
+#   - STAN-0208 (slow length for Text): domain data is Text; ByteString
+#     rewrites are not appropriate for short operator strings / ebuild bodies.
+# STAN-0209 (slow nub) is fixed in code via Data.Containers.ListUtils.nubOrd.
 check = [
   { type = "Exclude", severity = "Style", scope = "all" },
   { type = "Exclude", severity = "Warning", scope = "all" },
-  { type = "Exclude", severity = "Performance", scope = "all" },
   { type = "Exclude", category = "Infinite", scope = "all" },
+  { type = "Exclude", id = "STAN-0206", scope = "all" },
+  { type = "Exclude", id = "STAN-0208", scope = "all" },
 ]

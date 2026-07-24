@@ -8,8 +8,8 @@ module Update.Targets
   )
 where
 
+import Data.Containers.ListUtils (nubOrd)
 import Data.Either (lefts, rights)
-import Data.List (nub)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Update.Check (PackageEntry (..))
@@ -42,7 +42,7 @@ resolveTargets entries tokens =
     _ ->
       let results = map (resolveTargetToken entries) tokens
           errs = lefts results
-          keys = nub (rights results)
+          keys = nubOrd (rights results)
        in if null errs then Right keys else Left errs
 
 -- | Resolve one @category/package@ or bare @package@ token.

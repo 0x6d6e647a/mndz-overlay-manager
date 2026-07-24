@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE StrictData #-}
 
 module Update.Go.Lanes
   ( LaneId (..),
@@ -36,7 +37,9 @@ module Update.Go.Lanes
   )
 where
 
-import Data.List (nub, sort, sortBy)
+import Data.Containers.ListUtils (nubOrd)
+import Data.List (sort, sortBy)
+import Data.List.NonEmpty qualified as NE
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, samePV)
@@ -230,7 +233,7 @@ assembleKeywords lanes =
     Just token <- [tokenForArch arch]
   ]
   where
-    arches = sort (nub (map liArch lanes))
+    arches = sort (nubOrd (map liArch lanes))
     tokenForArch arch
       | any (\l -> liArch l == arch && liTier l == Plain) lanes =
           Just arch
@@ -246,7 +249,7 @@ collapsePlannedEbuilds targets =
         | t <- targets,
           Just _ <- [ltPackagePV t]
         ]
-      pvs = nub [pv | (Just pv, _) <- withPV]
+      pvs = nubOrd [pv | (Just pv, _) <- withPV]
    in map (buildEbuild withPV) pvs
   where
     buildEbuild withPV pv =
@@ -328,9 +331,9 @@ buildGapLines localPVs needsWorkPVs plan =
           fromPV =
             if any (samePV toPV) localPVs
               then toPV
-              else case pool of
-                [] -> toPV
-                _ -> pool !! (idx `mod` length pool)
+              else case NE.nonEmpty pool of
+                Nothing -> toPV
+                Just ne -> ne NE.!! (idx `mod` NE.length ne)
        in GapLine
             { glFrom = stripRev fromPV,
               glTo = stripRev toPV,
@@ -364,7 +367,7 @@ filterCandidateVersions localPVs upstream =
                 _ -> False
             ]
           localsBare = map stripRev localPVs
-          combined = nub (localsBare <> map stripRev newer)
+          combined = nubOrd (localsBare <> map stripRev newer)
        in Right combined
   where
     stripRev (Numeric comps _) = Numeric comps Nothing

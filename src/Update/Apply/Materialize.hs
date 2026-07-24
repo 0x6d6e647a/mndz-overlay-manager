@@ -17,8 +17,9 @@ where
 import CLI.Progress (MultiHandle (..))
 import Control.Concurrent.MVar (withMVar)
 import Control.Monad (when)
+import Data.Containers.ListUtils (nubOrd)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
-import Data.List (nub, sortOn)
+import Data.List (sortOn)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -358,7 +359,7 @@ materializeDepsPlan env overlayRoot entry src eco plan localPVs contentFix planD
   let key = peKey entry
       mh = aeMulti env
       needPVs =
-        nub
+        nubOrd
           ( missingTargets localPVs plan
               <> contentFix
           )

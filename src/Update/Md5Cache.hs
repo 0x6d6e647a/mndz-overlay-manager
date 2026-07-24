@@ -50,7 +50,7 @@ import Crypto.Hash (Digest, MD5 (..), hash)
 import Data.ByteArray.Encoding (Base (Base16), convertToBase)
 import Data.ByteString qualified as BS
 import Data.Char (isSpace)
-import Data.List (nub)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Maybe (isNothing, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -327,7 +327,7 @@ collectPackageCachePathspecs ::
   IO [FilePath]
 collectPackageCachePathspecs overlayRoot category pn before = do
   after <- listPackageMd5CacheRelPaths overlayRoot category pn
-  pure (nub (before <> after))
+  pure (nubOrd (before <> after))
 
 ------------------------------------------------------------------------
 -- egencache runner
@@ -512,7 +512,7 @@ gencachePackages runner gitOps overlayRoot keys force mJobs = do
     Left err -> pure (Left err)
     Right () -> do
       afterAll <- listAllMd5CacheRelPaths overlayRoot
-      let pathspecs = nub (beforeAll <> afterAll)
+      let pathspecs = nubOrd (beforeAll <> afterAll)
       if null pathspecs
         then pure (Right Nothing)
         else do

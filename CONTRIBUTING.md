@@ -106,6 +106,20 @@ Same order as `hk.pkl` / pre-commit:
 | 4 | Stan | `.tools/bin/stan --hiedir=.hie/lib` (config: `.stan.toml`) |
 | 5 | Weeder | `.tools/bin/weeder --config=weeder.toml --hie-directory=.hie/lib --hie-directory=.hie/exe --hie-directory=.hie/test` |
 
+#### Stan baseline
+
+`.stan.toml` is the committed include/exclude baseline. Intent (see comments in that file for per-inspection notes):
+
+| Class | Status |
+|-------|--------|
+| **Error** anti-patterns | Enforced |
+| **Performance** | Enforced, with narrow justified excludes for `STAN-0206` (non-strict fields / package-wide StrictData deferred) and `STAN-0208` (`Text` length; domain stays on `Text`) |
+| **Style** | Deferred |
+| **Warning** | Deferred |
+| **Infinite** category | Deferred |
+
+Prefer fixing new findings over widening excludes. When you deliberately change the baseline, update `.stan.toml` comments and this table in the same change.
+
 **Preferred single entrypoint:**
 
 ```bash

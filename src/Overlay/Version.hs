@@ -22,7 +22,13 @@ data EbuildVersion
         evRevision :: Maybe Word
       }
   | Raw Text
-  deriving (Eq, Show)
+  deriving
+    ( -- | Structural 'Ord' for containers / 'nubOrd' only — not Portage order
+      -- ('comparePV' remains the version-comparison source of truth).
+      Eq,
+      Ord,
+      Show
+    )
 
 -- | Parse a Gentoo-style version string. Non-numeric forms become 'Raw'.
 parseEbuildVersion :: Text -> EbuildVersion

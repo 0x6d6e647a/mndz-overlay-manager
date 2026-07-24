@@ -40,7 +40,8 @@ module Update.Runtime.Ceilings
 where
 
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
-import Data.List (nub, sort)
+import Data.Containers.ListUtils (nubOrd)
+import Data.List (sort)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, mapMaybe)
@@ -223,7 +224,7 @@ isLiveRuntimeVersion (Raw t) =
 discoverArches :: [RuntimeEbuildMeta] -> [Arch]
 discoverArches metas =
   sort $
-    nub
+    nubOrd
       [ arch
       | m <- metas,
         tok <- remKeywords m,
@@ -409,7 +410,7 @@ discoverRustUnionCeilingsWith run = do
 -- | Per arch×tier ceiling = max of the two inputs (U1).
 mergeCeilingsMax :: Text -> RuntimeCeilings -> RuntimeCeilings -> RuntimeCeilings
 mergeCeilingsMax atom a b =
-  let arches = sort $ nub (Map.keys (rcByArch a) <> Map.keys (rcByArch b))
+  let arches = sort $ nubOrd (Map.keys (rcByArch a) <> Map.keys (rcByArch b))
       byArch =
         Map.fromList
           [ (arch, mergeArch (lookupArch a arch) (lookupArch b arch))

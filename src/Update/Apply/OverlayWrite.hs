@@ -7,7 +7,7 @@ module Update.Apply.OverlayWrite
   )
 where
 
-import Data.List (nub)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -141,7 +141,7 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer digests t
                       newRel <- relativeOverlayPath overlayRoot newPath
                       manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
                       let unitPaths =
-                            nub $
+                            nubOrd $
                               [newRel, manRel]
                                 <> [ebuildRel | removedTemplate || templatePath /= newPath]
                           msg = unitCommitMessage key (renderPV targetVer)

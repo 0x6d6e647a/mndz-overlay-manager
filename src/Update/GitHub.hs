@@ -9,8 +9,9 @@ where
 
 import Data.Aeson (Value, eitherDecode, withArray, withObject, (.:))
 import Data.Aeson.Types (Parser, parseMaybe)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (toList)
-import Data.List (nub, sortBy)
+import Data.List (sortBy)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -80,7 +81,7 @@ listGitHubVersionsWith mgr mToken = \case
                       _ -> Nothing
                 )
                 allTags
-            unique = nub versions
+            unique = nubOrd versions
             ordered =
               sortBy
                 ( \a b ->

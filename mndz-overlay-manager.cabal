@@ -23,10 +23,13 @@ name:               mndz-overlay-manager
 version:            0.1.0.0
 
 -- A short (one-line) description of the package.
--- synopsis:
+synopsis:           Gentoo overlay manager CLI (list, outdated, update, gencache)
 
 -- A longer description of the package.
--- description:
+description:
+    Haskell CLI for managing a Gentoo overlay: list ebuilds, check for
+    outdated packages, apply updates with Manifest regeneration and
+    GPG-signed commits, and maintain Portage metadata/md5-cache.
 
 -- URL for the project homepage or repository.
 homepage:           https://github.com/0x6d6e647a/mndz-overlay-manager
