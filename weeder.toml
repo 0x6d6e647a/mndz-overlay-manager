@@ -36,6 +36,8 @@ root-modules = [
   "Update.Npm",
   "Update.Npm.Cache",
   "Update.Bun.Cache",
+  "Update.Cargo.Crates",
+  "Update.Cargo.Msrv",
   "Update.Deps.Plan",
   "Update.Engines",
   "Update.Go.Lanes",

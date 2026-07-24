@@ -92,7 +92,7 @@ import Update.Apply
     signedOverlayCommit,
   )
 import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
-import Update.Assets.Layout (depsTarballName, vendorTarballName)
+import Update.Assets.Layout (cratesTarballName, depsTarballName, vendorTarballName)
 import Update.Assets.Release
   ( ReleaseAsset (..),
     ReleaseInfo (..),
@@ -103,14 +103,24 @@ import Update.Assets.Release
   )
 import Update.Auth (resolveGitHubTokenWith)
 import Update.Bun.Cache (productionBunCacheOps)
+import Update.Cargo.Crates (productionCargoOps)
+import Update.Cargo.Msrv
+  ( combineMsrv,
+    normalizeRustVersion,
+    parseRustMinVerFromEbuild,
+    parseRustVersionField,
+  )
 import Update.Check (PackageEntry (..), groupNewest)
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
     ebuildHasDevLangGoBdepend,
+    ebuildNeedsCargoContentFix,
     ebuildNeedsContentFix,
+    ensureCargoAssetsSrcUri,
     ensureGoBdepend,
     ensureNodejsBdepend,
+    ensureRustMinVer,
     goBdependAtom,
     goBdependMatches,
     keywordsMatch,
@@ -138,6 +148,7 @@ import Update.Go.Lanes
     extrasToDelete,
     filterCandidateVersions,
     laneLabel,
+    laneLabelWith,
     ltLane,
     maxVersionUnder,
     missingTargets,
@@ -167,6 +178,8 @@ import Update.Go.Tree
     isLiveGoVersion,
     keywordsHasBare,
     keywordsHasTildeOrBare,
+    mergeCeilingsMax,
+    normalizeArchToken,
     parseGoEbuildMeta,
     parseKeywordsField,
   )
@@ -309,6 +322,8 @@ main = do
   testCandidateVersionFilter
   testEnginesMinimumParse
   testDepsDistfileNames
+  testCargoMsrvAndCeilings
+  testCargoContentFix
   testGoKeywordsAssembly
   testGoLaneSelection
   testGoLaneCollapse
@@ -557,9 +572,20 @@ testPolicyClassification = do
       hPutStrLn stderr $ "opencode technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/mise") of
-    Just (PackagePolicy _ (Unsupported _)) -> pure ()
+    Just (PackagePolicy (GitHub "jdx" "mise" "v") (DepsAndAssets (Cargo Nothing Nothing))) ->
+      pure ()
     other -> do
       hPutStrLn stderr $ "mise technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/hk") of
+    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing Nothing))) -> pure ()
+    other -> do
+      hPutStrLn stderr $ "hk technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/usage") of
+    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing (Just "cli")))) -> pure ()
+    other -> do
+      hPutStrLn stderr $ "usage technique: " <> show other
       exitFailure
   assertEq "unmapped" Nothing (lookupPolicy (PackageKey "dev-lang/haskell"))
   case lookupPolicy (PackageKey "dev-lang/bun-bin") of
@@ -1615,6 +1641,136 @@ testDepsDistfileNames = do
     "deps"
     "openspec-1.4.2-deps.tar.xz"
     (depsTarballName "openspec" "1.4.2")
+  assertEq
+    "crates"
+    "mise-2026.7.5-crates.tar.xz"
+    (cratesTarballName "mise" "2026.7.5")
+
+testCargoMsrvAndCeilings :: IO ()
+testCargoMsrvAndCeilings = do
+  assertEq "normalize short" (Just "1.91.0") (normalizeRustVersion "1.91")
+  assertEq "normalize full" (Just "1.88.0") (normalizeRustVersion "1.88.0")
+  assertEq
+    "parse rust-version"
+    (Just "1.88.0")
+    (parseRustVersionField "name = \"hk\"\nrust-version = \"1.88.0\"\n")
+  assertEq
+    "parse RUST_MIN_VER"
+    (Just "1.95.0")
+    (parseRustMinVerFromEbuild "RUST_MIN_VER=\"1.95.0\"\n")
+  -- max(root missing, deps 1.90, donor 1.95) = 1.95
+  assertEq
+    "max deps vs donor"
+    (Just "1.95.0")
+    (combineMsrv Nothing (Just "1.90.0") (Just "1.95.0"))
+  assertEq
+    "max root over deps"
+    (Just "1.92.0")
+    (combineMsrv (Just "1.92") (Just "1.90.0") Nothing)
+  assertEq
+    "missing all hard-fail signal"
+    Nothing
+    (combineMsrv Nothing Nothing Nothing)
+  -- U1 max: rust-bin ahead on plain amd64
+  let rustCeil =
+        RuntimeCeilings
+          { rcAtom = "dev-lang/rust",
+            rcByArch =
+              Map.fromList
+                [ ( "amd64",
+                    ArchCeilings
+                      { acPlain = Just (parseEbuildVersion "1.95.0"),
+                        acTilde = Just (parseEbuildVersion "1.96.0")
+                      }
+                  )
+                ]
+          }
+      binCeil =
+        RuntimeCeilings
+          { rcAtom = "dev-lang/rust-bin",
+            rcByArch =
+              Map.fromList
+                [ ( "amd64",
+                    ArchCeilings
+                      { acPlain = Just (parseEbuildVersion "1.96.1"),
+                        acTilde = Just (parseEbuildVersion "1.96.1")
+                      }
+                  )
+                ]
+          }
+      merged = mergeCeilingsMax "dev-lang/rust|rust-bin" rustCeil binCeil
+  assertEq "union atom" "dev-lang/rust|rust-bin" (rcAtom merged)
+  assertEq
+    "U1 max plain"
+    (Just (parseEbuildVersion "1.96.1"))
+    (acPlain (rcByArch merged Map.! "amd64"))
+  assertEq
+    "U1 max tilde"
+    (Just (parseEbuildVersion "1.96.1"))
+    (acTilde (rcByArch merged Map.! "amd64"))
+  assertEq
+    "lane label union"
+    "(dev-lang/rust|rust-bin ~amd64)"
+    (laneLabelWith "dev-lang/rust|rust-bin" LaneAmd64Tilde)
+  -- rust-bin-style KEYWORDS with trailing shell comment must not invent arches
+  let rustBinKw =
+        parseKeywordsField
+          "KEYWORDS=\"~amd64 ~arm64 ~x86\" # \"~mips ~sparc\"\n"
+  assertTrue "has amd64" ("~amd64" `elem` rustBinKw || "amd64" `elem` rustBinKw)
+  assertTrue "no hash token" ("#" `notElem` rustBinKw)
+  assertTrue "no quoted mips" (not (any ("mips" `T.isInfixOf`) (filter (T.isPrefixOf "\"") rustBinKw)))
+  assertEq
+    "normalize rejects hash"
+    Nothing
+    (normalizeArchToken "#")
+  assertEq
+    "normalize rejects quote junk"
+    Nothing
+    (normalizeArchToken "x86\"")
+
+testCargoContentFix :: IO ()
+testCargoContentFix = do
+  let listEra =
+        T.unlines
+          [ "inherit cargo",
+            "KEYWORDS=\"~amd64\"",
+            "CRATES=\"foo-1 bar-2\"",
+            "SRC_URI=\"",
+            "\thttps://github.com/jdx/mise/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz",
+            "\t${CARGO_CRATE_URIS}",
+            "\""
+          ]
+      fixed0 = ensureCargoAssetsSrcUri "mise" listEra
+  assertTrue "no CARGO_CRATE_URIS" (not ("CARGO_CRATE_URIS" `T.isInfixOf` fixed0))
+  assertTrue "has crates asset" ("-crates.tar.xz" `T.isInfixOf` fixed0)
+  assertTrue "parameterized" ("${PV}" `T.isInfixOf` fixed0)
+  assertTrue
+    "preserves github source"
+    ("github.com/jdx/mise/archive" `T.isInfixOf` fixed0)
+  assertTrue
+    "SRC_URI+= not nested in string"
+    ( not
+        ( "SRC_URI=\"\nSRC_URI+=" `T.isInfixOf` fixed0
+            || "SRC_URI=\"\r\nSRC_URI+=" `T.isInfixOf` fixed0
+        )
+    )
+  msrvEd <- assertRight "rust min" (ensureRustMinVer "1.88" fixed0)
+  assertTrue "RUST_MIN_VER" ("RUST_MIN_VER=\"1.88.0\"" `T.isInfixOf` msrvEd)
+  assertTrue
+    "list-era needs fix"
+    (ebuildNeedsCargoContentFix ["~amd64"] listEra (Just "1.88.0"))
+  let good =
+        T.unlines
+          [ "inherit cargo",
+            "KEYWORDS=\"~amd64\"",
+            "CRATES=\"\"",
+            "RUST_MIN_VER=\"1.88.0\"",
+            "SRC_URI=\"https://github.com/jdx/mise/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/mise-${PV}/mise-${PV}-crates.tar.xz\""
+          ]
+  assertTrue
+    "tarball form ok"
+    (not (ebuildNeedsCargoContentFix ["~amd64"] good (Just "1.88.0")))
 
 testGoKeywordsAssembly :: IO ()
 testGoKeywordsAssembly = do
@@ -2612,6 +2768,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeVendorOps = vendorOps,
         aeNpmCacheOps = productionNpmCacheOps,
         aeBunCacheOps = productionBunCacheOps,
+        aeCargoOps = productionCargoOps,
         aeReleaseOps = releaseOps,
         aeAssetsRoot = assetsRoot,
         aeGitHubToken = Just "tok",

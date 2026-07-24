@@ -1,8 +1,4 @@
-## Purpose
-
-Shared `DepsAndAssets` technique for Go vendor, npm/Bun dependency assets, and Cargo crates assets: ecosystem specs, distfile naming, materialize/reuse spine, and policy wiring.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: DepsAndAssets technique
 
@@ -84,26 +80,3 @@ The hardcoded policy map SHALL set `DepsAndAssets` with ecosystem `Go` for `dev-
 
 - **WHEN** policy is resolved for `dev-util/mise`
 - **THEN** the technique is `DepsAndAssets Cargo`
-
-### Requirement: Non-live local ebuild required
-
-For `DepsAndAssets` plan and apply, the program SHALL require at least one non-live local ebuild for the package. If only live ebuilds exist or the package directory has no versioned non-live ebuild, the program SHALL hard-fail (or fail planning) with a message that first import / empty package dirs are not supported. Live ebuilds SHALL NOT be used as candidates, targets, or apply units.
-
-#### Scenario: Empty package dir hard-fails
-
-- **WHEN** `DepsAndAssets` apply is attempted for a package with no non-live `*.ebuild`
-- **THEN** the attempt fails without inventing a first versioned ebuild
-
-### Requirement: Shared materialize spine
-
-For each planned PV that needs work under `DepsAndAssets`, the program SHALL either reuse an existing assets release asset for the expected distfile name or run the ecosystem materializer, publish assets before overlay mutation on the full path, rewrite overlay ebuild content (parameterized assets SRC_URI, planned KEYWORDS, and runtime field from requirement probe — BDEPEND or `RUST_MIN_VER` per ecosystem), run `ebuild … manifest`, verify Manifest SHA512 for the distfile against the published or downloaded bytes, and create the signed overlay commit for that unit before the next PV unit. Host language runtime version gates SHALL apply on the full path only and SHALL NOT apply on the reuse path (Cargo full path does not require host `rustc`).
-
-#### Scenario: Publish before overlay on full path
-
-- **WHEN** the expected release asset is absent and materialization succeeds
-- **THEN** assets commit, push, and release upload complete before the overlay ebuild for that PV is renamed or rewritten
-
-#### Scenario: Reuse skips rebuild
-
-- **WHEN** release tag `{pn}-{pv}` already has the expected vendor or deps asset
-- **THEN** apply does not rebuild the tarball and does not create a new release for that tag

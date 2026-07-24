@@ -34,6 +34,7 @@ import Control.Concurrent.MVar (MVar, withMVar)
 import Control.Monad (when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (nub, sortOn)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -74,6 +75,18 @@ import Update.Bun.Cache
     BunCacheProgress (..),
     buildBunDepsTarball,
   )
+import Update.Cargo.Crates
+  ( CargoOps (..),
+    CargoProgress (..),
+    CargoResult (..),
+    buildCargoCratesTarball,
+  )
+import Update.Cargo.Msrv
+  ( combineMsrv,
+    normalizeRustVersion,
+    parseRustMinVerFromEbuild,
+    parseRustVersionField,
+  )
 import Update.Check (PackageEntry (..))
 import Update.Deps.Plan
   ( DepsPlanOps (..),
@@ -83,11 +96,15 @@ import Update.EbuildEdit
   ( bunBdependAtom,
     ebuildFileNameWithRev,
     ebuildHasDevLangGoBdepend,
+    ebuildNeedsCargoContentFix,
     ebuildNeedsContentFix,
     ebuildNeedsContentFixAtom,
     ensureBunBdepend,
+    ensureCargoAssetsSrcUri,
+    ensureEmptyCrates,
     ensureGoBdepend,
     ensureNodejsBdepend,
+    ensureRustMinVer,
     goBdependAtom,
     manifestHasVendorDist,
     nodejsBdependAtom,
@@ -165,6 +182,7 @@ data ApplyEnv = ApplyEnv
     aeVendorOps :: VendorOps,
     aeNpmCacheOps :: NpmCacheOps,
     aeBunCacheOps :: BunCacheOps,
+    aeCargoOps :: CargoOps,
     aeReleaseOps :: ReleaseOps,
     aeAssetsRoot :: Maybe FilePath,
     aeGitHubToken :: Maybe Text,
@@ -535,10 +553,12 @@ depsApplyPlanProgress mh key eco doneRef =
         Go _ -> "discovering go ceilings"
         NpmEco -> "discovering nodejs ceilings"
         Bun -> "discovering bun-bin ceilings"
+        Cargo {} -> "discovering rust ceilings"
       probeLabel = case eco of
         Go _ -> "probing go.mod"
         NpmEco -> "probing engines.node"
         Bun -> "probing engines.bun"
+        Cargo {} -> "probing rust-version"
    in PlanProgress
         { ppOnCeilingsStart = do
             mhSteps mh key 3
@@ -612,6 +632,10 @@ contentFixNeededEnv env eco src pkgDir pn plan =
                 _ -> pure Nothing
               pure $
                 ebuildNeedsContentFix (peKeywords pe) content mGoVer || manMissing
+            Cargo mLock mPkg -> do
+              mMsrv <- fetchCargoMsrvForPV env src mLock mPkg pvNoRev content
+              pure $
+                ebuildNeedsCargoContentFix (peKeywords pe) content mMsrv || manMissing
             _ -> do
               mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
               pure $
@@ -642,7 +666,47 @@ fetchRequiredBdependAtom env eco src pvNoRev =
       pure $ case eres of
         Right ver -> Just (bunBdependAtom ver)
         Left _ -> Nothing
+    (Cargo {}, _) -> pure Nothing
     _ -> pure Nothing
+
+-- | Plan/content-fix MSRV: root Cargo.toml (+ donor when content provided).
+fetchCargoMsrvForPV ::
+  ApplyEnv ->
+  UpdateSource ->
+  Maybe FilePath ->
+  Maybe FilePath ->
+  Text ->
+  Text ->
+  IO (Maybe Text)
+fetchCargoMsrvForPV env src mLock mPkg pvNoRev donorContent =
+  case src of
+    GitHub owner repo prefix -> do
+      mRoot <- fetchCargoRustVersion env owner repo prefix pvNoRev mPkg mLock
+      let mDonor = parseRustMinVerFromEbuild donorContent
+      pure (combineMsrv mRoot Nothing mDonor)
+    _ -> pure (parseRustMinVerFromEbuild donorContent)
+
+fetchCargoRustVersion ::
+  ApplyEnv ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  Maybe FilePath ->
+  IO (Maybe Text)
+fetchCargoRustVersion env owner repo prefix pvNoRev mPkg mLock = go [mPkg, mLock, Nothing]
+  where
+    go [] = pure Nothing
+    go (mSub : rest) = do
+      eres <-
+        dpoFetchCargoToml (aeDepsPlanOps env) owner repo prefix pvNoRev mSub
+      case eres of
+        Left _ -> go rest
+        Right body ->
+          case parseRustVersionField body of
+            Just ver -> pure (normalizeRustVersion ver)
+            Nothing -> go rest
 
 -- | Legacy Go-only content fix (tests).
 contentFixNeeded ::
@@ -1071,10 +1135,21 @@ fullDepsPublishAndOverlay
   key
   stepsDoneRef =
     withSystemTempDirectory "mndz-deps-out-" $ \outDir -> do
-      built <- materializeDistfile env eco src pvNoRev outDir tarballName stepsDoneRef mh key
+      built <-
+        materializeDistfile
+          env
+          eco
+          src
+          entry
+          pvNoRev
+          outDir
+          tarballName
+          stepsDoneRef
+          mh
+          key
       case built of
         Left err -> pure $ ApplyHardFail key err False False
-        Right (tarballPath, mReqVer) -> do
+        Right (tarballPath, mReqVer, mEbuildBody) -> do
           mhStatus mh key "committing assets"
           digests <- hashFile tarballPath
           let sp = sidecarPaths assetsRoot category pn tarballName
@@ -1150,25 +1225,27 @@ fullDepsPublishAndOverlay
                   digests
                   tarballName
                   mReqVer
+                  mEbuildBody
               case outcome of
                 ApplySuccess {} ->
                   markMaterializeStep stepsDoneRef mh key "regenerating manifest"
                 _ -> pure ()
               pure outcome
 
--- | Build vendor or deps tarball; returns path and optional runtime version for BDEPEND.
+-- | Build vendor/deps/crates tarball; returns path, optional runtime version, optional ebuild body.
 materializeDistfile ::
   ApplyEnv ->
   EcosystemSpec ->
   UpdateSource ->
+  PackageEntry ->
   Text ->
   FilePath ->
   FilePath ->
   IORef Int ->
   MultiHandle ->
   PackageKey ->
-  IO (Either Text (FilePath, Maybe Text))
-materializeDistfile env eco src pvNoRev outDir tarballName stepsDoneRef mh key =
+  IO (Either Text (FilePath, Maybe Text, Maybe Text))
+materializeDistfile env eco src entry pvNoRev outDir tarballName stepsDoneRef mh key =
   case (eco, src) of
     (Go mSub, GitHub owner repo prefix) -> do
       built <-
@@ -1185,7 +1262,7 @@ materializeDistfile env eco src pvNoRev outDir tarballName stepsDoneRef mh key =
       pure $ case built of
         Left err -> Left err
         Right VendorResult {vrTarballPath = p, vrGoModVersion = mGo} ->
-          Right (p, mGo)
+          Right (p, mGo, Nothing)
     (NpmEco, Npm npmPkg) -> do
       -- Require engines for host gate: fetch first
       eng <- dpoFetchNpmEngines (aeDepsPlanOps env) npmPkg pvNoRev
@@ -1204,7 +1281,7 @@ materializeDistfile env eco src pvNoRev outDir tarballName stepsDoneRef mh key =
               tarballName
           pure $ case built of
             Left err -> Left err
-            Right p -> Right (p, Just nodeReq)
+            Right p -> Right (p, Just nodeReq, Nothing)
     (Bun, GitHub owner repo prefix) -> do
       eng <-
         dpoFetchBunEngines (aeDepsPlanOps env) owner repo prefix pvNoRev
@@ -1225,10 +1302,38 @@ materializeDistfile env eco src pvNoRev outDir tarballName stepsDoneRef mh key =
               tarballName
           pure $ case built of
             Left err -> Left err
-            Right p -> Right (p, Just bunReq)
+            Right p -> Right (p, Just bunReq, Nothing)
+    (Cargo mLock mPkg, GitHub owner repo prefix) -> do
+      donorPath <- findTemplate (takeDirectory (pePath entry)) (pePN entry) (parseEbuildVersion pvNoRev) (pePath entry)
+      donorContent <- TIO.readFile donorPath
+      let progress = cargoCratesProgress stepsDoneRef mh key
+      built <-
+        buildCargoCratesTarball
+          (aeCargoOps env)
+          progress
+          owner
+          repo
+          prefix
+          pvNoRev
+          mLock
+          mPkg
+          donorContent
+          (pePN entry)
+          outDir
+          tarballName
+      pure $ case built of
+        Left err -> Left err
+        Right
+          CargoResult
+            { crTarballPath = p,
+              crMsrv = msrv,
+              crEbuildBody = body
+            } ->
+            Right (p, Just msrv, Just body)
     (Go _, _) -> pure (Left "DepsAndAssets Go requires a GitHub update source")
     (NpmEco, _) -> pure (Left "DepsAndAssets Npm requires an Npm update source")
     (Bun, _) -> pure (Left "DepsAndAssets Bun requires a GitHub update source")
+    (Cargo {}, _) -> pure (Left "DepsAndAssets Cargo requires a GitHub update source")
 
 npmCacheProgress :: IORef Int -> MultiHandle -> PackageKey -> NpmCacheProgress
 npmCacheProgress stepsDoneRef mh key =
@@ -1250,6 +1355,15 @@ bunCacheProgress stepsDoneRef mh key =
       bcpOnInstallDone = markMaterializeStep stepsDoneRef mh key "bun install",
       bcpOnCompressStart = mhStatus mh key "compressing tarball",
       bcpOnCompressDone = markMaterializeStep stepsDoneRef mh key "compressing tarball"
+    }
+
+cargoCratesProgress :: IORef Int -> MultiHandle -> PackageKey -> CargoProgress
+cargoCratesProgress stepsDoneRef mh key =
+  CargoProgress
+    { cgpOnCloneStart = mhStatus mh key "cloning upstream",
+      cgpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
+      cgpOnPycargoStart = mhStatus mh key "pycargoebuild",
+      cgpOnPycargoDone = markMaterializeStep stepsDoneRef mh key "pycargoebuild"
     }
 
 reuseDepsReleaseAsset ::
@@ -1290,6 +1404,7 @@ reuseDepsReleaseAsset
         reusedLines = markSuccessLinesReused lines_
         verifyLabel = case eco of
           Go _ -> "verifying vendor asset"
+          Cargo {} -> "verifying crates asset"
           _ -> "verifying deps asset"
     withSystemTempDirectory "mndz-reuse-asset-" $ \tmpDir -> do
       let dest = tmpDir </> tarballName
@@ -1322,6 +1437,15 @@ reuseDepsReleaseAsset
                   GitHub owner repo prefix ->
                     fetchGoModVersion env owner repo prefix pvNoRev mSub
                   _ -> pure Nothing
+                Cargo mLock mPkg -> do
+                  donorPath <-
+                    findTemplate
+                      (takeDirectory (pePath entry))
+                      (pePN entry)
+                      targetVer
+                      (pePath entry)
+                  donorContent <- TIO.readFile donorPath
+                  fetchCargoMsrvForPV env src mLock mPkg pvNoRev donorContent
                 _ -> do
                   mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
                   pure $ case mAtom of
@@ -1346,6 +1470,7 @@ reuseDepsReleaseAsset
                   digests
                   tarballName
                   mReq
+                  Nothing
               case outcome of
                 ApplySuccess k sls paths -> do
                   markMaterializeStep stepsDoneRef mh key "regenerating manifest"
@@ -1419,8 +1544,10 @@ overlayAfterAssets ::
   FileDigests ->
   FilePath ->
   Maybe Text ->
+  -- | Optional ebuild body after full-path materialize (cargo pycargoebuild).
+  Maybe Text ->
   IO ApplyOutcome
-overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer digests tarballName mReqVer = do
+overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer digests tarballName mReqVer mEbuildBody = do
   let key = peKey entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
@@ -1442,9 +1569,13 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer digests t
           False
           orphan
     Right False -> do
-      content <- TIO.readFile templatePath
-      let parameterized = parameterizeAssetsSrcUri pn content
-          withKw = setKeywords keywords parameterized
+      templateContent <- TIO.readFile templatePath
+      let content = fromMaybe templateContent mEbuildBody
+          withAssets = case eco of
+            Cargo {} ->
+              ensureEmptyCrates (ensureCargoAssetsSrcUri pn content)
+            _ -> parameterizeAssetsSrcUri pn content
+          withKw = setKeywords keywords withAssets
       contentFixed <- case (eco, mReqVer) of
         (Go _, Just goVer) -> pure (ensureGoBdepend goVer withKw)
         (Go _, Nothing)
@@ -1459,6 +1590,13 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer digests t
         (Bun, Just ver) -> pure (ensureBunBdepend ver withKw)
         (Bun, Nothing) ->
           pure (Left "could not obtain engines.bun for BDEPEND alignment")
+        (Cargo {}, Just msrv) -> pure (ensureRustMinVer msrv withKw)
+        (Cargo {}, Nothing) ->
+          pure
+            ( Left
+                "could not determine RUST_MIN_VER (no package.rust-version, \
+                \dependency rust-version, or donor RUST_MIN_VER)"
+            )
       case contentFixed of
         Left err -> pure $ ApplyHardFail key err False orphan
         Right fixed -> do

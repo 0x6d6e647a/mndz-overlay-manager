@@ -21,6 +21,7 @@ module Update.Types
     ecosystemIsGo,
     ecosystemIsNpm,
     ecosystemIsBun,
+    ecosystemIsCargo,
   )
 where
 
@@ -111,6 +112,12 @@ data EcosystemSpec
     Go (Maybe FilePath)
   | NpmEco
   | Bun
+  | -- | Optional lock/workdir subdir (Cargo.lock) and package subdir (binary Cargo.toml / rust-version).
+    -- 'Nothing' means repository root for that role.
+    Cargo
+      { cargoLockSubdir :: Maybe FilePath,
+        cargoPackageSubdir :: Maybe FilePath
+      }
   deriving (Eq, Show)
 
 -- | How (or whether) to apply a version bump in the overlay.
@@ -136,6 +143,10 @@ ecosystemIsNpm _ = False
 ecosystemIsBun :: EcosystemSpec -> Bool
 ecosystemIsBun Bun = True
 ecosystemIsBun _ = False
+
+ecosystemIsCargo :: EcosystemSpec -> Bool
+ecosystemIsCargo Cargo {} = True
+ecosystemIsCargo _ = False
 
 -- | Hardcoded per-package source and apply technique.
 data PackagePolicy = PackagePolicy

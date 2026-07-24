@@ -32,6 +32,7 @@ import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import System.Directory (doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 import Update.Assets.Layout (distfileKindForEcosystem, distfileTarballName)
+import Update.Cargo.Msrv (normalizeRustVersion, parseRustVersionField)
 import Update.Deps.Plan
   ( DepsPlanOps (..),
     planDepsPackageWithProgress,
@@ -39,6 +40,7 @@ import Update.Deps.Plan
   )
 import Update.EbuildEdit
   ( bunBdependAtom,
+    ebuildNeedsCargoContentFix,
     ebuildNeedsContentFix,
     ebuildNeedsContentFixAtom,
     manifestHasVendorDist,
@@ -319,10 +321,12 @@ depsPlanProgress mh key eco =
         Go _ -> "discovering go ceilings"
         NpmEco -> "discovering nodejs ceilings"
         Bun -> "discovering bun-bin ceilings"
+        Cargo {} -> "discovering rust ceilings"
       probeLabel = case eco of
         Go _ -> "probing go.mod"
         NpmEco -> "probing engines.node"
         Bun -> "probing engines.bun"
+        Cargo {} -> "probing rust-version"
    in PlanProgress
         { ppOnCeilingsStart = do
             mhSteps mh key 3
@@ -389,6 +393,11 @@ contentFixPVs depsOps eco src locals plan = do
                   pure $
                     ebuildNeedsContentFixAtom (peKeywords pe) content mAtom
                       || manMissing
+                Cargo mLock mPkg -> do
+                  mMsrv <- fetchCargoMsrv depsOps src mLock mPkg pvNoRev
+                  pure $
+                    ebuildNeedsCargoContentFix (peKeywords pe) content mMsrv
+                      || manMissing
               pure [pePV pe | bad]
     samePV a b = case comparePV a b of Just EQ -> True; _ -> False
 
@@ -433,6 +442,30 @@ fetchBunAtom depsOps src pvNoRev =
       pure $ case eres of
         Right ver -> Just (bunBdependAtom ver)
         Left _ -> Nothing
+    _ -> pure Nothing
+
+fetchCargoMsrv ::
+  DepsPlanOps ->
+  UpdateSource ->
+  Maybe FilePath ->
+  Maybe FilePath ->
+  Text ->
+  IO (Maybe Text)
+fetchCargoMsrv depsOps src mLock mPkg pvNoRev =
+  case src of
+    GitHub owner repo prefix -> do
+      let tryPaths = [mPkg, mLock, Nothing]
+      go tryPaths
+      where
+        go [] = pure Nothing
+        go (mSub : rest) = do
+          eres <- dpoFetchCargoToml depsOps owner repo prefix pvNoRev mSub
+          case eres of
+            Left _ -> go rest
+            Right body ->
+              case parseRustVersionField body of
+                Just ver -> pure (normalizeRustVersion ver)
+                Nothing -> go rest
     _ -> pure Nothing
 
 statusFromCompare :: EbuildVersion -> EbuildVersion -> UpdateStatus

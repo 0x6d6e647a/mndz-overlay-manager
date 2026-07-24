@@ -6,6 +6,8 @@ module Update.Preflight
     goRequiredTools,
     npmRequiredTools,
     bunRequiredTools,
+    cargoRequiredTools,
+    cargoFetcherTools,
     goAssetsRequiredTools,
     checkToolsOnPath,
     preflightUpdate,
@@ -39,6 +41,14 @@ npmRequiredTools = ["npm"]
 bunRequiredTools :: [String]
 bunRequiredTools = ["bun"]
 
+-- | Always required when any Cargo DepsAndAssets package is selected (P1).
+cargoRequiredTools :: [String]
+cargoRequiredTools = ["pycargoebuild"]
+
+-- | At least one of these must be present for cargo full path (pycargoebuild fetch).
+cargoFetcherTools :: [String]
+cargoFetcherTools = ["wget", "aria2c", "aria2"]
+
 -- | Legacy combined Go + xz tools (full-path Go materialize).
 goAssetsRequiredTools :: [String]
 goAssetsRequiredTools = goRequiredTools <> assetsRequiredTools
@@ -48,7 +58,8 @@ data AssetsPreflight = AssetsPreflight
   { apNeedAssets :: Bool,
     apNeedGo :: Bool,
     apNeedNpm :: Bool,
-    apNeedBun :: Bool
+    apNeedBun :: Bool,
+    apNeedCargo :: Bool
   }
   deriving (Eq, Show)
 
@@ -71,19 +82,32 @@ preflightUpdateWith needGoAssets =
       { apNeedAssets = needGoAssets,
         apNeedGo = needGoAssets,
         apNeedNpm = False,
-        apNeedBun = False
+        apNeedBun = False,
+        apNeedCargo = False
       }
 
 -- | Preflight with per-ecosystem tool requirements.
 preflightUpdateTools :: AssetsPreflight -> IO (Either Text ())
 preflightUpdateTools ap = do
-  let tools =
+  let baseTools =
         updateRequiredTools
           <> [t | apNeedAssets ap, t <- assetsRequiredTools]
           <> [t | apNeedGo ap, t <- goRequiredTools]
           <> [t | apNeedNpm ap, t <- npmRequiredTools]
           <> [t | apNeedBun ap, t <- bunRequiredTools]
-  missing <- checkToolsOnPath findExecutable tools
+          <> [t | apNeedCargo ap, t <- cargoRequiredTools]
+  missingBase <- checkToolsOnPath findExecutable baseTools
+  missingFetchers <-
+    if apNeedCargo ap
+      then do
+        foundAny <- checkToolsOnPath findExecutable cargoFetcherTools
+        -- missing all fetchers → report the group
+        pure
+          [ "wget or aria2c"
+          | length foundAny == length cargoFetcherTools
+          ]
+      else pure []
+  let missing = missingBase <> missingFetchers
   pure $ case missing of
     [] -> Right ()
     ms ->

@@ -9,6 +9,7 @@ module Update.Assets.Layout
     distfileTarballName,
     vendorTarballName,
     depsTarballName,
+    cratesTarballName,
     releaseTag,
     releaseName,
     commitMessage,
@@ -46,14 +47,16 @@ sidecarPaths assetsRoot category package distfile =
 data DistfileKind
   = VendorDist
   | DepsDist
+  | CratesDist
   deriving (Eq, Show)
 
 distfileKindForEcosystem :: EcosystemSpec -> DistfileKind
 distfileKindForEcosystem (Go _) = VendorDist
 distfileKindForEcosystem NpmEco = DepsDist
 distfileKindForEcosystem Bun = DepsDist
+distfileKindForEcosystem Cargo {} = CratesDist
 
--- | @{pn}-{pv}-vendor.tar.xz@ or @{pn}-{pv}-deps.tar.xz@ (overlay PN, never npm scope).
+-- | @{pn}-{pv}-vendor|deps|crates.tar.xz@ (overlay PN, never npm scope / Cargo.toml name).
 distfileTarballName :: DistfileKind -> Text -> Text -> FilePath
 distfileTarballName kind pn pv =
   T.unpack pn <> "-" <> T.unpack pv <> suffix
@@ -61,6 +64,7 @@ distfileTarballName kind pn pv =
     suffix = case kind of
       VendorDist -> "-vendor.tar.xz"
       DepsDist -> "-deps.tar.xz"
+      CratesDist -> "-crates.tar.xz"
 
 -- | Go vendor distfile basename (always overlay PN).
 vendorTarballName :: Text -> Text -> FilePath
@@ -69,6 +73,10 @@ vendorTarballName = distfileTarballName VendorDist
 -- | npm/Bun deps distfile basename (always overlay PN).
 depsTarballName :: Text -> Text -> FilePath
 depsTarballName = distfileTarballName DepsDist
+
+-- | Cargo crates distfile basename (always overlay PN).
+cratesTarballName :: Text -> Text -> FilePath
+cratesTarballName = distfileTarballName CratesDist
 
 releaseTag :: Text -> Text -> Text
 releaseTag pn pv = pn <> "-" <> pv

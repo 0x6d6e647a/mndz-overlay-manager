@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Shared mndz-overlay-assets checksum sidecars, git commit/push, and GitHub release upload for vendor/deps distfiles.
+Shared mndz-overlay-assets checksum sidecars, git commit/push, and GitHub release upload for vendor/deps/crates distfiles.
 
 ## Requirements
 
@@ -50,7 +50,7 @@ After a successful assets push, the program SHALL create a GitHub release on the
 - `tag_name` = `{pn}-{pv}`
 - `name` = `{category}/{pn}-{pv}`
 - `body` = `category/package: version` (same text as the assets commit message)
-- release asset = the vendor (or deps) tarball file
+- release asset = the vendor, deps, or crates tarball file
 
 The program SHALL upload the tarball as a release asset. API or upload failure SHALL hard-fail the package.
 
@@ -73,9 +73,23 @@ When multiple packages publish to the same assets worktree concurrently, git ind
 - **WHEN** two `GoVendorAndAssets` packages finish tarballs at the same time
 - **THEN** their assets commit/push/release steps do not interleave on the shared assets worktree
 
+### Requirement: Crates tarball assets use same publish spine
+
+When publishing a Cargo crates distfile `{pn}-{pv}-crates.tar.xz`, the program SHALL use the same checksum sidecars layout, signed assets commit message form `category/package: version`, git push, and GitHub release upload behavior as for Go vendor and npm/Bun deps distfiles, with release tag `{pn}-{pv}` and asset basename `{pn}-{pv}-crates.tar.xz`.
+
+#### Scenario: mise crates release asset name
+
+- **WHEN** assets publish completes for `dev-util/mise` at PV `2026.7.5`
+- **THEN** the GitHub release tag is `mise-2026.7.5` and the uploaded asset basename is `mise-2026.7.5-crates.tar.xz`
+
+#### Scenario: Sidecars under category package
+
+- **WHEN** publishing `hk-1.50.0-crates.tar.xz` for `dev-util/hk`
+- **THEN** sidecars are created under `dev-util/hk/` in the configured assets worktree
+
 ### Requirement: Forward-compatible publish API
 
-Assets hashing, worktree commit/push, and release upload SHALL accept a distfile path and package coordinates (`category`, `package`, version, asset filename) without assuming Go-only filename suffixes in the core publish helpers, so future npm/bun `-deps.tar.xz` publishers can reuse the same path.
+Assets hashing, worktree commit/push, and release upload SHALL accept a distfile path and package coordinates (`category`, `package`, version, asset filename) without assuming Go-only filename suffixes in the core publish helpers, so npm/bun `-deps.tar.xz` and cargo `-crates.tar.xz` publishers can reuse the same path.
 
 #### Scenario: Non-vendor filename accepted by layout helper
 

@@ -47,6 +47,7 @@ import Update.Apply
 import Update.Assets.Release (ReleaseOps (..), productionReleaseOps)
 import Update.Auth (resolveGitHubToken)
 import Update.Bun.Cache (productionBunCacheOps)
+import Update.Cargo.Crates (productionCargoOps)
 import Update.Check
   ( PackageEntry (..),
     checkOverlayWithDepsPlan,
@@ -167,12 +168,14 @@ runUpdate rt pkgArgs = do
           needGo = any (entryNeedsEco ecosystemIsGo) selected
           needNpm = any (entryNeedsEco ecosystemIsNpm) selected
           needBun = any (entryNeedsEco ecosystemIsBun) selected
+          needCargo = any (entryNeedsEco ecosystemIsCargo) selected
           assetsPf =
             AssetsPreflight
               { apNeedAssets = needAssets,
                 apNeedGo = needGo,
                 apNeedNpm = needNpm,
-                apNeedBun = needBun
+                apNeedBun = needBun,
+                apNeedCargo = needCargo
               }
       preflightOk <- liftIO $ runPreflightSteps (rtProgress rt) assetsPf
       case preflightOk of
@@ -220,6 +223,7 @@ runUpdate rt pkgArgs = do
                       aeVendorOps = productionVendorOps,
                       aeNpmCacheOps = productionNpmCacheOps,
                       aeBunCacheOps = productionBunCacheOps,
+                      aeCargoOps = productionCargoOps,
                       aeReleaseOps = releaseOps,
                       aeAssetsRoot = assetsRoot,
                       aeGitHubToken = token,
@@ -317,6 +321,10 @@ ecosystemIsBun :: EcosystemSpec -> Bool
 ecosystemIsBun Bun = True
 ecosystemIsBun _ = False
 
+ecosystemIsCargo :: EcosystemSpec -> Bool
+ecosystemIsCargo Cargo {} = True
+ecosystemIsCargo _ = False
+
 emitOutcome :: (WithLog env Message m, MonadIO m) => ApplyOutcome -> m ()
 emitOutcome = \case
   ApplySuccess key lines_ _paths -> do
@@ -402,7 +410,7 @@ runGencache rt pkgArgs force = do
               <> T.pack (show (length paths))
               <> " cache path(s)"
 
--- | @{pn}-{pv} / {pn}-{pv}-vendor.tar.xz@ for deferred reuse logs.
+-- | @{pn}-{pv}@ release tag label for deferred reuse logs.
 packageAssetLabel :: PackageKey -> EbuildVersion -> T.Text
 packageAssetLabel key ver =
   let pn = case T.breakOnEnd "/" (packageKeyText key) of
@@ -414,7 +422,7 @@ packageAssetLabel key ver =
         Numeric comps _ ->
           T.intercalate "." (map (T.pack . show) comps)
         Raw t -> t
-   in pn' <> "-" <> pv <> " / " <> pn' <> "-" <> pv <> "-vendor.tar.xz"
+   in pn' <> "-" <> pv
 
 formatSuccessLine :: PackageKey -> SuccessLine -> T.Text
 formatSuccessLine key sl =

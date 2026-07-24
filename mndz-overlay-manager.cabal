@@ -81,6 +81,8 @@ library
       , Update.Assets.Release
       , Update.Auth
       , Update.Bun.Cache
+      , Update.Cargo.Crates
+      , Update.Cargo.Msrv
       , Update.Check
       , Update.Deps.Plan
       , Update.EbuildEdit

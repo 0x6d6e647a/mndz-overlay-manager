@@ -14,7 +14,7 @@ This project targets **GHC 9.10.x** and needs a matching **cabal-install**. The 
 |------|------------------|
 | `update` (always) | `git`, `ebuild` (Portage), `egencache` (Portage), `gpg` |
 | `gencache` | `git`, `egencache`, `gpg` |
-| `update` of packages that publish vendor/deps assets | additionally `xz`, plus language tools as needed: `go` (Go vendor), `npm` (npm deps), and/or `bun` (Bun deps) |
+| `update` of packages that publish vendor/deps/crates assets | additionally `xz`, plus language tools as needed: `go` (Go vendor), `npm` (npm deps), `bun` (Bun deps), and/or `pycargoebuild` plus `wget` or `aria2c` (Cargo crates). If `pycargoebuild` is installed via `uv`/`pipx` rather than Gentoo `app-portage/pycargoebuild`, ensure it can import system Portage (e.g. `PYTHONPATH=/usr/lib/python3.*/site-packages`) |
 
 `list` and `outdated` only need a readable overlay and a valid config; they do not require Portage or GPG. Help (`--help`) does not load configuration and needs no overlay.
 
@@ -90,7 +90,7 @@ cabal run mndz-overlay-manager -- -v --jobs 4 outdated
 
 ### `update`
 
-Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, regenerate package-scoped Portage `egencache` md5-cache, and create GPG-signed git commits in the overlay (ebuild/Manifest and `metadata/md5-cache/` paths together). For packages under the **DepsAndAssets** technique (Go vendor, npm deps, or Bun deps), it may also materialize cache/vendor tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token and the extra runtime tools above: `xz` plus `go` / `npm` / `bun` as applicable). Reusing an existing assets release does not require the language tool.
+Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, regenerate package-scoped Portage `egencache` md5-cache, and create GPG-signed git commits in the overlay (ebuild/Manifest and `metadata/md5-cache/` paths together). For packages under the **DepsAndAssets** technique (Go vendor, npm/Bun deps, or Cargo crates), it may also materialize cache/vendor/crates tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token and the extra runtime tools above: `xz` plus `go` / `npm` / `bun` / `pycargoebuild`+fetcher as applicable). Reusing an existing assets release does not require `go`/`npm`/`bun`; Cargo packages still require `pycargoebuild` and a fetcher in preflight whenever selected.
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every package that needs work is selected (outdated non-deps packages and DepsAndAssets packages with runtime-lane gaps). Explicit targets that do not need work are soft-skipped.
 

@@ -10,6 +10,7 @@ module Update.EbuildEdit
     manifestHasVendorDist,
     ebuildNeedsContentFix,
     ebuildNeedsContentFixAtom,
+    ebuildNeedsCargoContentFix,
     goBdependAtom,
     nodejsBdependAtom,
     bunBdependAtom,
@@ -22,6 +23,10 @@ module Update.EbuildEdit
     ensureGoBdepend,
     ensureNodejsBdepend,
     ensureBunBdepend,
+    ensureRustMinVer,
+    ensureCargoAssetsSrcUri,
+    ensureEmptyCrates,
+    cargoCratesSrcUriLine,
     parseKeywordsLine,
     setKeywords,
     keywordsMatch,
@@ -29,10 +34,12 @@ module Update.EbuildEdit
 where
 
 import Data.Char (isAlpha, isDigit, isHexDigit)
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), comparePV, renderPV)
 import System.FilePath (takeFileName)
+import Update.Cargo.Msrv (normalizeRustVersion, parseRustMinVerFromEbuild)
 
 assetsMarker :: Text
 assetsMarker = "mndz-overlay-assets/releases/download/"
@@ -82,7 +89,7 @@ parameterizeAssetsSrcUri pn content =
               suffix =
                 firstSuffix
                   afterPn
-                  ["-vendor", "-deps", ".tar"]
+                  ["-vendor", "-deps", "-crates", ".tar"]
            in pkgName <> "-${PV}" <> suffix
 
     firstSuffix t markers =
@@ -186,6 +193,219 @@ ebuildNeedsContentFixAtom keywords content mAtom =
     || case mAtom of
       Just atom -> not (atom `T.isInfixOf` content)
       Nothing -> False
+
+-- | Cargo content fix: assets crates SRC_URI, KEYWORDS, RUST_MIN_VER, no list-era form.
+ebuildNeedsCargoContentFix :: [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsCargoContentFix keywords content mRequiredMsrv =
+  not (assetsSrcUriParameterized content)
+    || not (keywordsMatch keywords content)
+    || not (hasCratesAssetsSrcUri content)
+    || hasListEraCargoDeps content
+    || cratesFieldNonEmpty content
+    || case mRequiredMsrv of
+      Just ver ->
+        case parseRustMinVerFromEbuild content of
+          Just existing ->
+            case (normalizeRustVersion existing, normalizeRustVersion ver) of
+              (Just a, Just b) -> a /= b
+              _ -> True
+          Nothing -> True
+      Nothing -> False
+
+hasCratesAssetsSrcUri :: Text -> Bool
+hasCratesAssetsSrcUri content =
+  assetsMarker `T.isInfixOf` content
+    && "-crates.tar.xz" `T.isInfixOf` content
+
+-- | List-era crate deps via @CARGO_CRATE_URIS@ or crates.io crate dist URLs.
+hasListEraCargoDeps :: Text -> Bool
+hasListEraCargoDeps content =
+  "CARGO_CRATE_URIS" `T.isInfixOf` content
+    || "crates.io/api/v1/crates" `T.isInfixOf` content
+
+-- | True when @CRATES=@ is present and not empty (quoted empty is OK).
+cratesFieldNonEmpty :: Text -> Bool
+cratesFieldNonEmpty content =
+  case mapMaybe lineCrates (T.lines content) of
+    (val : _) ->
+      let stripped = T.strip val
+       in not (T.null stripped) && stripped /= "\"\"" && stripped /= "''"
+    [] -> False
+  where
+    mapMaybe f = foldr (\x acc -> case f x of Just y -> y : acc; Nothing -> acc) []
+    lineCrates ln =
+      let s = T.stripStart ln
+       in if "CRATES=" `T.isPrefixOf` s
+            then Just (T.drop (T.length ("CRATES=" :: Text)) s)
+            else Nothing
+
+-- | Assets crates SRC_URI line (parameterized).
+cargoCratesSrcUriLine :: Text -> Text
+cargoCratesSrcUriLine pn =
+  "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/"
+    <> pn
+    <> "-${PV}/"
+    <> pn
+    <> "-${PV}-crates.tar.xz\""
+
+-- | Ensure assets crates SRC_URI form; strip list-era crate URI patterns.
+--
+-- Rewrites the whole @SRC_URI@ assignment to a clean two-line form:
+--
+-- @
+-- SRC_URI=\"\<github source archive\>\"
+-- SRC_URI+=\" https://…\/mndz-overlay-assets\/…\/{pn}-${PV}-crates.tar.xz\"
+-- @
+--
+-- so multi-line donor\/pycargoebuild blocks (with @${CARGO_CRATE_URIS}@) cannot
+-- swallow the @SRC_URI+=@ line inside the quoted string.
+ensureCargoAssetsSrcUri :: Text -> Text -> Text
+ensureCargoAssetsSrcUri pn content
+  -- Already in clean single-line source + crates form: only parameterize.
+  | hasCratesAssetsSrcUri content
+      && hasCleanGithubSourceLine content
+      && not (hasListEraCargoDeps content) =
+      parameterizeAssetsSrcUri pn content
+  | otherwise =
+      let (pre, _oldBlock, post) = splitSrcUriAssignment (T.lines content)
+          mSource = extractGithubSourceArchiveUri content
+          sourceLine = case mSource of
+            Just uri -> "SRC_URI=\"" <> uri <> "\""
+            Nothing -> "SRC_URI=\"\""
+          cratesLine = cargoCratesSrcUriLine pn
+          rebuilt = T.unlines (pre <> [sourceLine, cratesLine] <> post)
+       in parameterizeAssetsSrcUri pn rebuilt
+
+hasCleanGithubSourceLine :: Text -> Bool
+hasCleanGithubSourceLine content =
+  any
+    ( \ln ->
+        let s = T.stripStart ln
+         in ( "SRC_URI=\"" `T.isPrefixOf` s
+                || (not ("SRC_URI" `T.isPrefixOf` s) && "https://github.com/" `T.isPrefixOf` s)
+            )
+              && "/archive/" `T.isInfixOf` s
+              && not ("SRC_URI=\"SRC_URI=" `T.isInfixOf` s)
+    )
+    (T.lines content)
+
+-- | Split ebuild lines into (before SRC_URI, SRC_URI lines, after).
+-- Handles both single-line and multi-line @SRC_URI=\"…\"@ blocks, and adjacent
+-- @SRC_URI+=@ lines.
+splitSrcUriAssignment :: [Text] -> ([Text], [Text], [Text])
+splitSrcUriAssignment lns =
+  let (pre, rest) = break isSrcUriStart lns
+   in case rest of
+        [] -> (lns, [], [])
+        _ ->
+          let (block, after) = takeSrcUriBlock rest
+           in (pre, block, after)
+  where
+    isSrcUriStart ln =
+      let s = T.stripStart ln
+       in "SRC_URI=" `T.isPrefixOf` s || "SRC_URI+=" `T.isPrefixOf` s
+
+    takeSrcUriBlock [] = ([], [])
+    takeSrcUriBlock (x : xs)
+      | isSrcUriStart x =
+          if isCompleteSrcUriLine x
+            then
+              let (morePlus, rest) = span isSrcUriPlus xs
+               in (x : morePlus, rest)
+            else
+              -- Multi-line SRC_URI=" … " — consume until a line with closing quote.
+              let (mid, rest0) = break lineClosesQuote xs
+               in case rest0 of
+                    (closeLn : rest1) ->
+                      let (morePlus, rest2) = span isSrcUriPlus rest1
+                       in (x : mid <> [closeLn] <> morePlus, rest2)
+                    [] -> (x : mid, [])
+      | otherwise = ([], x : xs)
+
+    isSrcUriPlus ln = "SRC_URI+=" `T.isPrefixOf` T.stripStart ln
+
+    -- Single-line assignment: SRC_URI="…" or SRC_URI+="…" with closing " on same line.
+    isCompleteSrcUriLine ln =
+      let s = T.strip ln
+          afterEq = T.drop 1 (T.dropWhile (/= '=') s)
+       in T.length afterEq >= 2 && T.head afterEq == '"' && T.count "\"" afterEq >= 2
+
+    lineClosesQuote ln =
+      let t = T.stripEnd ln
+       in not (T.null t) && T.last t == '"'
+
+-- | Prefer the GitHub source archive URI (including @-> ${P}.tar.gz@ rename) from ebuild text.
+extractGithubSourceArchiveUri :: Text -> Maybe Text
+extractGithubSourceArchiveUri content =
+  case mapMaybe cleanLine (T.lines content) of
+    (u : _) -> Just u
+    [] -> Nothing
+  where
+    cleanLine ln
+      | "mndz-overlay-assets" `T.isInfixOf` ln = Nothing
+      | "crates.io" `T.isInfixOf` ln = Nothing
+      | not ("github.com/" `T.isInfixOf` ln) = Nothing
+      | not ("/archive/" `T.isInfixOf` ln) = Nothing
+      | otherwise =
+          let t0 = T.strip ln
+              t1
+                | "SRC_URI+=" `T.isPrefixOf` t0 =
+                    T.drop (T.length ("SRC_URI+=" :: Text)) t0
+                | "SRC_URI=" `T.isPrefixOf` t0 =
+                    T.drop (T.length ("SRC_URI=" :: Text)) t0
+                | otherwise = t0
+              t2 = T.strip t1
+              t3 =
+                if T.length t2 >= 1 && T.head t2 == '"'
+                  then T.drop 1 t2
+                  else t2
+              t4 = T.dropWhileEnd (\c -> c == '"' || c == '\r') (T.strip t3)
+           in if T.null t4 then Nothing else Just t4
+
+-- | Force @CRATES=""@ (tarball packaging). Replaces multi-line CRATES blocks.
+ensureEmptyCrates :: Text -> Text
+ensureEmptyCrates content =
+  let lns = T.lines content
+      (pre, post) = break isCratesLine lns
+      line = "CRATES=\"\""
+   in case post of
+        [] -> content
+        (first : rest0) ->
+          let rest =
+                if isCompleteCratesLine first
+                  then rest0
+                  else drop 1 (dropWhile (not . lineClosesQuote) rest0)
+           in T.unlines (pre <> [line] <> rest)
+  where
+    isCratesLine ln = "CRATES=" `T.isPrefixOf` T.stripStart ln
+    isCompleteCratesLine ln =
+      let s = T.strip ln
+          afterEq = T.drop 1 (T.dropWhile (/= '=') s)
+       in T.length afterEq >= 2 && T.head afterEq == '"' && T.count "\"" afterEq >= 2
+    lineClosesQuote ln =
+      let t = T.stripEnd ln
+       in not (T.null t) && T.last t == '"'
+
+-- | Ensure @RUST_MIN_VER="…"@ is present and matches @ver@ (normalized).
+ensureRustMinVer :: Text -> Text -> Either Text Text
+ensureRustMinVer ver content =
+  case normalizeRustVersion ver of
+    Nothing -> Left ("invalid RUST_MIN_VER: " <> ver)
+    Just norm ->
+      let line = "RUST_MIN_VER=\"" <> norm <> "\""
+          lns = T.lines content
+          (pre, post) = break isRustMin lns
+       in case post of
+            (_old : rest) -> Right (T.unlines (pre <> [line] <> rest))
+            [] ->
+              case findLastInheritIdx lns of
+                Nothing -> Right (T.unlines (lns <> ["", line]))
+                Just idx ->
+                  let (before, after) = splitAt (idx + 1) lns
+                      (blanks, rest) = span T.null after
+                   in Right (T.unlines (before <> blanks <> [line] <> rest))
+  where
+    isRustMin ln = "RUST_MIN_VER=" `T.isPrefixOf` T.stripStart ln
 
 -- | BDEPEND adequacy vs optional known go.mod language version.
 bdependNeedsFix :: Maybe Text -> Text -> Bool
@@ -407,13 +627,13 @@ keywordsMatch expected content =
         && all (`elem` expected) actual
 
 -- | Set or replace KEYWORDS to the given space-joined tokens (quoted).
+-- Replaces a multi-line @KEYWORDS=\"…\"@ block when present.
 setKeywords :: [Text] -> Text -> Text
 setKeywords toks content =
-  let line = "KEYWORDS=\"" <> T.unwords toks <> "\""
+  let line = "KEYWORDS=\"" <> T.unwords (map stripTok toks) <> "\""
       lns = T.lines content
       (pre, post) = break isKeywordsLine lns
    in case post of
-        (_old : rest) -> T.unlines (pre <> [line] <> rest)
         [] ->
           -- Insert after inherit block when missing.
           case findLastInheritIdx lns of
@@ -422,5 +642,23 @@ setKeywords toks content =
               let (before, after) = splitAt (idx + 1) lns
                   (blanks, rest) = span T.null after
                in T.unlines (before <> blanks <> [line] <> rest)
+        (first : rest0) ->
+          let rest =
+                if isCompleteKeywordsLine first
+                  then rest0
+                  else drop 1 (dropWhile (not . lineClosesQuote) rest0)
+           in T.unlines (pre <> [line] <> rest)
   where
     isKeywordsLine ln = "KEYWORDS=" `T.isPrefixOf` T.stripStart ln
+    isCompleteKeywordsLine ln =
+      let s = T.strip ln
+          afterEq = T.drop 1 (T.dropWhile (/= '=') s)
+       in T.length afterEq >= 2 && T.head afterEq == '"' && T.count "\"" afterEq >= 2
+    lineClosesQuote ln =
+      let t = T.stripEnd ln
+       in not (T.null t) && T.last t == '"'
+    stripTok t =
+      let t1 = T.strip t
+       in if T.length t1 >= 2 && T.head t1 == '"' && T.last t1 == '"'
+            then T.init (T.tail t1)
+            else t1

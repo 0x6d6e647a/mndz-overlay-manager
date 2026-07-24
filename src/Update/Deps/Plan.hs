@@ -30,7 +30,9 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion (..), comparePV)
+import System.FilePath ((</>))
 import Update.Bun.Cache (parseEnginesBunFromPackageJson)
+import Update.Cargo.Msrv (parseRustVersionField)
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
   ( GoLanePlan (..),
@@ -58,6 +60,7 @@ import Update.Go.Tree
     discoverBunBinCeilings,
     discoverGoCeilingsWith,
     discoverNodejsCeilingsWith,
+    discoverRustUnionCeilingsWith,
     productionPortageqRunner,
   )
 import Update.Go.Vendor (versionTag)
@@ -71,10 +74,13 @@ data DepsPlanOps = DepsPlanOps
     dpoFetchGoMod :: GoModFetcher,
     dpoFetchNpmEngines :: Text -> Text -> IO (Either Text Text),
     dpoFetchBunEngines :: Text -> Text -> Text -> Text -> IO (Either Text Text),
+    -- | Fetch package Cargo.toml body at tag for rust-version probe.
+    dpoFetchCargoToml :: Text -> Text -> Text -> Text -> Maybe FilePath -> IO (Either Text Text),
     dpoWorkBudget :: WorkBudget,
     dpoGoCeilingsCache :: MVar (Maybe RuntimeCeilings),
     dpoNodeCeilingsCache :: MVar (Maybe RuntimeCeilings),
     dpoBunCeilingsCache :: MVar (Maybe RuntimeCeilings),
+    dpoRustCeilingsCache :: MVar (Maybe RuntimeCeilings),
     dpoOverlayRoot :: Maybe FilePath,
     dpoManager :: Manager
   }
@@ -99,6 +105,7 @@ productionDepsPlanOps mToken jobs mOverlay = do
   goCache <- newMVar Nothing
   nodeCache <- newMVar Nothing
   bunCache <- newMVar Nothing
+  rustCache <- newMVar Nothing
   pure
     DepsPlanOps
       { dpoPortageq = productionPortageqRunner,
@@ -109,10 +116,12 @@ productionDepsPlanOps mToken jobs mOverlay = do
         dpoFetchGoMod = cachedMod,
         dpoFetchNpmEngines = fetchNpmEnginesNode mgr,
         dpoFetchBunEngines = fetchBunEnginesAtTag mgr mToken,
+        dpoFetchCargoToml = fetchCargoTomlAtTag mgr mToken,
         dpoWorkBudget = budget,
         dpoGoCeilingsCache = goCache,
         dpoNodeCeilingsCache = nodeCache,
         dpoBunCeilingsCache = bunCache,
+        dpoRustCeilingsCache = rustCache,
         dpoOverlayRoot = mOverlay,
         dpoManager = mgr
       }
@@ -129,6 +138,7 @@ planDepsPackageWithProgress ops progress eco src locals =
     Go mSub -> planGo ops progress src mSub locals
     NpmEco -> planNpm ops progress src locals
     Bun -> planBun ops progress src locals
+    Cargo mLock mPkg -> planCargo ops progress src mLock mPkg locals
 
 ------------------------------------------------------------------------
 -- Go
@@ -235,6 +245,75 @@ planBun ops progress src locals =
                   Right ver -> Right (Just ver)
             )
     _ -> pure (Left "DepsAndAssets Bun requires a GitHub update source")
+
+------------------------------------------------------------------------
+-- Cargo
+------------------------------------------------------------------------
+
+planCargo ::
+  DepsPlanOps ->
+  PlanProgress ->
+  UpdateSource ->
+  Maybe FilePath ->
+  Maybe FilePath ->
+  [EbuildVersion] ->
+  IO (Either Text GoLanePlan)
+planCargo ops progress src mLockSub mPkgSub locals =
+  case src of
+    GitHub owner repo prefix ->
+      planWith
+        ops
+        progress
+        src
+        locals
+        ( discoverCeilingsCached
+            (dpoRustCeilingsCache ops)
+            (discoverRustUnionCeilingsWith (dpoPortageq ops))
+        )
+        ( \pv -> do
+            let pvText = renderPVNoRev pv
+            -- Prefer package subdir Cargo.toml; fall back to lock-root / repo root.
+            let tryPaths =
+                  nubMaybe
+                    [ mPkgSub,
+                      mLockSub,
+                      Nothing
+                    ]
+            probeRustVersion ops owner repo prefix pvText tryPaths
+        )
+    _ -> pure (Left "DepsAndAssets Cargo requires a GitHub update source")
+
+-- | Probe rust-version from the first readable Cargo.toml among subdirs.
+probeRustVersion ::
+  DepsPlanOps ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  [Maybe FilePath] ->
+  IO (Either Text (Maybe Text))
+probeRustVersion ops owner repo prefix pv = go
+  where
+    go [] =
+      -- No declared rust-version: still eligible under any ceiling; apply path
+      -- recomputes max-deps + donor and hard-fails if still unknown.
+      pure (Right (Just "0.0.0"))
+    go (mSub : rest) = do
+      eres <- dpoFetchCargoToml ops owner repo prefix pv mSub
+      case eres of
+        Left _ -> go rest
+        Right body ->
+          case parseRustVersionField body of
+            Just ver -> pure (Right (Just ver))
+            Nothing -> go rest
+
+nubMaybe :: (Eq a) => [Maybe a] -> [Maybe a]
+nubMaybe = go []
+  where
+    go acc [] = reverse acc
+    go acc (x : xs)
+      | x `elem` acc = go acc xs
+      | otherwise = go (x : acc) xs
 
 ------------------------------------------------------------------------
 -- Shared spine
@@ -416,4 +495,50 @@ fetchBunEnginesAtTag mgr mToken owner repo prefix pv = do
                             <> "@"
                             <> tag
                         )
+            else Left ("HTTP " <> T.pack (show code) <> " from " <> T.pack url)
+
+fetchCargoTomlAtTag ::
+  Manager ->
+  Maybe Text ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  IO (Either Text Text)
+fetchCargoTomlAtTag mgr mToken owner repo prefix pv mSub = do
+  let tag = versionTag prefix pv
+      subPath = case mSub of
+        Nothing -> "Cargo.toml"
+        Just sub -> sub </> "Cargo.toml"
+      url =
+        "https://raw.githubusercontent.com/"
+          <> T.unpack owner
+          <> "/"
+          <> T.unpack repo
+          <> "/"
+          <> T.unpack tag
+          <> "/"
+          <> subPath
+  req0 <- parseRequest url
+  let req =
+        req0
+          { method = "GET",
+            requestHeaders =
+              [ ("User-Agent", "mndz-overlay-manager"),
+                ("Accept", "text/plain")
+              ]
+                <> case mToken of
+                  Just t -> [("Authorization", "Bearer " <> TE.encodeUtf8 t)]
+                  Nothing -> []
+          }
+  eres <-
+    (Right <$> httpLbs req mgr)
+      `catch` \(e :: SomeException) -> pure (Left (T.pack (show e)))
+  pure $ case eres of
+    Left err -> Left err
+    Right resp ->
+      let code = statusCode (responseStatus resp)
+       in if code >= 200 && code < 300
+            then Right (TE.decodeUtf8 (BL.toStrict (responseBody resp)))
             else Left ("HTTP " <> T.pack (show code) <> " from " <> T.pack url)

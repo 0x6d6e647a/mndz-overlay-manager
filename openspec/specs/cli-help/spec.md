@@ -38,6 +38,15 @@ When the program is invoked with no subcommand (empty command position after glo
 - **THEN** the program writes top-level usage text
 - **AND** the program exits with status `0`
 
+### Requirement: Update help acknowledges cargo operator tools when documented
+
+When operator-facing documentation or command-scoped update help lists conditional language/runtime tools for `DepsAndAssets`, it SHALL include `pycargoebuild` (and a crates.io fetcher such as `wget` or `aria2c`) among tools that may be required for cargo packages, consistent with README accuracy requirements in `project-docs`.
+
+#### Scenario: README or update help names pycargoebuild
+
+- **WHEN** an operator reads the documented runtime tools for `update` after this change
+- **THEN** `pycargoebuild` is named as a conditional requirement for cargo `DepsAndAssets` packages
+
 ### Requirement: Per-command help is detailed and flag-only
 
 Each work subcommand (`list`, `outdated`, `update`, `gencache`) SHALL support `--help` and `-h` that render command-scoped usage (that command’s arguments and local options when any exist), a brief description of the command’s behaviour, and a note that global options are supplied before the subcommand and are documented by top-level `--help`. Per-command help SHALL NOT be provided via a positional `help` subcommand.

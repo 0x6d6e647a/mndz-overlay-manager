@@ -16,6 +16,7 @@ module Update.Go.Tree
     nodejsPackageDir,
     bunBinPackageDir,
     parseKeywordsField,
+    normalizeArchToken,
     keywordsHasBare,
     keywordsHasTildeOrBare,
     isLiveRuntimeVersion,
@@ -31,12 +32,18 @@ module Update.Go.Tree
     discoverGoCeilingsWith,
     discoverNodejsCeilingsWith,
     discoverBunBinCeilings,
+    discoverRustUnionCeilingsWith,
+    mergeCeilingsMax,
     goRuntimeAtom,
     nodejsRuntimeAtom,
     bunBinRuntimeAtom,
+    rustUnionRuntimeAtom,
+    rustPackageDir,
+    rustBinPackageDir,
   )
 where
 
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.List (nub, sort)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -92,6 +99,10 @@ nodejsRuntimeAtom = "net-libs/nodejs"
 
 bunBinRuntimeAtom :: Text
 bunBinRuntimeAtom = "dev-lang/bun-bin"
+
+-- | Fixed union id for cargo lane labels (rust || rust-bin).
+rustUnionRuntimeAtom :: Text
+rustUnionRuntimeAtom = "dev-lang/rust|rust-bin"
 
 emptyCeilings :: Text -> RuntimeCeilings
 emptyCeilings atom = RuntimeCeilings {rcAtom = atom, rcByArch = Map.empty}
@@ -158,7 +169,15 @@ nodejsPackageDir gentooRoot = gentooRoot </> "net-libs" </> "nodejs"
 bunBinPackageDir :: FilePath -> FilePath
 bunBinPackageDir overlayRoot = overlayRoot </> "dev-lang" </> "bun-bin"
 
+rustPackageDir :: FilePath -> FilePath
+rustPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "rust"
+
+rustBinPackageDir :: FilePath -> FilePath
+rustBinPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "rust-bin"
+
 -- | Parse KEYWORDS=... from ebuild body into token list.
+-- Shell comments after the assignment (@# …@) are stripped so rust-bin lines like
+-- @KEYWORDS=\"…\" # \"~mips ~sparc\"@ do not pollute arch discovery.
 parseKeywordsField :: Text -> [Text]
 parseKeywordsField content =
   case mapMaybe lineKeywords (T.lines content) of
@@ -172,8 +191,18 @@ parseKeywordsField content =
             else Nothing
 
     tokenizeKeywordsValue raw =
-      let unquoted = stripQuotes (T.strip raw)
-       in filter (not . T.null) (T.words unquoted)
+      let noComment = stripShellComment (T.strip raw)
+          unquoted = stripQuotes noComment
+       in mapMaybe cleanKeywordToken (T.words unquoted)
+
+    -- Drop @#…@ only when @#@ is outside a still-open quote (best-effort for one line).
+    stripShellComment t =
+      let go inQ i
+            | i >= T.length t = t
+            | T.index t i == '"' = go (not inQ) (i + 1)
+            | T.index t i == '#' && not inQ = T.take i t
+            | otherwise = go inQ (i + 1)
+       in T.strip (go False 0)
 
     stripQuotes t
       | T.length t >= 2,
@@ -185,6 +214,10 @@ parseKeywordsField content =
         T.last t == '\'' =
           T.init (T.tail t)
       | otherwise = t
+
+    cleanKeywordToken t =
+      let t1 = T.dropWhile (== '"') (T.dropWhileEnd (== '"') (T.strip t))
+       in if T.null t1 then Nothing else Just t1
 
 -- | True when KEYWORDS contain the bare arch token (exact word, not @~arch@).
 keywordsHasBare :: Arch -> [Text] -> Bool
@@ -223,11 +256,26 @@ normalizeArchToken :: Text -> Maybe Arch
 normalizeArchToken tok
   | tok == "-*" = Nothing
   | tok == "*" = Nothing
+  | tok == "#" = Nothing
   | "-" `T.isPrefixOf` tok = Nothing
   | "~" `T.isPrefixOf` tok =
       let arch = T.drop 1 tok
-       in if T.null arch then Nothing else Just arch
-  | otherwise = Just tok
+       in validArchName arch
+  | otherwise = validArchName tok
+
+-- | Gentoo arch token: letters, digits, @-@, @_@ only (reject @#@, quotes, etc.).
+validArchName :: Text -> Maybe Arch
+validArchName a
+  | T.null a = Nothing
+  | T.all isArchChar a = Just a
+  | otherwise = Nothing
+  where
+    isArchChar c =
+      isAsciiLower c
+        || isAsciiUpper c
+        || isDigit c
+        || c == '-'
+        || c == '_'
 
 -- | Parse PV + KEYWORDS from a runtime ebuild path and content.
 parseRuntimeEbuildMeta :: FilePath -> Text -> Maybe RuntimeEbuildMeta
@@ -338,3 +386,73 @@ discoverBunBinCeilings overlayRoot =
     bunBinRuntimeAtom
     (bunBinPackageDir overlayRoot)
     (Just "bun-bin-")
+
+-- | Discover cargo ceilings: U1 max of gentoo @dev-lang/rust@ ∪ @dev-lang/rust-bin@.
+-- Missing side is ignored; both missing is an error.
+discoverRustUnionCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)
+discoverRustUnionCeilingsWith run = do
+  pathResult <- gentooRepoPath run
+  case pathResult of
+    Left err -> pure (Left err)
+    Right gentooRoot -> do
+      rustExists <- doesDirectoryExist (rustPackageDir gentooRoot)
+      binExists <- doesDirectoryExist (rustBinPackageDir gentooRoot)
+      if not rustExists && not binExists
+        then
+          pure $
+            Left
+              ( "neither "
+                  <> "dev-lang/rust"
+                  <> " nor "
+                  <> "dev-lang/rust-bin"
+                  <> " found under "
+                  <> T.pack gentooRoot
+              )
+        else do
+          rustC <-
+            if rustExists
+              then
+                discoverRuntimeCeilingsInDir
+                  "dev-lang/rust"
+                  (rustPackageDir gentooRoot)
+                  (Just "rust-")
+              else pure (Right (emptyCeilings "dev-lang/rust"))
+          binC <-
+            if binExists
+              then
+                discoverRuntimeCeilingsInDir
+                  "dev-lang/rust-bin"
+                  (rustBinPackageDir gentooRoot)
+                  (Just "rust-bin-")
+              else pure (Right (emptyCeilings "dev-lang/rust-bin"))
+          pure $ case (rustC, binC) of
+            (Left err, _) -> Left err
+            (_, Left err) -> Left err
+            (Right a, Right b) ->
+              Right (mergeCeilingsMax rustUnionRuntimeAtom a b)
+
+-- | Per arch×tier ceiling = max of the two inputs (U1).
+mergeCeilingsMax :: Text -> RuntimeCeilings -> RuntimeCeilings -> RuntimeCeilings
+mergeCeilingsMax atom a b =
+  let arches = sort $ nub (Map.keys (rcByArch a) <> Map.keys (rcByArch b))
+      byArch =
+        Map.fromList
+          [ (arch, mergeArch (lookupArch a arch) (lookupArch b arch))
+          | arch <- arches
+          ]
+   in RuntimeCeilings {rcAtom = atom, rcByArch = byArch}
+  where
+    lookupArch c arch =
+      Map.findWithDefault (ArchCeilings Nothing Nothing) arch (rcByArch c)
+    mergeArch x y =
+      ArchCeilings
+        { acPlain = maxMaybe (acPlain x) (acPlain y),
+          acTilde = maxMaybe (acTilde x) (acTilde y)
+        }
+    maxMaybe Nothing o = o
+    maxMaybe o Nothing = o
+    maxMaybe (Just x) (Just y) =
+      Just $
+        case comparePV x y of
+          Just LT -> y
+          _ -> x

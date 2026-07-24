@@ -66,15 +66,15 @@ hardcodedPolicies =
       policy
         "dev-util/hk"
         (GitHub "jdx" "hk" "v")
-        (Unsupported "cargo CRATES"),
+        (DepsAndAssets (Cargo Nothing Nothing)),
       policy
         "dev-util/mise"
         (GitHub "jdx" "mise" "v")
-        (Unsupported "cargo CRATES"),
+        (DepsAndAssets (Cargo Nothing Nothing)),
       policy
         "dev-util/usage"
         (GitHub "jdx" "usage" "v")
-        (Unsupported "cargo CRATES")
+        (DepsAndAssets (Cargo Nothing (Just "cli")))
     ]
   where
     policy key src tech =
