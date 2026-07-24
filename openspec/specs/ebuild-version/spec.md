@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD
+Parse, pretty-render (PV form without leading `v`), and compare ebuild version strings (revision ignored for update ordering) used by discovery, outdated, and update flows.
 
 ## Requirements
 

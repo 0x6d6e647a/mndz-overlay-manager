@@ -34,7 +34,7 @@ import Data.Text.IO qualified as T
 import Logging.Bootstrap (LogHold, mkLogHold, mkLogger)
 import Options.Applicative (execParser)
 import Overlay.Discovery (collectEbuilds, discoveryErrorMessage)
-import Overlay.Types (Ebuild, ebuildAtom)
+import Overlay.Types (Ebuild, ebuildAtom, ebuildCategory, ebuildPackage)
 import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (EbuildVersion (..), prettyVersion)
 import System.Exit (ExitCode (..), exitWith)
@@ -90,6 +90,7 @@ import Update.Types
     SuccessLine (..),
     UpdateReport (..),
     UpdateTechnique (..),
+    mkPackageKey,
     packageKeyText,
     techniqueNeedsAssets,
   )
@@ -128,7 +129,7 @@ main = do
       usingLoggerT logger $
         case cmd of
           Cmd.List -> runList rt
-          Cmd.Outdated -> runOutdated rt
+          Cmd.Outdated pkgs -> runOutdated rt pkgs
           Cmd.Update pkgs -> runUpdate rt pkgs
           Cmd.Gencache targets force -> runGencache rt targets force
 
@@ -137,18 +138,32 @@ runList rt = do
   ebuilds <- loadValidatedEbuilds (rtOptions rt)
   liftIO $ mapM_ (T.putStrLn . ebuildAtom) ebuilds
 
-runOutdated :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
-runOutdated rt = do
+runOutdated :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> m ()
+runOutdated rt pkgArgs = do
   (cfg, ebuilds) <- loadValidatedEbuildsWithConfig (rtOptions rt)
-  token <- liftIO (resolveGitHubToken cfg)
-  fetch <- liftIO (productionFetcherWithToken token)
-  depsOps <- liftIO (productionDepsPlanOps token (rtJobs rt) (Just (overlayPath cfg)))
-  let total = length (groupNewest ebuilds)
-  reports <-
-    liftIO $
-      withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
-        checkOverlayWithDepsPlan (rtJobs rt) mh fetch depsOps ebuilds
-  mapM_ emitReport reports
+  let entries = groupNewest ebuilds
+      tokens = map T.pack pkgArgs
+  case resolveTargets entries tokens of
+    Left errs -> do
+      mapM_ (logError . targetErrorMessage) errs
+      liftIO $ exitWith (ExitFailure 1)
+    Right keys -> do
+      let selectedEntries = [e | e <- entries, peKey e `elem` keys]
+          filteredEbuilds =
+            filter
+              ( \eb ->
+                  mkPackageKey (ebuildCategory eb) (ebuildPackage eb) `elem` keys
+              )
+              ebuilds
+          total = length selectedEntries
+      token <- liftIO (resolveGitHubToken cfg)
+      fetch <- liftIO (productionFetcherWithToken token)
+      depsOps <- liftIO (productionDepsPlanOps token (rtJobs rt) (Just (overlayPath cfg)))
+      reports <-
+        liftIO $
+          withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
+            checkOverlayWithDepsPlan (rtJobs rt) mh fetch depsOps filteredEbuilds
+      mapM_ emitReport reports
 
 runUpdate :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> m ()
 runUpdate rt pkgArgs = do

@@ -34,7 +34,7 @@ data ColorMode
 
 data Command
   = List
-  | Outdated
+  | Outdated [String]
   | Update [String]
   | Gencache
       { gencacheTargets :: [String],
@@ -190,15 +190,29 @@ listInfo =
           )
     )
 
+outdatedParser :: Parser Command
+outdatedParser =
+  Outdated
+    <$> many
+      ( strArgument
+          ( metavar "PACKAGE..."
+              <> help
+                "Package targets as category/package or an unambiguous package \
+                \name; omit to check all discovered packages"
+          )
+      )
+
 outdatedInfo :: ParserInfo Command
 outdatedInfo =
   info
-    (pure Outdated)
+    outdatedParser
     ( fullDesc
         <> progDesc "Report packages with newer upstream versions"
         <> footer
-          ( "Check each discovered package against its update source and print \
-            \outdated lines to stdout. Empty inventory is an error. No \
+          ( "Check discovered packages against their update sources and print \
+            \outdated lines to stdout. PACKAGE may be category/package or an \
+            \unambiguous package name. With no PACKAGE arguments, check all \
+            \discovered packages. Empty inventory is an error. No \
             \subcommand-local flags. "
               <> globalsFooter
           )

@@ -1,20 +1,52 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+# Project context shown to AI when creating artifacts.
+context: |
+  Product: mndz-overlay-manager — a Haskell CLI for managing the mndz Gentoo overlay
+  (discover ebuilds, check outdated packages, apply version bumps with GPG-signed
+  commits, regenerate Portage md5-cache).
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Domain vocabulary:
+  - Work commands: list, outdated, update, gencache.
+  - Package targets: zero or more PACKAGE tokens as category/package or unambiguous
+    bare package name; empty means all inventory keys (outdated/gencache) or all that
+    need work (update). Shared resolution via Update.Targets.resolveTargets; unknown
+    and ambiguous tokens hard-fail (exit 1) before package work.
+  - Update techniques: GitMvAndManifest; DepsAndAssets with ecosystem Go | Npm | Bun |
+    Cargo; Unsupported. Never use the legacy name GoVendorAndAssets in specs or docs.
+  - DepsAndAssets packages use runtime-lane planning (per-arch plain/tilde ceilings);
+    apply may materialize vendor/deps/crates assets and publish under assets-path.
+  - PV / version is never a CLI argument; package selection ≠ automatic PV selection.
+
+  Quality gates: prefer CONTRIBUTING.md — `hk check` is the full gate; project-local
+  tools under .tools/bin only (ormolu, hlint, stan, weeder). Agent process: AGENTS.md.
+
+  Spec style: living openspec/specs/ is product source of truth. Prefer observable
+  operator behavior over library names (e.g. layoutz), MVar, or thread internals in
+  requirements. Purpose sections must be real one-line descriptions (never TBD).
+  Do not write residual change-delta language (“in this change”, “at the time of this
+  change”, “as today”, “future non-Go”) into living SoT.
+
+# Per-artifact rules for OpenSpec planning artifacts.
+rules:
+  proposal:
+    - Keep proposals focused; always include a Non-goals section (or explicit out-of-scope bullets).
+    - Distinguish package targets from PV selection; never invent CLI version pins unless that is the goal.
+    - Use DepsAndAssets (ecosystem Go/Npm/Bun/Cargo), not GoVendorAndAssets.
+  design:
+    - Always include Goals and Non-Goals.
+    - Prefer reusing existing helpers (resolveTargets, progress hosts) over parallel implementations.
+    - Record technique vocabulary as DepsAndAssets; call out SoT scrub if renaming residues remain.
+  specs:
+    - Every capability MUST have a Purpose section with a real one-line description (never TBD).
+    - Requirements describe operator-observable behavior; do not pin library names (layoutz) or MVar/thread APIs unless the product contracts them.
+    - Living SoT MUST NOT say “in this change”, “at the time of this change”, “as today”, or similar delta residue.
+    - Use DepsAndAssets (and ecosystem) vocabulary; never GoVendorAndAssets as a technique name.
+    - When listing DepsAndAssets ecosystems in shared apply/update rules, include Cargo alongside Go/Npm/Bun where first-class apply applies.
+    - Package-target model for work commands: category/package | bare package | empty; hard-fail unknown/ambiguous.
+  tasks:
+    - Break work into checkable items; mark complete only when the relevant gate is green.
+    - Include SoT merge/scrub and openspec validate / hk check when the change touches product or specs.
+  apply:
+    - Implement from tasks.md; keep README/CONTRIBUTING/AGENTS in the same change when operator/agent surfaces move (project-docs).
+    - After SoT hygiene, rg openspec/specs for GoVendorAndAssets and “in this change” should be clean.

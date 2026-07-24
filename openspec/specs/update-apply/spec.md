@@ -2,13 +2,13 @@
 
 ## Purpose
 
-Package policy (hardcoded source + technique), applying updates (`GitMvAndManifest` and `GoVendorAndAssets`), dirty checks, assets publish coordination, and creating isolated GPG-signed commits in the overlay work tree.
+Package policy (hardcoded source + technique), applying updates (`GitMvAndManifest` and `DepsAndAssets`), dirty checks, assets publish coordination, and creating isolated GPG-signed commits in the overlay work tree.
 
 ## Requirements
 
 ### Requirement: Package policy model
 
-The library SHALL model a package policy that binds a package key `category/package` to an update source and an update technique. The technique SHALL be one of: `GitMvAndManifest`; `DepsAndAssets` with an ecosystem specification (`Go` with optional go.mod subdirectory, `Npm`, `Bun`, or `Cargo` with optional lock/package subdirectories); or `Unsupported` with a human-readable reason. Policy lookup SHALL use a hardcoded map only. The former technique constructor `GoVendorAndAssets` SHALL NOT remain as a distinct technique alternative.
+The library SHALL model a package policy that binds a package key `category/package` to an update source and an update technique. The technique SHALL be one of: `GitMvAndManifest`; `DepsAndAssets` with an ecosystem specification (`Go` with optional go.mod subdirectory, `Npm`, `Bun`, or `Cargo` with optional lock/package subdirectories); or `Unsupported` with a human-readable reason. Policy lookup SHALL use a hardcoded map only. There SHALL NOT be a separate legacy Go-only technique alternative outside `DepsAndAssets`.
 
 #### Scenario: Supported GitMv technique entry
 
@@ -37,7 +37,7 @@ The library SHALL model a package policy that binds a package key `category/pack
 
 ### Requirement: Hardcoded policy covers known overlay packages
 
-The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay at the time of this change, each with both a source and a technique. At minimum, `dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, and `dev-util/opencode-bin` SHALL use `GitMvAndManifest`. At minimum, `dev-db/dolt`, `dev-util/beads`, and `dev-util/crush` SHALL use `DepsAndAssets` with ecosystem `Go`. At minimum, `dev-util/openspec` SHALL use `DepsAndAssets Npm` and `dev-util/ralph-tui` SHALL use `DepsAndAssets Bun`. At minimum, `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets` with ecosystem `Cargo`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone.
+The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay that this manager automates, each with both a source and a technique. At minimum, `dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, and `dev-util/opencode-bin` SHALL use `GitMvAndManifest`. At minimum, `dev-db/dolt`, `dev-util/beads`, and `dev-util/crush` SHALL use `DepsAndAssets` with ecosystem `Go`. At minimum, `dev-util/openspec` SHALL use `DepsAndAssets Npm` and `dev-util/ralph-tui` SHALL use `DepsAndAssets Bun`. At minimum, `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets` with ecosystem `Cargo`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone.
 
 #### Scenario: Simple binary package is GitMvAndManifest
 
@@ -99,7 +99,7 @@ When the ebuild filename changes, staged paths SHALL include at least: the **old
 
 ### Requirement: Dirty involved paths block package update
 
-Before mutating an apply unit, the program SHALL check that the unit’s involved paths are clean relative to git HEAD (not modified or staged with uncommitted changes). For `GitMvAndManifest`, involved paths are the newest ebuild file and the package `Manifest`. For each `GoVendorAndAssets` planned PV unit, involved paths are the template or target ebuild path for that PV and the package `Manifest`. If any involved path is dirty, the unit SHALL hard-fail without mutating. Dirtiness of unrelated paths SHALL NOT fail the unit. After a prior unit in the same package has successfully committed, dirt from that unit SHALL NOT remain uncommitted and therefore SHALL NOT cause the next unit’s dirty check to fail solely due to that prior unit’s work.
+Before mutating an apply unit, the program SHALL check that the unit’s involved paths are clean relative to git HEAD (not modified or staged with uncommitted changes). For `GitMvAndManifest`, involved paths are the newest ebuild file and the package `Manifest`. For each `DepsAndAssets` planned PV unit, involved paths are the template or target ebuild path for that PV and the package `Manifest`. If any involved path is dirty, the unit SHALL hard-fail without mutating. Dirtiness of unrelated paths SHALL NOT fail the unit. After a prior unit in the same package has successfully committed, dirt from that unit SHALL NOT remain uncommitted and therefore SHALL NOT cause the next unit’s dirty check to fail solely due to that prior unit’s work.
 
 #### Scenario: Dirty Manifest fails package
 
@@ -113,7 +113,7 @@ Before mutating an apply unit, the program SHALL check that the unit’s involve
 
 #### Scenario: Prior committed PV does not dirty-fail next PV
 
-- **WHEN** a Go package materializes planned PV `0.82.0` successfully (including its signed overlay commit) and then materializes planned PV `0.84.0` on a tree with no foreign dirt
+- **WHEN** a DepsAndAssets package materializes planned PV `0.82.0` successfully (including its signed overlay commit) and then materializes planned PV `0.84.0` on a tree with no foreign dirt
 - **THEN** the dirty check for `0.84.0` passes even though `0.82.0` updated the shared `Manifest` earlier in the same `update` run
 
 ### Requirement: Parallel work then serial signed commits
@@ -183,18 +183,18 @@ The `update` apply path SHALL require the overlay path to be inside a git work t
 - **WHEN** the configured overlay path is not a git work tree
 - **THEN** the program logs an error and does not apply package updates
 
-### Requirement: GoVendorAndAssets is a first-class apply technique
+### Requirement: DepsAndAssets is a first-class apply technique
 
-`DepsAndAssets` SHALL be a first-class apply technique for Go, Npm, and Bun ecosystems. Apply SHALL plan via runtime lanes, materialize or reuse distfiles, publish assets on the full path, rewrite overlay ebuilds, verify Manifest digests, and commit per successful PV unit as specified by `deps-assets`, `runtime-lanes`, `go-vendor-assets`, `npm-deps-assets`, and `bun-deps-assets`. Soft-skip solely for “unsupported vendor/deps assets” SHALL NOT apply to packages configured with `DepsAndAssets`.
+`DepsAndAssets` SHALL be a first-class apply technique for Go, Npm, Bun, and Cargo ecosystems. Apply SHALL plan via runtime lanes, materialize or reuse distfiles, publish assets on the full path, rewrite overlay ebuilds, verify Manifest digests, and commit per successful PV unit as specified by `deps-assets`, `runtime-lanes`, `go-vendor-assets`, `npm-deps-assets`, `bun-deps-assets`, and `cargo-crates-assets`. Soft-skip solely for “unsupported vendor/deps/crates assets” SHALL NOT apply to packages configured with `DepsAndAssets`.
 
 #### Scenario: DepsAndAssets package is not soft-skipped as unsupported
 
 - **WHEN** apply runs for a package with technique `DepsAndAssets` that needs work
-- **THEN** the program does not soft-skip solely because vendor or deps assets are required
+- **THEN** the program does not soft-skip solely because vendor, deps, or crates assets are required
 
-### Requirement: GoVendorAndAssets multi-lane apply
+### Requirement: DepsAndAssets multi-lane apply
 
-For packages with technique `DepsAndAssets`, apply SHALL use the runtime-lane planner for the package’s ecosystem to obtain the planned set of PVs and KEYWORDS, materialize each PV that needs work (full or reuse path), commit each successful unit before the next, and perform exact-set prune of non-live ebuilds after all planned PVs succeed. Multi-PV ordering and failure isolation SHALL match existing Go multi-unit behavior (later unit failure does not roll back earlier committed units).
+For packages with technique `DepsAndAssets`, apply SHALL use the runtime-lane planner for the package’s ecosystem to obtain the planned set of PVs and KEYWORDS, materialize each PV that needs work (full or reuse path), commit each successful unit before the next, and perform exact-set prune of non-live ebuilds after all planned PVs succeed. Multi-PV ordering and failure isolation SHALL match multi-unit behavior (later unit failure does not roll back earlier committed units).
 
 #### Scenario: Multiple planned PVs
 
@@ -212,7 +212,7 @@ When a planned PV is materialized via the reuse path (existing release asset), t
 
 ### Requirement: GitMvAndManifest leaves other versions
 
-`GitMvAndManifest` apply behavior for non-selected ebuild versions in the package directory SHALL remain as today (other versions left in place). Exact-set pruning applies only to `GoVendorAndAssets` tree-lane apply.
+`GitMvAndManifest` apply behavior for non-selected ebuild versions in the package directory SHALL leave other non-selected versions in place. Exact-set pruning applies only to `DepsAndAssets` runtime-lane apply.
 
 #### Scenario: Binary update does not delete siblings
 

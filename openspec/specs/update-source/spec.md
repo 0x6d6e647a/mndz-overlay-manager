@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD
+Define how packages obtain upstream version information: the update-source model (GitHub, npm, Http), hardcoded package-to-source mapping, fetching latest version, and listing comparable GitHub versions for runtime-lane planning.
 
 ## Requirements
 

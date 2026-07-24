@@ -81,11 +81,18 @@ cabal run mndz-overlay-manager -- --overlay-path /path/to/overlay list
 
 ### `outdated`
 
-Compare each discovered package to its configured update source and report packages that have a newer upstream version. Outdated lines go to standard output; warnings (unmapped packages, fetch failures, local ahead of remote) go to the log on stderr. No subcommand-local flags. Soft failures do not by themselves force a non-zero exit; spine failures (missing config, invalid overlay, empty inventory) do.
+Compare discovered packages to their configured update sources and report packages that have a newer upstream version (or a runtime-lane gap for DepsAndAssets packages). Outdated lines go to standard output; warnings (unmapped packages, fetch failures, local ahead of remote) go to the log on stderr. Soft failures do not by themselves force a non-zero exit; spine failures (missing config, invalid overlay, empty inventory, unknown/ambiguous package targets) do.
+
+**Targets:** zero or more package arguments as `category/package` or an unambiguous package name (same form as `update` / `gencache`). With no arguments, every discovered package is checked. With one or more targets, only the selected packages are checked.
 
 ```bash
+# All discovered packages
 cabal run mndz-overlay-manager -- outdated
 cabal run mndz-overlay-manager -- -v --jobs 4 outdated
+
+# One or more packages
+cabal run mndz-overlay-manager -- outdated dev-util/crush
+cabal run mndz-overlay-manager -- outdated crush dolt
 ```
 
 ### `update`

@@ -82,7 +82,7 @@ When `update` will attempt assets publish for at least one selected package, the
 
 #### Scenario: Missing assets path when Go update selected
 
-- **WHEN** `update` selects a `GoVendorAndAssets` package that will apply and assets path is unset
+- **WHEN** `update` selects a `DepsAndAssets` package that will apply and assets path is unset
 - **THEN** the program logs an error and exits with status `1` before package mutation
 
 #### Scenario: Assets path not a git worktree

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the `update` subcommand: spine and preflight, package targets, stdout for successful bumps, soft skips vs hard failures, and latest-upstream-only upgrades.
+Define the `update` subcommand: spine and preflight, package targets, automatic version selection without PV arguments, stdout for successful bumps, soft skips vs hard failures, and progress presentation.
 
 ## Requirements
 
@@ -108,7 +108,7 @@ Packages that are unmapped, configured as unsupported, or not outdated SHALL be 
 
 ### Requirement: Hard failures continue others then exit one
 
-Hard per-package or per-unit failures (including dirty involved paths, `ebuild manifest` failure, git commit or signing failure, assets commit/push/release failure, Manifest hash mismatch after vendor publish, host Go older than the package `go.mod` requirement during `GoVendorAndAssets` apply, inability to obtain go.mod when BDEPEND alignment is required, and fetch/compare errors when an update was attempted) SHALL be logged as errors. Other packages SHALL continue. After all selected packages are processed, if any hard failure occurred, the program SHALL exit with status `1`; otherwise exit with status `0` when the spine succeeded. Host Go version sufficiency for a given package’s `go.mod` is evaluated during that package’s apply (after clone on the full path), not as a spine-wide preflight that aborts all packages before any work. When one planned PV unit of a multi-PV Go package succeeds (including its signed overlay commit) and a later unit hard-fails, the program SHALL still exit with status `1` while retaining the successful unit’s commit.
+Hard per-package or per-unit failures (including dirty involved paths, `ebuild manifest` failure, git commit or signing failure, assets commit/push/release failure, Manifest hash mismatch after vendor publish, host Go older than the package `go.mod` requirement during `DepsAndAssets` Go apply, inability to obtain go.mod when BDEPEND alignment is required, and fetch/compare errors when an update was attempted) SHALL be logged as errors. Other packages SHALL continue. After all selected packages are processed, if any hard failure occurred, the program SHALL exit with status `1`; otherwise exit with status `0` when the spine succeeded. Host Go version sufficiency for a given package’s `go.mod` is evaluated during that package’s apply (after clone on the full path), not as a spine-wide preflight that aborts all packages before any work. When one planned PV unit of a multi-PV Go package succeeds (including its signed overlay commit) and a later unit hard-fails, the program SHALL still exit with status `1` while retaining the successful unit’s commit.
 
 #### Scenario: One package fails others complete
 
@@ -127,7 +127,7 @@ Hard per-package or per-unit failures (including dirty involved paths, `ebuild m
 
 #### Scenario: Host Go too old hard-fails one Go package
 
-- **WHEN** package A is `GoVendorAndAssets` and hard-fails because host Go is older than its `go.mod` requirement, and package B is selected and can succeed
+- **WHEN** package A is `DepsAndAssets` Go and hard-fails because host Go is older than its `go.mod` requirement, and package B is selected and can succeed
 - **THEN** package A is logged as an error, package B may still complete, and the program exits with status `1`
 
 #### Scenario: Partial multi-PV still exits one
@@ -137,30 +137,40 @@ Hard per-package or per-unit failures (including dirty involved paths, `ebuild m
 
 ### Requirement: Go version gate is not spine preflight
 
-Spine preflight for `update` SHALL continue to require only that `go` is present on `PATH` when any selected package needs `GoVendorAndAssets`. Preflight SHALL NOT parse remote or local `go.mod` files to enforce a global minimum Go version before package work begins. Per-package host vs `go.mod` checks are defined by the `go-vendor-assets` capability.
+Spine preflight for `update` SHALL continue to require only that `go` is present on `PATH` when any selected package needs full-path `DepsAndAssets` Go work. Preflight SHALL NOT parse remote or local `go.mod` files to enforce a global minimum Go version before package work begins. Per-package host vs `go.mod` checks are defined by the `go-vendor-assets` capability.
 
 #### Scenario: Preflight passes with go on PATH even if later package needs newer Go
 
 - **WHEN** the user runs `update` for a Go package, `go` is on `PATH`, and other Go preflight requirements are met
 - **THEN** preflight succeeds even if that package’s upstream `go.mod` will later require a newer Go than the host provides
 
-### Requirement: Latest upstream only
+### Requirement: Automatic version selection without PV arguments
 
-For packages that are not `DepsAndAssets`, the `update` command SHALL upgrade to the latest version obtained from the package’s configured update source. For `DepsAndAssets` packages, target versions SHALL be those produced by the runtime-lane planner (per-lane maxima under runtime ceilings), which MAY be older than upstream latest when latest’s requirement exceeds a ceiling. The `update` command SHALL NOT accept a user-specified target version in this change.
+Package selection for `update` SHALL use only package targets (`category/package`, unambiguous bare package name, or empty for all that need work) as specified by the package-targets requirement. The `update` command SHALL NOT accept a user-specified target version or PV as a CLI argument. For packages that are not `DepsAndAssets`, when an update applies, the program SHALL upgrade to the latest version obtained from the package’s configured update source. For `DepsAndAssets` packages, target versions SHALL be those produced by the runtime-lane planner (per-lane maxima under runtime ceilings), which MAY be older than upstream latest when latest’s requirement exceeds a ceiling.
 
 #### Scenario: Lane may select older than latest
 
 - **WHEN** upstream latest requires a runtime newer than the plain ceiling but an older candidate fits
 - **THEN** update may target the older candidate for that lane
 
-### Requirement: Soft skip no longer treats Go packages as unsupported
+#### Scenario: No PV CLI argument
 
-Packages configured with `DepsAndAssets` (Go, Npm, or Bun) SHALL NOT be soft-skipped with an “unsupported” reason for vendor or deps assets. Soft skips for those packages remain available for not-outdated / already-fixed cases as defined by apply logic.
+- **WHEN** the user runs `update` with package tokens only (or no tokens)
+- **THEN** the program does not interpret any token as a target PV or version pin
+
+### Requirement: Soft skip does not treat DepsAndAssets as unsupported
+
+Packages configured with `DepsAndAssets` (Go, Npm, Bun, or Cargo) SHALL NOT be soft-skipped with an “unsupported” reason for vendor, deps, or crates assets. Soft skips for those packages remain available for not-outdated / already-fixed cases as defined by apply logic.
 
 #### Scenario: openspec not unsupported
 
 - **WHEN** the user runs `update dev-util/openspec` and the package needs a version bump with deps assets
 - **THEN** the program does not soft-skip it solely because deps assets are required
+
+#### Scenario: mise not unsupported
+
+- **WHEN** the user runs `update dev-util/mise` and the package needs crates assets work
+- **THEN** the program does not soft-skip it solely because crates assets are required
 
 ### Requirement: Update preflight progress when enabled
 
@@ -173,16 +183,16 @@ When activity indicators are enabled, `update` SHALL show a sequential preflight
 
 ### Requirement: Update phase-one multi-progress when enabled
 
-When activity indicators are enabled, `update` phase-1 package apply SHALL show multi-progress (top-level done/total and per-package rows) as specified by `cli-activity`. For `GoVendorAndAssets` (and similarly long techniques), the package row SHALL update short sub-phase labels and advance per-package step progress during work without requiring nested progress bars. For full-path Go vendor materialize, labels and steps SHALL follow the fine-grained sequence specified by `cli-activity` (clone, go mod download, compress, commit assets, push assets, upload release asset, regenerating manifest). For reuse-path materialize, labels and steps SHALL follow the reuse sequence specified by `cli-activity`.
+When activity indicators are enabled, `update` phase-1 package apply SHALL show multi-progress (top-level done/total and per-package rows) as specified by `cli-activity`. For `DepsAndAssets` (and similarly long techniques), the package row SHALL update short sub-phase labels and advance per-package step progress during work without requiring nested progress bars. For full-path Go vendor materialize, labels and steps SHALL follow the fine-grained sequence specified by `cli-activity` (clone, go mod download, compress, commit assets, push assets, upload release asset, regenerating manifest). For reuse-path materialize, labels and steps SHALL follow the reuse sequence specified by `cli-activity`.
 
 #### Scenario: Go package shows sub-phase label
 
-- **WHEN** indicators are enabled and a `GoVendorAndAssets` package is being applied
+- **WHEN** indicators are enabled and a `DepsAndAssets` Go package is being applied
 - **THEN** the package’s multi-progress row includes a short sub-phase description that can change as the technique advances
 
 #### Scenario: Go full path advances materialize sub-phases
 
-- **WHEN** indicators are enabled and a `GoVendorAndAssets` package PV is materialized on the full vendor+publish path
+- **WHEN** indicators are enabled and a `DepsAndAssets` Go package PV is materialized on the full vendor+publish path
 - **THEN** the package row’s sub-phase description and step progress advance through vendor construction and assets publish sub-phases as specified by `cli-activity`, not only a single frozen vendoring or publishing label for those phases
 
 ### Requirement: Update commit progress when enabled

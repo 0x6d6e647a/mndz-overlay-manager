@@ -6,9 +6,9 @@ Go package update technique: vendor tarball build, assets publish, ebuild SRC_UR
 
 ## Requirements
 
-### Requirement: GoVendorAndAssets technique
+### Requirement: DepsAndAssets Go technique
 
-The library SHALL support Go packages under the update technique `DepsAndAssets` with ecosystem `Go` and an optional go.mod subdirectory relative to the upstream repository root (`Nothing` means repository root). Apply logic SHALL use this subdirectory when running Go module download after clone. The former technique name `GoVendorAndAssets` SHALL NOT remain as a separate technique constructor.
+The library SHALL support Go packages under the update technique `DepsAndAssets` with ecosystem `Go` and an optional go.mod subdirectory relative to the upstream repository root (unset means repository root). Apply logic SHALL use this subdirectory when running Go module download after clone. There SHALL NOT be a separate legacy Go-only technique constructor outside `DepsAndAssets` with ecosystem `Go`.
 
 #### Scenario: Root go.mod package
 
@@ -20,7 +20,7 @@ The library SHALL support Go packages under the update technique `DepsAndAssets`
 - **WHEN** policy for `dev-db/dolt` uses `DepsAndAssets` with ecosystem `Go` and subdirectory `go`
 - **THEN** vendor construction runs in the `go/` directory of the clone
 
-### Requirement: Hardcoded Go packages use GoVendorAndAssets
+### Requirement: Hardcoded Go packages use DepsAndAssets Go
 
 The hardcoded policy map SHALL set `DepsAndAssets` with ecosystem `Go` for `dev-db/dolt` (subdir `go`), `dev-util/beads` (root), and `dev-util/crush` (root), each with their existing GitHub update sources. Those packages SHALL NOT remain `Unsupported` solely for vendor assets.
 
@@ -87,7 +87,7 @@ From the go.mod directory the program SHALL: (1) populate a `go-mod` directory v
 
 ### Requirement: Assets publish before overlay mutation
 
-For `GoVendorAndAssets`, the program SHALL complete assets-repo checksum commit, assets remote push, and GitHub release asset upload for the vendor tarball **before** renaming or rewriting the overlay ebuild or running `ebuild … manifest`. If assets publish fails, the package SHALL hard-fail and the overlay package tree SHALL NOT be mutated for that attempt.
+For `DepsAndAssets` Go packages, the program SHALL complete assets-repo checksum commit, assets remote push, and GitHub release asset upload for the vendor tarball **before** renaming or rewriting the overlay ebuild or running `ebuild … manifest`. If assets publish fails, the package SHALL hard-fail and the overlay package tree SHALL NOT be mutated for that attempt.
 
 #### Scenario: Push failure leaves overlay untouched
 
@@ -122,15 +122,15 @@ When a planned PV is already present as one or more local non-live ebuilds and t
 
 ### Requirement: Assets SRC_URI uses full path with ${PV}
 
-When rewriting or writing a Go package ebuild’s vendor/deps assets `SRC_URI`, the program SHALL produce a URL of the form:
+When rewriting or writing a Go package ebuild’s vendor assets `SRC_URI`, the program SHALL produce a URL of the form:
 
 `https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/{pn}-${PV}/{pn}-${PV}-vendor.tar.xz`
 
-(or the equivalent `-deps.tar.xz` suffix for future non-Go techniques). Both the release tag path segment and the asset filename SHALL use the literal Portage variable `${PV}` (not a frozen version digit string). When Portage expands `${PV}` for package version `2.1.11` and package name `dolt`, the fetch URL SHALL be:
+Both the release tag path segment and the asset filename SHALL use the literal Portage variable `${PV}` (not a frozen version digit string). When Portage expands `${PV}` for package version `2.1.11` and package name `dolt`, the fetch URL SHALL be:
 
 `https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/dolt-2.1.11/dolt-2.1.11-vendor.tar.xz`
 
-Rewriting frozen versions to `${PV}` SHALL preserve the `mndz-overlay-assets/releases/download/` path segment. The program SHALL NOT produce bare host paths such as `https://github.com/0x6d6e647a/{pn}-${PV}/…` that omit the assets repository and release download prefix.
+Rewriting frozen versions to `${PV}` SHALL preserve the `mndz-overlay-assets/releases/download/` path segment. The program SHALL NOT produce bare host paths such as `https://github.com/0x6d6e647a/{pn}-${PV}/…` that omit the assets repository and release download prefix. Non-Go ecosystems use their own distfile suffixes (`-deps.tar.xz`, `-crates.tar.xz`) as specified by `deps-assets` and the ecosystem capabilities; this requirement covers Go vendor SRC_URI form.
 
 #### Scenario: Frozen dolt URL becomes fully parameterized
 
@@ -171,7 +171,7 @@ When assets publish has succeeded and a later overlay step fails (dirty check, e
 
 ### Requirement: Host Go meets go.mod language version
 
-After the temporary clone for `DepsAndAssets` Go and after locating `go.mod` in the configured subdirectory (or repository root), the program SHALL parse the module’s top-level `go` directive version and the host toolchain version from `go version` (or an equivalent injectable probe). If both versions parse successfully and the host version is strictly older than the `go.mod` requirement, the program SHALL hard-fail that package **before** running `go mod download`, and SHALL NOT publish assets or mutate the overlay for that attempt. The error message SHALL name the host version and the required version and SHALL indicate that the operator must install a newer `dev-lang/go` (the program SHALL NOT set `GOTOOLCHAIN=auto` or download a Go toolchain to work around the mismatch). If the host version is greater than or equal to the required version, vendor construction MAY proceed with `go mod download` as today. If `go.mod` has no parseable `go` directive, the program SHALL skip this gate and proceed to `go mod download`. If the host `go version` output cannot be parsed, the program SHALL hard-fail with an error that the host Go version could not be determined. The reuse path SHALL NOT require this host Go gate.
+After the temporary clone for `DepsAndAssets` Go and after locating `go.mod` in the configured subdirectory (or repository root), the program SHALL parse the module’s top-level `go` directive version and the host toolchain version from `go version` (or an equivalent injectable probe). If both versions parse successfully and the host version is strictly older than the `go.mod` requirement, the program SHALL hard-fail that package **before** running `go mod download`, and SHALL NOT publish assets or mutate the overlay for that attempt. The error message SHALL name the host version and the required version and SHALL indicate that the operator must install a newer `dev-lang/go` (the program SHALL NOT set `GOTOOLCHAIN=auto` or download a Go toolchain to work around the mismatch). If the host version is greater than or equal to the required version, vendor construction MAY proceed with `go mod download`. If `go.mod` has no parseable `go` directive, the program SHALL skip this gate and proceed to `go mod download`. If the host `go version` output cannot be parsed, the program SHALL hard-fail with an error that the host Go version could not be determined. The reuse path SHALL NOT require this host Go gate.
 
 #### Scenario: Host older than go.mod hard-fails before download
 
@@ -190,7 +190,7 @@ After the temporary clone for `DepsAndAssets` Go and after locating `go.mod` in 
 
 ### Requirement: Ebuild BDEPEND matches go.mod Go version
 
-When applying overlay ebuild changes for a `GoVendorAndAssets` package after a successful assets publish, on the reuse path, or as part of any overlay mutation that rewrites assets `SRC_URI` or KEYWORDS for a planned PV, the program SHALL ensure the ebuild declares a build dependency atom `>=dev-lang/go-<version>:=` where `<version>` is the `go` directive from that package’s `go.mod` for the tag corresponding to that PV (from the temporary vendor clone on the full path, or from the go.mod probe without a vendor clone on the reuse path and for content-fix planning). The program SHALL insert such a `BDEPEND` if no `dev-lang/go` atom is present, or replace an existing `dev-lang/go` atom so it matches the required version. The program SHALL NOT remove unrelated dependency atoms. The `toolchain` directive in `go.mod`, if present, SHALL NOT be used as the BDEPEND version source.
+When applying overlay ebuild changes for a `DepsAndAssets` Go package after a successful assets publish, on the reuse path, or as part of any overlay mutation that rewrites assets `SRC_URI` or KEYWORDS for a planned PV, the program SHALL ensure the ebuild declares a build dependency atom `>=dev-lang/go-<version>:=` where `<version>` is the `go` directive from that package’s `go.mod` for the tag corresponding to that PV (from the temporary vendor clone on the full path, or from the go.mod probe without a vendor clone on the reuse path and for content-fix planning). The program SHALL insert such a `BDEPEND` if no `dev-lang/go` atom is present, or replace an existing `dev-lang/go` atom so it matches the required version. The program SHALL NOT remove unrelated dependency atoms. The `toolchain` directive in `go.mod`, if present, SHALL NOT be used as the BDEPEND version source.
 
 For planning, content-fix detection, soft-skip “already matches plan,” and outdated adequacy, a local ebuild for a planned PV SHALL be treated as needing a Go BDEPEND content fix when the required `go.mod` version for that PV is known and the ebuild does **not** already contain the exact atom `>=dev-lang/go-<version>:=` (missing atom or different version). Mere presence of any `dev-lang/go` substring SHALL NOT satisfy adequacy when a required version is known. When content-fix or materialization requires BDEPEND alignment and the required `go.mod` version cannot be obtained, the program SHALL hard-fail that PV (or not soft-skip the package as fully matching) rather than silently leaving BDEPEND unchanged.
 
@@ -254,7 +254,7 @@ On the reuse path the program SHALL download the existing vendor release asset, 
 
 ### Requirement: Manifest incompleteness is needs-work
 
-For a planned `GoVendorAndAssets` PV that already has a local non-live ebuild, the program SHALL treat the PV as still needing materialization (not fully satisfied / not soft-skippable solely for “already matches plan”) when the package `Manifest` lacks a DIST entry for `{pn}-{pv}-vendor.tar.xz`, in addition to content-fix rules for assets SRC_URI parameterization, **BDEPEND matching the PV’s go.mod requirement when known**, and planned KEYWORDS. Soft-skip of a package as fully matching the tree-lane plan SHALL require that every planned PV is present with adequate ebuild content (including correct Go BDEPEND when the requirement is known) **and** a Manifest vendor DIST entry for that PV’s vendor tarball name.
+For a planned `DepsAndAssets` Go PV that already has a local non-live ebuild, the program SHALL treat the PV as still needing materialization (not fully satisfied / not soft-skippable solely for “already matches plan”) when the package `Manifest` lacks a DIST entry for `{pn}-{pv}-vendor.tar.xz`, in addition to content-fix rules for assets SRC_URI parameterization, **BDEPEND matching the PV’s go.mod requirement when known**, and planned KEYWORDS. Soft-skip of a package as fully matching the tree-lane plan SHALL require that every planned PV is present with adequate ebuild content (including correct Go BDEPEND when the requirement is known) **and** a Manifest vendor DIST entry for that PV’s vendor tarball name.
 
 #### Scenario: Good ebuild missing vendor Manifest is not pure soft-skip
 
@@ -273,7 +273,7 @@ For a planned `GoVendorAndAssets` PV that already has a local non-live ebuild, t
 
 ### Requirement: Overlay commit after each successful Go PV unit
 
-After a `GoVendorAndAssets` planned PV successfully completes overlay ebuild mutation, `ebuild … manifest`, and vendor SHA512 verification (full or reuse path), the program SHALL create the signed overlay commit for that unit before materializing the next planned PV for the same package. The commit SHALL use message `category/package: version` with the written ebuild version string (without leading `v`). The program SHALL NOT leave that unit’s paths uncommitted solely to batch multiple PVs into a later barrier.
+After a `DepsAndAssets` Go planned PV successfully completes overlay ebuild mutation, `ebuild … manifest`, and vendor SHA512 verification (full or reuse path), the program SHALL create the signed overlay commit for that unit before materializing the next planned PV for the same package. The commit SHALL use message `category/package: version` with the written ebuild version string (without leading `v`). The program SHALL NOT leave that unit’s paths uncommitted solely to batch multiple PVs into a later barrier.
 
 #### Scenario: Sequential PVs each committed before next
 

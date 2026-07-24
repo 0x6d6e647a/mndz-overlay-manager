@@ -125,21 +125,30 @@ The change that introduces this capability SHALL establish a baseline where `REA
 
 ### Requirement: README documents gencache and md5-cache tools
 
-When this change is implemented, `README.md` SHALL document the `gencache` work subcommand (purpose, optional package targets, `--force`, and at least one example), SHALL list `egencache` among runtime tools required for `update` and `gencache`, and SHALL briefly describe the operator bootstrap/recovery sequence: ensure `cache-formats = md5-dict` in overlay `layout.conf`, run `gencache` for initial cache, use `update` for version bumps, and use `gencache` / `gencache --force` when `update` reports missing or mismatched md5-cache.
+`README.md` SHALL document the `gencache` work subcommand (purpose, optional package targets, `--force`, and at least one example), SHALL list `egencache` among runtime tools required for `update` and `gencache`, and SHALL briefly describe the operator bootstrap/recovery sequence: ensure `cache-formats = md5-dict` in overlay `layout.conf`, run `gencache` for initial cache, use `update` for version bumps, and use `gencache` / `gencache --force` when `update` reports missing or mismatched md5-cache.
 
 #### Scenario: README catalogs gencache
 
-- **WHEN** an operator reads `README.md` after this change
+- **WHEN** an operator reads `README.md`
 - **THEN** the document describes `gencache` with an example invocation
 - **AND** runtime requirements mention `egencache` for `update` and `gencache`
 
+### Requirement: README documents outdated package targets
+
+When documenting the `outdated` command, `README.md` SHALL state that `outdated` accepts zero or more package arguments in the same form as `update` (`category/package` or unambiguous package name), that omitting arguments checks all discovered packages, and SHALL include at least one example with a package target.
+
+#### Scenario: README shows filtered outdated example
+
+- **WHEN** an operator reads the README `outdated` section
+- **THEN** the section describes optional package targets and shows an example such as `outdated category/package` or `outdated package`
+
 ### Requirement: Document DepsAndAssets operator tools
 
-When this change lands operator-facing `update` behavior for npm, Bun, or Cargo packages, project docs SHALL state that `update` of packages that publish Go vendor, npm/Bun deps, or Cargo crates assets may require `go` and/or `npm` and/or `bun` and/or `pycargoebuild` plus a fetcher (`wget` or `aria2c`) as applicable, in addition to existing tools (`xz`, assets path, token). README (or equivalent operator surface) SHALL mention `DepsAndAssets` ecosystems at a high level without re-hosting full pipeline tables in AGENTS.md. CONTRIBUTING and AGENTS SHALL NOT pin `pycargoebuild` in project-local `.tools/bin` install scripts; operator runtimes remain documented in README only unless CONTRIBUTING already lists go/npm/bun as application runtimes in the same section.
+Project docs SHALL state that `update` of packages that publish Go vendor, npm/Bun deps, or Cargo crates assets may require `go` and/or `npm` and/or `bun` and/or `pycargoebuild` plus a fetcher (`wget` or `aria2c`) as applicable, in addition to existing tools (`xz`, assets path, token). README (or equivalent operator surface) SHALL mention `DepsAndAssets` ecosystems at a high level without re-hosting full pipeline tables in AGENTS.md. CONTRIBUTING and AGENTS SHALL NOT pin `pycargoebuild` in project-local `.tools/bin` install scripts; operator runtimes remain documented in README only unless CONTRIBUTING already lists go/npm/bun as application runtimes in the same section.
 
 #### Scenario: README lists language tools
 
-- **WHEN** operator documentation is updated for this change
+- **WHEN** an operator reads runtime-tool documentation for `update`
 - **THEN** it names `npm` and `bun` as conditional runtime tools for deps asset packages alongside `go` for vendor packages
 
 #### Scenario: README lists pycargoebuild for cargo

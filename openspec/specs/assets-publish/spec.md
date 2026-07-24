@@ -70,7 +70,7 @@ When multiple packages publish to the same assets worktree concurrently, git ind
 
 #### Scenario: Two Go packages do not interleave assets git
 
-- **WHEN** two `GoVendorAndAssets` packages finish tarballs at the same time
+- **WHEN** two `DepsAndAssets` packages finish tarballs at the same time
 - **THEN** their assets commit/push/release steps do not interleave on the shared assets worktree
 
 ### Requirement: Crates tarball assets use same publish spine

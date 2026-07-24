@@ -44,7 +44,7 @@ When operator-facing documentation or command-scoped update help lists condition
 
 #### Scenario: README or update help names pycargoebuild
 
-- **WHEN** an operator reads the documented runtime tools for `update` after this change
+- **WHEN** an operator reads the documented runtime tools for `update`
 - **THEN** `pycargoebuild` is named as a conditional requirement for cargo `DepsAndAssets` packages
 
 ### Requirement: Per-command help is detailed and flag-only
@@ -64,10 +64,11 @@ Each work subcommand (`list`, `outdated`, `update`, `gencache`) SHALL support `-
 - **THEN** the usage text describes the `list` command
 - **AND** the program exits with status `0` without loading configuration
 
-#### Scenario: Outdated help is command-scoped
+#### Scenario: Outdated help documents package targets
 
 - **WHEN** the user runs `outdated --help`
-- **THEN** the usage text describes the `outdated` command
+- **THEN** the usage text describes optional `PACKAGE...` targets (`category/package` or unambiguous package name)
+- **AND** the usage text states that omitting targets checks all discovered packages
 - **AND** the program exits with status `0` without loading configuration
 
 #### Scenario: Gencache help is command-scoped

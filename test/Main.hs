@@ -749,14 +749,17 @@ sampleEntries =
 
 testTargetResolution :: IO ()
 testTargetResolution = do
+  -- category/package exact key
   assertEq
     "full key"
     (Right (PackageKey "dev-lang/deno-bin"))
     (resolveTargetToken sampleEntries "dev-lang/deno-bin")
+  -- bare package name (unambiguous)
   assertEq
     "bare unique"
     (Right (PackageKey "dev-util/opencode-bin"))
     (resolveTargetToken sampleEntries "opencode-bin")
+  -- ambiguous bare name hard-fails
   case resolveTargetToken sampleEntries "foo" of
     Left (AmbiguousPackage "foo" keys) ->
       assertEq
@@ -766,11 +769,38 @@ testTargetResolution = do
     other -> do
       hPutStrLn stderr $ "expected ambiguous foo, got " <> show other
       exitFailure
+  -- zero tokens = full inventory (outdated/update/gencache)
   case resolveTargets sampleEntries [] of
-    Right keys ->
+    Right keys -> do
       assertEq "all keys count" 4 (length keys)
+      assertEq
+        "all keys set"
+        (sort (map packageKeyText keys))
+        ["bar/foo", "baz/foo", "dev-lang/deno-bin", "dev-util/opencode-bin"]
     Left e -> do
       hPutStrLn stderr $ "all targets: " <> show e
+      exitFailure
+  -- cat/pn and bare pn together; selected set only those keys
+  case resolveTargets sampleEntries ["dev-lang/deno-bin", "opencode-bin"] of
+    Right keys -> do
+      assertEq
+        "selected keys"
+        (sort (map packageKeyText keys))
+        ["dev-lang/deno-bin", "dev-util/opencode-bin"]
+      let selected = [e | e <- sampleEntries, peKey e `elem` keys]
+      assertEq "filtered entry count" 2 (length selected)
+      assertTrue
+        "unselected packages excluded"
+        (all (\e -> pePN e /= "foo") selected)
+    Left e -> do
+      hPutStrLn stderr $ "selected targets: " <> show e
+      exitFailure
+  -- unknown package hard-fails (alone or with valid tokens)
+  case resolveTargets sampleEntries ["missing/pkg"] of
+    Left errs ->
+      assertTrue "unknown alone" (any isUnknown errs)
+    Right _ -> do
+      hPutStrLn stderr "expected unknown missing/pkg"
       exitFailure
   case resolveTargets sampleEntries ["deno-bin", "nope"] of
     Left errs ->
@@ -778,9 +808,18 @@ testTargetResolution = do
     Right _ -> do
       hPutStrLn stderr "expected unknown error"
       exitFailure
+  -- ambiguous bare name in multi-token resolve hard-fails
+  case resolveTargets sampleEntries ["foo"] of
+    Left errs ->
+      assertTrue "has ambiguous" (any isAmbiguous errs)
+    Right _ -> do
+      hPutStrLn stderr "expected ambiguous foo"
+      exitFailure
   where
     isUnknown (UnknownPackage _) = True
     isUnknown _ = False
+    isAmbiguous (AmbiguousPackage _ _) = True
+    isAmbiguous _ = False
 
 testPreflightMissingTools :: IO ()
 testPreflightMissingTools = do
