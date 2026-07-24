@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 
-module Test.Progress (tests) where
+module Test.Progress (unitTests, integrationTests) where
 
 import CLI.Jobs
   ( mapConcurrentlyN,
@@ -269,13 +269,13 @@ import Update.Types
     packageKeyText,
   )
 
-tests :: TestTree
-tests =
+-- | Progress UI / state helpers without apply-plan spine.
+unitTests :: TestTree
+unitTests =
   testGroup
     "Progress"
     [ testCase "Multi Progress State" testMultiProgressState,
       testCase "Multi Progress Skip Vs Fail" testMultiProgressSkipVsFail,
-      testCase "Apply Progress Soft Skip Handle" testApplyProgressSoftSkipHandle,
       testCase "Plan Draw" testPlanDraw,
       testCase "Multi Progress Draw Throw No Hang" testMultiProgressDrawThrowNoHang,
       testCase "Multi Progress Body Throw No Hang" testMultiProgressBodyThrowNoHang,
@@ -284,6 +284,14 @@ tests =
       testCase "Step Progress Body Throw No Hang" testStepProgressBodyThrowNoHang,
       testCase "Step Progress Panel Fail Success" testStepProgressPanelFailSuccess,
       testCase "Pause Clear Throw Lock Not Stuck" testPauseClearThrowLockNotStuck
+    ]
+
+-- | Soft-skip handle drives ApplyEnv / PlanOps apply path.
+integrationTests :: TestTree
+integrationTests =
+  testGroup
+    "Progress"
+    [ testCase "Apply Progress Soft Skip Handle" testApplyProgressSoftSkipHandle
     ]
 
 testMultiProgressState :: IO ()

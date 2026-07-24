@@ -19,6 +19,7 @@ Prefer **[CONTRIBUTING.md](CONTRIBUTING.md)** for how to run tools and pass qual
 ```bash
 hk check          # full gate — required before “done” / shipping
 hk fix            # preflight + ormolu inplace only
+./scripts/coverage            # coverage-enabled tests + HPC reports (gate test step)
 ./scripts/install-dev-tools   # if .tools/bin tools are missing
 ```
 
@@ -30,5 +31,5 @@ hk fix            # preflight + ormolu inplace only
 4. **Keep project docs in sync.** If the change alters operator CLI/config, quality bootstrap/pipeline, or agent process, update the matching markdown file(s) in the **same** change per `project-docs`. Do not leave README/CONTRIBUTING/AGENTS for a follow-up. Do not re-host full command catalogs or pipeline tables in this file.
 5. **Do not weaken static analysis casually.** Prefer fixing code over broadening `.stan.toml` excludes or `weeder.toml` roots. Do not leave scaffold / unused exports that weeder will flag without deliberately updating `weeder.toml` with justification—and only with an explicit user decision when weakening baselines. **Do not reintroduce a blanket weeder `root-modules` list** covering essentially the entire library; roots must stay entrypoint-oriented (`Main.main`, justified public roots only). **Do not casually expand `exposed-modules`** without a real need from the executable or test-suite (prefer `other-modules` for internals).
 6. **HIE must match sources.** Do not run stan/weeder without a recent successful `cabal build all` (and the test component when weeder should see test roots). HIE lives under `.hie/{lib,exe,test}/` so app and test `Main` do not clobber each other. After deleting modules, clear stale HIE if needed (`rm -rf .hie && cabal build all`).
-7. **Keep tool pins in sync** if you change versions: both `cabal.project` and `scripts/install-dev-tools`. Do not commit `.tools/`, `.hie/`, or `dist-newstyle/`.
+7. **Keep tool pins in sync** if you change versions: both `cabal.project` and `scripts/install-dev-tools`. Do not commit `.tools/`, `.hie/`, `coverage/`, or `dist-newstyle/`.
 8. **No parallel hook stacks** (mise/pre-commit/lefthook, etc.) without an explicit design change. Do not lower `cabal-version` or drop HIE flags just to silence tools.

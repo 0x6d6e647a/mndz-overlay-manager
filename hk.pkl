@@ -33,11 +33,18 @@ local linters = new Mapping<String, Step> {
     check = "\(ormolu) --mode check {{files}}"
     fix = "\(ormolu) --mode inplace {{files}}"
   }
-  ["cabal-test"] {
+  ["cabal-build"] {
     exclusive = true
     workspace_indicator = "mndz-overlay-manager.cabal"
-    // Build all components (HIE for app+lib+test) then run tests.
-    check = "cabal build all && cabal test all"
+    // Non-coverage build: emits HIE under .hie/{lib,exe,test}/ for stan/weeder.
+    check = "cabal build all"
+  }
+  ["coverage"] {
+    exclusive = true
+    workspace_indicator = "mndz-overlay-manager.cabal"
+    // Instrumented tests + Overall/Unit/Integration HPC reports (scripts/coverage).
+    // Blocking test gate; floors are not enforced in phase 1.
+    check = "./scripts/coverage"
   }
   ["hlint"] {
     glob = hsGlob

@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 
-module Test.Md5Cache (tests) where
+module Test.Md5Cache (unitTests, integrationTests) where
 
 import CLI.Jobs
   ( mapConcurrentlyN,
@@ -275,15 +275,23 @@ import Update.Types
     packageKeyText,
   )
 
-tests :: TestTree
-tests =
+-- | Single-module md5-cache layout/status helpers and pure decisions.
+unitTests :: TestTree
+unitTests =
   testGroup
     "Md5Cache"
     [ testCase "Md5Cache Layout Gate" testMd5CacheLayoutGate,
       testCase "Md5Cache Match Mismatch Missing" testMd5CacheMatchMismatchMissing,
       testCase "Md5Cache Multi Version Completeness" testMd5CacheMultiVersionCompleteness,
-      testCase "Md5Cache Gencache Decisions" testMd5CacheGencacheDecisions,
-      testCase "Md5Cache Gate Blocks Git Mv" testMd5CacheGateBlocksGitMv,
+      testCase "Md5Cache Gencache Decisions" testMd5CacheGencacheDecisions
+    ]
+
+-- | Apply gate + gencache runner paths with ApplyEnv / temp overlays.
+integrationTests :: TestTree
+integrationTests =
+  testGroup
+    "Md5Cache"
+    [ testCase "Md5Cache Gate Blocks Git Mv" testMd5CacheGateBlocksGitMv,
       testCase "Gencache Force And Mismatch" testGencacheForceAndMismatch
     ]
 

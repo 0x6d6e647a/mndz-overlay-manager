@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# Run coverage-enabled tests and produce HPC reports (Overall / Unit / Integration).
+#
+# Usage (from repository root):
+#   ./scripts/coverage
+#
+# Pipeline position (hk): after non-coverage `cabal build all`, before hlint/stan/weeder.
+#
+# Outputs (gitignored under coverage/):
+#   coverage/html/          human HPC markup (Overall suite)
+#   coverage/summary.json   machine-readable Overall / Unit / Integration metrics
+#   coverage/tix/*.tix      saved tix snapshots used for reports
+#   coverage/xml/*.xml      raw hpc report --xml-output
+#
+# Product denominator: library modules under the package `*-inplace/` map, excluding
+# scaffolding listed in EXCLUDES (e.g. Update.Apply.TestSupport). Test modules are
+# not scored.
+#
+# Phase-1 success: instrumented tests pass and required reports are written.
+# Numeric floors / ratchet are intentionally NOT enforced.
+#
+# Requires: cabal-install, GHC (ships `hpc`), python3 (summary JSON only).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT}"
+
+OUT_DIR="${ROOT}/coverage"
+TIX_DIR="${OUT_DIR}/tix"
+XML_DIR="${OUT_DIR}/xml"
+HTML_DIR="${OUT_DIR}/html"
+SUMMARY_JSON="${OUT_DIR}/summary.json"
+
+# Scaffolding / injectability seams excluded from the product denominator.
+# Document changes here and in CONTRIBUTING.
+EXCLUDES=(
+  Update.Apply.TestSupport
+)
+
+# Test-suite modules (not product code).
+TEST_EXCLUDES=(
+  Main
+  Test.Apply
+  Test.Assert
+  Test.Assets
+  Test.CLI
+  Test.Config
+  Test.EbuildEdit
+  Test.Gpg
+  Test.Lanes
+  Test.Md5Cache
+  Test.Overlay
+  Test.Policy
+  Test.Preflight
+  Test.Progress
+  Test.Properties
+  Test.Ssh
+  Test.Support
+  Test.Targets
+)
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+need_cmd cabal
+need_cmd hpc
+need_cmd python3
+
+rm -rf "${OUT_DIR}"
+mkdir -p "${TIX_DIR}" "${XML_DIR}" "${HTML_DIR}"
+
+find_latest_tix() {
+  # Cabal writes: dist-newstyle/.../t/<suite>/hpc/vanilla/tix/<suite>.tix
+  local found
+  found="$(find "${ROOT}/dist-newstyle" -type f -path '*/hpc/vanilla/tix/*.tix' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr \
+    | head -n1 \
+    | cut -d' ' -f2- || true)"
+  if [[ -z "${found}" ]]; then
+    die "no HPC .tix found under dist-newstyle after coverage test run"
+  fi
+  printf '%s\n' "${found}"
+}
+
+collect_hpcdirs() {
+  # Parent mix directories containing per-component mix folders.
+  find "${ROOT}/dist-newstyle" -type d -path '*/hpc/vanilla/mix' -print 2>/dev/null | sort -u
+}
+
+# Discover library package prefix from a tix file (e.g. mndz-overlay-manager-0.1.0.0-inplace).
+discover_lib_package() {
+  local tix="$1"
+  python3 - "$tix" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+mods = re.findall(r'TixModule "([^"]+)"', text)
+for m in mods:
+    if "/" not in m:
+        continue
+    pkg, mod = m.split("/", 1)
+    # Library package is *-inplace without the test-suite suffix.
+    if pkg.endswith("-inplace") and "mndz-overlay-manager-test" not in pkg and not mod.startswith("Test."):
+        print(pkg)
+        sys.exit(0)
+sys.exit("error: could not discover library package prefix from tix")
+PY
+}
+
+run_hpc_report() {
+  local label="$1"
+  local tix="$2"
+  local lib_pkg="$3"
+  shift 3
+  local hpcdirs=("$@")
+
+  local args=(report "${tix}")
+  local d
+  for d in "${hpcdirs[@]}"; do
+    args+=(--hpcdir="${d}")
+  done
+  args+=(--include="${lib_pkg}:")
+  local e
+  for e in "${EXCLUDES[@]}"; do
+    args+=(--exclude="${e}")
+  done
+  for e in "${TEST_EXCLUDES[@]}"; do
+    args+=(--exclude="${e}")
+  done
+
+  echo "---- HPC report: ${label} ----"
+  # Text report is the source of truth for percentages (boolean = fully covered).
+  hpc "${args[@]}" | tee "${XML_DIR}/${label}.txt"
+  hpc "${args[@]}" --xml-output >"${XML_DIR}/${label}.xml"
+}
+
+run_hpc_markup() {
+  local tix="$1"
+  local lib_pkg="$2"
+  shift 2
+  local hpcdirs=("$@")
+
+  # Mix files store paths like "src/Module/File.hs"; srcdir is the repo root.
+  local args=(markup "${tix}" --destdir="${HTML_DIR}" --srcdir="${ROOT}")
+  local d
+  for d in "${hpcdirs[@]}"; do
+    args+=(--hpcdir="${d}")
+  done
+  args+=(--include="${lib_pkg}:")
+  local e
+  for e in "${EXCLUDES[@]}"; do
+    args+=(--exclude="${e}")
+  done
+  for e in "${TEST_EXCLUDES[@]}"; do
+    args+=(--exclude="${e}")
+  done
+
+  echo "---- HPC markup → ${HTML_DIR} ----"
+  hpc "${args[@]}"
+}
+
+run_tests() {
+  local label="$1"
+  local pattern="${2:-}"
+
+  echo "==== Coverage test run: ${label}${pattern:+ (tasty -p ${pattern})} ===="
+  if [[ -n "${pattern}" ]]; then
+    cabal test all --enable-coverage --test-show-details=direct \
+      --test-options="-p ${pattern}"
+  else
+    cabal test all --enable-coverage --test-show-details=direct
+  fi
+
+  local tix
+  tix="$(find_latest_tix)"
+  cp -f "${tix}" "${TIX_DIR}/${label}.tix"
+  echo "saved tix: ${TIX_DIR}/${label}.tix (from ${tix})"
+}
+
+# --- runs ---
+# Overall first (full suite correctness gate), then attribution runs.
+run_tests overall
+run_tests unit Unit
+run_tests integration Integration
+
+mapfile -t HPCDIRS < <(collect_hpcdirs)
+if [[ "${#HPCDIRS[@]}" -eq 0 ]]; then
+  die "no hpc/vanilla/mix directories found under dist-newstyle"
+fi
+echo "hpc mix dirs:"
+printf '  %s\n' "${HPCDIRS[@]}"
+
+LIB_PKG="$(discover_lib_package "${TIX_DIR}/overall.tix")"
+echo "library package prefix: ${LIB_PKG}"
+echo "product excludes: ${EXCLUDES[*]}"
+
+for label in overall unit integration; do
+  run_hpc_report "${label}" "${TIX_DIR}/${label}.tix" "${LIB_PKG}" "${HPCDIRS[@]}"
+done
+
+run_hpc_markup "${TIX_DIR}/overall.tix" "${LIB_PKG}" "${HPCDIRS[@]}"
+
+# Machine-readable summary from hpc text reports (matches printed percentages).
+python3 - "${SUMMARY_JSON}" "${XML_DIR}" "${EXCLUDES[@]}" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+xml_dir = Path(sys.argv[2])
+excludes = list(sys.argv[3:])
+
+def pct(count, total):
+    if total <= 0:
+        return None
+    return round(100.0 * count / total, 2)
+
+def parse_text(path):
+    """Parse hpc report text for expressions / alternatives / booleans."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    # Examples:
+    #   45% expressions used (6167/13644)
+    #   20% boolean coverage (72/348)
+    #   36% alternatives used (525/1433)
+    exp = re.search(r"([\d.]+)% expressions used \((\d+)/(\d+)\)", text)
+    boolean = re.search(r"([\d.]+)% boolean coverage \((\d+)/(\d+)\)", text)
+    alts = re.search(r"([\d.]+)% alternatives used \((\d+)/(\d+)\)", text)
+    if not (exp and boolean and alts):
+        raise SystemExit(f"error: could not parse hpc text report: {path}")
+
+    def row(m):
+        covered = int(m.group(2))
+        total = int(m.group(3))
+        return {
+            "covered": covered,
+            "total": total,
+            "percent": pct(covered, total),
+        }
+
+    return {
+        "expressions": row(exp),
+        "alternatives": row(alts),
+        "booleans": row(boolean),
+    }
+
+rows = {}
+for label, key in (("overall", "Overall"), ("unit", "Unit"), ("integration", "Integration")):
+    path = xml_dir / f"{label}.txt"
+    if not path.is_file():
+        raise SystemExit(f"error: missing report text: {path}")
+    rows[key] = parse_text(path)
+
+doc = {
+    "engine": "hpc",
+    "phase": 1,
+    "floors_enforced": False,
+    "excludes": excludes,
+    "metrics": rows,
+}
+summary_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+print(f"wrote {summary_path}")
+print()
+print("Coverage summary (product modules; floors not enforced):")
+print(f"{'Level':<14} {'expr%':>8} {'alt%':>8} {'bool%':>8}")
+for key in ("Overall", "Unit", "Integration"):
+    m = rows[key]
+
+    def fmt(x):
+        p = m[x]["percent"]
+        return "n/a" if p is None else f"{p:.1f}"
+
+    print(f"{key:<14} {fmt('expressions'):>8} {fmt('alternatives'):>8} {fmt('booleans'):>8}")
+PY
+
+# Required artifacts
+[[ -f "${SUMMARY_JSON}" ]] || die "summary.json was not written"
+[[ -d "${HTML_DIR}" ]] || die "HTML markup directory missing"
+# At least one HTML index or module page
+if ! find "${HTML_DIR}" -type f \( -name '*.html' -o -name 'hpc_index*' \) | grep -q .; then
+  die "no HTML markup files under ${HTML_DIR}"
+fi
+for label in overall unit integration; do
+  [[ -f "${XML_DIR}/${label}.xml" ]] || die "missing ${XML_DIR}/${label}.xml"
+  [[ -f "${TIX_DIR}/${label}.tix" ]] || die "missing ${TIX_DIR}/${label}.tix"
+done
+
+echo
+echo "coverage entrypoint OK"
+echo "  summary: ${SUMMARY_JSON}"
+echo "  html:    ${HTML_DIR}/"

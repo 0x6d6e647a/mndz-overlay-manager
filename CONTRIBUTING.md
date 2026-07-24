@@ -11,7 +11,7 @@ AI coding agents should also read **[AGENTS.md](AGENTS.md)**.
 2. **Tools are project-local only.** Hooks use `.tools/bin/*`, never ambient `ormolu` / `hlint` / `stan` / `weeder` on `PATH`.
 3. **Strict bootstrap.** If a tool is missing, hooks **fail** and instruct you to run `./scripts/install-dev-tools`. Hooks do not auto-install and do not fall back to global binaries.
 4. **Keep tool pins in sync** when changing versions: `cabal.project` **and** `scripts/install-dev-tools`.
-5. **Do not commit** `.tools/`, `.hie/`, or `dist-newstyle/`.
+5. **Do not commit** `.tools/`, `.hie/`, `coverage/`, or `dist-newstyle/`.
 6. **Do not** add mise/pre-commit/lefthook as a parallel tool path without a design change.
 7. **Do not** `cabal install` quality tools into `~/.local/bin` for “convenience” in this repo’s workflow.
 8. **Do not** disable pre-commit (`--no-verify`) to land work that fails gates.
@@ -101,10 +101,15 @@ Same order as `hk.pkl` / pre-commit:
 |---|------|----------------|
 | 0 | Preflight | `.tools/bin/{ormolu,hlint,stan,weeder}` must be executable |
 | 1 | Format | `.tools/bin/ormolu --mode check` / `--mode inplace` |
-| 2 | Build + test | `cabal build all && cabal test all` (emits HIE under `.hie/{lib,exe,test}/`) |
-| 3 | Lint | `.tools/bin/hlint` on `*.hs` |
-| 4 | Stan | `.tools/bin/stan --hiedir=.hie/lib` (config: `.stan.toml`) |
-| 5 | Weeder | `.tools/bin/weeder --config=weeder.toml --hie-directory=.hie/lib --hie-directory=.hie/exe --hie-directory=.hie/test` |
+| 2 | Build (HIE) | `cabal build all` — non-coverage build; emits HIE under `.hie/{lib,exe,test}/` for stan/weeder |
+| 3 | Coverage tests + reports | `./scripts/coverage` — `cabal test all --enable-coverage` (Overall, then Unit, then Integration) and HPC reports |
+| 4 | Lint | `.tools/bin/hlint` on `*.hs` |
+| 5 | Stan | `.tools/bin/stan --hiedir=.hie/lib` (config: `.stan.toml`) |
+| 6 | Weeder | `.tools/bin/weeder --config=weeder.toml --hie-directory=.hie/lib --hie-directory=.hie/exe --hie-directory=.hie/test` |
+
+Coverage is the **blocking test gate**. There is no separate uninstrumented `cabal test all` in the hook path. Stan and weeder always consume HIE from the non-coverage build step (step 2), not from coverage-flagged objects.
+
+**Phase 1:** the coverage step fails only if instrumented tests fail or required reports cannot be produced. **Numeric coverage floors / ratchet baselines are not enforced yet** (measure first; floors are a follow-up once summary numbers exist).
 
 #### Stan baseline
 
@@ -127,14 +132,16 @@ hk check          # full gate (same as pre-commit, check-oriented)
 hk fix            # preflight + ormolu inplace only
 ```
 
-Do not run stan/weeder without a recent successful `cabal build all` (HIE must match sources and GHC).
+Do not run stan/weeder without a recent successful non-coverage `cabal build all` (HIE must match sources and GHC). Coverage builds use a separate Cabal plan and must not be treated as the HIE source for analyzers.
 
 ### Day-to-day commands
 
 ```bash
-hk check          # full gate
+hk check          # full gate (build + coverage + analyzers)
 hk fix            # preflight + ormolu fix only
 hk run pre-commit # exercise the pre-commit hook without committing
+
+./scripts/coverage   # instrumented tests + HPC reports only
 
 # After editing pin versions:
 ./scripts/install-dev-tools
@@ -144,18 +151,41 @@ hk run pre-commit # exercise the pre-commit hook without committing
 
 The test suite is a **tasty** harness under `test/` with domain modules (`test/Test/*.hs`) and a thin `test/Main.hs`. Fixtures live in `test/fixtures/`.
 
+Top-level tasty groups are **`Unit`** and **`Integration`** (isolation levels for coverage attribution):
+
+| Level | Meaning |
+|-------|---------|
+| **Unit** | Single library concern; no multi-step apply/plan/commit spine; I/O limited to small committed fixtures or pure in-memory behavior. Property tests (QuickCheck) count as Unit technique. |
+| **Integration** | Multi-module workflow; temporary overlay mutation; `ApplyEnv` / `PlanOps` / runners / multi-phase behavior. |
+| **Overall** | Full suite (union used for the primary human markup and Overall summary row). |
+
 ```bash
-cabal test all                          # full suite (required gate)
-cabal test all --test-options='-p Overlay'   # tasty pattern filter (subset)
+cabal test all                                    # full suite (uninstrumented; local iteration)
+cabal test all --test-options='-p Unit'           # unit isolation group only
+cabal test all --test-options='-p Integration'    # integration isolation group only
+cabal test all --test-options='-p Overlay'        # tasty pattern filter (domain subset)
+./scripts/coverage                                # gate-equivalent: coverage-enabled tests + reports
 ```
 
-Tasty’s `-p` / `--pattern` accepts a pattern over test names (see [tasty’s pattern syntax](https://github.com/UnkindPartition/tasty#patterns)). Prefer the full suite before shipping; filters are for local iteration.
+Tasty’s `-p` / `--pattern` accepts a pattern over test names (see [tasty’s pattern syntax](https://github.com/UnkindPartition/tasty#patterns)). Prefer `./scripts/coverage` or full `hk check` before shipping; uninstrumented filters are for local iteration.
+
+### Coverage reports
+
+| Artifact | Path |
+|----------|------|
+| Machine summary (Overall / Unit / Integration) | `coverage/summary.json` |
+| Human HPC markup (Overall) | `coverage/html/` |
+| Saved tix / XML | `coverage/tix/`, `coverage/xml/` |
+
+Metrics are HPC-native: **expressions**, **alternatives**, and **booleans**. Scored modules are product library code under `src/` (and executable modules when present in the map). **`Update.Apply.TestSupport`** is excluded from the product denominator (scaffolding); the exclude list lives in `scripts/coverage` and should stay in sync with this note.
+
+Generated coverage output is **gitignored** — do not commit HTML, `.tix`, or summary files. There is no committed floor/baseline file in phase 1.
 
 ### Edit → verify loop
 
 1. Implement the change (prefer OpenSpec change tasks when one is active).
 2. Format: `hk fix` or `.tools/bin/ormolu --mode inplace …`.
-3. Tests: `cabal test all` (or full `hk check`).
+3. Tests: `./scripts/coverage` (or full `hk check`). For a quick uninstrumented smoke: `cabal test all`.
 4. Fix hlint/stan/weeder findings; do not weaken configs without intent.
 5. Re-run `hk check` until green.
 6. Mark OpenSpec tasks complete only when the relevant gate is green.
@@ -166,7 +196,8 @@ Tasty’s `-p` / `--pattern` accepts a pattern over test names (see [tasty’s p
 |---------|------------|
 | `missing project tool: .tools/bin/...` | Run `./scripts/install-dev-tools` |
 | ormolu wants a reformat | `hk fix` or `.tools/bin/ormolu --mode inplace path/to/File.hs` |
-| tests / build fail | Fix compile/test errors; `cabal test all` locally |
+| tests / build fail | Fix compile/test errors; `cabal test all` or `./scripts/coverage` locally |
+| coverage report missing / script error | Ensure `hpc` is on PATH (ships with GHC); inspect `scripts/coverage` output; confirm `.tix` under `dist-newstyle/.../hpc/vanilla/tix/` |
 | hlint hints | Apply suggestions or adjust code; default hlint must be clean |
 | stan observations | Fix code; update `.stan.toml` only with intent (baseline excludes are deliberate) |
 | weeder weeds (exit 228) | Remove dead code or adjust `weeder.toml` `roots` / `root-modules` with justification |
@@ -187,8 +218,10 @@ Product behavior is specified under OpenSpec:
 ```
 app/                 executable
 src/                 library
-test/                tasty suite: Main.hs, Test/* modules, fixtures/
+test/                tasty suite: Main.hs (Unit/Integration groups), Test/* modules, fixtures/
 scripts/install-dev-tools
+scripts/coverage     HPC coverage entrypoint (gate test step)
+coverage/            generated reports (gitignored)
 hk.pkl               hook configuration
 weeder.toml          weeder roots
 .stan.toml           stan baseline checks

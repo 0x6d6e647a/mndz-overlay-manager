@@ -13,3 +13,7 @@ Thumbs.db
 # Dev quality tools (scripts/install-dev-tools) and HIE output (stan/weeder)
 .tools/
 .hie/
+
+# HPC coverage reports (scripts/coverage); do not commit HTML/tix/summaries
+coverage/
+*.tix

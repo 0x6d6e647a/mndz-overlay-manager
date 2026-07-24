@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 
-module Test.Lanes (tests) where
+module Test.Lanes (unitTests, integrationTests) where
 
 import CLI.Jobs
   ( mapConcurrentlyN,
@@ -269,8 +269,9 @@ import Update.Types
     packageKeyText,
   )
 
-tests :: TestTree
-tests =
+-- | Pure / single-concern lane ceilings, filters, and cache helpers.
+unitTests :: TestTree
+unitTests =
   testGroup
     "Lanes"
     [ testCase "Go Tree Ceilings" testGoTreeCeilings,
@@ -283,14 +284,21 @@ tests =
       testCase "Go Lane Collapse" testGoLaneCollapse,
       testCase "Go Gap Lines" testGoGapLines,
       testCase "Go Strip And Parse List" testGoStripAndParseList,
-      testCase "Go Plan Integration Mocked" testGoPlanIntegrationMocked,
+      testCase "Go Mod Cache Concurrent Distinct Keys" testGoModCacheConcurrentDistinctKeys,
+      testCase "Go Mod Cache Hit No Refetch" testGoModCacheHitNoRefetch
+    ]
+
+-- | PlanOps-driven go plan / probe workflows (multi-phase planning).
+integrationTests :: TestTree
+integrationTests =
+  testGroup
+    "Lanes"
+    [ testCase "Go Plan Integration Mocked" testGoPlanIntegrationMocked,
       testCase "Go Mod Probe Early Exit Tip Fills All" testGoModProbeEarlyExitTipFillsAll,
       testCase "Go Mod Probe Early Exit Plain Older" testGoModProbeEarlyExitPlainOlder,
       testCase "Go Mod Probe Early Exit Matches Full Probe" testGoModProbeEarlyExitMatchesFullProbe,
       testCase "Go Mod Probe Early Exit Skips Unparseable Tip" testGoModProbeEarlyExitSkipsUnparseableTip,
-      testCase "Go Plan Progress Coarse Steps" testGoPlanProgressCoarseSteps,
-      testCase "Go Mod Cache Concurrent Distinct Keys" testGoModCacheConcurrentDistinctKeys,
-      testCase "Go Mod Cache Hit No Refetch" testGoModCacheHitNoRefetch
+      testCase "Go Plan Progress Coarse Steps" testGoPlanProgressCoarseSteps
     ]
 
 ------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 
-module Test.Apply (tests) where
+module Test.Apply (unitTests, integrationTests) where
 
 import CLI.Jobs
   ( mapConcurrentlyN,
@@ -275,25 +275,33 @@ import Update.Types
     packageKeyText,
   )
 
-tests :: TestTree
-tests =
+-- | Single-concern helpers (pure apply math / vendor event order).
+unitTests :: TestTree
+unitTests =
   testGroup
     "Apply"
     [ testCase "New Ebuild File Name" testNewEbuildFileName,
       testCase "Fold Exit Hard Fail" testFoldExitHardFail,
-      testCase "Content Fix Manifest" testContentFixManifest,
       testCase "Mark Success Lines Reused" testMarkSuccessLinesReused,
+      testCase "Vendor Progress Event Order" testVendorProgressEventOrder,
+      testCase "Materialize Step Budget" testMaterializeStepBudget,
+      testCase "Bdepend Mismatch Needs Fix" testBdependMismatchNeedsFix,
+      testCase "Bdepend Missing Needs Fix" testBdependMissingNeedsFix
+    ]
+
+-- | Multi-module apply/plan/commit spine with ApplyEnv / PlanOps / temp overlays.
+integrationTests :: TestTree
+integrationTests =
+  testGroup
+    "Apply"
+    [ testCase "Content Fix Manifest" testContentFixManifest,
       testCase "Reuse Vs Full Publish" testReuseVsFullPublish,
       testCase "Git Mv Commits On Success" testGitMvCommitsOnSuccess,
       testCase "Go Multi Pv Sequential Commits" testGoMultiPvSequentialCommits,
       testCase "Go Multi Pv Stop On Hard Fail" testGoMultiPvStopOnHardFail,
-      testCase "Vendor Progress Event Order" testVendorProgressEventOrder,
       testCase "Full Path Apply Progress Sequence" testFullPathApplyProgressSequence,
       testCase "Reuse Path Apply Progress Sequence" testReusePathApplyProgressSequence,
-      testCase "Materialize Step Budget" testMaterializeStepBudget,
-      testCase "Overlay Commit Lock" testOverlayCommitLock,
-      testCase "Bdepend Mismatch Needs Fix" testBdependMismatchNeedsFix,
-      testCase "Bdepend Missing Needs Fix" testBdependMissingNeedsFix
+      testCase "Overlay Commit Lock" testOverlayCommitLock
     ]
 
 testNewEbuildFileName :: IO ()
