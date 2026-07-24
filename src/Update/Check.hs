@@ -49,8 +49,8 @@ import Update.EbuildEdit
 import Update.GitHub (fetchGitHubWith)
 import Update.Go.Lanes
   ( GapLine (..),
-    GoLanePlan (..),
     PlannedEbuild (..),
+    RuntimeLanePlan (..),
     buildGapLines,
     missingTargets,
     planNeedsWork,
@@ -340,7 +340,7 @@ contentFixPVs ::
   EcosystemSpec ->
   UpdateSource ->
   [Ebuild] ->
-  GoLanePlan ->
+  RuntimeLanePlan ->
   IO [EbuildVersion]
 contentFixPVs depsOps eco src locals plan = do
   let planned = glpEbuilds plan

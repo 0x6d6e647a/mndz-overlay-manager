@@ -137,10 +137,10 @@ import Update.Git (GitOps (..))
 import Update.GitHub (stripAndParse)
 import Update.Go.Lanes
   ( GapLine (..),
-    GoLanePlan (..),
     LaneId (..),
     LaneTarget (..),
     PlannedEbuild (..),
+    RuntimeLanePlan (..),
     VersionCandidate (..),
     assembleKeywords,
     buildGapLines,
@@ -167,21 +167,6 @@ import Update.Go.Plan
     noopPlanProgress,
     planGoPackage,
     planGoPackageWithProgress,
-  )
-import Update.Go.Tree
-  ( ArchCeilings (..),
-    RuntimeCeilings (..),
-    RuntimeEbuildMeta (..),
-    computeCeilings,
-    discoverGoCeilingsWith,
-    emptyCeilings,
-    isLiveGoVersion,
-    keywordsHasBare,
-    keywordsHasTildeOrBare,
-    mergeCeilingsMax,
-    normalizeArchToken,
-    parseGoEbuildMeta,
-    parseKeywordsField,
   )
 import Update.Go.Vendor
   ( VendorOps (..),
@@ -231,6 +216,21 @@ import Update.Md5Cache
 import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
+import Update.Runtime.Ceilings
+  ( ArchCeilings (..),
+    RuntimeCeilings (..),
+    RuntimeEbuildMeta (..),
+    computeCeilings,
+    discoverGoCeilingsWith,
+    emptyCeilings,
+    isLiveRuntimeVersion,
+    keywordsHasBare,
+    keywordsHasTildeOrBare,
+    mergeCeilingsMax,
+    normalizeArchToken,
+    parseKeywordsField,
+    parseRuntimeEbuildMeta,
+  )
 import Update.SshAgent
   ( AgentIdentities (..),
     SshAgentOps (..),
@@ -1577,9 +1577,9 @@ testGoTreeCeilings = do
   assertTrue "not bare when tilde only" (not (keywordsHasBare "amd64" kwTilde))
   assertTrue "tilde or bare for ~amd64" (keywordsHasTildeOrBare "amd64" kwTilde)
   assertTrue "tilde or bare for bare" (keywordsHasTildeOrBare "amd64" kwPlain)
-  assertTrue "live 9999" (isLiveGoVersion (parseEbuildVersion "9999"))
-  assertTrue "not live" (not (isLiveGoVersion (parseEbuildVersion "1.26.3")))
-  case parseGoEbuildMeta "/x/go-9999.ebuild" "KEYWORDS=\"~amd64\"\n" of
+  assertTrue "live 9999" (isLiveRuntimeVersion (parseEbuildVersion "9999"))
+  assertTrue "not live" (not (isLiveRuntimeVersion (parseEbuildVersion "1.26.3")))
+  case parseRuntimeEbuildMeta "/x/go-9999.ebuild" "KEYWORDS=\"~amd64\"\n" of
     Nothing -> pure ()
     Just _ -> do
       hPutStrLn stderr "expected Nothing for live go ebuild"
@@ -2179,7 +2179,7 @@ mkEarlyExitPlanOps versions fetchBody = do
           }
   pure (planOps, fetchTags)
 
-lanePV :: GoLanePlan -> LaneId -> Maybe EbuildVersion
+lanePV :: RuntimeLanePlan -> LaneId -> Maybe EbuildVersion
 lanePV plan lid =
   case [ltPackagePV t | t <- glpLanes plan, ltLane t == lid] of
     (m : _) -> m
@@ -2891,7 +2891,7 @@ testContentFixManifest =
               "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
             ]
         plan =
-          GoLanePlan
+          RuntimeLanePlan
             { glpLanes = [],
               glpEbuilds =
                 [ PlannedEbuild
@@ -3308,7 +3308,7 @@ testGoMultiPvSequentialCommits =
               pePath = pkgDir </> "crush-0.80.0.ebuild"
             }
         plan =
-          GoLanePlan
+          RuntimeLanePlan
             { glpLanes = [],
               glpEbuilds =
                 [ PlannedEbuild {pePV = pv1, peKeywords = ["~amd64"], peLanes = []},
@@ -3469,7 +3469,7 @@ testGoMultiPvStopOnHardFail =
               pePath = pkgDir </> "crush-0.80.0.ebuild"
             }
         plan =
-          GoLanePlan
+          RuntimeLanePlan
             { glpLanes = [],
               glpEbuilds =
                 [ PlannedEbuild {pePV = pv1, peKeywords = ["~amd64"], peLanes = []},

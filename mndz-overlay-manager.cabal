@@ -92,9 +92,9 @@ library
       , Update.Go.Lanes
       , Update.Go.ModFetch
       , Update.Go.Plan
-      , Update.Go.Tree
       , Update.Go.Vendor
       , Update.Go.Version
+      , Update.GpgAgent
       , Update.Hardcoded
       , Update.Http
       , Update.Md5Cache
@@ -102,7 +102,7 @@ library
       , Update.Npm.Cache
       , Update.Preflight
       , Update.Resolve
-      , Update.GpgAgent
+      , Update.Runtime.Ceilings
       , Update.SshAgent
       , Update.Targets
       , Update.TextUtil

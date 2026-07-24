@@ -115,8 +115,8 @@ import Update.EbuildEdit
 import Update.Git (GitOps (..), relativeOverlayPath)
 import Update.Go.Lanes
   ( GapLine (..),
-    GoLanePlan (..),
     PlannedEbuild (..),
+    RuntimeLanePlan (..),
     buildGapLines,
     missingTargets,
     planNeedsWork,
@@ -589,7 +589,7 @@ contentFixNeededEnv ::
   UpdateSource ->
   FilePath ->
   Text ->
-  GoLanePlan ->
+  RuntimeLanePlan ->
   IO [EbuildVersion]
 contentFixNeededEnv env eco src pkgDir pn plan =
   concat <$> mapM checkPlanned (glpEbuilds plan)
@@ -690,7 +690,7 @@ contentFixNeeded ::
   Maybe FilePath ->
   FilePath ->
   Text ->
-  GoLanePlan ->
+  RuntimeLanePlan ->
   IO [EbuildVersion]
 contentFixNeeded env owner repo prefix mSub =
   contentFixNeededEnv env (Go mSub) (GitHub owner repo prefix)
@@ -712,7 +712,7 @@ materializeDepsPlan ::
   PackageEntry ->
   UpdateSource ->
   EcosystemSpec ->
-  GoLanePlan ->
+  RuntimeLanePlan ->
   [EbuildVersion] ->
   [EbuildVersion] ->
   Int ->
@@ -803,7 +803,7 @@ materializePlan ::
   Text ->
   Text ->
   Maybe FilePath ->
-  GoLanePlan ->
+  RuntimeLanePlan ->
   [EbuildVersion] ->
   [EbuildVersion] ->
   Int ->
@@ -816,7 +816,7 @@ materializePlan env overlayRoot entry owner repo prefix mSub =
     (GitHub owner repo prefix)
     (Go mSub)
 
-gapSuccessLines :: [EbuildVersion] -> [EbuildVersion] -> GoLanePlan -> [SuccessLine]
+gapSuccessLines :: [EbuildVersion] -> [EbuildVersion] -> RuntimeLanePlan -> [SuccessLine]
 gapSuccessLines localPVs needs plan =
   [ SuccessLine
       { slFrom = glFrom g,
@@ -838,7 +838,7 @@ materializeOneDeps ::
   UpdateSource ->
   EcosystemSpec ->
   [EbuildVersion] ->
-  GoLanePlan ->
+  RuntimeLanePlan ->
   PlannedEbuild ->
   IORef Int ->
   Int ->
@@ -868,7 +868,7 @@ pruneExtras ::
   ApplyEnv ->
   FilePath ->
   PackageEntry ->
-  GoLanePlan ->
+  RuntimeLanePlan ->
   IO (Either Text [FilePath])
 pruneExtras env overlayRoot entry plan = do
   let pkgDir = takeDirectory (pePath entry)

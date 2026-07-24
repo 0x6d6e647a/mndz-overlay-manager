@@ -1,14 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Update.Go.Tree
+module Update.Runtime.Ceilings
   ( Arch,
     KeywordTier (..),
     CeilingLane (..),
     ArchCeilings (..),
     RuntimeCeilings (..),
-    GoCeilings,
     RuntimeEbuildMeta (..),
-    GoEbuildMeta,
     PortageqRunner,
     productionPortageqRunner,
     gentooRepoPath,
@@ -20,9 +18,7 @@ module Update.Go.Tree
     keywordsHasBare,
     keywordsHasTildeOrBare,
     isLiveRuntimeVersion,
-    isLiveGoVersion,
     parseRuntimeEbuildMeta,
-    parseGoEbuildMeta,
     discoverArches,
     computeCeilings,
     emptyCeilings,
@@ -89,9 +85,6 @@ data RuntimeCeilings = RuntimeCeilings
   }
   deriving (Eq, Show)
 
--- | Historical alias used by Go planning paths.
-type GoCeilings = RuntimeCeilings
-
 goRuntimeAtom :: Text
 goRuntimeAtom = "dev-lang/go"
 
@@ -131,8 +124,6 @@ data RuntimeEbuildMeta = RuntimeEbuildMeta
     remKeywords :: [Text]
   }
   deriving (Eq, Show)
-
-type GoEbuildMeta = RuntimeEbuildMeta
 
 -- | Injectable @portageq@ runner: args → stdout or error.
 type PortageqRunner = [String] -> IO (Either Text Text)
@@ -228,9 +219,6 @@ isLiveRuntimeVersion (Numeric comps _)
 isLiveRuntimeVersion (Raw t) =
   T.strip t == "9999" || "9999" `T.isPrefixOf` t
 
-isLiveGoVersion :: EbuildVersion -> Bool
-isLiveGoVersion = isLiveRuntimeVersion
-
 -- | Discover arch names from KEYWORDS (strip @~@; ignore @-*@).
 discoverArches :: [RuntimeEbuildMeta] -> [Arch]
 discoverArches metas =
@@ -282,9 +270,6 @@ parseRuntimeEbuildMeta path content =
                   { remPV = pv,
                     remKeywords = parseKeywordsField content
                   }
-
-parseGoEbuildMeta :: FilePath -> Text -> Maybe GoEbuildMeta
-parseGoEbuildMeta = parseRuntimeEbuildMeta
 
 -- | Compute ceilings from already-parsed runtime ebuild metadata.
 computeCeilings :: Text -> [RuntimeEbuildMeta] -> RuntimeCeilings

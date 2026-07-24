@@ -41,7 +41,7 @@ root-modules = [
   "Update.Deps.Plan",
   "Update.Engines",
   "Update.Go.Lanes",
-  "Update.Go.Tree",
+  "Update.Runtime.Ceilings",
   "Update.Resolve",
   "Update.GpgAgent",
   "Update.SshAgent",

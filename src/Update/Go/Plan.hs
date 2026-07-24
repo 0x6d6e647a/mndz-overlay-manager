@@ -26,8 +26,8 @@ import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPVNoRev)
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
-  ( GoLanePlan (..),
-    LaneTarget (..),
+  ( LaneTarget (..),
+    RuntimeLanePlan (..),
     VersionCandidate (..),
     filterCandidateVersions,
     planFromTargetsWithAtom,
@@ -41,13 +41,13 @@ import Update.Go.ModFetch
     productionGoModFetcher,
     withGoModCache,
   )
-import Update.Go.Tree
+import Update.Go.Vendor (versionTag)
+import Update.Runtime.Ceilings
   ( PortageqRunner,
     RuntimeCeilings (..),
     discoverGoCeilingsWith,
     productionPortageqRunner,
   )
-import Update.Go.Vendor (versionTag)
 import Update.Types (UpdateSource (..))
 
 -- | Injectable dependencies for Go tree-lane planning.
@@ -142,7 +142,7 @@ planGoPackage ::
   PlanOps ->
   UpdateSource ->
   Maybe FilePath ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planGoPackage ops = planGoPackageWithProgress ops noopPlanProgress
 
 planGoPackageWithProgress ::
@@ -150,7 +150,7 @@ planGoPackageWithProgress ::
   PlanProgress ->
   UpdateSource ->
   Maybe FilePath ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planGoPackageWithProgress ops progress src mSub =
   -- Without local PVs, treat listed upstream as the full candidate set
   -- (tests that mock listVersions only). Production apply/check pass locals.
@@ -164,7 +164,7 @@ planGoPackageWithLocals ::
   UpdateSource ->
   Maybe FilePath ->
   Maybe [EbuildVersion] ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planGoPackageWithLocals ops =
   planGoPackageWithLocalsProgress ops noopPlanProgress
 
@@ -174,7 +174,7 @@ planGoPackageWithLocalsProgress ::
   UpdateSource ->
   Maybe FilePath ->
   Maybe [EbuildVersion] ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planGoPackageWithLocalsProgress ops progress src mSub mLocals =
   case src of
     GitHub owner repo prefix -> do

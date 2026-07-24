@@ -14,8 +14,7 @@ module Update.Go.Lanes
     laneCeilingLane,
     LaneTarget (..),
     PlannedEbuild (..),
-    GoLanePlan (..),
-    LanePlan,
+    RuntimeLanePlan (..),
     GapLine (..),
     VersionCandidate (..),
     selectLaneTarget,
@@ -39,7 +38,8 @@ import Data.List (nub, sort, sortBy)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, samePV)
-import Update.Go.Tree
+import Update.Go.Version (compareGoVersions)
+import Update.Runtime.Ceilings
   ( Arch,
     CeilingLane (..),
     KeywordTier (..),
@@ -47,7 +47,6 @@ import Update.Go.Tree
     allCeilingLanes,
     ceilingFor,
   )
-import Update.Go.Version (compareGoVersions)
 
 -- | Logical lane id: arch × plain/tilde.
 data LaneId = LaneId
@@ -117,7 +116,7 @@ data PlannedEbuild = PlannedEbuild
   deriving (Eq, Show)
 
 -- | Full plan for one DepsAndAssets package (runtime lanes).
-data GoLanePlan = GoLanePlan
+data RuntimeLanePlan = RuntimeLanePlan
   { glpLanes :: [LaneTarget],
     glpEbuilds :: [PlannedEbuild],
     glpUniquePVs :: [EbuildVersion],
@@ -125,8 +124,6 @@ data GoLanePlan = GoLanePlan
     glpRuntimeAtom :: Text
   }
   deriving (Eq, Show)
-
-type LanePlan = GoLanePlan
 
 -- | One outdated/success report line.
 data GapLine = GapLine
@@ -228,13 +225,13 @@ collapsePlannedEbuilds targets =
               peLanes = lanes
             }
 
-planFromTargets :: [LaneTarget] -> GoLanePlan
+planFromTargets :: [LaneTarget] -> RuntimeLanePlan
 planFromTargets = planFromTargetsWithAtom "dev-lang/go"
 
-planFromTargetsWithAtom :: Text -> [LaneTarget] -> GoLanePlan
+planFromTargetsWithAtom :: Text -> [LaneTarget] -> RuntimeLanePlan
 planFromTargetsWithAtom atom targets =
   let ebuilds = collapsePlannedEbuilds targets
-   in GoLanePlan
+   in RuntimeLanePlan
         { glpLanes = targets,
           glpEbuilds = ebuilds,
           glpUniquePVs = map pePV ebuilds,
@@ -245,21 +242,21 @@ planFromTargetsWithAtom atom targets =
 planNeedsWork ::
   [EbuildVersion] ->
   [EbuildVersion] ->
-  GoLanePlan ->
+  RuntimeLanePlan ->
   Bool
 planNeedsWork localPVs contentFixPVs plan =
   not (null (missingTargets localPVs plan))
     || not (null (extrasToDelete localPVs plan))
     || not (null contentFixPVs)
 
-missingTargets :: [EbuildVersion] -> GoLanePlan -> [EbuildVersion]
+missingTargets :: [EbuildVersion] -> RuntimeLanePlan -> [EbuildVersion]
 missingTargets localPVs plan =
   [ pv
   | pv <- glpUniquePVs plan,
     not (any (samePV pv) localPVs)
   ]
 
-extrasToDelete :: [EbuildVersion] -> GoLanePlan -> [EbuildVersion]
+extrasToDelete :: [EbuildVersion] -> RuntimeLanePlan -> [EbuildVersion]
 extrasToDelete localPVs plan =
   [ loc
   | loc <- localPVs,
@@ -269,7 +266,7 @@ extrasToDelete localPVs plan =
 buildGapLines ::
   [EbuildVersion] ->
   [EbuildVersion] ->
-  GoLanePlan ->
+  RuntimeLanePlan ->
   [GapLine]
 buildGapLines localPVs needsWorkPVs plan =
   let unsatisfied =

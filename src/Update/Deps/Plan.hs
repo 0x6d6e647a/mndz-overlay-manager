@@ -35,8 +35,8 @@ import Update.Bun.Cache (parseEnginesBunFromPackageJson)
 import Update.Cargo.Msrv (parseRustVersionField)
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
-  ( GoLanePlan (..),
-    LaneTarget (..),
+  ( LaneTarget (..),
+    RuntimeLanePlan (..),
     VersionCandidate (..),
     filterCandidateVersions,
     planFromTargetsWithAtom,
@@ -54,7 +54,9 @@ import Update.Go.Plan
   ( PlanOps (..),
     PlanProgress (..),
   )
-import Update.Go.Tree
+import Update.Go.Vendor (versionTag)
+import Update.Npm.Cache (fetchNpmEnginesNode, listNpmVersions)
+import Update.Runtime.Ceilings
   ( PortageqRunner,
     RuntimeCeilings (..),
     discoverBunBinCeilings,
@@ -63,8 +65,6 @@ import Update.Go.Tree
     discoverRustUnionCeilingsWith,
     productionPortageqRunner,
   )
-import Update.Go.Vendor (versionTag)
-import Update.Npm.Cache (fetchNpmEnginesNode, listNpmVersions)
 import Update.Types (EcosystemSpec (..), UpdateSource (..))
 
 -- | Injectable ops for multi-ecosystem deps planning.
@@ -132,7 +132,7 @@ planDepsPackageWithProgress ::
   EcosystemSpec ->
   UpdateSource ->
   [EbuildVersion] ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planDepsPackageWithProgress ops progress eco src locals =
   case eco of
     Go mSub -> planGo ops progress src mSub locals
@@ -150,7 +150,7 @@ planGo ::
   UpdateSource ->
   Maybe FilePath ->
   [EbuildVersion] ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planGo ops progress src mSub locals =
   case src of
     GitHub owner repo prefix ->
@@ -185,7 +185,7 @@ planNpm ::
   PlanProgress ->
   UpdateSource ->
   [EbuildVersion] ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planNpm ops progress src locals =
   case src of
     Npm npmPkg ->
@@ -215,7 +215,7 @@ planBun ::
   PlanProgress ->
   UpdateSource ->
   [EbuildVersion] ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planBun ops progress src locals =
   case src of
     GitHub owner repo prefix ->
@@ -257,7 +257,7 @@ planCargo ::
   Maybe FilePath ->
   Maybe FilePath ->
   [EbuildVersion] ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planCargo ops progress src mLockSub mPkgSub locals =
   case src of
     GitHub owner repo prefix ->
@@ -326,7 +326,7 @@ planWith ::
   [EbuildVersion] ->
   IO (Either Text RuntimeCeilings) ->
   (EbuildVersion -> IO (Either Text (Maybe Text))) ->
-  IO (Either Text GoLanePlan)
+  IO (Either Text RuntimeLanePlan)
 planWith ops progress src locals discoverCeilings fetchReq = do
   ppOnCeilingsStart progress
   ceilingsResult <- discoverCeilings
