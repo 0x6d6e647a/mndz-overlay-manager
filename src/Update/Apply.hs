@@ -12,6 +12,8 @@ module Update.Apply
     ApplyEnv (..),
     -- | Exported for 'Update.Apply.TestSupport' and direct unit tests.
     applyPackagePhase1,
+    -- | Exported for multi-progress terminal-handle unit tests.
+    applyPackagePhase1Tracked,
   )
 where
 
@@ -102,7 +104,7 @@ applyPackagePhase1Tracked env overlayRoot entry = do
               let reason = case [r | ApplySoftSkip _ r <- outcomes] of
                     (r : _) -> r
                     [] -> "skipped"
-               in mhFail mh key (shortReason reason)
+               in mhSkip mh key (shortReason reason)
             else mhSuccess mh key
   pure outcomes
   where

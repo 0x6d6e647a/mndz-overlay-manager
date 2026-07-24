@@ -77,6 +77,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Update.Apply
   ( ApplyEnv (..),
     EbuildRunner,
+    applyPackagePhase1Tracked,
     foldExitHardFail,
   )
 import Update.Apply.Errors
@@ -318,6 +319,8 @@ main = do
   testGoModCacheHitNoRefetch
   testWorkBudgetBound
   testMultiProgressState
+  testMultiProgressSkipVsFail
+  testApplyProgressSoftSkipHandle
   testPlanDraw
   testMultiProgressDrawThrowNoHang
   testMultiProgressBodyThrowNoHang
@@ -2514,6 +2517,133 @@ testMultiProgressState = do
     "single-step omits 0/0 fraction"
     (not ("0/0" `T.isInfixOf` T.pack frame))
 
+-- | Soft-skip and hard-fail terminals keep distinct chrome; both count as done.
+testMultiProgressSkipVsFail :: IO ()
+testMultiProgressSkipVsFail = do
+  stateRef <-
+    newIORef
+      MultiState
+        { msLabel = "Updating packages",
+          msTotal = 3,
+          msSucceeded = 0,
+          msJobs = Map.empty,
+          msTick = 0
+        }
+  let mh = multiHandle stateRef
+      kSkip = mkPackageKey "app-misc" "skipped"
+      kFail = mkPackageKey "dev-lang" "broken"
+      kOk = mkPackageKey "dev-util" "ok"
+  mhStart mh kSkip
+  mhStart mh kFail
+  mhStart mh kOk
+  mhSkip mh kSkip "already at latest"
+  mhFail mh kFail "dirty involved paths"
+  mhSuccess mh kOk
+  s <- readIORef stateRef
+  assertEq "success bumps top" 1 (msSucceeded s)
+  assertTrue "success removes row" (Map.notMember kOk (msJobs s))
+  case Map.lookup kSkip (msJobs s) of
+    Just (JobSkipped reason) ->
+      assertEq "skip reason retained" "already at latest" reason
+    other -> do
+      hPutStrLn stderr ("expected JobSkipped, got: " <> show other)
+      exitFailure
+  case Map.lookup kFail (msJobs s) of
+    Just (JobFailed reason) ->
+      assertEq "fail reason retained" "dirty involved paths" reason
+    other -> do
+      hPutStrLn stderr ("expected JobFailed, got: " <> show other)
+      exitFailure
+  let frame = T.pack (renderMulti ColorOff s)
+  assertTrue "skip glyph" ("⚠" `T.isInfixOf` frame)
+  assertTrue "fail glyph" ("✗" `T.isInfixOf` frame)
+  assertTrue "skip reason in frame" ("already at latest" `T.isInfixOf` frame)
+  assertTrue "fail reason in frame" ("dirty involved paths" `T.isInfixOf` frame)
+  assertTrue "skip package key" ("app-misc/skipped" `T.isInfixOf` frame)
+  assertTrue "fail package key" ("dev-lang/broken" `T.isInfixOf` frame)
+  -- Top done = 1 success + 2 retained terminals
+  assertTrue "top done counts skip+fail" ("3/3" `T.isInfixOf` frame)
+  -- Color on: skip uses yellow path, fail uses red path (distinct styling).
+  let frameOn = T.pack (renderMulti ColorOn s)
+      yellow = "\ESC[93m"
+      red = "\ESC[91m"
+  assertTrue "skip styling yellow when color on" (yellow `T.isInfixOf` frameOn)
+  assertTrue "fail styling red when color on" (red `T.isInfixOf` frameOn)
+
+-- | Soft-skip-only package outcomes call mhSkip, not mhFail.
+testApplyProgressSoftSkipHandle :: IO ()
+testApplyProgressSoftSkipHandle = do
+  withSystemTempDirectory "mndz-soft-skip-handle-" $ \tmp -> do
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    terminal <- newIORef ([] :: [T.Text])
+    let logTerm t = atomicModifyIORef' terminal (\xs -> (t : xs, ()))
+        key = mkPackageKey "app-misc" "no-such-policy-pkg"
+        entry =
+          PackageEntry
+            { peKey = key,
+              pePN = "no-such-policy-pkg",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = tmp </> "no-such-policy-pkg-1.0.0.ebuild"
+            }
+        mh =
+          MultiHandle
+            { mhStart = \_ -> logTerm "start",
+              mhStatus = \_ _ -> pure (),
+              mhSteps = \_ _ -> pure (),
+              mhStep = \_ _ -> pure (),
+              mhSuccess = \_ -> logTerm "success",
+              mhSkip = \_ reason -> logTerm ("skip:" <> reason),
+              mhFail = \_ reason -> logTerm ("fail:" <> reason)
+            }
+        gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Left "unused"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+        releaseOps =
+          ReleaseOps
+            { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
+              roDownloadAsset = \_ _ -> pure (Left "unused"),
+              roCreateReleaseWithAsset = \_ _ -> pure (Right ())
+            }
+    env0 <-
+      mkTestApplyEnv
+        gitOps
+        planOps
+        (\_ _ -> pure (Right ()))
+        releaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let env = env0 {aeMulti = mh}
+    outcomes <- applyPackagePhase1Tracked env tmp entry
+    case outcomes of
+      [ApplySoftSkip k reason] -> do
+        assertEq "soft-skip key" key k
+        assertTrue "no-policy reason" ("no hardcoded policy" `T.isInfixOf` reason)
+      other -> do
+        hPutStrLn stderr ("expected soft-skip, got: " <> show other)
+        exitFailure
+    calls <- reverse <$> readIORef terminal
+    assertTrue "started" ("start" `elem` calls)
+    assertTrue
+      "called mhSkip"
+      (any ("skip:" `T.isPrefixOf`) calls)
+    assertTrue "did not call mhFail" (not (any ("fail:" `T.isPrefixOf`) calls))
+    assertTrue "did not call mhSuccess" ("success" `notElem` calls)
+
 ------------------------------------------------------------------------
 -- Pure panel redraw plan (tight dynamic height)
 ------------------------------------------------------------------------
@@ -3719,6 +3849,7 @@ testFullPathApplyProgressSequence =
               mhSteps = \_ n -> logEv ("steps:" <> T.pack (show n)),
               mhStep = \_ name -> logEv ("step:" <> name),
               mhSuccess = \_ -> pure (),
+              mhSkip = \_ _ -> pure (),
               mhFail = \_ _ -> pure ()
             }
         gitOps =
@@ -3885,6 +4016,7 @@ testReusePathApplyProgressSequence =
               mhSteps = \_ n -> logEv ("steps:" <> T.pack (show n)),
               mhStep = \_ name -> logEv ("step:" <> name),
               mhSuccess = \_ -> pure (),
+              mhSkip = \_ _ -> pure (),
               mhFail = \_ _ -> pure ()
             }
         gitOps =

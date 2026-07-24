@@ -87,6 +87,8 @@ data MultiHandle = MultiHandle
     -- | Advance steps done by 1 and set the current step name.
     mhStep :: PackageKey -> Text -> IO (),
     mhSuccess :: PackageKey -> IO (),
+    -- | Soft-skip terminal: retain row with skip/warning chrome (not hard-fail).
+    mhSkip :: PackageKey -> Text -> IO (),
     mhFail :: PackageKey -> Text -> IO ()
   }
 
@@ -103,6 +105,7 @@ noopMultiHandle =
       mhSteps = \_ _ -> pure (),
       mhStep = \_ _ -> pure (),
       mhSuccess = \_ -> pure (),
+      mhSkip = \_ _ -> pure (),
       mhFail = \_ _ -> pure ()
     }
 
@@ -202,6 +205,7 @@ data ActiveJob = ActiveJob
 
 data JobRow
   = JobActive ActiveJob
+  | JobSkipped Text
   | JobFailed Text
   deriving (Eq, Show)
 
@@ -346,6 +350,11 @@ multiHandle stateRef =
           let jobs' = Map.delete key (msJobs s)
               succ' = msSucceeded s + 1
            in (s {msJobs = jobs', msSucceeded = succ'}, ()),
+      mhSkip = \key reason ->
+        atomicModifyIORef' stateRef $ \s ->
+          ( s {msJobs = Map.insert key (JobSkipped reason) (msJobs s)},
+            ()
+          ),
       mhFail = \key reason ->
         atomicModifyIORef' stateRef $ \s ->
           ( s {msJobs = Map.insert key (JobFailed reason) (msJobs s)},
@@ -393,8 +402,17 @@ renderMulti color MultiState {..} =
     layout $
       top : rows
   where
-    failedCount = length [() | JobFailed _ <- Map.elems msJobs]
-    done = msSucceeded + failedCount
+    -- Retained terminals (skip + hard-fail) count as package-done alongside success.
+    retainedTerminal =
+      length
+        [ ()
+        | j <- Map.elems msJobs,
+          case j of
+            JobSkipped _ -> True
+            JobFailed _ -> True
+            JobActive _ -> False
+        ]
+    done = msSucceeded + retainedTerminal
     progress =
       if msTotal == 0
         then 1.0
@@ -438,6 +456,14 @@ renderJob color tick key = \case
                     else pkg <> "  " <> name
              in maybeColor color ColorBrightWhite $
                   spinner label tick SpinnerDots
+  JobSkipped reason ->
+    let line =
+          "⚠ "
+            <> T.unpack (packageKeyText key)
+            <> if T.null reason
+              then ""
+              else "  " <> T.unpack reason
+     in maybeColor color ColorBrightYellow (text line)
   JobFailed reason ->
     let line =
           "✗ "

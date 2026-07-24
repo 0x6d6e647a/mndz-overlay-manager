@@ -36,8 +36,11 @@ For concurrent per-package work under `outdated` and `update` phase 1, when indi
 1. A top-level determinate progress bar whose done/total counter reflects **packages** that have reached a terminal state over the **total package jobs** for that phase, with a phase label
 2. A row per in-flight package with a spinner, package key (`category/package`), and current step or phase name
 3. When a package reports a step total greater than one, that row SHALL also show a determinate progress bar and a steps done/total counter for that package’s internal steps; when the step total is at most one or is unset, the row SHALL omit the step bar and step fraction and MAY show only the step or phase name
-4. Retention of rows that end in soft-skip or hard-fail, with a non-spinner failure or warning glyph and a short reason
-5. Removal of rows that complete successfully, with the top-level package done count incremented
+4. Retention of rows that end in **soft-skip** with a non-spinner **skip or warning** presentation (glyph and/or styling distinct from hard-fail when color is enabled) and a short reason
+5. Retention of rows that end in **hard-fail** with a non-spinner **failure** presentation (glyph and/or styling distinct from soft-skip when color is enabled) and a short reason
+6. Removal of rows that complete successfully, with the top-level package done count incremented
+
+Soft-skip terminal presentation SHALL NOT use the hard-fail presentation path. Process exit codes and apply hard-fail folding policy are unaffected by this presentation rule.
 
 When every package job has reached a terminal state, the program SHALL clear the entire panel before emitting deferred logs and machine stdout lines.
 
@@ -46,10 +49,18 @@ When every package job has reached a terminal state, the program SHALL clear the
 - **WHEN** a package job completes successfully during multi-progress
 - **THEN** its spinner row disappears from the panel and the top-level package done count increases
 
-#### Scenario: Failure retains package row until clear
+#### Scenario: Soft-skip retains package row as skip not hard-fail
 
-- **WHEN** a package job soft-skips or hard-fails during multi-progress
-- **THEN** its row remains on the panel in a failed or warning state until the panel is cleared at the end of the phase
+- **WHEN** a package job soft-skips during multi-progress (for example already at latest, or no work under apply soft-skip rules)
+- **THEN** its row remains on the panel until the panel is cleared at the end of the phase
+- **AND** the row uses skip or warning presentation that is distinct from hard-fail presentation when color is enabled
+- **AND** the row includes a short reason
+
+#### Scenario: Hard-fail retains package row as failure
+
+- **WHEN** a package job hard-fails during multi-progress
+- **THEN** its row remains on the panel in a failure state until the panel is cleared at the end of the phase
+- **AND** the row includes a short reason
 
 #### Scenario: Panel clears before deferred output
 
