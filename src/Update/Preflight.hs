@@ -10,8 +10,6 @@ module Update.Preflight
     cargoFetcherTools,
     goAssetsRequiredTools,
     checkToolsOnPath,
-    preflightUpdate,
-    preflightUpdateWith,
     preflightUpdateTools,
     validateAssetsPath,
     AssetsPreflight (..),
@@ -69,22 +67,6 @@ checkToolsOnPath :: (String -> IO (Maybe FilePath)) -> [String] -> IO [String]
 checkToolsOnPath findTool tools = do
   results <- mapM (\t -> (t,) <$> findTool t) tools
   pure [name | (name, path) <- results, isNothing path]
-
--- | Production preflight for @update@ without assets extras.
-preflightUpdate :: IO (Either Text ())
-preflightUpdate = preflightUpdateWith False
-
--- | Preflight with optional combined Go/assets tool requirements (legacy Bool).
-preflightUpdateWith :: Bool -> IO (Either Text ())
-preflightUpdateWith needGoAssets =
-  preflightUpdateTools
-    AssetsPreflight
-      { apNeedAssets = needGoAssets,
-        apNeedGo = needGoAssets,
-        apNeedNpm = False,
-        apNeedBun = False,
-        apNeedCargo = False
-      }
 
 -- | Preflight with per-ecosystem tool requirements.
 preflightUpdateTools :: AssetsPreflight -> IO (Either Text ())

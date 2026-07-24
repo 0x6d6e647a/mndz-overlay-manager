@@ -85,7 +85,7 @@ data GpgAgentOps = GpgAgentOps
     gaoResumeUi :: IO ()
   }
 
--- | Production ops. Pass pause\/resume from 'CLI.Progress.withUiSuspended' wiring.
+-- | Production ops. Pass pause\/resume from 'CLI.Progress' panel controls.
 productionGpgAgentOps :: IO () -> IO () -> GpgAgentOps
 productionGpgAgentOps pauseUi resumeUi =
   GpgAgentOps

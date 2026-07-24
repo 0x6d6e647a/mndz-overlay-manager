@@ -1,51 +1,14 @@
-# Dead-code analysis roots.
-# Main.main (app + test) anchors the runtime graph; root-modules keep library
-# public exports alive for intentional library API surface.
+# Dead-code analysis roots — entrypoint-oriented only.
+# Do not reintroduce a blanket root-modules list of every library module;
+# that defeats weeder for this application-internal library surface.
+# Intentional public roots belong in comments + justified root-modules entries,
+# not a full-module dump.
+#
+# HIE layout (see cabal ghc-options): .hie/lib, .hie/exe, .hie/test so app and
+# test Main modules do not overwrite each other. Invoke weeder with all three
+# --hie-directory flags (see hk.pkl / CONTRIBUTING).
 roots = [
   "^Main\\.main$",
   "^Paths_mndz_overlay_manager\\..*",
-]
-root-modules = [
-  "Update.Git",
-  "CLI.Jobs",
-  "CLI.Parser",
-  "CLI.Progress",
-  "Config.Loader",
-  "Config.Types",
-  "Logging.Bootstrap",
-  "Overlay.Discovery",
-  "Overlay.Types",
-  "Overlay.Validation",
-  "Overlay.Version",
-  "Update.Check",
-  "Update.Targets",
-  "Update.Preflight",
-  "Update.Apply",
-  "Update.Apply.Errors",
-  "Update.Assets.Hash",
-  "Update.Assets.Layout",
-  "Update.Assets.Release",
-  "Update.Auth",
-  "Update.EbuildEdit",
-  "Update.GitHub",
-  "Update.Go.Plan",
-  "Update.Go.Vendor",
-  "Update.Go.Version",
-  "Update.Hardcoded",
-  "Update.Http",
-  "Update.Md5Cache",
-  "Update.Npm",
-  "Update.Npm.Cache",
-  "Update.Bun.Cache",
-  "Update.Cargo.Crates",
-  "Update.Cargo.Msrv",
-  "Update.Deps.Plan",
-  "Update.Engines",
-  "Update.Go.Lanes",
-  "Update.Runtime.Ceilings",
-  "Update.Resolve",
-  "Update.GpgAgent",
-  "Update.SshAgent",
-  "Update.Types",
 ]
 type-class-roots = true

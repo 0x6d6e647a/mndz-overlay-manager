@@ -4,12 +4,10 @@
 module Logging.Bootstrap
   ( ColorMode (..),
     LogHold,
-    bootstrapLogger,
     mkLogger,
     mkLogHold,
     beginLogHold,
     flushLogHold,
-    runWithLogger,
     verbosityToSeverity,
     fmtMessageColored,
     showSeverityColored,
@@ -28,11 +26,9 @@ import Colog
     logTextStderr,
     msgSeverity,
     showSourceLoc,
-    usingLoggerT,
   )
 import Colog qualified as C
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar)
-import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -49,10 +45,6 @@ data LogHold = LogHold
   { lhHolding :: IORef Bool,
     lhQueue :: MVar [Message]
   }
-
--- | Legacy unfiltered logger (warn-level filtering applied by 'mkLogger' in production).
-bootstrapLogger :: LogAction IO Message
-bootstrapLogger = cmap (fmtMessageColored ColorOn) logTextStderr
 
 -- | Create an empty log-hold for optional queuing.
 mkLogHold :: IO LogHold
@@ -112,6 +104,3 @@ mkLogger verbosity color hold =
         else unLogAction sink msg
   where
     sink = cmap (fmtMessageColored color) logTextStderr
-
-runWithLogger :: LogAction IO Message -> IO a -> IO a
-runWithLogger logger action = usingLoggerT logger (liftIO action)

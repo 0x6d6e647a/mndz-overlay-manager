@@ -1,9 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.GitHub
-  ( fetchGitHub,
-    fetchGitHubWith,
-    listGitHubVersions,
+  ( fetchGitHubWith,
     listGitHubVersionsWith,
     stripAndParse,
   )
@@ -21,25 +19,16 @@ import Network.HTTP.Client
   ( Manager,
     httpLbs,
     method,
-    newManager,
     parseRequest,
     requestHeaders,
     responseBody,
     responseStatus,
   )
-import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import Update.Http (tryHttp)
 import Update.Types (UpdateSource (..))
-
--- | Fetch latest version from GitHub (releases/latest, then tags fallback).
--- Uses unauthenticated API when @mToken@ is 'Nothing'.
-fetchGitHub :: UpdateSource -> IO (Either Text EbuildVersion)
-fetchGitHub src = do
-  mgr <- newManager tlsManagerSettings
-  fetchGitHubWith mgr Nothing src
 
 fetchGitHubWith ::
   Manager ->
@@ -71,11 +60,6 @@ githubHeaders mToken =
         <> authHeaders
 
 -- | List comparable package versions (paginated tags), ordered newest-first by PV.
-listGitHubVersions :: UpdateSource -> IO (Either Text [EbuildVersion])
-listGitHubVersions src = do
-  mgr <- newManager tlsManagerSettings
-  listGitHubVersionsWith mgr Nothing src
-
 listGitHubVersionsWith ::
   Manager ->
   Maybe Text ->

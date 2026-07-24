@@ -16,7 +16,6 @@ module Update.Types
     SuccessLine (..),
     ApplyOutcome (..),
     outcomeIsHardFail,
-    outcomeIsSuccess,
     techniqueNeedsAssets,
     ecosystemIsGo,
     ecosystemIsNpm,
@@ -168,7 +167,3 @@ data ApplyOutcome
 outcomeIsHardFail :: ApplyOutcome -> Bool
 outcomeIsHardFail ApplyHardFail {} = True
 outcomeIsHardFail _ = False
-
-outcomeIsSuccess :: ApplyOutcome -> Bool
-outcomeIsSuccess ApplySuccess {} = True
-outcomeIsSuccess _ = False

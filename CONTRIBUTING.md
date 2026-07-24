@@ -101,10 +101,10 @@ Same order as `hk.pkl` / pre-commit:
 |---|------|----------------|
 | 0 | Preflight | `.tools/bin/{ormolu,hlint,stan,weeder}` must be executable |
 | 1 | Format | `.tools/bin/ormolu --mode check` / `--mode inplace` |
-| 2 | Build + test | `cabal build all && cabal test all` (also emits HIE under `.hie/`) |
+| 2 | Build + test | `cabal build all && cabal test all` (emits HIE under `.hie/{lib,exe,test}/`) |
 | 3 | Lint | `.tools/bin/hlint` on `*.hs` |
-| 4 | Stan | `.tools/bin/stan --hiedir=.hie` (config: `.stan.toml`) |
-| 5 | Weeder | `.tools/bin/weeder --config=weeder.toml --hie-directory=.hie` |
+| 4 | Stan | `.tools/bin/stan --hiedir=.hie/lib` (config: `.stan.toml`) |
+| 5 | Weeder | `.tools/bin/weeder --config=weeder.toml --hie-directory=.hie/lib --hie-directory=.hie/exe --hie-directory=.hie/test` |
 
 **Preferred single entrypoint:**
 

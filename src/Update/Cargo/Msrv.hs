@@ -6,13 +6,10 @@ module Update.Cargo.Msrv
     parseRustMinVerFromEbuild,
     maxRustVersion,
     combineMsrv,
-    ceilingTokenForCompare,
     probeRustVersionFromCargoTomls,
   )
 where
 
-import Data.Char (isDigit)
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Update.Go.Version (compareGoVersions, parseGoVersionToken)
@@ -111,9 +108,3 @@ combineMsrv mRoot mDeps mDonor =
     step acc y = case acc of
       Nothing -> Just y
       Just a -> maxRustVersion a y
-
--- | Ceiling PV token for MSRV compare: numeric comps, or strip @_p*@ / non-digit noise.
-ceilingTokenForCompare :: Text -> Text
-ceilingTokenForCompare t =
-  let core = T.takeWhile (\c -> isDigit c || c == '.') (T.strip t)
-   in fromMaybe core (normalizeRustVersion core)

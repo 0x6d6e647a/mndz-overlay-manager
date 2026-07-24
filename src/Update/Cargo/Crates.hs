@@ -5,7 +5,6 @@ module Update.Cargo.Crates
     CargoProgress (..),
     CargoResult (..),
     productionCargoOps,
-    noopCargoProgress,
     buildCargoCratesTarball,
     crateTarballPrefix,
     maxRustVersionInTree,
@@ -58,15 +57,6 @@ data CargoProgress = CargoProgress
     cgpOnPycargoStart :: IO (),
     cgpOnPycargoDone :: IO ()
   }
-
-noopCargoProgress :: CargoProgress
-noopCargoProgress =
-  CargoProgress
-    { cgpOnCloneStart = pure (),
-      cgpOnCloneDone = pure (),
-      cgpOnPycargoStart = pure (),
-      cgpOnPycargoDone = pure ()
-    }
 
 productionCargoOps :: CargoOps
 productionCargoOps =

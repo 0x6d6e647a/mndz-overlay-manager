@@ -4,27 +4,22 @@ module Update.Go.Plan
   ( PlanOps (..),
     PlanProgress (..),
     noopPlanProgress,
-    productionPlanOps,
     planGoPackage,
     planGoPackageWithProgress,
-    planGoPackageWithLocals,
     planGoPackageWithLocalsProgress,
     localNonLivePVs,
     isLivePackageVersion,
   )
 where
 
-import CLI.Jobs (WorkBudget, newWorkBudget, withWorkSlot)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
+import CLI.Jobs (WorkBudget, withWorkSlot)
+import Control.Concurrent.MVar (MVar, modifyMVar_, readMVar)
 import Data.List (sortBy)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Network.HTTP.Client (newManager)
-import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPVNoRev)
-import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
   ( LaneTarget (..),
     PlanError (..),
@@ -38,15 +33,12 @@ import Update.Go.ModFetch
   ( GoModFetcher,
     GoModKey (..),
     parseGoReqFromMod,
-    productionGoModFetcher,
-    withGoModCache,
   )
 import Update.Go.Vendor (versionTag)
 import Update.Runtime.Ceilings
   ( PortageqRunner,
     RuntimeCeilings (..),
     discoverGoCeilingsWith,
-    productionPortageqRunner,
   )
 import Update.Types (UpdateSource (..))
 
@@ -82,23 +74,6 @@ noopPlanProgress =
       ppOnListDone = \_ -> pure (),
       ppOnProbeDone = pure ()
     }
-
--- | Production plan ops with go.mod cache, work budget, and ceiling cache.
-productionPlanOps :: Maybe Text -> Int -> IO PlanOps
-productionPlanOps mToken jobs = do
-  mgr <- newManager tlsManagerSettings
-  baseMod <- productionGoModFetcher mToken
-  cachedMod <- withGoModCache baseMod
-  budget <- newWorkBudget jobs
-  ceilingsCache <- newMVar Nothing
-  pure
-    PlanOps
-      { poPortageq = productionPortageqRunner,
-        poListVersions = listGitHubVersionsWith mgr mToken,
-        poFetchGoMod = cachedMod,
-        poWorkBudget = budget,
-        poCeilingsCache = ceilingsCache
-      }
 
 isLivePackageVersion :: EbuildVersion -> Bool
 isLivePackageVersion (Numeric [9999] _) = True
@@ -137,7 +112,6 @@ discoverCeilingsCached ops = do
             Nothing -> Right c
 
 -- | Full plan without progress hooks (no local-PV filter; all listed versions).
--- Prefer 'planGoPackageWithLocals' for production candidate-set rules.
 planGoPackage ::
   PlanOps ->
   UpdateSource ->
@@ -159,15 +133,6 @@ planGoPackageWithProgress ops progress src mSub =
 -- | Plan with optional local non-live PVs for the candidate-set rule.
 -- When @Just locals@ is empty, hard-fails (first import not supported).
 -- When @Nothing@, does not apply the local∪newer filter (test/legacy path).
-planGoPackageWithLocals ::
-  PlanOps ->
-  UpdateSource ->
-  Maybe FilePath ->
-  Maybe [EbuildVersion] ->
-  IO (Either PlanError RuntimeLanePlan)
-planGoPackageWithLocals ops =
-  planGoPackageWithLocalsProgress ops noopPlanProgress
-
 planGoPackageWithLocalsProgress ::
   PlanOps ->
   PlanProgress ->

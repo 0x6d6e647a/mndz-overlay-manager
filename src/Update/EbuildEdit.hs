@@ -15,11 +15,8 @@ module Update.EbuildEdit
     nodejsBdependAtom,
     bunBdependAtom,
     ebuildHasDevLangGoBdepend,
-    ebuildHasNodejsBdepend,
-    ebuildHasBunBinBdepend,
     goBdependMatches,
     nodejsBdependMatches,
-    bunBdependMatches,
     ensureGoBdepend,
     ensureNodejsBdepend,
     ensureBunBdepend,
@@ -427,14 +424,6 @@ ebuildHasDevLangGoBdepend :: Text -> Bool
 ebuildHasDevLangGoBdepend content =
   "dev-lang/go" `T.isInfixOf` content
 
-ebuildHasNodejsBdepend :: Text -> Bool
-ebuildHasNodejsBdepend content =
-  "net-libs/nodejs" `T.isInfixOf` content
-
-ebuildHasBunBinBdepend :: Text -> Bool
-ebuildHasBunBinBdepend content =
-  "dev-lang/bun-bin" `T.isInfixOf` content
-
 -- | True when the ebuild already has the exact required go BDEPEND atom.
 goBdependMatches :: Text -> Text -> Bool
 goBdependMatches goVer content =
@@ -443,10 +432,6 @@ goBdependMatches goVer content =
 nodejsBdependMatches :: Text -> Text -> Bool
 nodejsBdependMatches ver content =
   nodejsBdependAtom ver `T.isInfixOf` content
-
-bunBdependMatches :: Text -> Text -> Bool
-bunBdependMatches ver content =
-  bunBdependAtom ver `T.isInfixOf` content
 
 -- | Ensure the ebuild declares @BDEPEND@ with @>=dev-lang/go-<ver>:=@.
 ensureGoBdepend :: Text -> Text -> Either Text Text

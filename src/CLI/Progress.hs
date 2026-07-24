@@ -11,7 +11,6 @@ module CLI.Progress
     noopStepHandle,
     withMultiProgress,
     withStepProgress,
-    withUiSuspended,
     pauseActivePanel,
     resumeActivePanel,
     -- Test seam (production entry points wrap defaultPanelIO)
@@ -36,7 +35,7 @@ import Colog (LogAction, Message)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, cancel, race, waitCatch, withAsync)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, tryPutMVar, tryTakeMVar, withMVar)
-import Control.Exception (bracket_, finally)
+import Control.Exception (finally)
 import Control.Monad (unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -145,13 +144,6 @@ resumeActivePanel :: ProgressConfig -> IO ()
 resumeActivePanel cfg = do
   mCtrl <- readIORef (pcPanelCtrl cfg)
   for_ mCtrl panelResume
-
--- | Clear and pause the active activity panel (if any), run @action@, then resume.
---
--- Used for interactive GPG ready-prompt / pinentry so redraws do not garble the TTY.
-withUiSuspended :: ProgressConfig -> IO a -> IO a
-withUiSuspended cfg =
-  bracket_ (pauseActivePanel cfg) (resumeActivePanel cfg)
 
 ------------------------------------------------------------------------
 -- Injectable panel IO (test seam)

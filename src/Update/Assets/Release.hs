@@ -1,8 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.Assets.Release
-  ( createReleaseWithAsset,
-    createReleaseWithAssetHttp,
+  ( createReleaseWithAssetHttp,
     ReleaseMeta (..),
     deleteReleaseBestEffort,
     -- Lookup / download (reuse path)
@@ -90,15 +89,6 @@ productionReleaseOps token = do
 
 -- | Create a GitHub release and upload one asset. On upload failure after
 -- create, best-effort deletes the release.
-createReleaseWithAsset ::
-  Text ->
-  ReleaseMeta ->
-  FilePath ->
-  IO (Either Text ())
-createReleaseWithAsset token meta assetPath = do
-  mgr <- newManager tlsManagerSettings
-  createReleaseWithAssetHttp mgr token meta assetPath
-
 createReleaseWithAssetHttp ::
   Manager ->
   Text ->

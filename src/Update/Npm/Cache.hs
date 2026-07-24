@@ -5,7 +5,6 @@ module Update.Npm.Cache
     NpmCacheProgress (..),
     productionNpmCacheOps,
     buildNpmDepsTarball,
-    parseEnginesNodeFromPackageJson,
     fetchNpmEnginesNode,
     listNpmVersions,
     hostNodeVersion,
@@ -18,12 +17,10 @@ import Data.Aeson (Value (..), eitherDecode, withObject, (.:), (.:?))
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson.Types (Parser, parseMaybe)
-import Data.ByteString.Lazy qualified as BL
 import Data.Char (isDigit)
 import Data.List (sortBy)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client
   ( Manager,
     httpLbs,
@@ -216,12 +213,6 @@ tarXzNpmCache workDir entry outPath = do
     if code == ExitSuccess
       then Right ()
       else Left ("tar xz npm-cache failed: " <> T.pack err)
-
-parseEnginesNodeFromPackageJson :: Text -> Maybe Text
-parseEnginesNodeFromPackageJson body =
-  case eitherDecode (BL.fromStrict (TE.encodeUtf8 body)) of
-    Right val -> parseEnginesMinimum =<< parseMaybe parseEnginesNode val
-    Left _ -> Nothing
 
 parseEnginesNode :: Value -> Parser Text
 parseEnginesNode =

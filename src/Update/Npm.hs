@@ -1,8 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.Npm
-  ( fetchNpm,
-    fetchNpmWith,
+  ( fetchNpmWith,
   )
 where
 
@@ -14,24 +13,17 @@ import Network.HTTP.Client
   ( Manager,
     httpLbs,
     method,
-    newManager,
     parseRequest,
     requestHeaders,
     responseBody,
     responseStatus,
   )
-import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
 import Update.Http (tryHttp)
 import Update.Types (UpdateSource (..))
 
 -- | Fetch latest version from the npm registry.
-fetchNpm :: UpdateSource -> IO (Either Text EbuildVersion)
-fetchNpm src = do
-  mgr <- newManager tlsManagerSettings
-  fetchNpmWith mgr src
-
 fetchNpmWith :: Manager -> UpdateSource -> IO (Either Text EbuildVersion)
 fetchNpmWith mgr = \case
   Npm pkg -> do

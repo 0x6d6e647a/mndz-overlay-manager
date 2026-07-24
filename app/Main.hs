@@ -90,6 +90,10 @@ import Update.Types
     SuccessLine (..),
     UpdateReport (..),
     UpdateTechnique (..),
+    ecosystemIsBun,
+    ecosystemIsCargo,
+    ecosystemIsGo,
+    ecosystemIsNpm,
     mkPackageKey,
     packageKeyText,
     techniqueNeedsAssets,
@@ -323,22 +327,6 @@ entryNeedsEco ecoPred e =
   case lookupPolicy (peKey e) of
     Just (PackagePolicy _ (DepsAndAssets eco)) -> ecoPred eco
     _ -> False
-
-ecosystemIsGo :: EcosystemSpec -> Bool
-ecosystemIsGo (Go _) = True
-ecosystemIsGo _ = False
-
-ecosystemIsNpm :: EcosystemSpec -> Bool
-ecosystemIsNpm NpmEco = True
-ecosystemIsNpm _ = False
-
-ecosystemIsBun :: EcosystemSpec -> Bool
-ecosystemIsBun Bun = True
-ecosystemIsBun _ = False
-
-ecosystemIsCargo :: EcosystemSpec -> Bool
-ecosystemIsCargo Cargo {} = True
-ecosystemIsCargo _ = False
 
 emitOutcome :: (WithLog env Message m, MonadIO m) => ApplyOutcome -> m ()
 emitOutcome = \case

@@ -77,9 +77,16 @@ import System.IO.Temp (withSystemTempDirectory)
 import Update.Apply
   ( ApplyEnv (..),
     EbuildRunner,
-    applyPackagePhase1,
-    contentFixNeeded,
     foldExitHardFail,
+  )
+import Update.Apply.Errors
+  ( ApplyUnitError (..),
+    applyUnitErrorMessage,
+    applyUnitHardFail,
+  )
+import Update.Apply.TestSupport
+  ( applyPackagePhase1,
+    contentFixNeeded,
     fullPathMaterializeSteps,
     goPublishAndOverlay,
     markSuccessLinesReused,
@@ -90,11 +97,6 @@ import Update.Apply
     reusePathMaterializeSteps,
     reviseMaterializeStepTotal,
     signedOverlayCommit,
-  )
-import Update.Apply.Errors
-  ( ApplyUnitError (..),
-    applyUnitErrorMessage,
-    applyUnitHardFail,
   )
 import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
 import Update.Assets.Layout (cratesTarballName, depsTarballName, vendorTarballName)

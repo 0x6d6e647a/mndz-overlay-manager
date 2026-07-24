@@ -57,13 +57,18 @@ common warnings
     ghc-options:
         -Wall
         -fwrite-ide-info
-        -hiedir=.hie
 
 library
     -- Import common warning flags.
     import:           warnings
 
-    -- Modules exported by the library.
+    -- Per-component HIE dirs avoid app/test both writing Main.hie (needed for
+    -- entrypoint-oriented weeder roots).
+    ghc-options:
+        -hiedir=.hie/lib
+
+    -- Public surface for the executable and test-suite (inventory-driven).
+    -- Not a third-party API: expand only when app/ or test/ need a new import.
     exposed-modules:
         CLI.Jobs
       , CLI.Parser
@@ -76,12 +81,8 @@ library
       , Overlay.Validation
       , Overlay.Version
       , Update.Apply
-      , Update.Apply.Commit
-      , Update.Apply.Env
       , Update.Apply.Errors
-      , Update.Apply.GitMv
-      , Update.Apply.Materialize
-      , Update.Apply.OverlayWrite
+      , Update.Apply.TestSupport
       , Update.Assets.Hash
       , Update.Assets.Layout
       , Update.Assets.Release
@@ -102,20 +103,25 @@ library
       , Update.Go.Version
       , Update.GpgAgent
       , Update.Hardcoded
-      , Update.Http
       , Update.Md5Cache
-      , Update.Npm
       , Update.Npm.Cache
       , Update.Preflight
       , Update.Resolve
       , Update.Runtime.Ceilings
       , Update.SshAgent
       , Update.Targets
-      , Update.TextUtil
       , Update.Types
 
-    -- Modules included in this library but not exported.
-    -- other-modules:
+    -- Implementation details not imported by app/ or test/.
+    other-modules:
+        Update.Apply.Commit
+      , Update.Apply.Env
+      , Update.Apply.GitMv
+      , Update.Apply.Materialize
+      , Update.Apply.OverlayWrite
+      , Update.Http
+      , Update.Npm
+      , Update.TextUtil
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -169,6 +175,7 @@ executable mndz-overlay-manager
         -threaded
         -rtsopts
         -with-rtsopts=-N
+        -hiedir=.hie/exe
 
     -- Other library packages from which modules are imported.
     build-depends:
@@ -206,6 +213,7 @@ test-suite mndz-overlay-manager-test
         -threaded
         -rtsopts
         -with-rtsopts=-N
+        -hiedir=.hie/test
 
     -- Directories containing source files.
     hs-source-dirs:   test

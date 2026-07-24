@@ -1,26 +1,17 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Product Apply surface used by the executable.
+--
+-- Per-package helpers and materialize budgets for unit tests live in
+-- 'Update.Apply.TestSupport' (not advertised as product API).
 module Update.Apply
   ( applyOverlay,
-    applyPackagePhase1,
     foldExitHardFail,
-    newEbuildFileName,
-    renderPVNoRev,
     EbuildRunner,
     productionEbuildRunner,
     ApplyEnv (..),
-    needsGoAssetsApply,
-    contentFixNeeded,
-    goPublishAndOverlay,
-    markSuccessLinesReused,
-    signedOverlayCommit,
-    egencacheAndSignedCommit,
-    materializePlan,
-    -- Materialize step budget (tests / callers)
-    fullPathMaterializeSteps,
-    reusePathMaterializeSteps,
-    materializeStepTotalUpper,
-    reviseMaterializeStepTotal,
+    -- | Exported for 'Update.Apply.TestSupport' and direct unit tests.
+    applyPackagePhase1,
   )
 where
 
@@ -32,31 +23,13 @@ import CLI.Progress
   )
 import Data.Text (Text)
 import Data.Text qualified as T
-import Overlay.Version (renderPVNoRev)
-import Update.Apply.Commit
-  ( egencacheAndSignedCommit,
-    signedOverlayCommit,
-  )
 import Update.Apply.Env
   ( ApplyEnv (..),
     EbuildRunner,
     productionEbuildRunner,
   )
-import Update.Apply.GitMv
-  ( applyGitMv,
-    newEbuildFileName,
-  )
-import Update.Apply.Materialize
-  ( applyDepsAndAssets,
-    contentFixNeeded,
-    fullPathMaterializeSteps,
-    goPublishAndOverlay,
-    markSuccessLinesReused,
-    materializePlan,
-    materializeStepTotalUpper,
-    reusePathMaterializeSteps,
-    reviseMaterializeStepTotal,
-  )
+import Update.Apply.GitMv (applyGitMv)
+import Update.Apply.Materialize (applyDepsAndAssets)
 import Update.Check (PackageEntry (..))
 import Update.Git (GitOps (..))
 import Update.Hardcoded (lookupPolicy)
@@ -66,15 +39,7 @@ import Update.Types
     PackagePolicy (..),
     UpdateTechnique (..),
     outcomeIsHardFail,
-    techniqueNeedsAssets,
   )
-
-needsGoAssetsApply :: [PackageEntry] -> Bool
-needsGoAssetsApply =
-  any $ \e ->
-    case lookupPolicy (peKey e) of
-      Just p -> techniqueNeedsAssets (policyTechnique p)
-      Nothing -> False
 
 foldExitHardFail :: [ApplyOutcome] -> Bool
 foldExitHardFail = any outcomeIsHardFail

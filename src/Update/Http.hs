@@ -1,8 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.Http
-  ( fetchHttp,
-    fetchHttpWith,
+  ( fetchHttpWith,
     tryHttp,
   )
 where
@@ -15,21 +14,13 @@ import Network.HTTP.Client
   ( Manager,
     httpLbs,
     method,
-    newManager,
     parseRequest,
     responseBody,
     responseStatus,
   )
-import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
 import Update.Types (UpdateSource (..))
-
--- | Fetch version from Http source (primary then fallback). Uses a fresh manager.
-fetchHttp :: UpdateSource -> IO (Either Text EbuildVersion)
-fetchHttp src = do
-  mgr <- newManager tlsManagerSettings
-  fetchHttpWith mgr src
 
 fetchHttpWith :: Manager -> UpdateSource -> IO (Either Text EbuildVersion)
 fetchHttpWith mgr = \case

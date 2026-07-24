@@ -47,12 +47,14 @@ local linters = new Mapping<String, Step> {
   ["stan"] {
     exclusive = true
     workspace_indicator = "mndz-overlay-manager.cabal"
-    check = "\(stan) --hiedir=.hie"
+    // Library HIE only (stan analyzes package sources; exe/test are thin Mains).
+    check = "\(stan) --hiedir=.hie/lib"
   }
   ["weeder"] {
     exclusive = true
     workspace_indicator = "mndz-overlay-manager.cabal"
-    check = "\(weeder) --config=weeder.toml --hie-directory=.hie"
+    // Separate component dirs so app and test Main.hie do not clobber each other.
+    check = "\(weeder) --config=weeder.toml --hie-directory=.hie/lib --hie-directory=.hie/exe --hie-directory=.hie/test"
   }
 }
 

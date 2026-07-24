@@ -4,14 +4,9 @@ module Update.Check
   ( groupNewest,
     groupByPackage,
     PackageEntry (..),
-    checkOverlay,
-    checkOverlayWith,
-    checkOverlayWithPlan,
     checkOverlayWithDepsPlan,
     checkPackage,
     checkPackageDeps,
-    checkPackageGo,
-    productionFetcher,
     productionFetcherWithToken,
     statusFromCompare,
     renderPVNoRev,
@@ -36,7 +31,6 @@ import Update.Cargo.Msrv (probeRustVersionFromCargoTomls)
 import Update.Deps.Plan
   ( DepsPlanOps (..),
     planDepsPackageWithProgress,
-    productionDepsPlanOps,
   )
 import Update.EbuildEdit
   ( bunBdependAtom,
@@ -58,8 +52,7 @@ import Update.Go.Lanes
   )
 import Update.Go.ModFetch (GoModKey (..), parseGoReqFromMod)
 import Update.Go.Plan
-  ( PlanOps (..),
-    PlanProgress (..),
+  ( PlanProgress (..),
     localNonLivePVs,
   )
 import Update.Go.Vendor (versionTag)
@@ -133,52 +126,6 @@ compareForNewest a b =
   case comparePV a b of
     Just o -> o
     Nothing -> compare (show a) (show b)
-
--- | Run update checks concurrently with a jobs limit (no progress UI).
-checkOverlay :: Int -> Fetcher -> [Ebuild] -> IO [UpdateReport]
-checkOverlay jobs = checkOverlayWith jobs noopMulti
-  where
-    noopMulti =
-      MultiHandle
-        { mhStart = \_ -> pure (),
-          mhStatus = \_ _ -> pure (),
-          mhSteps = \_ _ -> pure (),
-          mhStep = \_ _ -> pure (),
-          mhSuccess = \_ -> pure (),
-          mhFail = \_ _ -> pure ()
-        }
-
--- | Concurrent checks with multi-progress callbacks.
-checkOverlayWith ::
-  Int ->
-  MultiHandle ->
-  Fetcher ->
-  [Ebuild] ->
-  IO [UpdateReport]
-checkOverlayWith jobs mh fetch ebuilds = do
-  depsOps <- productionDepsPlanOps Nothing jobs Nothing
-  checkOverlayWithDepsPlan jobs mh fetch depsOps ebuilds
-
--- | Like 'checkOverlayWith' with injectable Go plan ops (token-aware list/mod).
-checkOverlayWithPlan ::
-  Int ->
-  MultiHandle ->
-  Fetcher ->
-  PlanOps ->
-  [Ebuild] ->
-  IO [UpdateReport]
-checkOverlayWithPlan jobs mh fetch planOps ebuilds = do
-  -- Wrap PlanOps into a minimal DepsPlanOps for Go-only paths.
-  depsOps <- productionDepsPlanOps Nothing jobs Nothing
-  let depsOps' =
-        depsOps
-          { dpoPortageq = poPortageq planOps,
-            dpoListVersions = poListVersions planOps,
-            dpoFetchGoMod = poFetchGoMod planOps,
-            dpoWorkBudget = poWorkBudget planOps,
-            dpoGoCeilingsCache = poCeilingsCache planOps
-          }
-  checkOverlayWithDepsPlan jobs mh fetch depsOps' ebuilds
 
 checkOverlayWithDepsPlan ::
   Int ->
@@ -296,27 +243,6 @@ checkPackageDeps mh depsOps entry locals src eco = do
                     | g <- gaps
                     ]
           }
-
--- | Go-only entry (tests).
-checkPackageGo ::
-  MultiHandle ->
-  PlanOps ->
-  PackageEntry ->
-  [Ebuild] ->
-  UpdateSource ->
-  Maybe FilePath ->
-  IO UpdateReport
-checkPackageGo mh planOps entry locals src mSub = do
-  depsOps <- productionDepsPlanOps Nothing 2 Nothing
-  let depsOps' =
-        depsOps
-          { dpoPortageq = poPortageq planOps,
-            dpoListVersions = poListVersions planOps,
-            dpoFetchGoMod = poFetchGoMod planOps,
-            dpoWorkBudget = poWorkBudget planOps,
-            dpoGoCeilingsCache = poCeilingsCache planOps
-          }
-  checkPackageDeps mh depsOps' entry locals src (Go mSub)
 
 depsPlanProgress :: MultiHandle -> PackageKey -> EcosystemSpec -> PlanProgress
 depsPlanProgress mh key eco =
@@ -483,10 +409,6 @@ statusFromCompare local remote =
         )
 
 -- | Production fetcher dispatching to Http / GitHub / npm clients.
-productionFetcher :: IO Fetcher
-productionFetcher = productionFetcherWithToken Nothing
-
--- | Like 'productionFetcher' with an optional resolved GitHub token.
 productionFetcherWithToken :: Maybe T.Text -> IO Fetcher
 productionFetcherWithToken mToken = do
   mgr <- newManager tlsManagerSettings
