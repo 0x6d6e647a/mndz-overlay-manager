@@ -27,12 +27,12 @@ import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, rende
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
   ( LaneTarget (..),
+    PlanError (..),
     RuntimeLanePlan (..),
     VersionCandidate (..),
     filterCandidateVersions,
     planFromTargetsWithAtom,
     selectAllLaneTargets,
-    zeroPlannedPVsError,
   )
 import Update.Go.ModFetch
   ( GoModFetcher,
@@ -142,7 +142,7 @@ planGoPackage ::
   PlanOps ->
   UpdateSource ->
   Maybe FilePath ->
-  IO (Either Text RuntimeLanePlan)
+  IO (Either PlanError RuntimeLanePlan)
 planGoPackage ops = planGoPackageWithProgress ops noopPlanProgress
 
 planGoPackageWithProgress ::
@@ -150,7 +150,7 @@ planGoPackageWithProgress ::
   PlanProgress ->
   UpdateSource ->
   Maybe FilePath ->
-  IO (Either Text RuntimeLanePlan)
+  IO (Either PlanError RuntimeLanePlan)
 planGoPackageWithProgress ops progress src mSub =
   -- Without local PVs, treat listed upstream as the full candidate set
   -- (tests that mock listVersions only). Production apply/check pass locals.
@@ -164,7 +164,7 @@ planGoPackageWithLocals ::
   UpdateSource ->
   Maybe FilePath ->
   Maybe [EbuildVersion] ->
-  IO (Either Text RuntimeLanePlan)
+  IO (Either PlanError RuntimeLanePlan)
 planGoPackageWithLocals ops =
   planGoPackageWithLocalsProgress ops noopPlanProgress
 
@@ -174,14 +174,14 @@ planGoPackageWithLocalsProgress ::
   UpdateSource ->
   Maybe FilePath ->
   Maybe [EbuildVersion] ->
-  IO (Either Text RuntimeLanePlan)
+  IO (Either PlanError RuntimeLanePlan)
 planGoPackageWithLocalsProgress ops progress src mSub mLocals =
   case src of
     GitHub owner repo prefix -> do
       ppOnCeilingsStart progress
       ceilingsResult <- discoverCeilingsCached ops
       case ceilingsResult of
-        Left err -> pure (Left err)
+        Left err -> pure (Left (PlanCeilingFailed err))
         Right ceilings -> do
           ppOnCeilingsDone progress
           ppOnListStart progress
@@ -189,7 +189,7 @@ planGoPackageWithLocalsProgress ops progress src mSub mLocals =
             withWorkSlot (poWorkBudget ops) $
               poListVersions ops src
           case versResult of
-            Left err -> pure (Left ("list versions failed: " <> err))
+            Left err -> pure (Left (PlanListVersionsFailed err))
             Right versions -> do
               ppOnListDone progress (length versions)
               let candidateFilter = case mLocals of
@@ -216,9 +216,15 @@ planGoPackageWithLocalsProgress ops progress src mSub mLocals =
                           (rcAtom ceilings)
                           targets
                   if null (glpUniquePVs plan)
-                    then pure (Left zeroPlannedPVsError)
+                    then pure (Left PlanZeroPlannedPVs)
                     else pure (Right plan)
-    _ -> pure (Left "DepsAndAssets Go planning requires a GitHub update source")
+    _ ->
+      pure
+        ( Left
+            ( PlanFailed
+                "DepsAndAssets Go planning requires a GitHub update source"
+            )
+        )
 
 sortNewestFirst :: [EbuildVersion] -> [EbuildVersion]
 sortNewestFirst =

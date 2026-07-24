@@ -30,6 +30,8 @@ module Update.Go.Lanes
     goReqMeetsCeiling,
     maxVersionUnder,
     filterCandidateVersions,
+    PlanError (..),
+    planErrorMessage,
     zeroPlannedPVsError,
   )
 where
@@ -47,6 +49,36 @@ import Update.Runtime.Ceilings
     allCeilingLanes,
     ceilingFor,
   )
+
+-- | Structured failures from runtime-lane / deps planning.
+-- Convert to operator 'Text' with 'planErrorMessage' at CLI / report edges.
+data PlanError
+  = -- | No non-live local ebuilds (first import / empty package dirs).
+    PlanNoNonLiveLocal
+  | -- | Selection produced zero unique planned PVs.
+    PlanZeroPlannedPVs
+  | -- | Runtime ceiling discovery failed (message already operator-facing).
+    PlanCeilingFailed Text
+  | -- | Listing upstream versions failed.
+    PlanListVersionsFailed Text
+  | -- | Per-version probe (go.mod / engines / rust-version) hard-failed.
+    PlanProbeFailed Text
+  | -- | Other plan preconditions (wrong source type, missing overlay path, …).
+    PlanFailed Text
+  deriving (Eq, Show)
+
+planErrorMessage :: PlanError -> Text
+planErrorMessage = \case
+  PlanNoNonLiveLocal ->
+    "DepsAndAssets requires at least one non-live local ebuild \
+    \(first import / empty package dirs are not supported)"
+  PlanZeroPlannedPVs ->
+    "runtime-lane planning produced no ebuild targets \
+    \(no candidate satisfies any runtime ceiling)"
+  PlanCeilingFailed err -> err
+  PlanListVersionsFailed err -> "list versions failed: " <> err
+  PlanProbeFailed err -> err
+  PlanFailed msg -> msg
 
 -- | Logical lane id: arch × plain/tilde.
 data LaneId = LaneId
@@ -318,13 +350,10 @@ buildGapLines localPVs needsWorkPVs plan =
 filterCandidateVersions ::
   [EbuildVersion] ->
   [EbuildVersion] ->
-  Either Text [EbuildVersion]
+  Either PlanError [EbuildVersion]
 filterCandidateVersions localPVs upstream =
   case localPVs of
-    [] ->
-      Left
-        "DepsAndAssets requires at least one non-live local ebuild \
-        \(first import / empty package dirs are not supported)"
+    [] -> Left PlanNoNonLiveLocal
     _ ->
       let maxLocal = foldl1 maxVer localPVs
           newer =
@@ -345,7 +374,6 @@ filterCandidateVersions localPVs upstream =
         Just LT -> b
         _ -> a
 
+-- | Stable pretty string for 'PlanZeroPlannedPVs' (tests / legacy call sites).
 zeroPlannedPVsError :: Text
-zeroPlannedPVsError =
-  "runtime-lane planning produced no ebuild targets \
-  \(no candidate satisfies any runtime ceiling)"
+zeroPlannedPVsError = planErrorMessage PlanZeroPlannedPVs

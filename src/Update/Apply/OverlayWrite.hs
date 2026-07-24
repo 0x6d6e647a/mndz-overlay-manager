@@ -18,6 +18,10 @@ import System.Directory (listDirectory, removeFile)
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import Update.Apply.Commit (egencacheAndSignedCommit, unitCommitMessage)
 import Update.Apply.Env (ApplyEnv (..))
+import Update.Apply.Errors
+  ( ApplyUnitError (..),
+    applyUnitHardFail,
+  )
 import Update.Assets.Hash (FileDigests (..))
 import Update.Check (PackageEntry (..))
 import Update.EbuildEdit
@@ -69,12 +73,7 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer digests t
   case dirty of
     Left err -> pure $ ApplyHardFail key err False orphan
     Right True ->
-      pure $
-        ApplyHardFail
-          key
-          "involved paths are dirty (newest ebuild and/or Manifest)"
-          False
-          orphan
+      pure $ applyUnitHardFail key ApplyDirtyInvolvedPaths False orphan
     Right False -> do
       templateContent <- TIO.readFile templatePath
       let content = fromMaybe templateContent mEbuildBody

@@ -53,6 +53,7 @@ import Update.Go.Lanes
     RuntimeLanePlan (..),
     buildGapLines,
     missingTargets,
+    planErrorMessage,
     planNeedsWork,
   )
 import Update.Go.ModFetch (GoModKey (..), parseGoReqFromMod)
@@ -259,7 +260,11 @@ checkPackageDeps mh depsOps entry locals src eco = do
     planDepsPackageWithProgress depsOps progress eco src localPVs
   case planResult of
     Left err ->
-      pure UpdateReport {reportKey = key, reportStatus = FetchError err}
+      pure
+        UpdateReport
+          { reportKey = key,
+            reportStatus = FetchError (planErrorMessage err)
+          }
     Right plan -> do
       contentFix <- contentFixPVs depsOps eco src locals plan
       let missing = missingTargets localPVs plan

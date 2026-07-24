@@ -78,6 +78,7 @@ library
       , Update.Apply
       , Update.Apply.Commit
       , Update.Apply.Env
+      , Update.Apply.Errors
       , Update.Apply.GitMv
       , Update.Apply.Materialize
       , Update.Apply.OverlayWrite

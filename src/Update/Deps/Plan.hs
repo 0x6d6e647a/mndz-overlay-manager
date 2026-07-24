@@ -36,12 +36,12 @@ import Update.Cargo.Msrv (parseRustVersionField)
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
   ( LaneTarget (..),
+    PlanError (..),
     RuntimeLanePlan (..),
     VersionCandidate (..),
     filterCandidateVersions,
     planFromTargetsWithAtom,
     selectAllLaneTargets,
-    zeroPlannedPVsError,
   )
 import Update.Go.ModFetch
   ( GoModFetcher,
@@ -132,7 +132,7 @@ planDepsPackageWithProgress ::
   EcosystemSpec ->
   UpdateSource ->
   [EbuildVersion] ->
-  IO (Either Text RuntimeLanePlan)
+  IO (Either PlanError RuntimeLanePlan)
 planDepsPackageWithProgress ops progress eco src locals =
   case eco of
     Go mSub -> planGo ops progress src mSub locals
@@ -150,7 +150,7 @@ planGo ::
   UpdateSource ->
   Maybe FilePath ->
   [EbuildVersion] ->
-  IO (Either Text RuntimeLanePlan)
+  IO (Either PlanError RuntimeLanePlan)
 planGo ops progress src mSub locals =
   case src of
     GitHub owner repo prefix ->
@@ -174,7 +174,7 @@ planGo ops progress src mSub locals =
               Left _ -> Right Nothing
               Right txt -> Right (parseGoReqFromMod txt)
         )
-    _ -> pure (Left "DepsAndAssets Go requires a GitHub update source")
+    _ -> pure (Left (PlanFailed "DepsAndAssets Go requires a GitHub update source"))
 
 ------------------------------------------------------------------------
 -- Npm
@@ -185,7 +185,7 @@ planNpm ::
   PlanProgress ->
   UpdateSource ->
   [EbuildVersion] ->
-  IO (Either Text RuntimeLanePlan)
+  IO (Either PlanError RuntimeLanePlan)
 planNpm ops progress src locals =
   case src of
     Npm npmPkg ->
@@ -201,10 +201,10 @@ planNpm ops progress src locals =
         ( \pv -> do
             eres <- dpoFetchNpmEngines ops npmPkg (renderPVNoRev pv)
             pure $ case eres of
-              Left err -> Left err
+              Left err -> Left (PlanProbeFailed err)
               Right ver -> Right (Just ver)
         )
-    _ -> pure (Left "DepsAndAssets Npm requires an Npm update source")
+    _ -> pure (Left (PlanFailed "DepsAndAssets Npm requires an Npm update source"))
 
 ------------------------------------------------------------------------
 -- Bun
@@ -215,13 +215,18 @@ planBun ::
   PlanProgress ->
   UpdateSource ->
   [EbuildVersion] ->
-  IO (Either Text RuntimeLanePlan)
+  IO (Either PlanError RuntimeLanePlan)
 planBun ops progress src locals =
   case src of
     GitHub owner repo prefix ->
       case dpoOverlayRoot ops of
         Nothing ->
-          pure (Left "overlay path required for bun-bin runtime ceilings")
+          pure
+            ( Left
+                ( PlanFailed
+                    "overlay path required for bun-bin runtime ceilings"
+                )
+            )
         Just overlayRoot ->
           planWith
             ops
@@ -241,10 +246,10 @@ planBun ops progress src locals =
                     prefix
                     (renderPVNoRev pv)
                 pure $ case eres of
-                  Left err -> Left err
+                  Left err -> Left (PlanProbeFailed err)
                   Right ver -> Right (Just ver)
             )
-    _ -> pure (Left "DepsAndAssets Bun requires a GitHub update source")
+    _ -> pure (Left (PlanFailed "DepsAndAssets Bun requires a GitHub update source"))
 
 ------------------------------------------------------------------------
 -- Cargo
@@ -257,7 +262,7 @@ planCargo ::
   Maybe FilePath ->
   Maybe FilePath ->
   [EbuildVersion] ->
-  IO (Either Text RuntimeLanePlan)
+  IO (Either PlanError RuntimeLanePlan)
 planCargo ops progress src mLockSub mPkgSub locals =
   case src of
     GitHub owner repo prefix ->
@@ -281,7 +286,7 @@ planCargo ops progress src mLockSub mPkgSub locals =
                     ]
             probeRustVersion ops owner repo prefix pvText tryPaths
         )
-    _ -> pure (Left "DepsAndAssets Cargo requires a GitHub update source")
+    _ -> pure (Left (PlanFailed "DepsAndAssets Cargo requires a GitHub update source"))
 
 -- | Probe rust-version from the first readable Cargo.toml among subdirs.
 probeRustVersion ::
@@ -291,7 +296,7 @@ probeRustVersion ::
   Text ->
   Text ->
   [Maybe FilePath] ->
-  IO (Either Text (Maybe Text))
+  IO (Either PlanError (Maybe Text))
 probeRustVersion ops owner repo prefix pv = go
   where
     go [] =
@@ -325,13 +330,13 @@ planWith ::
   UpdateSource ->
   [EbuildVersion] ->
   IO (Either Text RuntimeCeilings) ->
-  (EbuildVersion -> IO (Either Text (Maybe Text))) ->
-  IO (Either Text RuntimeLanePlan)
+  (EbuildVersion -> IO (Either PlanError (Maybe Text))) ->
+  IO (Either PlanError RuntimeLanePlan)
 planWith ops progress src locals discoverCeilings fetchReq = do
   ppOnCeilingsStart progress
   ceilingsResult <- discoverCeilings
   case ceilingsResult of
-    Left err -> pure (Left err)
+    Left err -> pure (Left (PlanCeilingFailed err))
     Right ceilings -> do
       ppOnCeilingsDone progress
       ppOnListStart progress
@@ -339,7 +344,7 @@ planWith ops progress src locals discoverCeilings fetchReq = do
         withWorkSlot (dpoWorkBudget ops) $
           dpoListVersions ops src
       case versResult of
-        Left err -> pure (Left ("list versions failed: " <> err))
+        Left err -> pure (Left (PlanListVersionsFailed err))
         Right versions -> do
           ppOnListDone progress (length versions)
           case filterCandidateVersions locals versions of
@@ -362,7 +367,7 @@ planWith ops progress src locals discoverCeilings fetchReq = do
                           (rcAtom ceilings)
                           targets
                   if null (glpUniquePVs plan)
-                    then pure (Left zeroPlannedPVsError)
+                    then pure (Left PlanZeroPlannedPVs)
                     else pure (Right plan)
 
 discoverCeilingsCached ::
@@ -392,8 +397,8 @@ buildCandidates ::
   PlanProgress ->
   RuntimeCeilings ->
   [EbuildVersion] ->
-  (EbuildVersion -> IO (Either Text (Maybe Text))) ->
-  IO (Either Text [VersionCandidate])
+  (EbuildVersion -> IO (Either PlanError (Maybe Text))) ->
+  IO (Either PlanError [VersionCandidate])
 buildCandidates ops progress ceilings versions fetchReq = do
   result <- walk [] versions
   ppOnProbeDone progress

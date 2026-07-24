@@ -40,6 +40,10 @@ import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Update.Apply.Commit (egencacheAndSignedCommit, pruneCommitMessage)
 import Update.Apply.Env (ApplyEnv (..))
+import Update.Apply.Errors
+  ( ApplyUnitError (..),
+    applyUnitHardFail,
+  )
 import Update.Apply.GitMv (requirePackageMd5Cache)
 import Update.Apply.OverlayWrite (findTemplate, overlayAfterAssets)
 import Update.Assets.Hash (FileDigests (..), hashFile, writeSidecars)
@@ -94,6 +98,7 @@ import Update.Go.Lanes
     RuntimeLanePlan (..),
     buildGapLines,
     missingTargets,
+    planErrorMessage,
     planNeedsWork,
   )
 import Update.Go.ModFetch (GoModKey (..), parseGoReqFromMod)
@@ -143,7 +148,13 @@ applyDepsAndAssets env overlayRoot entry src eco = do
       localPVs
   case planResult of
     Left err ->
-      pure [ApplyHardFail key ("runtime-lane plan failed: " <> err) False False]
+      pure
+        [ ApplyHardFail
+            key
+            ("runtime-lane plan failed: " <> planErrorMessage err)
+            False
+            False
+        ]
     Right plan -> do
       contentFix <- contentFixNeededEnv env eco src pkgDir (pePN entry) plan
       if not (planNeedsWork localPVs contentFix plan)
@@ -151,7 +162,7 @@ applyDepsAndAssets env overlayRoot entry src eco = do
         else do
           cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
           case cacheGate of
-            Left err -> pure [ApplyHardFail key err False False]
+            Left unitErr -> pure [applyUnitHardFail key unitErr False False]
             Right () -> do
               planDone <- readIORef planDoneRef
               materializeDepsPlan
@@ -583,23 +594,14 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
       remainingAfter = max 0 (remainingPVs - 1)
   case (aeAssetsRoot env, aeGitHubToken env) of
     (Nothing, _) ->
-      pure $
-        ApplyHardFail
-          key
-          "assets-path is required for DepsAndAssets packages"
-          False
-          False
+      pure $ applyUnitHardFail key ApplyMissingAssetsPath False False
     (_, Nothing) ->
-      pure $
-        ApplyHardFail
-          key
-          "GitHub token is required to publish assets releases"
-          False
-          False
+      pure $ applyUnitHardFail key ApplyMissingGitHubToken False False
     (Just assetsRoot, Just _token) ->
       case splitPackageKey key of
         Nothing ->
-          pure $ ApplyHardFail key "invalid package key" False False
+          pure $
+            applyUnitHardFail key (ApplyInvalidPackageKey Nothing) False False
         Just (category, _) -> do
           mhStatus mh key "probing release asset"
           looked <-

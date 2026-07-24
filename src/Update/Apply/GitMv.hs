@@ -16,12 +16,13 @@ import System.Directory (doesFileExist, renameFile)
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import Update.Apply.Commit (egencacheAndSignedCommit, unitCommitMessage)
 import Update.Apply.Env (ApplyEnv (..))
+import Update.Apply.Errors
+  ( ApplyUnitError (..),
+    applyUnitHardFail,
+  )
 import Update.Check (PackageEntry (..))
 import Update.Git (GitOps (..), relativeOverlayPath)
-import Update.Md5Cache
-  ( inspectPackageCache,
-    packageCacheGateError,
-  )
+import Update.Md5Cache (inspectPackageCache)
 import Update.Types
   ( ApplyOutcome (..),
     PackageKey (..),
@@ -36,15 +37,16 @@ requirePackageMd5Cache ::
   FilePath ->
   PackageKey ->
   FilePath ->
-  IO (Either Text ())
+  IO (Either ApplyUnitError ())
 requirePackageMd5Cache overlayRoot key pkgDir =
   case splitPackageKey key of
-    Nothing -> pure (Left ("invalid package key: " <> packageKeyText key))
+    Nothing ->
+      pure (Left (ApplyInvalidPackageKey (Just (packageKeyText key))))
     Just (category, pn) -> do
       inspected <- inspectPackageCache overlayRoot category pn pkgDir
       pure $ case inspected of
         Right () -> Right ()
-        Left issue -> Left (packageCacheGateError key issue)
+        Left issue -> Left (ApplyMd5CacheGate key issue)
 
 newEbuildFileName :: Text -> EbuildVersion -> FilePath
 newEbuildFileName pn remote =
@@ -112,7 +114,7 @@ gitMvDo env key local remote oldPath pkgDir pn overlayRoot = do
       ebuildRun = aeEbuildRunner env
   cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
   case cacheGate of
-    Left err -> pure $ ApplyHardFail key err False False
+    Left unitErr -> pure $ applyUnitHardFail key unitErr False False
     Right () -> do
       ebuildRel <- relativeOverlayPath overlayRoot oldPath
       let manifestAbs = pkgDir </> "Manifest"
@@ -121,12 +123,7 @@ gitMvDo env key local remote oldPath pkgDir pn overlayRoot = do
       case dirty' of
         Left err -> pure $ ApplyHardFail key err False False
         Right True ->
-          pure $
-            ApplyHardFail
-              key
-              "involved paths are dirty (newest ebuild and/or Manifest)"
-              False
-              False
+          pure $ applyUnitHardFail key ApplyDirtyInvolvedPaths False False
         Right False -> do
           let newName = newEbuildFileName pn remote
               newPath = pkgDir </> newName

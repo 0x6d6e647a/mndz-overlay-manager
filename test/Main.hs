@@ -91,6 +91,11 @@ import Update.Apply
     reviseMaterializeStepTotal,
     signedOverlayCommit,
   )
+import Update.Apply.Errors
+  ( ApplyUnitError (..),
+    applyUnitErrorMessage,
+    applyUnitHardFail,
+  )
 import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
 import Update.Assets.Layout (cratesTarballName, depsTarballName, vendorTarballName)
 import Update.Assets.Release
@@ -139,6 +144,7 @@ import Update.Go.Lanes
   ( GapLine (..),
     LaneId (..),
     LaneTarget (..),
+    PlanError (..),
     PlannedEbuild (..),
     RuntimeLanePlan (..),
     VersionCandidate (..),
@@ -152,9 +158,11 @@ import Update.Go.Lanes
     ltLane,
     maxVersionUnder,
     missingTargets,
+    planErrorMessage,
     planFromTargets,
     planNeedsWork,
     selectAllLaneTargets,
+    zeroPlannedPVsError,
     pattern LaneAmd64Plain,
     pattern LaneAmd64Tilde,
     pattern LaneArm64Plain,
@@ -1647,7 +1655,7 @@ testCandidateVersionFilter = do
         ]
   case filterCandidateVersions local upstream of
     Left err -> do
-      hPutStrLn stderr (T.unpack err)
+      hPutStrLn stderr (T.unpack (planErrorMessage err))
       exitFailure
     Right cs -> do
       assertTrue "has local 1.4.1" (parseEbuildVersion "1.4.1" `elem` cs)
@@ -1655,10 +1663,22 @@ testCandidateVersionFilter = do
       assertTrue "has 1.6.0" (parseEbuildVersion "1.6.0" `elem` cs)
       assertTrue "no 1.4.0" (parseEbuildVersion "1.4.0" `notElem` cs)
   case filterCandidateVersions [] upstream of
-    Left _ -> pure ()
+    Left PlanNoNonLiveLocal -> pure ()
+    Left other -> do
+      hPutStrLn stderr ("expected PlanNoNonLiveLocal, got: " <> show other)
+      exitFailure
     Right _ -> do
       hPutStrLn stderr "expected hard-fail for empty local"
       exitFailure
+
+  -- Pretty-printers stay stable for known plan failure classes
+  assertEq
+    "zero planned PVs message"
+    zeroPlannedPVsError
+    (planErrorMessage PlanZeroPlannedPVs)
+  assertTrue
+    "no non-live local mentions first import"
+    ("first import" `T.isInfixOf` planErrorMessage PlanNoNonLiveLocal)
 
 testEnginesMinimumParse :: IO ()
 testEnginesMinimumParse = do
@@ -4237,6 +4257,30 @@ testMd5CacheGencacheDecisions = do
     ( "gencache --force dev-util/crush"
         `T.isInfixOf` packageCacheGateError key (PackageCacheMismatch [])
     )
+  -- Apply unit pretty-printers mirror md5 gate / config hard-fail wording
+  assertEq
+    "apply unit md5 missing via ADT"
+    (packageCacheGateError key (PackageCacheMissing []))
+    (applyUnitErrorMessage (ApplyMd5CacheGate key (PackageCacheMissing [])))
+  assertEq
+    "dirty paths message"
+    "involved paths are dirty (newest ebuild and/or Manifest)"
+    (applyUnitErrorMessage ApplyDirtyInvolvedPaths)
+  assertTrue
+    "assets-path message identifiable"
+    ("assets-path" `T.isInfixOf` applyUnitErrorMessage ApplyMissingAssetsPath)
+  assertTrue
+    "token message identifiable"
+    ("token" `T.isInfixOf` applyUnitErrorMessage ApplyMissingGitHubToken)
+  case applyUnitHardFail key ApplyMissingAssetsPath False True of
+    ApplyHardFail k msg half assets -> do
+      assertEq "hard-fail key" key k
+      assertTrue "half unchanged" (not half)
+      assertTrue "assets flag preserved" assets
+      assertTrue "assets-path in hard-fail" ("assets-path" `T.isInfixOf` msg)
+    other -> do
+      hPutStrLn stderr ("expected ApplyHardFail, got: " <> show other)
+      exitFailure
 
 testMd5CacheGateBlocksGitMv :: IO ()
 testMd5CacheGateBlocksGitMv =
@@ -4290,9 +4334,14 @@ testMd5CacheGateBlocksGitMv =
               aeEgencacheRunner = \_ -> pure (Left "egencache should not run")
             }
     outcomes <- applyPackagePhase1 env overlayRoot entry
+    let key = peKey entry
     case outcomes of
       [ApplyHardFail _ msg half _] -> do
         assertTrue "mentions gencache" ("gencache" `T.isInfixOf` msg)
+        assertEq
+          "matches ApplyMd5CacheGate pretty"
+          (applyUnitErrorMessage (ApplyMd5CacheGate key (PackageCacheMissing [])))
+          msg
         assertTrue "not half-applied" (not half)
         stillThere <- doesFileExist (pkgDir </> oldName)
         assertTrue "ebuild not renamed" stillThere

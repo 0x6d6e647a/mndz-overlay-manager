@@ -21,6 +21,7 @@ root-modules = [
   "Update.Targets",
   "Update.Preflight",
   "Update.Apply",
+  "Update.Apply.Errors",
   "Update.Assets.Hash",
   "Update.Assets.Layout",
   "Update.Assets.Release",
