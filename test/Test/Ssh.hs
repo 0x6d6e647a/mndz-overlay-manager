@@ -70,7 +70,7 @@ import Overlay.Version
     prettyVersion,
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
@@ -229,6 +229,11 @@ import Update.Md5Cache
   )
 import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
+import Update.Process
+  ( ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+  )
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
   ( ArchCeilings (..),
@@ -251,6 +256,7 @@ import Update.SshAgent
     SshSession (..),
     defaultIdentityCandidates,
     ensureSshAgent,
+    mkSshAgentOps,
     parseIdentityFiles,
     teardownSshSession,
   )
@@ -285,7 +291,9 @@ tests =
       testCase "Ssh Ensure Fresh Unreachable After Add" testSshEnsureFreshUnreachableAfterAdd,
       testCase "Ssh Teardown Reused And Owned" testSshTeardownReusedAndOwned,
       testCase "Default Identity Candidates" testDefaultIdentityCandidates,
-      testCase "Parse Identity Files Edges" testParseIdentityFilesEdges
+      testCase "Parse Identity Files Edges" testParseIdentityFilesEdges,
+      testCase "Ssh mk CommandRunner success lifecycle" testSshMkCommandRunnerSuccess,
+      testCase "Ssh mk CommandRunner failure edges" testSshMkCommandRunnerFailures
     ]
 
 baseSshOps :: SshAgentOps
@@ -542,3 +550,160 @@ testParseIdentityFilesEdges = do
     "multiple files order preserved"
     ["/a", "/b"]
     (parseIdentityFiles "/home/u" "IdentityFile /a\nIdentityFile /b\n")
+
+------------------------------------------------------------------------
+-- Production mkSshAgentOps via scripted CommandRunner (captured I/O)
+------------------------------------------------------------------------
+
+okResult :: String -> ProcessResult
+okResult out =
+  ProcessResult
+    { prExitCode = ExitSuccess,
+      prStdout = out,
+      prStderr = ""
+    }
+
+failResult :: Int -> String -> ProcessResult
+failResult n err =
+  ProcessResult
+    { prExitCode = ExitFailure n,
+      prStdout = "",
+      prStderr = err
+    }
+
+execCmd :: ProcessRequest -> Maybe (String, [String])
+execCmd req = case prMode req of
+  ExecCmd cmd args -> Just (cmd, args)
+  ShellCmd _ -> Nothing
+
+agentEnvOut :: String
+agentEnvOut =
+  "SSH_AUTH_SOCK=/tmp/mk-agent.sock; export SSH_AUTH_SOCK;\n"
+    <> "SSH_AGENT_PID=4242; export SSH_AGENT_PID;\n"
+
+testSshMkCommandRunnerSuccess :: IO ()
+testSshMkCommandRunnerSuccess = do
+  listRef <- newIORef (0 :: Int)
+  killRef <- newIORef ([] :: [String])
+  setRef <- newIORef ([] :: [(String, String)])
+  unsetRef <- newIORef ([] :: [String])
+  let lifecycleRun req = case execCmd req of
+        Just ("ssh-agent", ["-s"]) -> pure (okResult agentEnvOut)
+        Just ("ssh-add", ["-l"]) -> do
+          _ <- atomicModifyIORef' listRef (\i -> (i + 1, i))
+          pure (okResult "identity\n")
+        Just ("kill", [pid]) -> do
+          atomicModifyIORef' killRef (\xs -> (xs <> [pid], ()))
+          pure (okResult "")
+        _ -> pure (failResult 1 ("unexpected: " <> show (prMode req)))
+      ops =
+        (mkSshAgentOps lifecycleRun)
+          { saoLookupEnv = \_ -> pure Nothing,
+            saoSetEnv = \k v -> atomicModifyIORef' setRef (\xs -> (xs <> [(k, v)], ())),
+            saoUnsetEnv = \k -> atomicModifyIORef' unsetRef (\xs -> (xs <> [k], ())),
+            saoSshAdd = pure (Right ())
+          }
+  session <- assertRight "mk fresh success" =<< ensureSshAgent ops
+  assertEq "owned pid" (SshSessionOwned "4242") session
+  sets <- readIORef setRef
+  assertTrue "set sock" (("SSH_AUTH_SOCK", "/tmp/mk-agent.sock") `elem` sets)
+  assertTrue "set pid" (("SSH_AGENT_PID", "4242") `elem` sets)
+  lists <- readIORef listRef
+  assertTrue "listed identities" (lists >= 1)
+
+  -- Reuse path: existing sock + production list HasIdentities
+  let reuseRun req = case execCmd req of
+        Just ("ssh-add", ["-l"]) -> pure (okResult "identity\n")
+        _ -> pure (failResult 1 ("unexpected reuse: " <> show (prMode req)))
+      opsReuse =
+        (mkSshAgentOps reuseRun)
+          { saoLookupEnv = \k ->
+              pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/existing" else Nothing,
+            saoSshAdd = pure (Left "should not add")
+          }
+  reused <- assertRight "mk reuse" =<< ensureSshAgent opsReuse
+  assertEq "reused" SshSessionReused reused
+
+  -- Teardown owned via production kill
+  teardownSshSession ops session
+  kills <- readIORef killRef
+  assertEq "killed via CommandRunner" ["4242"] kills
+  unsets <- readIORef unsetRef
+  assertTrue "unset sock" ("SSH_AUTH_SOCK" `elem` unsets)
+  assertTrue "unset pid" ("SSH_AGENT_PID" `elem` unsets)
+
+testSshMkCommandRunnerFailures :: IO ()
+testSshMkCommandRunnerFailures = do
+  -- run agent fail
+  let failAgentRun req = case execCmd req of
+        Just ("ssh-agent", ["-s"]) -> pure (failResult 1 "no ssh-agent binary")
+        _ -> pure (failResult 1 "should not run")
+      opsAgentFail =
+        (mkSshAgentOps failAgentRun)
+          { saoLookupEnv = \_ -> pure Nothing,
+            saoSshAdd = pure (Left "should not add")
+          }
+  errAgent <- assertLeft "run agent fail" =<< ensureSshAgent opsAgentFail
+  assertTrue "ssh-agent failed" ("ssh-agent failed" `T.isInfixOf` errAgent)
+  assertTrue "stderr" ("no ssh-agent binary" `T.isInfixOf` errAgent)
+
+  -- unparseable agent env
+  let badEnvRun req = case execCmd req of
+        Just ("ssh-agent", ["-s"]) -> pure (okResult "not an env dump\n")
+        _ -> pure (failResult 1 "should not run")
+      opsBadEnv =
+        (mkSshAgentOps badEnvRun)
+          { saoLookupEnv = \_ -> pure Nothing,
+            saoSshAdd = pure (Left "should not add")
+          }
+  errParse <- assertLeft "parse agent env" =<< ensureSshAgent opsBadEnv
+  assertTrue "parse err" ("could not parse ssh-agent" `T.isInfixOf` errParse)
+
+  -- list fail (unreachable) on reuse path → starts fresh → agent fails
+  let listFailRun req = case execCmd req of
+        Just ("ssh-add", ["-l"]) -> pure (failResult 2 "Cannot connect to agent")
+        Just ("ssh-agent", ["-s"]) -> pure (failResult 127 "ssh-agent: not found")
+        _ -> pure (failResult 1 ("unexpected: " <> show (prMode req)))
+      opsListFail =
+        (mkSshAgentOps listFailRun)
+          { saoLookupEnv = \k ->
+              pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/stale" else Nothing,
+            saoSshAdd = pure (Left "should not add")
+          }
+  errList <- assertLeft "list then agent fail" =<< ensureSshAgent opsListFail
+  assertTrue "agent after list fail" ("ssh-agent failed" `T.isInfixOf` errList)
+
+  -- kill edge: fresh agent + add fails → production kill runs
+  killRef <- newIORef ([] :: [String])
+  let killEdgeRun req = case execCmd req of
+        Just ("ssh-agent", ["-s"]) -> pure (okResult agentEnvOut)
+        Just ("kill", [pid]) -> do
+          atomicModifyIORef' killRef (\xs -> (xs <> [pid], ()))
+          pure (okResult "")
+        _ -> pure (failResult 1 ("unexpected: " <> show (prMode req)))
+      opsKill =
+        (mkSshAgentOps killEdgeRun)
+          { saoLookupEnv = \_ -> pure Nothing,
+            saoSetEnv = \_ _ -> pure (),
+            saoUnsetEnv = \_ -> pure (),
+            saoSshAdd = pure (Left "no keys on host")
+          }
+  errAdd <- assertLeft "add fail kills" =<< ensureSshAgent opsKill
+  assertEq "add error" "no keys on host" errAdd
+  kills <- readIORef killRef
+  assertEq "kill via runner" ["4242"] kills
+
+  -- empty list after add (production list exit 1)
+  let stillEmptyRun req = case execCmd req of
+        Just ("ssh-agent", ["-s"]) -> pure (okResult agentEnvOut)
+        Just ("ssh-add", ["-l"]) -> pure (failResult 1 "")
+        _ -> pure (failResult 1 ("unexpected: " <> show (prMode req)))
+      opsEmpty =
+        (mkSshAgentOps stillEmptyRun)
+          { saoLookupEnv = \_ -> pure Nothing,
+            saoSetEnv = \_ _ -> pure (),
+            saoUnsetEnv = \_ -> pure (),
+            saoSshAdd = pure (Right ())
+          }
+  errEmpty <- assertLeft "still empty" =<< ensureSshAgent opsEmpty
+  assertTrue "no identities" ("no identities" `T.isInfixOf` errEmpty)

@@ -43,7 +43,7 @@ import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (nub, sort, sortBy)
+import Data.List (isInfixOf, nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isNothing)
 import Data.Text qualified as T
@@ -70,7 +70,7 @@ import Overlay.Version
     prettyVersion,
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
@@ -203,6 +203,7 @@ import Update.GpgAgent
   ( GpgAgentOps (..),
     Keygrip (..),
     ensureGpgReady,
+    mkGpgAgentOps,
     newGpgHandle,
     parseKeyinfoCached,
     parseSignCapableKeygrip,
@@ -229,6 +230,11 @@ import Update.Md5Cache
   )
 import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
+import Update.Process
+  ( ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+  )
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
   ( ArchCeilings (..),
@@ -285,7 +291,9 @@ tests =
       testCase "No Tty When Cold Fails" testNoTtyWhenColdFails,
       testCase "Clear Only If Warmed" testClearOnlyIfWarmed,
       testCase "Per Repo Keygrips" testPerRepoKeygrips,
-      testCase "Worktree State Reused" testWorktreeStateReused
+      testCase "Worktree State Reused" testWorktreeStateReused,
+      testCase "Gpg mk CommandRunner success edges" testGpgMkCommandRunnerSuccess,
+      testCase "Gpg mk CommandRunner failure edges" testGpgMkCommandRunnerFailures
     ]
 
 testParseSignCapableKeygrip :: IO ()
@@ -589,3 +597,173 @@ testWorktreeStateReused = do
   assertEq "signingkey once" 1 gets
   assertEq "resolve once" 1 resolves
   teardownGpgHandle h
+
+------------------------------------------------------------------------
+-- Production mkGpgAgentOps via scripted CommandRunner
+------------------------------------------------------------------------
+
+okResult :: String -> ProcessResult
+okResult out =
+  ProcessResult
+    { prExitCode = ExitSuccess,
+      prStdout = out,
+      prStderr = ""
+    }
+
+failResult :: String -> ProcessResult
+failResult err =
+  ProcessResult
+    { prExitCode = ExitFailure 1,
+      prStdout = "",
+      prStderr = err
+    }
+
+execCmd :: ProcessRequest -> Maybe (String, [String])
+execCmd req = case prMode req of
+  ExecCmd cmd args -> Just (cmd, args)
+  ShellCmd _ -> Nothing
+
+signKeyColonOut :: String
+signKeyColonOut =
+  unlines
+    [ "sec:u:255:22:AB3AA8D9F11259B4:1781074659:::u:::scESC:::+::ed25519:::0:",
+      "fpr:::::::::CD806AAD3E54156ACC3842B7AB3AA8D9F11259B4:",
+      "grp:::::::::6FD5C82CED9AF42C796A9C275BF5CD4082063513:",
+      "ssb:u:255:18:0FFCBBF091D67623:1781074659::::::e:::+::cv25519::",
+      "grp:::::::::76D0B0AC365AE824D6705200A8898C3E7F33A81D:"
+    ]
+
+keyinfoWarmOut :: String
+keyinfoWarmOut =
+  "S KEYINFO 6FD5C82CED9AF42C796A9C275BF5CD4082063513 D - - 1 P - - -\nOK\n"
+
+keyinfoColdOut :: String
+keyinfoColdOut =
+  "S KEYINFO 6FD5C82CED9AF42C796A9C275BF5CD4082063513 D - - - P - - -\nOK\n"
+
+-- Warm-cache path only uses process helpers (no TTY/pinentry).
+testGpgMkCommandRunnerSuccess :: IO ()
+testGpgMkCommandRunnerSuccess =
+  withSystemTempDirectory "mndz-gpg-mk-" $ \tmp -> do
+    clearRef <- newIORef ([] :: [T.Text])
+    let successRun req = case execCmd req of
+          Just ("git", "-C" : _root : "config" : "--get" : "user.signingkey" : _) ->
+            pure (okResult "KEY1\n")
+          Just ("gpg", "--list-secret-keys" : _) -> pure (okResult signKeyColonOut)
+          Just ("gpg-connect-agent", []) ->
+            case prStdin req of
+              s
+                | "KEYINFO" `T.isInfixOf` T.pack s ->
+                    pure (okResult keyinfoWarmOut)
+                | "CLEAR_PASSPHRASE" `T.isInfixOf` T.pack s -> do
+                    atomicModifyIORef' clearRef (\xs -> (xs <> ["cleared"], ()))
+                    pure (okResult "OK\n")
+                | otherwise -> pure (failResult ("unexpected agent stdin: " <> s))
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+        ops = mkGpgAgentOps successRun (pure ()) (pure ())
+    h <- newGpgHandle ops
+    void $ assertRight "mk warm ready" =<< ensureGpgReady h tmp
+    -- Second call reuses worktree state; KEYINFO still via runner
+    void $ assertRight "mk warm again" =<< ensureGpgReady h tmp
+    teardownGpgHandle h
+    clears <- readIORef clearRef
+    -- warm cache path does not mark as warmed-by-us → no CLEAR
+    assertEq "no clear when we did not warm" [] clears
+
+    -- Direct warm + clear: cold KEYINFO overridden with TTY-free fakes for
+    -- interactive fields, process warm/clear still via runner
+    clearRef2 <- newIORef ([] :: [String])
+    let warmRun req = case execCmd req of
+          Just ("git", "-C" : _ : "config" : _) -> pure (okResult "KEY1\n")
+          Just ("gpg", "--list-secret-keys" : _) -> pure (okResult signKeyColonOut)
+          Just ("gpg-connect-agent", []) ->
+            case prStdin req of
+              s
+                | "KEYINFO" `T.isInfixOf` T.pack s ->
+                    pure (okResult keyinfoColdOut)
+                | "CLEAR_PASSPHRASE" `T.isInfixOf` T.pack s -> do
+                    atomicModifyIORef' clearRef2 (\xs -> (xs <> [s], ()))
+                    pure (okResult "OK\n")
+                | otherwise -> pure (failResult ("unexpected agent stdin: " <> s))
+          Just ("gpg", "--local-user" : _) -> pure (okResult "-----BEGIN PGP SIGNED MESSAGE-----\n")
+          _ -> pure (failResult ("unexpected warm: " <> show (prMode req)))
+        opsWarm =
+          (mkGpgAgentOps warmRun (pure ()) (pure ()))
+            { gaoControllingTty = pure (Just "/dev/tty"),
+              gaoReadyPrompt = pure (Right ())
+            }
+    h2 <- newGpgHandle opsWarm
+    void $ assertRight "mk cold warm" =<< ensureGpgReady h2 tmp
+    teardownGpgHandle h2
+    clears2 <- readIORef clearRef2
+    assertTrue "clear after warm" (not (null clears2))
+    assertTrue
+      "clear grip"
+      (any ("6FD5C82CED9AF42C796A9C275BF5CD4082063513" `isInfixOf`) clears2)
+
+testGpgMkCommandRunnerFailures :: IO ()
+testGpgMkCommandRunnerFailures =
+  withSystemTempDirectory "mndz-gpg-mk-fail-" $ \tmp -> do
+    let gitFailRun req = case execCmd req of
+          Just ("git", _) -> pure (failResult "not a git repo")
+          _ -> pure (failResult "should not run")
+        opsGit = mkGpgAgentOps gitFailRun (pure ()) (pure ())
+    hGit <- newGpgHandle opsGit
+    errGit <- assertLeft "git fail" =<< ensureGpgReady hGit tmp
+    assertTrue "signingkey unset" ("signingkey" `T.isInfixOf` errGit)
+    teardownGpgHandle hGit
+
+    -- empty signing key stdout
+    let emptyKeyRun req = case execCmd req of
+          Just ("git", _) -> pure (okResult "   \n")
+          _ -> pure (failResult "should not run")
+        opsEmpty = mkGpgAgentOps emptyKeyRun (pure ()) (pure ())
+    hEmpty <- newGpgHandle opsEmpty
+    errEmpty <- assertLeft "empty key" =<< ensureGpgReady hEmpty tmp
+    assertTrue "empty signingkey" ("empty" `T.isInfixOf` errEmpty)
+    teardownGpgHandle hEmpty
+
+    let gpgListFailRun req = case execCmd req of
+          Just ("git", _) -> pure (okResult "KEY1\n")
+          Just ("gpg", "--list-secret-keys" : _) -> pure (failResult "no secret key")
+          _ -> pure (failResult "should not run")
+        opsList = mkGpgAgentOps gpgListFailRun (pure ()) (pure ())
+    hList <- newGpgHandle opsList
+    errList <- assertLeft "gpg list fail" =<< ensureGpgReady hList tmp
+    assertTrue "list secret" ("could not list secret key" `T.isInfixOf` errList)
+    teardownGpgHandle hList
+
+    let noSignRun req = case execCmd req of
+          Just ("git", _) -> pure (okResult "KEY1\n")
+          Just ("gpg", "--list-secret-keys" : _) ->
+            pure (okResult "ssb:u:255:18:X:1::::::e:::\ngrp:::::::::AAAA:\n")
+          _ -> pure (failResult "should not run")
+        opsNoSign = mkGpgAgentOps noSignRun (pure ()) (pure ())
+    hNoSign <- newGpgHandle opsNoSign
+    errNoSign <- assertLeft "no sign grip" =<< ensureGpgReady hNoSign tmp
+    assertTrue "no sign-capable" ("no sign-capable" `T.isInfixOf` errNoSign)
+    teardownGpgHandle hNoSign
+
+    let keyinfoFailRun req = case execCmd req of
+          Just ("git", _) -> pure (okResult "KEY1\n")
+          Just ("gpg", "--list-secret-keys" : _) -> pure (okResult signKeyColonOut)
+          Just ("gpg-connect-agent", []) -> pure (failResult "agent down")
+          _ -> pure (failResult "should not run")
+        opsKi = mkGpgAgentOps keyinfoFailRun (pure ()) (pure ())
+    hKi <- newGpgHandle opsKi
+    errKi <- assertLeft "keyinfo fail" =<< ensureGpgReady hKi tmp
+    assertTrue "KEYINFO failed" ("KEYINFO failed" `T.isInfixOf` errKi)
+    teardownGpgHandle hKi
+
+    -- warm (clearsign) failure via production gaoWarmKey
+    let warmFailRun req = case execCmd req of
+          Just ("gpg", "--local-user" : _) -> pure (failResult "pinentry cancelled")
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+        opsWarmFail = mkGpgAgentOps warmFailRun (pure ()) (pure ())
+    errWarm <- gaoWarmKey opsWarmFail "KEY1"
+    case errWarm of
+      Left msg ->
+        assertTrue "clearsign fail" ("clearsign warm" `T.isInfixOf` msg)
+      Right () -> do
+        hPutStrLn stderr "expected warm failure"
+        exitFailure

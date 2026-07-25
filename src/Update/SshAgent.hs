@@ -7,6 +7,7 @@ module Update.SshAgent
     teardownSshSession,
     SshAgentOps (..),
     productionSshAgentOps,
+    mkSshAgentOps,
     discoverIdentityFiles,
     defaultIdentityCandidates,
     parseIdentityFiles,
@@ -38,9 +39,15 @@ import System.Process
   ( CreateProcess (..),
     StdStream (Inherit, UseHandle),
     proc,
-    readProcessWithExitCode,
     waitForProcess,
     withCreateProcess,
+  )
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
   )
 
 -- | SSH agent session for the process lifetime.
@@ -76,17 +83,25 @@ data SshAgentOps = SshAgentOps
     saoKillAgent :: String -> IO ()
   }
 
-productionSshAgentOps :: SshAgentOps
-productionSshAgentOps =
+-- | Build SSH agent ops over an injectable command runner (Unit heat surface).
+--
+-- Captured-I/O helpers (@ssh-agent@, @ssh-add -l@, @kill@) go through the
+-- runner. Interactive @ssh-add@ (TTY / askpass) stays on the inherited-stdio
+-- path and is out of scope for CommandRunner heating.
+mkSshAgentOps :: CommandRunner -> SshAgentOps
+mkSshAgentOps run =
   SshAgentOps
     { saoLookupEnv = lookupEnv,
       saoSetEnv = setEnv,
       saoUnsetEnv = unsetEnv,
-      saoRunAgent = runSshAgent,
+      saoRunAgent = runSshAgent run,
       saoSshAdd = runSshAddInteractive,
-      saoListIdentities = listIdentities,
-      saoKillAgent = killSshAgent
+      saoListIdentities = listIdentities run,
+      saoKillAgent = killSshAgent run
     }
+
+productionSshAgentOps :: SshAgentOps
+productionSshAgentOps = mkSshAgentOps productionCommandRunner
 
 -- | Ensure an SSH agent is available for git push.
 --
@@ -166,12 +181,19 @@ teardownSshSession ops (SshSessionOwned pid) = do
   saoUnsetEnv ops "SSH_AUTH_SOCK"
   saoUnsetEnv ops "SSH_AGENT_PID"
 
-runSshAgent :: IO (Either Text (String, String))
-runSshAgent = do
-  (code, out, err) <- readProcessWithExitCode "ssh-agent" ["-s"] ""
-  if code /= ExitSuccess
-    then pure $ Left ("ssh-agent failed: " <> T.pack (nullToDash err out))
-    else pure $ parseAgentEnv out
+runSshAgent :: CommandRunner -> IO (Either Text (String, String))
+runSshAgent run = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "ssh-agent" ["-s"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  if prExitCode res /= ExitSuccess
+    then pure $ Left ("ssh-agent failed: " <> T.pack (nullToDash (prStderr res) (prStdout res)))
+    else pure $ parseAgentEnv (prStdout res)
 
 parseAgentEnv :: String -> Either Text (String, String)
 parseAgentEnv out =
@@ -383,10 +405,17 @@ runSshAddProcess cp keys mode = do
                 <> T.pack (unwords keys)
             )
 
-listIdentities :: IO AgentIdentities
-listIdentities = do
-  (code, out, err) <- readProcessWithExitCode "ssh-add" ["-l"] ""
-  pure $ case code of
+listIdentities :: CommandRunner -> IO AgentIdentities
+listIdentities run = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "ssh-add" ["-l"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  pure $ case prExitCode res of
     ExitSuccess -> HasIdentities
     ExitFailure 1 -> NoIdentities
     ExitFailure n ->
@@ -394,11 +423,18 @@ listIdentities = do
         "ssh-add -l exit "
           <> T.pack (show n)
           <> ": "
-          <> T.pack (nullToDash err out)
+          <> T.pack (nullToDash (prStderr res) (prStdout res))
 
-killSshAgent :: String -> IO ()
-killSshAgent pid = do
-  _ <- readProcessWithExitCode "kill" [pid] ""
+killSshAgent :: CommandRunner -> String -> IO ()
+killSshAgent run pid = do
+  _ <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "kill" [pid],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure ()
 
 nullToDash :: String -> String -> String

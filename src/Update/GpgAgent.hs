@@ -5,6 +5,7 @@ module Update.GpgAgent
     GpgAgentOps (..),
     GpgHandle,
     productionGpgAgentOps,
+    mkGpgAgentOps,
     newGpgHandle,
     ensureGpgReady,
     teardownGpgHandle,
@@ -36,11 +37,12 @@ import System.IO
     stderr,
     withFile,
   )
-import System.Process
-  ( CreateProcess (..),
-    proc,
-    readCreateProcessWithExitCode,
-    readProcessWithExitCode,
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
   )
 
 -- | GPG keygrip (hex string).
@@ -85,20 +87,28 @@ data GpgAgentOps = GpgAgentOps
     gaoResumeUi :: IO ()
   }
 
--- | Production ops. Pass pause\/resume from 'CLI.Progress' panel controls.
-productionGpgAgentOps :: IO () -> IO () -> GpgAgentOps
-productionGpgAgentOps pauseUi resumeUi =
+-- | Build GPG agent ops over an injectable command runner (Unit heat surface).
+--
+-- Process-oriented helpers (git config, gpg list/clearsign, gpg-connect-agent)
+-- go through the runner. TTY ready-prompt and controlling-tty discovery stay
+-- host-local (not CommandRunner).
+mkGpgAgentOps :: CommandRunner -> IO () -> IO () -> GpgAgentOps
+mkGpgAgentOps run pauseUi resumeUi =
   GpgAgentOps
-    { gaoGetSigningKey = gitGetSigningKey,
-      gaoResolveKeygrip = resolveKeygripViaGpg,
-      gaoKeyinfoCached = keyinfoCached,
+    { gaoGetSigningKey = gitGetSigningKey run,
+      gaoResolveKeygrip = resolveKeygripViaGpg run,
+      gaoKeyinfoCached = keyinfoCached run,
       gaoReadyPrompt = readyPromptOnTty,
-      gaoWarmKey = warmKeyDummy,
-      gaoClearPassphrase = clearPassphrase,
+      gaoWarmKey = warmKeyDummy run,
+      gaoClearPassphrase = clearPassphrase run,
       gaoControllingTty = controllingTtyPath,
       gaoPauseUi = pauseUi,
       gaoResumeUi = resumeUi
     }
+
+-- | Production ops. Pass pause\/resume from 'CLI.Progress' panel controls.
+productionGpgAgentOps :: IO () -> IO () -> GpgAgentOps
+productionGpgAgentOps = mkGpgAgentOps productionCommandRunner
 
 -- | Create a process-lifetime handle.
 newGpgHandle :: GpgAgentOps -> IO GpgHandle
@@ -220,25 +230,31 @@ markWarmed handle rootAbs grip = do
 -- Production ops
 ------------------------------------------------------------------------
 
-gitGetSigningKey :: FilePath -> IO (Either Text Text)
-gitGetSigningKey repoRoot = do
+gitGetSigningKey :: CommandRunner -> FilePath -> IO (Either Text Text)
+gitGetSigningKey run repoRoot = do
   rootAbs <- makeAbsolute repoRoot
-  (code, out, err) <-
-    readProcessWithExitCode
-      "git"
-      ["-C", rootAbs, "config", "--get", "user.signingkey"]
-      ""
+  res <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "git"
+              ["-C", rootAbs, "config", "--get", "user.signingkey"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code /= ExitSuccess
+    if prExitCode res /= ExitSuccess
       then
         Left
           ( "git config user.signingkey is unset for worktree "
               <> T.pack rootAbs
               <> "; set it for GPG-signed commits (no default-key fallback)."
-              <> nullSuffix err
+              <> nullSuffix (prStderr res)
           )
       else
-        let key = T.strip (T.pack out)
+        let key = T.strip (T.pack (prStdout res))
          in if T.null key
               then
                 Left
@@ -247,26 +263,32 @@ gitGetSigningKey repoRoot = do
                   )
               else Right key
 
-resolveKeygripViaGpg :: Text -> IO (Either Text Keygrip)
-resolveKeygripViaGpg signingKey = do
-  (code, out, err) <-
-    readProcessWithExitCode
-      "gpg"
-      [ "--list-secret-keys",
-        "--with-colons",
-        "--with-keygrip",
-        T.unpack signingKey
-      ]
-      ""
+resolveKeygripViaGpg :: CommandRunner -> Text -> IO (Either Text Keygrip)
+resolveKeygripViaGpg run signingKey = do
+  res <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "gpg"
+              [ "--list-secret-keys",
+                "--with-colons",
+                "--with-keygrip",
+                T.unpack signingKey
+              ],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code /= ExitSuccess
+    if prExitCode res /= ExitSuccess
       then
         Left
           ( "could not list secret key for user.signingkey="
               <> signingKey
-              <> nullSuffix err
+              <> nullSuffix (prStderr res)
           )
-      else parseSignCapableKeygrip out
+      else parseSignCapableKeygrip (prStdout res)
 
 -- | From @gpg --list-secret-keys --with-colons --with-keygrip@ output, pick the
 -- first secret key (sec\/ssb) whose capabilities include @s@ and return its
@@ -310,22 +332,25 @@ colonFields = splitOn ':'
         (a, []) -> [a]
         (a, _ : b) -> a : splitOn c b
 
-keyinfoCached :: Keygrip -> IO (Either Text Bool)
-keyinfoCached (Keygrip grip) = do
-  (code, out, err) <-
-    readProcessWithExitCode
-      "gpg-connect-agent"
-      []
-      ("KEYINFO " <> T.unpack grip <> "\n")
+keyinfoCached :: CommandRunner -> Keygrip -> IO (Either Text Bool)
+keyinfoCached run (Keygrip grip) = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "gpg-connect-agent" [],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = "KEYINFO " <> T.unpack grip <> "\n"
+        }
   pure $
-    if code /= ExitSuccess
+    if prExitCode res /= ExitSuccess
       then
         Left
           ( "gpg-connect-agent KEYINFO failed for keygrip "
               <> grip
-              <> nullSuffix err
+              <> nullSuffix (prStderr res)
           )
-      else parseKeyinfoCached out grip
+      else parseKeyinfoCached (prStdout res) grip
 
 -- | Parse @S KEYINFO <grip> <type> <serial> <idstr> <cached> …@ lines.
 -- @cached@ is @1@ (warm) or @-@ (cold).
@@ -377,47 +402,50 @@ readyPromptOnTty = do
             )
         Right () -> Right ()
 
-warmKeyDummy :: Text -> IO (Either Text ())
-warmKeyDummy signingKey = do
+warmKeyDummy :: CommandRunner -> Text -> IO (Either Text ())
+warmKeyDummy run signingKey = do
   mTty <- controllingTtyPath
   env0 <- getEnvironment
   let env1 = pinentryChildEnv mTty env0
-      cp =
-        ( proc
-            "gpg"
-            [ "--local-user",
-              T.unpack signingKey,
-              "--clearsign",
-              "--output",
-              "-",
-              "--yes"
-            ]
-        )
-          { env = Just env1
-          }
   hPutStr stderr "Unlocking GPG signing key (TTY pinentry)…\n"
   hFlush stderr
-  (code, _out, err) <-
-    readCreateProcessWithExitCode
-      cp
-      "mndz-overlay-manager gpg readiness warm\n"
+  res <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "gpg"
+              [ "--local-user",
+                T.unpack signingKey,
+                "--clearsign",
+                "--output",
+                "-",
+                "--yes"
+              ],
+          prCwd = Nothing,
+          prEnv = Just env1,
+          prStdin = "mndz-overlay-manager gpg readiness warm\n"
+        }
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
       else
         Left
           ( "GPG unlock (clearsign warm) failed for user.signingkey="
               <> signingKey
-              <> nullSuffix err
+              <> nullSuffix (prStderr res)
           )
 
-clearPassphrase :: Keygrip -> IO ()
-clearPassphrase (Keygrip grip) = do
+clearPassphrase :: CommandRunner -> Keygrip -> IO ()
+clearPassphrase run (Keygrip grip) = do
   _ <-
-    readProcessWithExitCode
-      "gpg-connect-agent"
-      []
-      ("CLEAR_PASSPHRASE --mode=normal " <> T.unpack grip <> "\n")
+    run
+      ProcessRequest
+        { prMode = ExecCmd "gpg-connect-agent" [],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = "CLEAR_PASSPHRASE --mode=normal " <> T.unpack grip <> "\n"
+        }
   pure ()
 
 controllingTtyPath :: IO (Maybe FilePath)
