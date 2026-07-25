@@ -4,6 +4,7 @@ module Update.Bun.Cache
   ( BunCacheOps (..),
     BunCacheProgress (..),
     productionBunCacheOps,
+    mkBunCacheOps,
     buildBunDepsTarball,
     parseEnginesBunFromPackageJson,
     hostBunVersion,
@@ -24,18 +25,18 @@ import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process
-  ( CreateProcess (..),
-    cwd,
-    env,
-    proc,
-    readCreateProcessWithExitCode,
-  )
 import Update.Engines (parseEnginesMinimum)
 import Update.Go.Vendor (githubCloneUrl, versionTag)
 import Update.Go.Version
   ( compareGoVersions,
     parseGoVersionToken,
+  )
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
   )
 
 -- | Injectable process steps for bun cache construction.
@@ -55,25 +56,36 @@ data BunCacheProgress = BunCacheProgress
     bcpOnCompressDone :: IO ()
   }
 
-productionBunCacheOps :: BunCacheOps
-productionBunCacheOps =
+-- | Build bun cache ops over an injectable command runner (Unit heat surface).
+mkBunCacheOps :: CommandRunner -> BunCacheOps
+mkBunCacheOps run =
   BunCacheOps
-    { bcoClone = gitCloneTag,
-      bcoHostBunVersion = hostBunVersion,
-      bcoBunInstall = bunInstallCache,
-      bcoTarXz = tarXzBunCache
+    { bcoClone = gitCloneTag run,
+      bcoHostBunVersion = hostBunVersion run,
+      bcoBunInstall = bunInstallCache run,
+      bcoTarXz = tarXzBunCache run
     }
 
-hostBunVersion :: IO (Either Text Text)
-hostBunVersion = do
-  (code, out, err) <- readCreateProcessWithExitCode (proc "bun" ["--version"]) ""
+productionBunCacheOps :: BunCacheOps
+productionBunCacheOps = mkBunCacheOps productionCommandRunner
+
+hostBunVersion :: CommandRunner -> IO (Either Text Text)
+hostBunVersion run = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "bun" ["--version"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code /= ExitSuccess
-      then Left ("could not determine host Bun version: " <> T.pack err)
-      else case parseBunVersionOutput (T.pack out) of
+    if prExitCode res /= ExitSuccess
+      then Left ("could not determine host Bun version: " <> T.pack (prStderr res))
+      else case parseBunVersionOutput (T.pack (prStdout res)) of
         Just v -> Right v
         Nothing ->
-          Left ("could not parse host Bun version from: " <> T.strip (T.pack out))
+          Left ("could not parse host Bun version from: " <> T.strip (T.pack (prStdout res)))
 
 parseBunVersionOutput :: Text -> Maybe Text
 parseBunVersionOutput out =
@@ -184,59 +196,66 @@ buildBunDepsTarball ops progress owner repo prefix pv bunReq outDir tarballName 
                             bcpOnCompressDone progress
                             pure (Right outPath)
 
-gitCloneTag :: Text -> Text -> FilePath -> IO (Either Text ())
-gitCloneTag url tag dest = do
-  (code, _out, err) <-
-    readCreateProcessWithExitCode
-      ( proc
-          "git"
-          [ "clone",
-            "--depth",
-            "1",
-            "--branch",
-            T.unpack tag,
-            T.unpack url,
-            dest
-          ]
-      )
-      ""
-  pure $
-    if code == ExitSuccess
-      then Right ()
-      else Left ("git clone failed: " <> T.pack err)
-
-bunInstallCache :: FilePath -> FilePath -> IO (Either Text ())
-bunInstallCache cloneDir cacheDir = do
-  (code, _out, err) <-
-    readCreateProcessWithExitCode
-      ( proc
-          "bun"
-          [ "install",
-            "--frozen-lockfile",
-            "--cache-dir",
-            cacheDir
-          ]
-      )
-        { cwd = Just cloneDir
+gitCloneTag :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text ())
+gitCloneTag run url tag dest = do
+  res <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "git"
+              [ "clone",
+                "--depth",
+                "1",
+                "--branch",
+                T.unpack tag,
+                T.unpack url,
+                dest
+              ],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
         }
-      ""
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
-      else Left ("bun install failed: " <> T.pack err)
+      else Left ("git clone failed: " <> T.pack (prStderr res))
 
-tarXzBunCache :: FilePath -> FilePath -> FilePath -> IO (Either Text ())
-tarXzBunCache workDir entry outPath = do
+bunInstallCache :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+bunInstallCache run cloneDir cacheDir = do
+  res <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "bun"
+              [ "install",
+                "--frozen-lockfile",
+                "--cache-dir",
+                cacheDir
+              ],
+          prCwd = Just cloneDir,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  pure $
+    if prExitCode res == ExitSuccess
+      then Right ()
+      else Left ("bun install failed: " <> T.pack (prStderr res))
+
+tarXzBunCache :: CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+tarXzBunCache run workDir entry outPath = do
   baseEnv <- getEnvironment
   let env' = ("XZ_OPT", "-T0 -9") : filter (\(k, _) -> k /= "XZ_OPT") baseEnv
-  (code, _out, err) <-
-    readCreateProcessWithExitCode
-      (proc "tar" ["-acf", outPath, entry])
-        { cwd = Just workDir,
-          env = Just env'
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "tar" ["-acf", outPath, entry],
+          prCwd = Just workDir,
+          prEnv = Just env',
+          prStdin = ""
         }
-      ""
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
-      else Left ("tar xz bun-cache failed: " <> T.pack err)
+      else Left ("tar xz bun-cache failed: " <> T.pack (prStderr res))

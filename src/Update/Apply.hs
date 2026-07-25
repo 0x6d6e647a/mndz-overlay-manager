@@ -9,6 +9,7 @@ module Update.Apply
     foldExitHardFail,
     EbuildRunner,
     productionEbuildRunner,
+    mkEbuildRunner,
     ApplyEnv (..),
     -- | Exported for 'Update.Apply.TestSupport' and direct unit tests.
     applyPackagePhase1,
@@ -28,6 +29,7 @@ import Data.Text qualified as T
 import Update.Apply.Env
   ( ApplyEnv (..),
     EbuildRunner,
+    mkEbuildRunner,
     productionEbuildRunner,
   )
 import Update.Apply.GitMv (applyGitMv)

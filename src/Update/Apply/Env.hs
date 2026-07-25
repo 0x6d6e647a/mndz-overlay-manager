@@ -4,6 +4,7 @@
 module Update.Apply.Env
   ( EbuildRunner,
     productionEbuildRunner,
+    mkEbuildRunner,
     ApplyEnv (..),
   )
 where
@@ -13,11 +14,6 @@ import Control.Concurrent.MVar (MVar)
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Exit (ExitCode (..))
-import System.Process
-  ( CreateProcess (cwd),
-    readCreateProcessWithExitCode,
-    shell,
-  )
 import Update.Assets.Release (ReleaseOps)
 import Update.Bun.Cache (BunCacheOps)
 import Update.Cargo.Crates (CargoOps)
@@ -27,19 +23,36 @@ import Update.Go.Plan (PlanOps)
 import Update.Go.Vendor (VendorOps)
 import Update.Md5Cache (EgencacheRunner)
 import Update.Npm.Cache (NpmCacheOps)
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
+  )
 import Update.Types (Fetcher)
 
 type EbuildRunner = FilePath -> FilePath -> IO (Either Text ())
 
-productionEbuildRunner :: EbuildRunner
-productionEbuildRunner pkgDir ebuildFileName = do
+-- | Build ebuild runner over an injectable command runner (shell mode).
+mkEbuildRunner :: CommandRunner -> EbuildRunner
+mkEbuildRunner run pkgDir ebuildFileName = do
   let cmd = "ebuild ./" <> ebuildFileName <> " manifest"
-      proc' = (shell cmd) {cwd = Just pkgDir}
-  (code, _out, err) <- readCreateProcessWithExitCode proc' ""
+  res <-
+    run
+      ProcessRequest
+        { prMode = ShellCmd cmd,
+          prCwd = Just pkgDir,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
-      else Left ("ebuild manifest failed: " <> T.pack err)
+      else Left ("ebuild manifest failed: " <> T.pack (prStderr res))
+
+productionEbuildRunner :: EbuildRunner
+productionEbuildRunner = mkEbuildRunner productionCommandRunner
 
 data ApplyEnv = ApplyEnv
   { aeFetcher :: Fetcher,

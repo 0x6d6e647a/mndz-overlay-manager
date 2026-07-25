@@ -9,6 +9,7 @@ module Update.Runtime.Ceilings
     RuntimeEbuildMeta (..),
     PortageqRunner,
     productionPortageqRunner,
+    mkPortageqRunner,
     gentooRepoPath,
     goPackageDir,
     nodejsPackageDir,
@@ -53,7 +54,13 @@ import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeFileName, (</>))
-import System.Process (readProcessWithExitCode)
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
+  )
 import Update.TextUtil (stripSurroundingQuotes)
 
 -- | Architecture token without leading @~@ (e.g. @"amd64"@, @"loong"@).
@@ -129,19 +136,30 @@ data RuntimeEbuildMeta = RuntimeEbuildMeta
 -- | Injectable @portageq@ runner: args → stdout or error.
 type PortageqRunner = [String] -> IO (Either Text Text)
 
-productionPortageqRunner :: PortageqRunner
-productionPortageqRunner args = do
-  (code, out, err) <- readProcessWithExitCode "portageq" args ""
+-- | Build portageq runner over an injectable command runner (Unit heat surface).
+mkPortageqRunner :: CommandRunner -> PortageqRunner
+mkPortageqRunner run args = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "portageq" args,
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code == ExitSuccess
-      then Right (T.strip (T.pack out))
+    if prExitCode res == ExitSuccess
+      then Right (T.strip (T.pack (prStdout res)))
       else
         Left
           ( "portageq "
               <> T.intercalate " " (map T.pack args)
               <> " failed: "
-              <> T.pack err
+              <> T.pack (prStderr res)
           )
+
+productionPortageqRunner :: PortageqRunner
+productionPortageqRunner = mkPortageqRunner productionCommandRunner
 
 -- | Resolve Gentoo repository path via @portageq get_repo_path / gentoo@.
 gentooRepoPath :: PortageqRunner -> IO (Either Text FilePath)

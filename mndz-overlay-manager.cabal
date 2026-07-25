@@ -111,6 +111,7 @@ library
       , Update.Npm
       , Update.Npm.Cache
       , Update.Preflight
+      , Update.Process
       , Update.Resolve
       , Update.Runtime.Ceilings
       , Update.SshAgent

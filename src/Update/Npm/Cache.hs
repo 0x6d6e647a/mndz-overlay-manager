@@ -4,6 +4,7 @@ module Update.Npm.Cache
   ( NpmCacheOps (..),
     NpmCacheProgress (..),
     productionNpmCacheOps,
+    mkNpmCacheOps,
     buildNpmDepsTarball,
     fetchNpmEnginesNode,
     listNpmVersions,
@@ -37,19 +38,19 @@ import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process
-  ( CreateProcess (..),
-    cwd,
-    env,
-    proc,
-    readCreateProcessWithExitCode,
-  )
 import Update.Engines (parseEnginesMinimum)
 import Update.Go.Version
   ( compareGoVersions,
     parseGoVersionToken,
   )
 import Update.Http (tryHttp)
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
+  )
 
 -- | Injectable process steps for npm cache construction.
 data NpmCacheOps = NpmCacheOps
@@ -68,25 +69,36 @@ data NpmCacheProgress = NpmCacheProgress
     ncpOnCompressDone :: IO ()
   }
 
-productionNpmCacheOps :: NpmCacheOps
-productionNpmCacheOps =
+-- | Build npm cache ops over an injectable command runner (Unit heat surface).
+mkNpmCacheOps :: CommandRunner -> NpmCacheOps
+mkNpmCacheOps run =
   NpmCacheOps
-    { ncoHostNodeVersion = hostNodeVersion,
-      ncoNpmPack = npmPack,
-      ncoNpmInstallCache = npmInstallCache,
-      ncoTarXz = tarXzNpmCache
+    { ncoHostNodeVersion = hostNodeVersion run,
+      ncoNpmPack = npmPack run,
+      ncoNpmInstallCache = npmInstallCache run,
+      ncoTarXz = tarXzNpmCache run
     }
 
-hostNodeVersion :: IO (Either Text Text)
-hostNodeVersion = do
-  (code, out, err) <- readCreateProcessWithExitCode (proc "node" ["--version"]) ""
+productionNpmCacheOps :: NpmCacheOps
+productionNpmCacheOps = mkNpmCacheOps productionCommandRunner
+
+hostNodeVersion :: CommandRunner -> IO (Either Text Text)
+hostNodeVersion run = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "node" ["--version"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code /= ExitSuccess
-      then Left ("could not determine host Node version: " <> T.pack err)
-      else case parseNodeVersionOutput (T.pack out) of
+    if prExitCode res /= ExitSuccess
+      then Left ("could not determine host Node version: " <> T.pack (prStderr res))
+      else case parseNodeVersionOutput (T.pack (prStdout res)) of
         Just v -> Right v
         Nothing ->
-          Left ("could not parse host Node version from: " <> T.strip (T.pack out))
+          Left ("could not parse host Node version from: " <> T.strip (T.pack (prStdout res)))
 
 parseNodeVersionOutput :: Text -> Maybe Text
 parseNodeVersionOutput out =
@@ -167,17 +179,19 @@ buildNpmDepsTarball ops progress npmPkg pv nodeReq outDir tarballName = do
                         ncpOnCompressDone progress
                         pure (Right outPath)
 
-npmPack :: Text -> Text -> FilePath -> IO (Either Text FilePath)
-npmPack npmPkg pv workDir = do
+npmPack :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text FilePath)
+npmPack run npmPkg pv workDir = do
   let spec = T.unpack npmPkg <> "@" <> T.unpack pv
-  (code, out, err) <-
-    readCreateProcessWithExitCode
-      (proc "npm" ["pack", spec, "--pack-destination", workDir])
-        { cwd = Just workDir
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "npm" ["pack", spec, "--pack-destination", workDir],
+          prCwd = Just workDir,
+          prEnv = Nothing,
+          prStdin = ""
         }
-      ""
-  if code /= ExitSuccess
-    then pure (Left ("npm pack failed: " <> T.pack err <> T.pack out))
+  if prExitCode res /= ExitSuccess
+    then pure (Left ("npm pack failed: " <> T.pack (prStderr res) <> T.pack (prStdout res)))
     else do
       names <- listDirectory workDir
       let tgzs = [workDir </> n | n <- names, ".tgz" `T.isSuffixOf` T.pack n]
@@ -185,34 +199,37 @@ npmPack npmPkg pv workDir = do
         (p : _) -> Right p
         [] -> Left "npm pack produced no .tgz file"
 
-npmInstallCache :: FilePath -> FilePath -> IO (Either Text ())
-npmInstallCache tgz cacheDir = do
-  (code, _out, err) <-
-    readCreateProcessWithExitCode
-      (proc "npm" ["--cache", cacheDir, "install", tgz])
-        { cwd = Just (takeDirectory tgz)
+npmInstallCache :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+npmInstallCache run tgz cacheDir = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "npm" ["--cache", cacheDir, "install", tgz],
+          prCwd = Just (takeDirectory tgz),
+          prEnv = Nothing,
+          prStdin = ""
         }
-      ""
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
-      else Left ("npm --cache install failed: " <> T.pack err)
+      else Left ("npm --cache install failed: " <> T.pack (prStderr res))
 
-tarXzNpmCache :: FilePath -> FilePath -> FilePath -> IO (Either Text ())
-tarXzNpmCache workDir entry outPath = do
+tarXzNpmCache :: CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+tarXzNpmCache run workDir entry outPath = do
   baseEnv <- getEnvironment
   let env' = ("XZ_OPT", "-T0 -9") : filter (\(k, _) -> k /= "XZ_OPT") baseEnv
-  (code, _out, err) <-
-    readCreateProcessWithExitCode
-      (proc "tar" ["-acf", outPath, entry])
-        { cwd = Just workDir,
-          env = Just env'
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "tar" ["-acf", outPath, entry],
+          prCwd = Just workDir,
+          prEnv = Just env',
+          prStdin = ""
         }
-      ""
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
-      else Left ("tar xz npm-cache failed: " <> T.pack err)
+      else Left ("tar xz npm-cache failed: " <> T.pack (prStderr res))
 
 parseEnginesNode :: Value -> Parser Text
 parseEnginesNode =

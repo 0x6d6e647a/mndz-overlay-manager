@@ -21,8 +21,9 @@ module Update.Md5Cache
     EgencacheRequest (..),
     EgencacheRunner,
     productionEgencacheRunner,
+    mkEgencacheRunner,
     buildRepositoriesConfiguration,
-    discoverGentooLocation,
+    discoverGentooLocationWith,
     checkLayoutCacheFormats,
     layoutConfPath,
     ebuildFileMd5,
@@ -67,9 +68,15 @@ import System.Directory
   )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.Process (readProcessWithExitCode)
 import Update.Git (GitOps (..))
 import Update.Go.Plan (isLivePackageVersion)
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
+  )
 import Update.Types (PackageKey (..), packageKeyText, splitPackageKey)
 
 -- | Per-version md5-cache consistency against a non-live ebuild.
@@ -334,14 +341,20 @@ collectPackageCachePathspecs overlayRoot category pn before = do
 ------------------------------------------------------------------------
 
 -- | Resolve gentoo master location for the injected repositories configuration.
-discoverGentooLocation :: IO (Either Text FilePath)
-discoverGentooLocation = do
-  (code, out, _err) <-
-    readProcessWithExitCode "portageq" ["get_repo_path", "/", "gentoo"] ""
+discoverGentooLocationWith :: CommandRunner -> IO (Either Text FilePath)
+discoverGentooLocationWith run = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "portageq" ["get_repo_path", "/", "gentoo"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   let fromPq =
-        if code == ExitSuccess
+        if prExitCode res == ExitSuccess
           then
-            let p = stripSpaces out
+            let p = stripSpaces (prStdout res)
              in if null p then Nothing else Just p
           else Nothing
   case fromPq of
@@ -381,9 +394,10 @@ buildRepositoriesConfiguration gentooLoc overlayLoc =
       "auto-sync = false"
     ]
 
-productionEgencacheRunner :: EgencacheRunner
-productionEgencacheRunner req = do
-  gentoo <- discoverGentooLocation
+-- | Build egencache runner over an injectable command runner (Unit heat surface).
+mkEgencacheRunner :: CommandRunner -> EgencacheRunner
+mkEgencacheRunner run req = do
+  gentoo <- discoverGentooLocationWith run
   case gentoo of
     Left err -> pure (Left err)
     Right gentooLoc -> do
@@ -402,11 +416,21 @@ productionEgencacheRunner req = do
             ]
               <> atoms
               <> jobsArgs
-      (code, _out, err) <- readProcessWithExitCode "egencache" args ""
+      res <-
+        run
+          ProcessRequest
+            { prMode = ExecCmd "egencache" args,
+              prCwd = Nothing,
+              prEnv = Nothing,
+              prStdin = ""
+            }
       pure $
-        if code == ExitSuccess
+        if prExitCode res == ExitSuccess
           then Right ()
-          else Left ("egencache failed: " <> T.pack err)
+          else Left ("egencache failed: " <> T.pack (prStderr res))
+
+productionEgencacheRunner :: EgencacheRunner
+productionEgencacheRunner = mkEgencacheRunner productionCommandRunner
 
 -- | Run package-scoped egencache and return pathspecs for git (before∪after).
 runPackageEgencache ::

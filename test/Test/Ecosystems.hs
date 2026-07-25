@@ -7,9 +7,11 @@ module Test.Ecosystems (unitTests, integrationTests) where
 import Control.Concurrent.MVar (newMVar)
 import Control.Monad (void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.List (isInfixOf)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
@@ -20,13 +22,14 @@ import Test.Support
   )
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
-import Update.Apply (ApplyEnv (..))
+import Update.Apply (ApplyEnv (..), mkEbuildRunner)
 import Update.Bun.Cache
   ( BunCacheOps (..),
     BunCacheProgress (..),
     buildBunDepsTarball,
     bunVersionTooOldMessage,
     hostMeetsBunRequirement,
+    mkBunCacheOps,
     parseEnginesBunFromPackageJson,
   )
 import Update.Cargo.Crates
@@ -36,16 +39,34 @@ import Update.Cargo.Crates
     buildCargoCratesTarball,
     crateTarballPrefix,
     maxRustVersionInTree,
+    mkCargoOps,
   )
 import Update.Git (GitOps (..))
 import Update.Go.Plan (PlanOps (..))
+import Update.Go.Vendor
+  ( VendorResult (..),
+    buildVendorTarball,
+    mkVendorOps,
+    noopVendorProgress,
+  )
+import Update.Md5Cache
+  ( EgencacheRequest (..),
+    mkEgencacheRunner,
+  )
 import Update.Npm.Cache
   ( NpmCacheOps (..),
     NpmCacheProgress (..),
     buildNpmDepsTarball,
     hostMeetsNodeRequirement,
+    mkNpmCacheOps,
     nodeVersionTooOldMessage,
   )
+import Update.Process
+  ( ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+  )
+import Update.Runtime.Ceilings (gentooRepoPath, mkPortageqRunner)
 
 unitTests :: TestTree
 unitTests =
@@ -86,6 +107,14 @@ unitTests =
           testCase "buildCargoCratesTarball clone failure" testCargoBuilderCloneFail,
           testCase "buildCargoCratesTarball missing Cargo.lock" testCargoBuilderMissingLock,
           testCase "buildCargoCratesTarball pycargo failure" testCargoBuilderPycargoFail
+        ],
+      testGroup
+        "production CommandRunner adapters"
+        [ testCase "npm mk path success + failure" testNpmMkCommandRunner,
+          testCase "bun mk path success + failure" testBunMkCommandRunner,
+          testCase "vendor mk path success + failure" testVendorMkCommandRunner,
+          testCase "cargo mk path success + failure" testCargoMkCommandRunner,
+          testCase "ebuild/egencache/portageq mk runners" testSimpleRunnersMk
         ]
     ]
 
@@ -627,6 +656,306 @@ testCargoBuilderPycargoFail = do
   case result of
     Left err -> assertTrue "error bubbled" ("boom" `T.isInfixOf` err)
     Right _ -> fail "expected pycargoebuild failure"
+
+------------------------------------------------------------------------
+-- Production mk*Ops / runners via scripted CommandRunner
+------------------------------------------------------------------------
+
+okResult :: String -> ProcessResult
+okResult out =
+  ProcessResult
+    { prExitCode = ExitSuccess,
+      prStdout = out,
+      prStderr = ""
+    }
+
+failResult :: String -> ProcessResult
+failResult err =
+  ProcessResult
+    { prExitCode = ExitFailure 1,
+      prStdout = "",
+      prStderr = err
+    }
+
+execCmd :: ProcessRequest -> Maybe (String, [String])
+execCmd req = case prMode req of
+  ExecCmd cmd args -> Just (cmd, args)
+  ShellCmd _ -> Nothing
+
+testNpmMkCommandRunner :: IO ()
+testNpmMkCommandRunner =
+  withSystemTempDirectory "mndz-npm-mk-" $ \outDir -> do
+    let successRun req = case execCmd req of
+          Just ("node", ["--version"]) -> pure (okResult "v20.19.0\n")
+          Just ("npm", "pack" : _) -> do
+            case prCwd req of
+              Just workDir -> writeFile (workDir </> "pkg-1.0.0.tgz") "packed"
+              Nothing -> pure ()
+            pure (okResult "")
+          Just ("npm", "--cache" : _) -> pure (okResult "")
+          Just ("tar", _) -> do
+            case prMode req of
+              ExecCmd _ (_ : outPath : _) -> writeFile outPath "npm-tarball"
+              _ -> pure ()
+            pure (okResult "")
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+        failRun req = case execCmd req of
+          Just ("node", ["--version"]) -> pure (failResult "node missing")
+          _ -> pure (failResult "should not run")
+    path <-
+      assertRight "npm mk success"
+        =<< buildNpmDepsTarball
+          (mkNpmCacheOps successRun)
+          noopNpmProgress
+          "left-pad"
+          "1.0.0"
+          "18.0.0"
+          outDir
+          "left-pad-1.0.0-npm-cache.tar.xz"
+    assertEq "out path" (outDir </> "left-pad-1.0.0-npm-cache.tar.xz") path
+    exists <- doesFileExist path
+    assertTrue "tarball written" exists
+    err <-
+      assertLeft "npm mk host fail"
+        =<< buildNpmDepsTarball
+          (mkNpmCacheOps failRun)
+          noopNpmProgress
+          "pkg"
+          "1.0.0"
+          "18.0.0"
+          outDir
+          "x.tar.xz"
+    assertTrue "host node error" ("could not determine host Node version" `T.isInfixOf` err)
+
+testBunMkCommandRunner :: IO ()
+testBunMkCommandRunner =
+  withSystemTempDirectory "mndz-bun-mk-" $ \outDir -> do
+    let successRun req = case execCmd req of
+          Just ("bun", ["--version"]) -> pure (okResult "1.2.3\n")
+          Just ("git", "clone" : args) -> do
+            let dest = last args
+            createDirectoryIfMissing True dest
+            TIO.writeFile (dest </> "bun.lock") "{}"
+            pure (okResult "")
+          Just ("bun", "install" : _) -> pure (okResult "")
+          Just ("tar", _) -> do
+            case prMode req of
+              ExecCmd _ (_ : outPath : _) -> writeFile outPath "bun-tarball"
+              _ -> pure ()
+            pure (okResult "")
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+        failRun req = case execCmd req of
+          Just ("bun", ["--version"]) -> pure (okResult "1.2.3\n")
+          Just ("git", "clone" : _) -> pure (failResult "clone offline")
+          _ -> pure (failResult "should not run")
+    path <-
+      assertRight "bun mk success"
+        =<< buildBunDepsTarball
+          (mkBunCacheOps successRun)
+          noopBunProgress
+          "owner"
+          "repo"
+          "v"
+          "0.1.0"
+          "1.0.0"
+          outDir
+          "repo-0.1.0-bun-cache.tar.xz"
+    exists <- doesFileExist path
+    assertTrue "bun tarball" exists
+    err <-
+      assertLeft "bun mk clone fail"
+        =<< buildBunDepsTarball
+          (mkBunCacheOps failRun)
+          noopBunProgress
+          "o"
+          "r"
+          "v"
+          "0.1.0"
+          "1.0.0"
+          outDir
+          "x.tar.xz"
+    assertTrue "clone error" ("git clone failed" `T.isInfixOf` err)
+
+testVendorMkCommandRunner :: IO ()
+testVendorMkCommandRunner =
+  withSystemTempDirectory "mndz-vendor-mk-" $ \outDir -> do
+    let goMod =
+          T.unlines
+            [ "module example.com/pkg",
+              "go 1.22.0"
+            ]
+        successRun req = case execCmd req of
+          Just ("git", "clone" : args) -> do
+            let dest = last args
+            createDirectoryIfMissing True dest
+            TIO.writeFile (dest </> "go.mod") goMod
+            pure (okResult "")
+          Just ("go", ["version"]) ->
+            pure (okResult "go version go1.22.5 linux/amd64\n")
+          Just ("go", "mod" : _) -> pure (okResult "")
+          Just ("tar", _) -> do
+            case prMode req of
+              ExecCmd _ (_ : outPath : _) -> writeFile outPath "vendor-tarball"
+              _ -> pure ()
+            pure (okResult "")
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+        failRun req = case execCmd req of
+          Just ("git", "clone" : _) -> pure (failResult "network down")
+          _ -> pure (failResult "should not run")
+    res <-
+      assertRight "vendor mk success"
+        =<< buildVendorTarball
+          (mkVendorOps successRun)
+          noopVendorProgress
+          "owner"
+          "repo"
+          "v"
+          "0.1.0"
+          Nothing
+          outDir
+          "pkg-0.1.0-vendor.tar.xz"
+    assertEq "go.mod version" (Just "1.22.0") (vrGoModVersion res)
+    exists <- doesFileExist (vrTarballPath res)
+    assertTrue "vendor tarball" exists
+    vendorFail <-
+      buildVendorTarball
+        (mkVendorOps failRun)
+        noopVendorProgress
+        "o"
+        "r"
+        "v"
+        "0.1.0"
+        Nothing
+        outDir
+        "x.tar.xz"
+    case vendorFail of
+      Left err -> assertTrue "clone error" ("git clone failed" `T.isInfixOf` err)
+      Right _ -> fail "expected vendor clone failure"
+
+testCargoMkCommandRunner :: IO ()
+testCargoMkCommandRunner =
+  withSystemTempDirectory "mndz-cargo-mk-" $ \outDir -> do
+    let successRun req = case execCmd req of
+          Just ("git", "clone" : args) -> do
+            let dest = last args
+            createDirectoryIfMissing True dest
+            TIO.writeFile (dest </> "Cargo.lock") "# lock\n"
+            TIO.writeFile
+              (dest </> "Cargo.toml")
+              "[package]\nname = \"pkg\"\nrust-version = \"1.85.0\"\n"
+            pure (okResult "")
+          Just ("pycargoebuild", args) -> do
+            -- -i ebuildPath ... --crate-tarball-path tarballPath ...
+            case dropWhile (/= "-i") args of
+              ("-i" : ebuildPath : rest) -> do
+                TIO.writeFile ebuildPath (donorEbuild <> "\n# pycargo\n")
+                case dropWhile (/= "--crate-tarball-path") rest of
+                  ("--crate-tarball-path" : tarballPath : _) ->
+                    writeFile tarballPath "crates-tarball"
+                  _ -> pure ()
+              _ -> pure ()
+            pure (okResult "")
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+        failRun req = case execCmd req of
+          Just ("git", "clone" : _) -> pure (failResult "clone refused")
+          _ -> pure (failResult "should not run")
+    res <-
+      assertRight "cargo mk success"
+        =<< buildCargoCratesTarball
+          (mkCargoOps successRun)
+          noopCargoProgress
+          "owner"
+          "repo"
+          "v"
+          "0.1.0"
+          Nothing
+          Nothing
+          donorEbuild
+          "pkg"
+          outDir
+          "pkg-0.1.0-crates.tar.xz"
+    assertEq "msrv" "1.85.0" (crMsrv res)
+    exists <- doesFileExist (crTarballPath res)
+    assertTrue "crates tarball" exists
+    cargoFail <-
+      buildCargoCratesTarball
+        (mkCargoOps failRun)
+        noopCargoProgress
+        "o"
+        "r"
+        "v"
+        "0.1.0"
+        Nothing
+        Nothing
+        donorEbuild
+        "pkg"
+        outDir
+        "x.tar.xz"
+    case cargoFail of
+      Left err -> assertTrue "clone error" ("git clone failed" `T.isInfixOf` err)
+      Right _ -> fail "expected cargo clone failure"
+
+testSimpleRunnersMk :: IO ()
+testSimpleRunnersMk =
+  withSystemTempDirectory "mndz-runners-mk-" $ \tmp -> do
+    let gentoo = tmp </> "gentoo"
+        overlay = tmp </> "overlay"
+    createDirectoryIfMissing True gentoo
+    createDirectoryIfMissing True overlay
+    -- ebuild shell-mode success + failure
+    let ebuildOk req = case prMode req of
+          ShellCmd cmd
+            | "ebuild" `isInfixOf` cmd && "manifest" `isInfixOf` cmd ->
+                pure (okResult "")
+          _ -> pure (failResult ("unexpected ebuild req: " <> show req))
+        ebuildFail _ = pure (failResult "ebuild died")
+    assertRight "ebuild ok"
+      =<< mkEbuildRunner ebuildOk overlay "pkg-1.0.ebuild"
+    ebuildErr <-
+      assertLeft "ebuild fail"
+        =<< mkEbuildRunner ebuildFail overlay "pkg-1.0.ebuild"
+    assertTrue "ebuild err" ("ebuild manifest failed" `T.isInfixOf` ebuildErr)
+    -- portageq success + failure
+    let pqOk = mkPortageqRunner $ \req -> case execCmd req of
+          Just ("portageq", ["get_repo_path", "/", "gentoo"]) ->
+            pure (okResult (gentoo <> "\n"))
+          _ -> pure (failResult ("unexpected portageq: " <> show req))
+        pqFail = mkPortageqRunner $ \_ -> pure (failResult "no portageq")
+    path <- assertRight "portageq path" =<< gentooRepoPath pqOk
+    assertEq "gentoo path" gentoo path
+    pqErr <- assertLeft "portageq fail" =<< gentooRepoPath pqFail
+    assertTrue "portageq err" ("portageq" `T.isInfixOf` pqErr)
+    -- egencache: portageq discover + egencache argv
+    let egenOk req = case execCmd req of
+          Just ("portageq", ["get_repo_path", "/", "gentoo"]) ->
+            pure (okResult (gentoo <> "\n"))
+          Just ("egencache", args) -> do
+            assertTrue "repo mndz" ("--repo" `elem` args && "mndz" `elem` args)
+            assertTrue "update" ("--update" `elem` args)
+            pure (okResult "")
+          _ -> pure (failResult ("unexpected egencache req: " <> show req))
+        egenFail req = case execCmd req of
+          Just ("portageq", _) -> pure (okResult (gentoo <> "\n"))
+          Just ("egencache", _) -> pure (failResult "egencache boom")
+          _ -> pure (failResult "unexpected")
+    assertRight "egencache ok"
+      =<< mkEgencacheRunner
+        egenOk
+        EgencacheRequest
+          { erOverlayRoot = overlay,
+            erAtoms = ["dev-lang/pkg"],
+            erJobs = Just 2
+          }
+    egenErr <-
+      assertLeft "egencache fail"
+        =<< mkEgencacheRunner
+          egenFail
+          EgencacheRequest
+            { erOverlayRoot = overlay,
+              erAtoms = ["dev-lang/pkg"],
+              erJobs = Nothing
+            }
+    assertTrue "egencache err" ("egencache failed" `T.isInfixOf` egenErr)
 
 ------------------------------------------------------------------------
 -- Light Integration: ApplyEnv eco ops wiring (not full Materialize)

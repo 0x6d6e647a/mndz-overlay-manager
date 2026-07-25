@@ -5,6 +5,7 @@ module Update.Cargo.Crates
     CargoProgress (..),
     CargoResult (..),
     productionCargoOps,
+    mkCargoOps,
     buildCargoCratesTarball,
     crateTarballPrefix,
     maxRustVersionInTree,
@@ -24,7 +25,6 @@ import System.Directory
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (proc, readCreateProcessWithExitCode)
 import Update.Cargo.Msrv
   ( combineMsrv,
     maxRustVersion,
@@ -32,6 +32,13 @@ import Update.Cargo.Msrv
     parseRustVersionField,
   )
 import Update.Go.Vendor (githubCloneUrl, versionTag)
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
+  )
 
 -- | Internal tarball path prefix expected by cargo.eclass.
 crateTarballPrefix :: Text
@@ -58,12 +65,16 @@ data CargoProgress = CargoProgress
     cgpOnPycargoDone :: IO ()
   }
 
-productionCargoOps :: CargoOps
-productionCargoOps =
+-- | Build cargo ops over an injectable command runner (Unit heat surface).
+mkCargoOps :: CommandRunner -> CargoOps
+mkCargoOps run =
   CargoOps
-    { coClone = gitCloneTag,
-      coPycargoebuild = runPycargoebuild
+    { coClone = gitCloneTag run,
+      coPycargoebuild = runPycargoebuild run
     }
+
+productionCargoOps :: CargoOps
+productionCargoOps = mkCargoOps productionCommandRunner
 
 -- | Clone @tag@, run @pycargoebuild -c -i -M -f@, return tarball + MSRV + ebuild body.
 buildCargoCratesTarball ::
@@ -228,8 +239,8 @@ findCargoTomls root = do
             names
       pure (here <> subs)
 
-runPycargoebuild :: FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
-runPycargoebuild ebuildPath lockRoot tarballPath distDir = do
+runPycargoebuild :: CommandRunner -> FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+runPycargoebuild run ebuildPath lockRoot tarballPath distDir = do
   let args =
         [ "-c",
           "-i",
@@ -244,38 +255,48 @@ runPycargoebuild ebuildPath lockRoot tarballPath distDir = do
           distDir,
           lockRoot
         ]
-  (code, out, err) <-
-    readCreateProcessWithExitCode (proc "pycargoebuild" args) ""
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "pycargoebuild" args,
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
       else
         Left
           ( "pycargoebuild failed: "
-              <> T.strip (T.pack err)
-              <> ( if T.null (T.strip (T.pack out))
+              <> T.strip (T.pack (prStderr res))
+              <> ( if T.null (T.strip (T.pack (prStdout res)))
                      then ""
-                     else "\n" <> T.strip (T.pack out)
+                     else "\n" <> T.strip (T.pack (prStdout res))
                  )
           )
 
-gitCloneTag :: Text -> Text -> FilePath -> IO (Either Text ())
-gitCloneTag url tag dest = do
-  (code, _out, err) <-
-    readCreateProcessWithExitCode
-      ( proc
-          "git"
-          [ "clone",
-            "--depth",
-            "1",
-            "--branch",
-            T.unpack tag,
-            T.unpack url,
-            dest
-          ]
-      )
-      ""
+gitCloneTag :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text ())
+gitCloneTag run url tag dest = do
+  res <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "git"
+              [ "clone",
+                "--depth",
+                "1",
+                "--branch",
+                T.unpack tag,
+                T.unpack url,
+                dest
+              ],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
-      else Left ("git clone failed: " <> T.pack err)
+      else Left ("git clone failed: " <> T.pack (prStderr res))

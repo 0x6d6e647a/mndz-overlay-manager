@@ -5,6 +5,7 @@ module Update.Go.Vendor
     VendorProgress (..),
     VendorResult (..),
     productionVendorOps,
+    mkVendorOps,
     noopVendorProgress,
     buildVendorTarball,
     githubCloneUrl,
@@ -20,13 +21,19 @@ import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (CreateProcess (..), cwd, env, proc, readCreateProcessWithExitCode)
 import Update.Go.Version
   ( enrichGoModDownloadError,
     goVersionTooOldMessage,
     hostMeetsGoRequirement,
     parseGoModGoDirective,
     parseGoVersionOutput,
+  )
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
   )
 
 -- | Result of a successful vendor tarball build.
@@ -70,14 +77,18 @@ noopVendorProgress =
       vpOnCompressDone = pure ()
     }
 
-productionVendorOps :: VendorOps
-productionVendorOps =
+-- | Build vendor ops over an injectable command runner (Unit heat surface).
+mkVendorOps :: CommandRunner -> VendorOps
+mkVendorOps run =
   VendorOps
-    { voClone = gitCloneTag,
-      voHostGoVersion = probeHostGoVersion,
-      voGoModDownload = goModDownload,
-      voTarXz = tarXzGoMod
+    { voClone = gitCloneTag run,
+      voHostGoVersion = probeHostGoVersion run,
+      voGoModDownload = goModDownload run,
+      voTarXz = tarXzGoMod run
     }
+
+productionVendorOps :: VendorOps
+productionVendorOps = mkVendorOps productionCommandRunner
 
 githubCloneUrl :: Text -> Text -> Text
 githubCloneUrl owner repo =
@@ -163,68 +174,82 @@ gateHostGo ops (Just required) = do
               <> " with go.mod requirement "
               <> required
 
-probeHostGoVersion :: IO (Either Text Text)
-probeHostGoVersion = do
-  (code, out, err) <-
-    readCreateProcessWithExitCode (proc "go" ["version"]) ""
+probeHostGoVersion :: CommandRunner -> IO (Either Text Text)
+probeHostGoVersion run = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "go" ["version"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code /= ExitSuccess
-      then Left ("go version failed: " <> T.pack err)
-      else case parseGoVersionOutput (T.pack out) of
+    if prExitCode res /= ExitSuccess
+      then Left ("go version failed: " <> T.pack (prStderr res))
+      else case parseGoVersionOutput (T.pack (prStdout res)) of
         Just v -> Right v
         Nothing ->
           Left $
             "could not parse host Go version from: "
-              <> T.strip (T.pack out)
+              <> T.strip (T.pack (prStdout res))
 
-gitCloneTag :: Text -> Text -> FilePath -> IO (Either Text ())
-gitCloneTag url tag dest = do
-  (code, _, err) <-
-    readCreateProcessWithExitCode
-      ( proc
-          "git"
-          [ "clone",
-            "--depth",
-            "1",
-            "--branch",
-            T.unpack tag,
-            T.unpack url,
-            dest
-          ]
-      )
-      ""
+gitCloneTag :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text ())
+gitCloneTag run url tag dest = do
+  res <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "git"
+              [ "clone",
+                "--depth",
+                "1",
+                "--branch",
+                T.unpack tag,
+                T.unpack url,
+                dest
+              ],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
-      else Left ("git clone failed: " <> T.pack err)
+      else Left ("git clone failed: " <> T.pack (prStderr res))
 
-goModDownload :: FilePath -> IO (Either Text ())
-goModDownload goDir = do
+goModDownload :: CommandRunner -> FilePath -> IO (Either Text ())
+goModDownload run goDir = do
   let cacheDir = goDir </> "go-mod"
   createDirectoryIfMissing True cacheDir
   env0 <- getEnvironment
   -- Only override GOMODCACHE; do not force GOTOOLCHAIN=auto.
-  let cp =
-        (proc "go" ["mod", "download", "-modcacherw"])
-          { cwd = Just goDir,
-            env = Just (("GOMODCACHE", cacheDir) : filter ((/= "GOMODCACHE") . fst) env0)
-          }
-  (code, _, err) <- readCreateProcessWithExitCode cp ""
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "go" ["mod", "download", "-modcacherw"],
+          prCwd = Just goDir,
+          prEnv = Just (("GOMODCACHE", cacheDir) : filter ((/= "GOMODCACHE") . fst) env0),
+          prStdin = ""
+        }
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
-      else Left (enrichGoModDownloadError (T.pack err))
+      else Left (enrichGoModDownloadError (T.pack (prStderr res)))
 
-tarXzGoMod :: FilePath -> FilePath -> FilePath -> IO (Either Text ())
-tarXzGoMod goDir entryName outPath = do
+tarXzGoMod :: CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+tarXzGoMod run goDir entryName outPath = do
   env0 <- getEnvironment
-  let cp =
-        (proc "tar" ["-acf", outPath, entryName])
-          { cwd = Just goDir,
-            env = Just (("XZ_OPT", "-T0 -9") : filter ((/= "XZ_OPT") . fst) env0)
-          }
-  (code, _, err) <- readCreateProcessWithExitCode cp ""
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "tar" ["-acf", outPath, entryName],
+          prCwd = Just goDir,
+          prEnv = Just (("XZ_OPT", "-T0 -9") : filter ((/= "XZ_OPT") . fst) env0),
+          prStdin = ""
+        }
   pure $
-    if code == ExitSuccess
+    if prExitCode res == ExitSuccess
       then Right ()
-      else Left ("tar failed: " <> T.pack err)
+      else Left ("tar failed: " <> T.pack (prStderr res))
