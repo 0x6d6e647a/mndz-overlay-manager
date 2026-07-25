@@ -37,7 +37,7 @@ import Config.Types (OverlayConfig (..))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
-import Control.Exception (SomeException, throwIO, try)
+import Control.Exception (SomeException, bracket_, throwIO, try)
 import Control.Monad (forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
@@ -73,6 +73,7 @@ import Overlay.Version
     prettyVersion,
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
+import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
@@ -129,7 +130,7 @@ import Update.Assets.Release
     lookupNamedAsset,
     parseReleaseInfo,
   )
-import Update.Auth (resolveGitHubTokenWith)
+import Update.Auth (resolveGitHubToken, resolveGitHubTokenWith)
 import Update.Bun.Cache (productionBunCacheOps)
 import Update.Cargo.Crates (productionCargoOps)
 import Update.Cargo.Msrv
@@ -290,6 +291,7 @@ tests =
   testGroup
     "Assets"
     [ testCase "Token Resolver" testTokenResolver,
+      testCase "Token Resolver IO" testTokenResolverIO,
       testCase "Hash Bytes" testHashBytes,
       testCase "Sidecar Line" testSidecarLine,
       testCase "Deps Distfile Names" testDepsDistfileNames,
@@ -321,6 +323,77 @@ testTokenResolver = do
     "none"
     Nothing
     (resolveGitHubTokenWith Nothing Nothing Nothing)
+  -- whitespace-only is treated as empty; surrounding whitespace is stripped
+  assertEq
+    "whitespace-only github_token skipped"
+    (Just "from-gh")
+    (resolveGitHubTokenWith (Just "   ") (Just "from-gh") (Just "cfg"))
+  assertEq
+    "whitespace-only gh_token skipped"
+    (Just "cfg")
+    (resolveGitHubTokenWith Nothing (Just " \t ") (Just "cfg"))
+  assertEq
+    "whitespace-only config skipped"
+    Nothing
+    (resolveGitHubTokenWith Nothing Nothing (Just "  \n"))
+  assertEq
+    "strip github_token"
+    (Just "tok")
+    (resolveGitHubTokenWith (Just "  tok  ") Nothing Nothing)
+  assertEq
+    "strip gh_token"
+    (Just "gh")
+    (resolveGitHubTokenWith Nothing (Just "\tgh\n") Nothing)
+  assertEq
+    "strip config token"
+    (Just "cfg")
+    (resolveGitHubTokenWith Nothing Nothing (Just " cfg "))
+  assertEq
+    "empty gh falls through to config"
+    (Just "cfg")
+    (resolveGitHubTokenWith Nothing (Just "") (Just "cfg"))
+
+-- | Thin IO wrapper over env lookup for GITHUB_TOKEN / GH_TOKEN.
+testTokenResolverIO :: IO ()
+testTokenResolverIO = do
+  let cfg =
+        OverlayConfig
+          { overlayPath = "/tmp/ov",
+            assetsPath = Nothing,
+            githubToken = Just "from-config"
+          }
+  withAuthEnv Nothing Nothing $ do
+    assertEq "config only" (Just "from-config") =<< resolveGitHubToken cfg
+  withAuthEnv (Just "  env-tok  ") (Just "gh") $ do
+    assertEq "GITHUB_TOKEN wins and strips" (Just "env-tok") =<< resolveGitHubToken cfg
+  withAuthEnv Nothing (Just "  gh-tok  ") $ do
+    assertEq "GH_TOKEN second" (Just "gh-tok") =<< resolveGitHubToken cfg
+  withAuthEnv (Just "   ") Nothing $ do
+    assertEq "whitespace env skipped" (Just "from-config") =<< resolveGitHubToken cfg
+  let cfgNoTok =
+        OverlayConfig
+          { overlayPath = "/tmp/ov",
+            assetsPath = Nothing,
+            githubToken = Nothing
+          }
+  withAuthEnv Nothing Nothing $ do
+    assertEq "none" Nothing =<< resolveGitHubToken cfgNoTok
+
+withAuthEnv :: Maybe String -> Maybe String -> IO a -> IO a
+withAuthEnv mGithub mGh action =
+  withEnvVar "GITHUB_TOKEN" mGithub $
+    withEnvVar "GH_TOKEN" mGh action
+
+withEnvVar :: String -> Maybe String -> IO a -> IO a
+withEnvVar key mVal action = do
+  prev <- lookupEnv key
+  let restore = case prev of
+        Nothing -> unsetEnv key
+        Just v -> setEnv key v
+      install = case mVal of
+        Nothing -> unsetEnv key
+        Just v -> setEnv key v
+  bracket_ install restore action
 
 testHashBytes :: IO ()
 testHashBytes = do

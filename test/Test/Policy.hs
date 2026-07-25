@@ -277,8 +277,14 @@ import Update.Types
     UpdateSource (..),
     UpdateStatus (..),
     UpdateTechnique (..),
+    ecosystemIsBun,
+    ecosystemIsCargo,
+    ecosystemIsGo,
+    ecosystemIsNpm,
     mkPackageKey,
     packageKeyText,
+    splitPackageKey,
+    techniqueNeedsAssets,
   )
 
 tests :: TestTree
@@ -296,7 +302,8 @@ tests =
       testCase "Fetch Http Wrong Source" testFetchHttpWrongSource,
       testCase "Fetch Http With Fake" testFetchHttpWithFake,
       testCase "Fetch Npm Wrong Source" testFetchNpmWrongSource,
-      testCase "Fetch Npm With Fake" testFetchNpmWithFake
+      testCase "Fetch Npm With Fake" testFetchNpmWithFake,
+      testCase "Types Helper Predicates" testTypesHelperPredicates
     ]
 
 ------------------------------------------------------------------------
@@ -604,3 +611,43 @@ testFetchNpmWithFake = do
   assertTrue "http" ("HTTP 404" `T.isInfixOf` err404)
   errNet <- assertLeft "net" =<< fetchNpmWithHttp httpNet (Npm "pkg")
   assertEq "net" "npm net" errNet
+
+------------------------------------------------------------------------
+-- Update.Types pure helpers
+------------------------------------------------------------------------
+
+testTypesHelperPredicates :: IO ()
+testTypesHelperPredicates = do
+  -- techniqueNeedsAssets
+  assertTrue "deps go needs assets" (techniqueNeedsAssets (DepsAndAssets (Go Nothing)))
+  assertTrue "deps npm needs assets" (techniqueNeedsAssets (DepsAndAssets NpmEco))
+  assertTrue
+    "deps cargo needs assets"
+    (techniqueNeedsAssets (DepsAndAssets (Cargo Nothing Nothing)))
+  assertTrue "git-mv no assets" (not (techniqueNeedsAssets GitMvAndManifest))
+  assertTrue "unsupported no assets" (not (techniqueNeedsAssets (Unsupported "why")))
+  -- ecosystem predicates (positive + negative arms)
+  assertTrue "is go" (ecosystemIsGo (Go (Just "subdir")))
+  assertTrue "go not npm" (not (ecosystemIsNpm (Go Nothing)))
+  assertTrue "is npm" (ecosystemIsNpm NpmEco)
+  assertTrue "npm not go" (not (ecosystemIsGo NpmEco))
+  assertTrue "is bun" (ecosystemIsBun Bun)
+  assertTrue "bun not cargo" (not (ecosystemIsCargo Bun))
+  assertTrue "is cargo" (ecosystemIsCargo (Cargo (Just "lock") (Just "pkg")))
+  assertTrue "cargo not bun" (not (ecosystemIsBun (Cargo Nothing Nothing)))
+  assertTrue "npm not bun" (not (ecosystemIsBun NpmEco))
+  assertTrue "go not cargo" (not (ecosystemIsCargo (Go Nothing)))
+  -- splitPackageKey success + Nothing arms
+  assertEq
+    "split ok"
+    (Just ("dev-util", "hk"))
+    (splitPackageKey (PackageKey "dev-util/hk"))
+  assertEq
+    "split via mk"
+    (Just ("app-misc", "foo"))
+    (splitPackageKey (mkPackageKey "app-misc" "foo"))
+  assertEq "empty" Nothing (splitPackageKey (PackageKey ""))
+  assertEq "no slash" Nothing (splitPackageKey (PackageKey "noslash"))
+  assertEq "empty category" Nothing (splitPackageKey (PackageKey "/pkg"))
+  assertEq "empty package" Nothing (splitPackageKey (PackageKey "cat/"))
+  assertEq "slash only" Nothing (splitPackageKey (PackageKey "/"))

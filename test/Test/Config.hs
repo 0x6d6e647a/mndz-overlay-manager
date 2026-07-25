@@ -32,12 +32,12 @@ import CLI.Progress
   )
 import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
-import Config.Loader (ConfigError (..), loadConfig)
+import Config.Loader (ConfigError (..), configErrorMessage, loadConfig)
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
-import Control.Exception (SomeException, throwIO, try)
+import Control.Exception (SomeException, bracket_, throwIO, try)
 import Control.Monad (forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
@@ -70,6 +70,7 @@ import Overlay.Version
     prettyVersion,
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
+import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
@@ -276,7 +277,10 @@ tests =
       testCase "Config Optional Keys" testConfigOptionalKeys,
       testCase "Config Load Missing" testConfigLoadMissing,
       testCase "Config Load Missing Key" testConfigLoadMissingKey,
-      testCase "Config Legacy Keys Rejected" testConfigLegacyKeysRejected
+      testCase "Config Legacy Keys Rejected" testConfigLegacyKeysRejected,
+      testCase "Config Error Messages" testConfigErrorMessages,
+      testCase "Config Default Path Via XDG" testConfigDefaultPathViaXdg,
+      testCase "Config Load Invalid Toml" testConfigLoadInvalidToml
     ]
 
 testConfigLoadSuccess :: IO ()
@@ -324,3 +328,63 @@ testConfigLegacyKeysRejected = do
     other -> do
       hPutStrLn stderr $ "expected DecodeError for legacy keys, got " <> show other
       exitFailure
+
+------------------------------------------------------------------------
+-- Config residual: error messages, default path, decode failure
+------------------------------------------------------------------------
+
+testConfigErrorMessages :: IO ()
+testConfigErrorMessages = do
+  assertEq
+    "not found message"
+    "config file not found: /tmp/missing.toml"
+    (configErrorMessage (ConfigNotFound "/tmp/missing.toml"))
+  assertEq
+    "decode message"
+    "failed to decode config: bad keys"
+    (configErrorMessage (DecodeError "bad keys"))
+
+-- | Hit 'defaultConfigPath' via 'loadConfig Nothing' under controlled XDG.
+testConfigDefaultPathViaXdg :: IO ()
+testConfigDefaultPathViaXdg =
+  withSystemTempDirectory "om-config-xdg" $ \tmp -> do
+    let expected = tmp </> "mndz" </> "overlay-manager.toml"
+    withEnvVar "XDG_CONFIG_HOME" (Just tmp) $ do
+      err <- assertLeft "default missing" =<< loadConfig Nothing
+      case err of
+        ConfigNotFound path ->
+          assertEq "xdg default path" expected path
+        other -> do
+          hPutStrLn stderr $ "expected ConfigNotFound for XDG default, got " <> show other
+          exitFailure
+    -- Success arm: place a valid config at the XDG default path.
+    createDirectoryIfMissing True (tmp </> "mndz")
+    TIO.writeFile expected "overlay-path = \"/tmp/from-xdg\"\n"
+    withEnvVar "XDG_CONFIG_HOME" (Just tmp) $ do
+      cfg <- assertRight "default present" =<< loadConfig Nothing
+      assertEq "loaded via xdg" "/tmp/from-xdg" (overlayPath cfg)
+
+testConfigLoadInvalidToml :: IO ()
+testConfigLoadInvalidToml =
+  withSystemTempDirectory "om-config-bad" $ \tmp -> do
+    let path = tmp </> "bad.toml"
+    TIO.writeFile path "this is not = valid toml [[[\n"
+    err <- assertLeft "invalid toml" =<< loadConfig (Just path)
+    case err of
+      DecodeError msg ->
+        assertTrue "decode error non-empty" (not (null msg))
+      other -> do
+        hPutStrLn stderr $ "expected DecodeError for invalid toml, got " <> show other
+        exitFailure
+
+-- | Temporarily set or clear an environment variable, restoring afterward.
+withEnvVar :: String -> Maybe String -> IO a -> IO a
+withEnvVar key mVal action = do
+  prev <- lookupEnv key
+  let restore = case prev of
+        Nothing -> unsetEnv key
+        Just v -> setEnv key v
+      install = case mVal of
+        Nothing -> unsetEnv key
+        Just v -> setEnv key v
+  bracket_ install restore action

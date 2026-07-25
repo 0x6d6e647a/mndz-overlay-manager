@@ -16,6 +16,7 @@ import CLI.Parser
     resolveColorMode,
     resolveJobs,
     resolveVerbosity,
+    showTopLevelHelpExit1,
   )
 import CLI.Parser qualified as CLI
 import CLI.Parser qualified as V
@@ -59,8 +60,11 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
 import GHC.Stack (callStack)
 import Logging.Bootstrap
-  ( fmtMessageColored,
+  ( beginLogHold,
+    flushLogHold,
+    fmtMessageColored,
     mkLogHold,
+    mkLogger,
     showSeverityColored,
     verbosityToSeverity,
   )
@@ -80,7 +84,7 @@ import Overlay.Version
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
 import System.Environment (lookupEnv, setEnv, unsetEnv)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
@@ -291,7 +295,10 @@ tests =
       testCase "Work Budget Bound" testWorkBudgetBound,
       testCase "Resolve Color Mode" testResolveColorMode,
       testCase "Resolve Jobs" testResolveJobs,
-      testCase "Parser Pure Commands" testParserPureCommands
+      testCase "Parser Pure Commands" testParserPureCommands,
+      testCase "Parser Residual Edges" testParserResidualEdges,
+      testCase "Show Top Level Help Exit 1" testShowTopLevelHelpExit1,
+      testCase "Logger Hold And Filter" testLoggerHoldAndFilter
     ]
 
 ------------------------------------------------------------------------
@@ -526,3 +533,108 @@ testParserPureCommands = do
     Just opts -> do
       hPutStrLn stderr $ "expected parse failure, got " <> show opts
       exitFailure
+
+-- | Residual verbosity / work-command edges beyond the baseline parser cases.
+testParserResidualEdges :: IO ()
+testParserResidualEdges = do
+  let parse args = getParseResult (execParserPure defaultPrefs parserInfo args)
+  case parse ["-vv", "list"] of
+    Just opts -> assertEq "double -v is debug" V.Debug (optVerbosity opts)
+    Nothing -> do
+      hPutStrLn stderr "parse -vv list failed"
+      exitFailure
+  case parse ["--verbose", "--verbose", "list"] of
+    Just opts -> assertEq "long verbose twice" V.Debug (optVerbosity opts)
+    Nothing -> do
+      hPutStrLn stderr "parse --verbose twice failed"
+      exitFailure
+  case parse ["--log-level", "info", "list"] of
+    Just opts -> assertEq "log-level info" V.Info (optVerbosity opts)
+    Nothing -> do
+      hPutStrLn stderr "parse log-level info failed"
+      exitFailure
+  case parse ["--log-level", "warn", "list"] of
+    Just opts -> assertEq "log-level warn" V.Warn (optVerbosity opts)
+    Nothing -> do
+      hPutStrLn stderr "parse log-level warn failed"
+      exitFailure
+  case parse ["--log-level", "debug", "list"] of
+    Just opts -> assertEq "log-level debug" V.Debug (optVerbosity opts)
+    Nothing -> do
+      hPutStrLn stderr "parse log-level debug failed"
+      exitFailure
+  case parse ["-v", "--log-level", "error", "list"] of
+    Just opts -> assertEq "log-level wins over -v" V.Error (optVerbosity opts)
+    Nothing -> do
+      hPutStrLn stderr "parse -v + log-level failed"
+      exitFailure
+  case parse ["--log-level", "nope", "list"] of
+    Nothing -> pure ()
+    Just opts -> do
+      hPutStrLn stderr $ "expected invalid log-level failure, got " <> show opts
+      exitFailure
+  case parse ["outdated"] of
+    Just opts -> assertEq "outdated all" (Just (CLI.Outdated [])) (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse outdated bare failed"
+      exitFailure
+  case parse ["gencache", "dev-lang/go", "--force"] of
+    Just opts ->
+      assertEq
+        "gencache force after target"
+        (Just (CLI.Gencache {CLI.gencacheTargets = ["dev-lang/go"], CLI.gencacheForce = True}))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse gencache target --force failed"
+      exitFailure
+  case parse ["update", "a/b", "c/d"] of
+    Just opts ->
+      assertEq
+        "update multi"
+        (Just (CLI.Update ["a/b", "c/d"]))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse update multi failed"
+      exitFailure
+
+testShowTopLevelHelpExit1 :: IO ()
+testShowTopLevelHelpExit1 = do
+  result <- try @ExitCode showTopLevelHelpExit1
+  case result of
+    Left (ExitFailure 1) -> pure ()
+    Left other -> do
+      hPutStrLn stderr $ "expected ExitFailure 1, got " <> show other
+      exitFailure
+    Right _ -> do
+      hPutStrLn stderr "showTopLevelHelpExit1 returned unexpectedly"
+      exitFailure
+
+testLoggerHoldAndFilter :: IO ()
+testLoggerHoldAndFilter = do
+  hold <- mkLogHold
+  let logger = mkLogger V.Warn ColorOff hold
+  captured <- newIORef ([] :: [T.Text])
+  let capture =
+        LogAction $ \msg ->
+          atomicModifyIORef' captured (\xs -> (xs <> [msgText msg], ()))
+  beginLogHold hold
+  unLogAction logger (Msg {msgSeverity = C.Info, msgStack = callStack, msgText = "info-hidden"})
+  unLogAction logger (Msg {msgSeverity = C.Warning, msgStack = callStack, msgText = "warn-held"})
+  unLogAction logger (Msg {msgSeverity = C.Error, msgStack = callStack, msgText = "err-held"})
+  flushLogHold hold capture
+  msgs <- readIORef captured
+  assertEq "held warn/error only, in order" ["warn-held", "err-held"] msgs
+  -- ColorOn + Debug path: hold debug messages then flush
+  hold2 <- mkLogHold
+  let loggerColor = mkLogger V.Debug ColorOn hold2
+  captured2 <- newIORef ([] :: [T.Text])
+  let capture2 =
+        LogAction $ \msg ->
+          atomicModifyIORef' captured2 (\xs -> (xs <> [msgText msg], ()))
+  beginLogHold hold2
+  unLogAction loggerColor (Msg {msgSeverity = C.Debug, msgStack = callStack, msgText = "dbg-held"})
+  flushLogHold hold2 capture2
+  msgs2 <- readIORef captured2
+  assertEq "debug held under ColorOn" ["dbg-held"] msgs2
+  -- Non-hold emit path (writes filtered sink to stderr)
+  unLogAction logger (Msg {msgSeverity = C.Warning, msgStack = callStack, msgText = "warn-direct"})

@@ -62,12 +62,15 @@ import Overlay.Discovery
     parseEbuildFileName,
   )
 import Overlay.Types (Ebuild (..), ebuildAtom)
-import Overlay.Validation (validateOverlay)
+import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version
   ( EbuildVersion (..),
     comparePV,
     parseEbuildVersion,
     prettyVersion,
+    renderPV,
+    renderPVNoRev,
+    samePV,
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
 import System.Exit (exitFailure)
@@ -97,7 +100,6 @@ import Update.Apply.TestSupport
     materializePlan,
     materializeStepTotalUpper,
     newEbuildFileName,
-    renderPVNoRev,
     reusePathMaterializeSteps,
     reviseMaterializeStepTotal,
     signedOverlayCommit,
@@ -280,9 +282,14 @@ tests =
       testCase "Discovery Package Mismatch" testDiscoveryPackageMismatch,
       testCase "Empty Inventory Is Empty List" testEmptyInventoryIsEmptyList,
       testCase "Validate Populated" testValidatePopulated,
+      testCase "Validate Not A Directory" testValidateNotADirectory,
+      testCase "Validate Missing Directory" testValidateMissingDirectory,
+      testCase "Validate Missing File" testValidateMissingFile,
+      testCase "Validate Repo Name Mismatch" testValidateRepoNameMismatch,
       testCase "Version Parse" testVersionParse,
       testCase "Version Render" testVersionRender,
-      testCase "Version Compare" testVersionCompare
+      testCase "Version Compare" testVersionCompare,
+      testCase "Version Residual Edges" testVersionResidualEdges
     ]
 
 testEbuildAtom :: IO ()
@@ -360,6 +367,63 @@ testValidatePopulated = do
   _ <- assertRight "validate populated" =<< validateOverlay root
   pure ()
 
+testValidateNotADirectory :: IO ()
+testValidateNotADirectory =
+  withSystemTempDirectory "om-ov-file" $ \tmp -> do
+    let filePath = tmp </> "not-a-dir"
+    TIO.writeFile filePath "x"
+    err <- assertLeft "not a directory" =<< validateOverlay filePath
+    case err of
+      NotADirectory path -> assertEq "path" filePath path
+      other -> do
+        hPutStrLn stderr $ "expected NotADirectory, got " <> show other
+        exitFailure
+
+testValidateMissingDirectory :: IO ()
+testValidateMissingDirectory =
+  withSystemTempDirectory "om-ov-missing-dir" $ \tmp -> do
+    err <- assertLeft "missing dir" =<< validateOverlay tmp
+    case err of
+      MissingDirectory path ->
+        assertTrue "mentions profiles" ("profiles" `T.isInfixOf` T.pack path)
+      other -> do
+        hPutStrLn stderr $ "expected MissingDirectory, got " <> show other
+        exitFailure
+
+testValidateMissingFile :: IO ()
+testValidateMissingFile =
+  withSystemTempDirectory "om-ov-missing-file" $ \tmp -> do
+    createDirectoryIfMissing True (tmp </> "profiles")
+    createDirectoryIfMissing True (tmp </> "metadata")
+    -- directories present but required files absent
+    err <- assertLeft "missing file" =<< validateOverlay tmp
+    case err of
+      MissingFile path ->
+        assertTrue
+          "mentions repo_name or layout.conf"
+          ( "repo_name" `T.isInfixOf` T.pack path
+              || "layout.conf" `T.isInfixOf` T.pack path
+          )
+      other -> do
+        hPutStrLn stderr $ "expected MissingFile, got " <> show other
+        exitFailure
+
+testValidateRepoNameMismatch :: IO ()
+testValidateRepoNameMismatch =
+  withSystemTempDirectory "om-ov-bad-repo" $ \tmp -> do
+    createDirectoryIfMissing True (tmp </> "profiles")
+    createDirectoryIfMissing True (tmp </> "metadata")
+    TIO.writeFile (tmp </> "profiles" </> "repo_name") "not-mndz\n"
+    TIO.writeFile (tmp </> "metadata" </> "layout.conf") "masters = gentoo\n"
+    err <- assertLeft "repo name" =<< validateOverlay tmp
+    case err of
+      RepoNameMismatch path got -> do
+        assertTrue "path mentions repo_name" ("repo_name" `T.isInfixOf` T.pack path)
+        assertEq "wrong name" "not-mndz" got
+      other -> do
+        hPutStrLn stderr $ "expected RepoNameMismatch, got " <> show other
+        exitFailure
+
 ------------------------------------------------------------------------
 -- Ebuild version
 ------------------------------------------------------------------------
@@ -408,3 +472,46 @@ testVersionCompare = do
     "incomparable raw"
     Nothing
     (comparePV (Raw "foo") (parseEbuildVersion "1.0"))
+
+-- | Residual parse/render/compare arms not covered by the baseline cases.
+testVersionResidualEdges :: IO ()
+testVersionResidualEdges = do
+  -- incomplete revision suffix and empty input become Raw
+  assertEq "incomplete -r" (Raw "1.0-r") (parseEbuildVersion "1.0-r")
+  assertEq "empty raw" (Raw "") (parseEbuildVersion "")
+  assertEq "non-digit trailing" (Raw "1.2x") (parseEbuildVersion "1.2x")
+  -- renderPV / renderPVNoRev / Raw passthrough
+  assertEq
+    "renderPV with rev"
+    "1.2.3-r4"
+    (renderPV (Numeric [1, 2, 3] (Just 4)))
+  assertEq
+    "renderPV no rev"
+    "9.0"
+    (renderPV (Numeric [9, 0] Nothing))
+  assertEq "renderPV raw" "live" (renderPV (Raw "live"))
+  assertEq
+    "renderPVNoRev strips rev"
+    "1.2.3"
+    (renderPVNoRev (Numeric [1, 2, 3] (Just 9)))
+  assertEq "renderPVNoRev raw" "9999" (renderPVNoRev (Raw "9999"))
+  -- trailing-zero component comparison and samePV
+  assertEq
+    "trailing zeros equal"
+    (Just EQ)
+    (comparePV (Numeric [1, 0] Nothing) (Numeric [1, 0, 0] Nothing))
+  assertEq
+    "shorter less when nonzero pad"
+    (Just LT)
+    (comparePV (Numeric [1] Nothing) (Numeric [1, 1] Nothing))
+  assertEq
+    "longer greater when nonzero pad"
+    (Just GT)
+    (comparePV (Numeric [1, 1] Nothing) (Numeric [1] Nothing))
+  assertTrue "samePV true" (samePV (parseEbuildVersion "2.0-r1") (parseEbuildVersion "2.0"))
+  assertTrue
+    "samePV false on order"
+    (not (samePV (parseEbuildVersion "1.0") (parseEbuildVersion "2.0")))
+  assertTrue
+    "samePV false on raw"
+    (not (samePV (Raw "a") (parseEbuildVersion "1.0")))
