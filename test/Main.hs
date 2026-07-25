@@ -9,6 +9,7 @@ import Test.EbuildEdit qualified as EbuildEdit
 import Test.Ecosystems qualified as Ecosystems
 import Test.Gpg qualified as Gpg
 import Test.Lanes qualified as Lanes
+import Test.Materialize qualified as Materialize
 import Test.Md5Cache qualified as Md5Cache
 import Test.Overlay qualified as Overlay
 import Test.Policy qualified as Policy
@@ -53,6 +54,7 @@ main =
             Lanes.unitTests,
             Progress.unitTests,
             Apply.unitTests,
+            Materialize.unitTests,
             Md5Cache.unitTests,
             Ecosystems.unitTests,
             CheckPlan.unitTests,
@@ -63,6 +65,7 @@ main =
           [ Lanes.integrationTests,
             Progress.integrationTests,
             Apply.integrationTests,
+            Materialize.integrationTests,
             Md5Cache.integrationTests,
             Ecosystems.integrationTests,
             CheckPlan.integrationTests

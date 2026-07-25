@@ -214,6 +214,7 @@ test-suite mndz-overlay-manager-test
         Test.Ecosystems
         Test.Gpg
         Test.Lanes
+        Test.Materialize
         Test.Md5Cache
         Test.Overlay
         Test.Policy
