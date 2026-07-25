@@ -212,7 +212,9 @@ test-suite mndz-overlay-manager-test
         Test.Config
         Test.EbuildEdit
         Test.Ecosystems
+        Test.Git
         Test.Gpg
+        Test.HttpFake
         Test.Lanes
         Test.Materialize
         Test.Md5Cache
@@ -257,8 +259,10 @@ test-suite mndz-overlay-manager-test
         filepath ^>=1.5,
         http-client ^>=0.7,
         http-client-tls ^>=0.3,
+        http-types ^>=0.12,
         mndz-overlay-manager,
         optparse-applicative ^>=0.19,
+        process ^>=1.6,
         QuickCheck ^>=2.14,
         tasty ^>=1.5,
         tasty-hunit ^>=0.10,

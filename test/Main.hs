@@ -7,6 +7,7 @@ import Test.CheckPlan qualified as CheckPlan
 import Test.Config qualified as Config
 import Test.EbuildEdit qualified as EbuildEdit
 import Test.Ecosystems qualified as Ecosystems
+import Test.Git qualified as Git
 import Test.Gpg qualified as Gpg
 import Test.Lanes qualified as Lanes
 import Test.Materialize qualified as Materialize
@@ -50,6 +51,7 @@ main =
             EbuildEdit.tests,
             Ssh.tests,
             Gpg.tests,
+            Git.tests,
             CLI.tests,
             Lanes.unitTests,
             Progress.unitTests,

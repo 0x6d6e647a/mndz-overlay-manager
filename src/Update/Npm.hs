@@ -2,6 +2,7 @@
 
 module Update.Npm
   ( fetchNpmWith,
+    fetchNpmWithHttp,
   )
 where
 
@@ -11,7 +12,6 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client
   ( Manager,
-    httpLbs,
     method,
     parseRequest,
     requestHeaders,
@@ -20,12 +20,16 @@ import Network.HTTP.Client
   )
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
-import Update.Http (tryHttp)
+import Update.Http (HttpLbs, httpLbsEither)
 import Update.Types (UpdateSource (..))
 
 -- | Fetch latest version from the npm registry.
 fetchNpmWith :: Manager -> UpdateSource -> IO (Either Text EbuildVersion)
-fetchNpmWith mgr = \case
+fetchNpmWith mgr = fetchNpmWithHttp (httpLbsEither mgr)
+
+-- | Injectable HTTP path for tests.
+fetchNpmWithHttp :: HttpLbs -> UpdateSource -> IO (Either Text EbuildVersion)
+fetchNpmWithHttp http = \case
   Npm pkg -> do
     let url = "https://registry.npmjs.org/" <> T.unpack pkg <> "/latest"
     req0 <- parseRequest url
@@ -37,7 +41,7 @@ fetchNpmWith mgr = \case
                   ("Accept", "application/json")
                 ]
             }
-    eres <- tryHttp (httpLbs req mgr)
+    eres <- http req
     pure $ case eres of
       Left err -> Left err
       Right resp ->

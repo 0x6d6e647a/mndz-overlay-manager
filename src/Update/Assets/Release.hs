@@ -2,16 +2,18 @@
 
 module Update.Assets.Release
   ( createReleaseWithAssetHttp,
+    createReleaseWithAssetHttpLbs,
     ReleaseMeta (..),
-    deleteReleaseBestEffort,
     -- Lookup / download (reuse path)
     ReleaseAsset (..),
     ReleaseInfo (..),
     ReleaseOps (..),
     productionReleaseOps,
     getReleaseByTagHttp,
+    getReleaseByTagHttpLbs,
     findAssetByName,
     downloadReleaseAssetHttp,
+    downloadReleaseAssetHttpLbs,
     lookupNamedAsset,
     parseReleaseInfo,
   )
@@ -26,7 +28,6 @@ import Data.Text.Encoding (encodeUtf8)
 import Network.HTTP.Client
   ( Manager,
     RequestBody (RequestBodyLBS),
-    httpLbs,
     method,
     newManager,
     parseRequest,
@@ -39,7 +40,7 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders, statusCode)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, takeFileName)
-import Update.Http (tryHttp)
+import Update.Http (HttpLbs, httpLbsEither)
 
 data ReleaseMeta = ReleaseMeta
   { rmOwner :: Text,
@@ -95,19 +96,29 @@ createReleaseWithAssetHttp ::
   ReleaseMeta ->
   FilePath ->
   IO (Either Text ())
-createReleaseWithAssetHttp mgr token meta assetPath = do
+createReleaseWithAssetHttp mgr =
+  createReleaseWithAssetHttpLbs (httpLbsEither mgr)
+
+-- | Injectable HTTP path for create + upload (+ best-effort delete on upload fail).
+createReleaseWithAssetHttpLbs ::
+  HttpLbs ->
+  Text ->
+  ReleaseMeta ->
+  FilePath ->
+  IO (Either Text ())
+createReleaseWithAssetHttpLbs http token meta assetPath = do
   let headers = authHeaders token
-  created <- createRelease mgr headers meta
+  created <- createRelease http headers meta
   case created of
     Left err -> pure (Left err)
     Right (releaseId, uploadUrlTemplate) -> do
       body <- LBS.readFile assetPath
       let assetName = takeFileName assetPath
-      uploaded <- uploadAsset mgr headers uploadUrlTemplate assetName body
+      uploaded <- uploadAsset http headers uploadUrlTemplate assetName body
       case uploaded of
         Right () -> pure (Right ())
         Left err -> do
-          _ <- deleteReleaseBestEffort mgr headers (rmOwner meta) (rmRepo meta) releaseId
+          _ <- deleteReleaseBestEffortHttp http headers (rmOwner meta) (rmRepo meta) releaseId
           pure (Left err)
 
 authHeaders :: Text -> RequestHeaders
@@ -118,11 +129,11 @@ authHeaders token =
   ]
 
 createRelease ::
-  Manager ->
+  HttpLbs ->
   RequestHeaders ->
   ReleaseMeta ->
   IO (Either Text (Int, Text))
-createRelease mgr headers meta = do
+createRelease http headers meta = do
   let url =
         "https://api.github.com/repos/"
           <> T.unpack (rmOwner meta)
@@ -145,7 +156,7 @@ createRelease mgr headers meta = do
             requestHeaders = headers <> [("Content-Type", "application/json")],
             requestBody = RequestBodyLBS (encode payload)
           }
-  eres <- tryHttp (httpLbs req mgr)
+  eres <- http req
   pure $ case eres of
     Left err -> Left err
     Right resp ->
@@ -174,13 +185,13 @@ parseReleaseCreated =
 -- | GitHub upload_url looks like
 -- @https://uploads.github.com/.../assets{?name,label}@
 uploadAsset ::
-  Manager ->
+  HttpLbs ->
   RequestHeaders ->
   Text ->
   FilePath ->
   LBS.ByteString ->
   IO (Either Text ())
-uploadAsset mgr headers uploadUrlTemplate assetName body = do
+uploadAsset http headers uploadUrlTemplate assetName body = do
   let base = T.takeWhile (/= '{') uploadUrlTemplate
       url =
         T.unpack base
@@ -197,7 +208,7 @@ uploadAsset mgr headers uploadUrlTemplate assetName body = do
                    ],
             requestBody = RequestBodyLBS body
           }
-  eres <- tryHttp (httpLbs req mgr)
+  eres <- http req
   pure $ case eres of
     Left err -> Left err
     Right resp ->
@@ -210,14 +221,15 @@ uploadAsset mgr headers uploadUrlTemplate assetName body = do
                   <> T.pack (show code)
                   <> " uploading release asset"
 
-deleteReleaseBestEffort ::
-  Manager ->
+-- | Best-effort DELETE of a release after a failed asset upload (errors ignored).
+deleteReleaseBestEffortHttp ::
+  HttpLbs ->
   RequestHeaders ->
   Text ->
   Text ->
   Int ->
   IO ()
-deleteReleaseBestEffort mgr headers owner repo releaseId = do
+deleteReleaseBestEffortHttp http headers owner repo releaseId = do
   let url =
         "https://api.github.com/repos/"
           <> T.unpack owner
@@ -231,7 +243,7 @@ deleteReleaseBestEffort mgr headers owner repo releaseId = do
           { method = "DELETE",
             requestHeaders = headers
           }
-  _ <- tryHttp (httpLbs req mgr)
+  _ <- http req
   pure ()
 
 ------------------------------------------------------------------------
@@ -249,7 +261,17 @@ getReleaseByTagHttp ::
   Text ->
   Text ->
   IO (Either Text (Maybe ReleaseInfo))
-getReleaseByTagHttp mgr token owner repo tag = do
+getReleaseByTagHttp mgr =
+  getReleaseByTagHttpLbs (httpLbsEither mgr)
+
+getReleaseByTagHttpLbs ::
+  HttpLbs ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  IO (Either Text (Maybe ReleaseInfo))
+getReleaseByTagHttpLbs http token owner repo tag = do
   let url =
         "https://api.github.com/repos/"
           <> T.unpack owner
@@ -264,7 +286,7 @@ getReleaseByTagHttp mgr token owner repo tag = do
           { method = "GET",
             requestHeaders = headers
           }
-  eres <- tryHttp (httpLbs req mgr)
+  eres <- http req
   pure $ case eres of
     Left err -> Left err
     Right resp ->
@@ -322,7 +344,16 @@ downloadReleaseAssetHttp ::
   Text ->
   FilePath ->
   IO (Either Text ())
-downloadReleaseAssetHttp mgr token downloadUrl destPath = do
+downloadReleaseAssetHttp mgr =
+  downloadReleaseAssetHttpLbs (httpLbsEither mgr)
+
+downloadReleaseAssetHttpLbs ::
+  HttpLbs ->
+  Text ->
+  Text ->
+  FilePath ->
+  IO (Either Text ())
+downloadReleaseAssetHttpLbs http token downloadUrl destPath = do
   req0 <- parseRequest (T.unpack downloadUrl)
   let req =
         req0
@@ -333,7 +364,7 @@ downloadReleaseAssetHttp mgr token downloadUrl destPath = do
                 ("Authorization", encodeUtf8 ("Bearer " <> token))
               ]
           }
-  eres <- tryHttp (httpLbs req mgr)
+  eres <- http req
   case eres of
     Left err -> pure (Left err)
     Right resp ->

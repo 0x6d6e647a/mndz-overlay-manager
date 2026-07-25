@@ -42,6 +42,8 @@ import Control.Monad (forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BSC
+import Data.ByteString.Lazy.Char8 qualified as L8
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
@@ -56,6 +58,7 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
+import Network.HTTP.Client (method, path)
 import Overlay.Discovery
   ( DiscoveryError (..),
     collectEbuilds,
@@ -75,6 +78,7 @@ import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
+import Test.HttpFake (fakeResponse)
 import Test.Support
   ( dualArchGoCeilings,
     mkTestApplyEnv,
@@ -116,8 +120,12 @@ import Update.Assets.Layout (cratesTarballName, depsTarballName, vendorTarballNa
 import Update.Assets.Release
   ( ReleaseAsset (..),
     ReleaseInfo (..),
+    ReleaseMeta (..),
     ReleaseOps (..),
+    createReleaseWithAssetHttpLbs,
+    downloadReleaseAssetHttpLbs,
     findAssetByName,
+    getReleaseByTagHttpLbs,
     lookupNamedAsset,
     parseReleaseInfo,
   )
@@ -285,7 +293,10 @@ tests =
       testCase "Hash Bytes" testHashBytes,
       testCase "Sidecar Line" testSidecarLine,
       testCase "Deps Distfile Names" testDepsDistfileNames,
-      testCase "Release Lookup" testReleaseLookup
+      testCase "Release Lookup" testReleaseLookup,
+      testCase "Release HTTP Get By Tag" testReleaseHttpGetByTag,
+      testCase "Release HTTP Download" testReleaseHttpDownload,
+      testCase "Release HTTP Create Upload Delete" testReleaseHttpCreateUploadDelete
     ]
 
 testTokenResolver :: IO ()
@@ -406,5 +417,127 @@ testReleaseLookup = do
   assertEq "lookup missing tag" (Right Nothing) missingTag
   missingAsset <- lookupNamedAsset opsFound "o" "r" "beads-1.0.5" "wrong-name.tar.xz"
   assertEq "lookup missing asset" (Right Nothing) missingAsset
+  -- hard error from ops
+  let opsErr =
+        ReleaseOps
+          { roGetReleaseByTag = \_ _ _ -> pure (Left "auth failed"),
+            roDownloadAsset = \_ _ -> pure (Left "unused"),
+            roCreateReleaseWithAsset = \_ _ -> pure (Left "unused")
+          }
+  hard <- lookupNamedAsset opsErr "o" "r" "t" "a"
+  assertEq "lookup hard error" (Left "auth failed") hard
+
+testReleaseHttpGetByTag :: IO ()
+testReleaseHttpGetByTag = do
+  let releaseJson =
+        L8.pack
+          "{\"id\":7,\"tag_name\":\"v1\",\"assets\":[{\"name\":\"a.tar.xz\",\"browser_download_url\":\"https://example/a\"}]}"
+      http404 _ = pure (Right (fakeResponse 404 ""))
+      http200 _ = pure (Right (fakeResponse 200 releaseJson))
+      http500 _ = pure (Right (fakeResponse 500 "nope"))
+      httpNet _ = pure (Left "network down")
+      httpBad _ = pure (Right (fakeResponse 200 "{not-json"))
+  assertEq
+    "404 not found"
+    (Right Nothing)
+    =<< getReleaseByTagHttpLbs http404 "tok" "o" "r" "missing"
+  found <- assertRight "200" =<< getReleaseByTagHttpLbs http200 "tok" "o" "r" "v1"
+  case found of
+    Just info -> do
+      assertEq "id" 7 (riId info)
+      assertEq "tag" "v1" (riTag info)
+    Nothing -> do
+      hPutStrLn stderr "expected Just release"
+      exitFailure
+  err500 <- assertLeft "500" =<< getReleaseByTagHttpLbs http500 "tok" "o" "r" "v1"
+  assertTrue "http 500" ("HTTP 500" `T.isInfixOf` err500)
+  errNet <- assertLeft "net" =<< getReleaseByTagHttpLbs httpNet "tok" "o" "r" "v1"
+  assertEq "network" "network down" errNet
+  errBad <- assertLeft "bad json" =<< getReleaseByTagHttpLbs httpBad "tok" "o" "r" "v1"
+  assertTrue "decode err nonempty" (not (T.null errBad))
+
+testReleaseHttpDownload :: IO ()
+testReleaseHttpDownload =
+  withSystemTempDirectory "rel-dl" $ \tmp -> do
+    let dest = tmp </> "out" </> "asset.bin"
+        httpOk _ = pure (Right (fakeResponse 200 "asset-bytes"))
+        httpFail _ = pure (Right (fakeResponse 403 "denied"))
+        httpNet _ = pure (Left "dl net")
+    void $ assertRight "download ok" =<< downloadReleaseAssetHttpLbs httpOk "tok" "https://example/a" dest
+    exists <- doesFileExist dest
+    assertTrue "wrote dest" exists
+    body <- BS.readFile dest
+    assertEq "body" (encodeUtf8 "asset-bytes") body
+    err403 <-
+      assertLeft "403" =<< downloadReleaseAssetHttpLbs httpFail "tok" "https://example/a" (tmp </> "x")
+    assertTrue "download http" ("HTTP 403" `T.isInfixOf` err403)
+    errNet <-
+      assertLeft "net" =<< downloadReleaseAssetHttpLbs httpNet "tok" "https://example/a" (tmp </> "y")
+    assertEq "net err" "dl net" errNet
+
+testReleaseHttpCreateUploadDelete :: IO ()
+testReleaseHttpCreateUploadDelete =
+  withSystemTempDirectory "rel-create" $ \tmp -> do
+    let assetPath = tmp </> "pkg.tar.xz"
+    BS.writeFile assetPath "xz-bytes"
+    methodsRef <- newIORef ([] :: [BS.ByteString])
+    let meta =
+          ReleaseMeta
+            { rmOwner = "o",
+              rmRepo = "r",
+              rmTag = "t1",
+              rmName = "n1",
+              rmBody = "b",
+              rmTargetCommitish = "main"
+            }
+        createBody =
+          L8.pack
+            "{\"id\":99,\"upload_url\":\"https://uploads.example/assets{?name,label}\"}"
+        -- Success: create 201 then upload 201
+        httpSuccess req = do
+          atomicModifyIORef' methodsRef (\xs -> (xs <> [method req], ()))
+          pure $
+            Right $
+              if method req == "POST" && "releases" `BSC.isInfixOf` path req
+                then fakeResponse 201 createBody
+                else fakeResponse 201 ""
+    void $
+      assertRight "create+upload"
+        =<< createReleaseWithAssetHttpLbs httpSuccess "tok" meta assetPath
+    methods <- readIORef methodsRef
+    assertEq "create then upload" ["POST", "POST"] methods
+
+    -- Create HTTP failure
+    let httpCreateFail _ = pure (Right (fakeResponse 422 "bad"))
+    errCreate <-
+      assertLeft "create fail"
+        =<< createReleaseWithAssetHttpLbs httpCreateFail "tok" meta assetPath
+    assertTrue "creating release" ("creating release" `T.isInfixOf` errCreate)
+
+    -- Create ok, upload fails → DELETE best-effort
+    delRef <- newIORef (0 :: Int)
+    let httpUploadFail req = do
+          case method req of
+            "DELETE" -> do
+              atomicModifyIORef' delRef (\n -> (n + 1, ()))
+              pure (Right (fakeResponse 204 ""))
+            "POST"
+              | "releases" `BSC.isInfixOf` path req ->
+                  pure (Right (fakeResponse 201 createBody))
+            "POST" -> pure (Right (fakeResponse 500 "upload boom"))
+            _ -> pure (Right (fakeResponse 500 "unexpected"))
+    errUp <-
+      assertLeft "upload fail"
+        =<< createReleaseWithAssetHttpLbs httpUploadFail "tok" meta assetPath
+    assertTrue "upload msg" ("uploading release asset" `T.isInfixOf` errUp)
+    deletes <- readIORef delRef
+    assertEq "best-effort delete" 1 deletes
+
+    -- Create network error
+    let httpNet _ = pure (Left "create net")
+    errNet <-
+      assertLeft "create net"
+        =<< createReleaseWithAssetHttpLbs httpNet "tok" meta assetPath
+    assertEq "net" "create net" errNet
 
 -- | Dual-arch Go ceilings helper for tests.

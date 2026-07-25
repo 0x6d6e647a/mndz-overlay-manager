@@ -276,11 +276,16 @@ tests =
       testCase "Parse Keyinfo Cached" testParseKeyinfoCached,
       testCase "Pinentry Child Env" testPinentryChildEnv,
       testCase "Missing Signing Key Fails" testMissingSigningKeyFails,
+      testCase "Resolve Keygrip Fails" testResolveKeygripFails,
+      testCase "Keyinfo Fail Propagates" testKeyinfoFailPropagates,
       testCase "Warm Cache Skips Prompt" testWarmCacheSkipsPrompt,
       testCase "Cold Cache Ready Then Warm" testColdCacheReadyThenWarm,
+      testCase "Cold Ready Prompt Fails" testColdReadyPromptFails,
+      testCase "Cold Warm Key Fails" testColdWarmKeyFails,
       testCase "No Tty When Cold Fails" testNoTtyWhenColdFails,
       testCase "Clear Only If Warmed" testClearOnlyIfWarmed,
-      testCase "Per Repo Keygrips" testPerRepoKeygrips
+      testCase "Per Repo Keygrips" testPerRepoKeygrips,
+      testCase "Worktree State Reused" testWorktreeStateReused
     ]
 
 testParseSignCapableKeygrip :: IO ()
@@ -307,6 +312,26 @@ testParseSignCapableKeygrip = do
     Right _ -> do
       hPutStrLn stderr "expected no sign-capable keygrip"
       exitFailure
+  -- sign-capable subkey (ssb with 's' in colon field 12)
+  let ssbSign =
+        unlines
+          [ "sec:u:255:22:PRIMARYKEY:1::::::e:::",
+            "grp:::::::::PRIMARYGRP:",
+            "ssb:u:255:22:SUBKEYID:1::::::s:::",
+            "grp:::::::::SUBGRIP123:",
+            ""
+          ]
+  case parseSignCapableKeygrip ssbSign of
+    Right (Keygrip g) -> assertEq "ssb sign grip" "SUBGRIP123" g
+    Left err -> do
+      hPutStrLn stderr $ "ssb sign parse failed: " <> T.unpack err
+      exitFailure
+  -- sec with sign but missing grp → failure
+  case parseSignCapableKeygrip "sec:u:255:22:X:1::::::s:::\nuid:u::::name::\n" of
+    Left _ -> pure ()
+    Right _ -> do
+      hPutStrLn stderr "expected missing keygrip"
+      exitFailure
 
 testParseKeyinfoCached :: IO ()
 testParseKeyinfoCached = do
@@ -317,6 +342,19 @@ testParseKeyinfoCached = do
         "S KEYINFO 6FD5C82CED9AF42C796A9C275BF5CD4082063513 D - - - P - - -\nOK\n"
   assertEq "warm" (Right True) (parseKeyinfoCached warm grip)
   assertEq "cold" (Right False) (parseKeyinfoCached cold grip)
+  case parseKeyinfoCached "OK\n" grip of
+    Left msg -> assertTrue "parse fail" ("could not parse KEYINFO" `T.isInfixOf` msg)
+    Right _ -> do
+      hPutStrLn stderr "expected KEYINFO parse failure"
+      exitFailure
+  -- unknown cached token is ignored → no match
+  let weird =
+        "S KEYINFO 6FD5C82CED9AF42C796A9C275BF5CD4082063513 D - - ? P - - -\nOK\n"
+  case parseKeyinfoCached weird grip of
+    Left _ -> pure ()
+    Right _ -> do
+      hPutStrLn stderr "expected unknown cached token to fail parse"
+      exitFailure
 
 testPinentryChildEnv :: IO ()
 testPinentryChildEnv = do
@@ -325,6 +363,11 @@ testPinentryChildEnv = do
   assertEq "GPG_TTY set" (Just "/dev/tty") (lookup "GPG_TTY" env')
   assertEq "DISPLAY cleared" Nothing (lookup "DISPLAY" env')
   assertEq "HOME kept" (Just "/home/u") (lookup "HOME" env')
+  let envNone = pinentryChildEnv Nothing parent
+  assertEq "no GPG_TTY when no tty" Nothing (lookup "GPG_TTY" envNone)
+  assertEq "DISPLAY still cleared" Nothing (lookup "DISPLAY" envNone)
+  let envEmpty = pinentryChildEnv (Just "") parent
+  assertEq "empty tty path omits GPG_TTY" Nothing (lookup "GPG_TTY" envEmpty)
 
 baseFakeOps :: GpgAgentOps
 baseFakeOps =
@@ -469,4 +512,80 @@ testPerRepoKeygrips = do
   roots <- readIORef resolveRef
   -- makeAbsolute may expand; we only require both repos were queried at least once
   assertTrue "queried more than once" (length roots >= 2)
+  teardownGpgHandle h
+
+testResolveKeygripFails :: IO ()
+testResolveKeygripFails = do
+  let ops =
+        baseFakeOps
+          { gaoResolveKeygrip = \_ -> pure (Left "no sign-capable secret keygrip")
+          }
+  h <- newGpgHandle ops
+  err <- assertLeft "resolve" =<< ensureGpgReady h "/tmp/overlay-repo"
+  assertTrue "mentions keygrip" ("keygrip" `T.isInfixOf` err)
+  teardownGpgHandle h
+
+testKeyinfoFailPropagates :: IO ()
+testKeyinfoFailPropagates = do
+  let ops =
+        baseFakeOps
+          { gaoKeyinfoCached = \_ -> pure (Left "KEYINFO failed")
+          }
+  h <- newGpgHandle ops
+  err <- assertLeft "keyinfo" =<< ensureGpgReady h "/tmp/overlay-repo"
+  assertEq "keyinfo error" "KEYINFO failed" err
+  teardownGpgHandle h
+
+testColdReadyPromptFails :: IO ()
+testColdReadyPromptFails = do
+  warmRef <- newIORef (0 :: Int)
+  let ops =
+        baseFakeOps
+          { gaoKeyinfoCached = \_ -> pure (Right False),
+            gaoReadyPrompt = pure (Left "prompt aborted"),
+            gaoWarmKey = \_ -> do
+              atomicModifyIORef' warmRef (\n -> (n + 1, ()))
+              pure (Right ())
+          }
+  h <- newGpgHandle ops
+  err <- assertLeft "prompt fail" =<< ensureGpgReady h "/tmp/overlay-repo"
+  assertEq "prompt error" "prompt aborted" err
+  warms <- readIORef warmRef
+  assertEq "no warm after prompt fail" 0 warms
+  teardownGpgHandle h
+
+testColdWarmKeyFails :: IO ()
+testColdWarmKeyFails = do
+  let ops =
+        baseFakeOps
+          { gaoKeyinfoCached = \_ -> pure (Right False),
+            gaoReadyPrompt = pure (Right ()),
+            gaoWarmKey = \_ -> pure (Left "clearsign failed")
+          }
+  h <- newGpgHandle ops
+  err <- assertLeft "warm fail" =<< ensureGpgReady h "/tmp/overlay-repo"
+  assertEq "warm error" "clearsign failed" err
+  teardownGpgHandle h
+
+testWorktreeStateReused :: IO ()
+testWorktreeStateReused = do
+  getKeyRef <- newIORef (0 :: Int)
+  resolveRef <- newIORef (0 :: Int)
+  let ops =
+        baseFakeOps
+          { gaoGetSigningKey = \_ -> do
+              atomicModifyIORef' getKeyRef (\n -> (n + 1, ()))
+              pure (Right "KEY1"),
+            gaoResolveKeygrip = \_ -> do
+              atomicModifyIORef' resolveRef (\n -> (n + 1, ()))
+              pure (Right (Keygrip "GRIP1")),
+            gaoKeyinfoCached = \_ -> pure (Right True)
+          }
+  h <- newGpgHandle ops
+  void $ assertRight "first" =<< ensureGpgReady h "/tmp/reuse-repo"
+  void $ assertRight "second" =<< ensureGpgReady h "/tmp/reuse-repo"
+  gets <- readIORef getKeyRef
+  resolves <- readIORef resolveRef
+  assertEq "signingkey once" 1 gets
+  assertEq "resolve once" 1 resolves
   teardownGpgHandle h

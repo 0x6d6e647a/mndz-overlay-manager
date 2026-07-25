@@ -1,7 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.Http
-  ( fetchHttpWith,
+  ( HttpLbs,
+    httpLbsEither,
+    fetchHttpWith,
+    fetchHttpWithHttp,
     tryHttp,
   )
 where
@@ -12,6 +15,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client
   ( Manager,
+    Request,
+    Response,
     httpLbs,
     method,
     parseRequest,
@@ -22,24 +27,35 @@ import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
 import Update.Types (UpdateSource (..))
 
+-- | Injectable HTTP GET/POST runner for tests (no live network).
+type HttpLbs = Request -> IO (Either Text (Response L8.ByteString))
+
+-- | Production runner: @tryHttp (httpLbs req mgr)@.
+httpLbsEither :: Manager -> HttpLbs
+httpLbsEither mgr req = tryHttp (httpLbs req mgr)
+
 fetchHttpWith :: Manager -> UpdateSource -> IO (Either Text EbuildVersion)
-fetchHttpWith mgr = \case
+fetchHttpWith mgr = fetchHttpWithHttp (httpLbsEither mgr)
+
+-- | Fetch version body from an Http primary (and optional fallback) URL.
+fetchHttpWithHttp :: HttpLbs -> UpdateSource -> IO (Either Text EbuildVersion)
+fetchHttpWithHttp http = \case
   Http primary mFallback -> do
-    primaryResult <- tryUrl mgr primary
+    primaryResult <- tryUrl http primary
     case primaryResult of
       Right v -> pure (Right v)
       Left _ ->
         case mFallback of
           Nothing -> pure primaryResult
-          Just fb -> tryUrl mgr fb
+          Just fb -> tryUrl http fb
   other ->
     pure (Left ("Update.Http: not an Http source: " <> T.pack (show other)))
 
-tryUrl :: Manager -> Text -> IO (Either Text EbuildVersion)
-tryUrl mgr urlText = do
+tryUrl :: HttpLbs -> Text -> IO (Either Text EbuildVersion)
+tryUrl http urlText = do
   req0 <- parseRequest (T.unpack urlText)
   let req = req0 {method = "GET"}
-  eres <- tryHttp (httpLbs req mgr)
+  eres <- http req
   pure $ case eres of
     Left err -> Left err
     Right resp ->

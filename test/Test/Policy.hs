@@ -42,6 +42,7 @@ import Control.Monad (forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
+import Data.ByteString.Lazy.Char8 qualified as L8
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
@@ -78,6 +79,7 @@ import System.IO (hPutStrLn, stderr)
 import System.IO.Error (userError)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
+import Test.HttpFake (fakeResponse)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
 import Update.Apply
@@ -219,7 +221,7 @@ import Update.GpgAgent
     teardownGpgHandle,
   )
 import Update.Hardcoded (lookupHardcoded, lookupPolicy)
-import Update.Http (fetchHttpWith, tryHttp)
+import Update.Http (fetchHttpWith, fetchHttpWithHttp, tryHttp)
 import Update.Md5Cache
   ( EgencacheRequest (..),
     GencacheAction (..),
@@ -237,7 +239,7 @@ import Update.Md5Cache
     packageCacheGateError,
     readCacheMd5Field,
   )
-import Update.Npm (fetchNpmWith)
+import Update.Npm (fetchNpmWith, fetchNpmWithHttp)
 import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
@@ -292,7 +294,9 @@ tests =
       testCase "Group By Package" testGroupByPackage,
       testCase "Try Http" testTryHttp,
       testCase "Fetch Http Wrong Source" testFetchHttpWrongSource,
-      testCase "Fetch Npm Wrong Source" testFetchNpmWrongSource
+      testCase "Fetch Http With Fake" testFetchHttpWithFake,
+      testCase "Fetch Npm Wrong Source" testFetchNpmWrongSource,
+      testCase "Fetch Npm With Fake" testFetchNpmWithFake
     ]
 
 ------------------------------------------------------------------------
@@ -525,6 +529,48 @@ testFetchHttpWrongSource = do
       hPutStrLn stderr $ "expected Left, got Right " <> show v
       exitFailure
 
+testFetchHttpWithFake :: IO ()
+testFetchHttpWithFake = do
+  let httpOk _ = pure (Right (fakeResponse 200 "1.2.3\n"))
+      httpEmpty _ = pure (Right (fakeResponse 200 "  \n"))
+      http404 _ = pure (Right (fakeResponse 404 "missing"))
+      httpNet _ = pure (Left "timeout")
+  ver <- assertRight "http ok" =<< fetchHttpWithHttp httpOk (Http "https://example.com/v" Nothing)
+  assertEq "parsed version" (parseEbuildVersion "1.2.3") ver
+  errEmpty <-
+    assertLeft "empty body"
+      =<< fetchHttpWithHttp httpEmpty (Http "https://example.com/v" Nothing)
+  assertTrue "empty msg" ("empty version body" `T.isInfixOf` errEmpty)
+  err404 <-
+    assertLeft "404"
+      =<< fetchHttpWithHttp http404 (Http "https://example.com/v" Nothing)
+  assertTrue "http 404" ("HTTP 404" `T.isInfixOf` err404)
+  errNet <-
+    assertLeft "net"
+      =<< fetchHttpWithHttp httpNet (Http "https://example.com/v" Nothing)
+  assertEq "timeout" "timeout" errNet
+  -- primary fails (500), fallback succeeds
+  nRef <- newIORef (0 :: Int)
+  let httpSeq _ = do
+        n <- atomicModifyIORef' nRef (\i -> (i + 1, i))
+        pure $
+          Right $
+            if n == 0
+              then fakeResponse 500 "primary fail"
+              else fakeResponse 200 "3.1.0"
+  verFb <-
+    assertRight "fallback"
+      =<< fetchHttpWithHttp
+        httpSeq
+        (Http "https://example.com/primary" (Just "https://example.com/fallback"))
+  assertEq "fallback ver" (parseEbuildVersion "3.1.0") verFb
+  -- primary fails and no fallback
+  let httpOnce _ = pure (Right (fakeResponse 500 "only"))
+  errOnly <-
+    assertLeft "no fallback"
+      =<< fetchHttpWithHttp httpOnce (Http "https://example.com/v" Nothing)
+  assertTrue "500" ("HTTP 500" `T.isInfixOf` errOnly)
+
 testFetchNpmWrongSource :: IO ()
 testFetchNpmWrongSource = do
   mgr <- newManager tlsManagerSettings
@@ -540,3 +586,21 @@ testFetchNpmWrongSource = do
     Right v -> do
       hPutStrLn stderr $ "expected Left, got Right " <> show v
       exitFailure
+
+testFetchNpmWithFake :: IO ()
+testFetchNpmWithFake = do
+  let httpOk _ = pure (Right (fakeResponse 200 "{\"version\":\"4.5.6\"}"))
+      httpBadJson _ = pure (Right (fakeResponse 200 "{nope"))
+      httpNoVer _ = pure (Right (fakeResponse 200 "{\"name\":\"x\"}"))
+      http404 _ = pure (Right (fakeResponse 404 "{}"))
+      httpNet _ = pure (Left "npm net")
+  ver <- assertRight "npm ok" =<< fetchNpmWithHttp httpOk (Npm "left-pad")
+  assertEq "npm ver" (parseEbuildVersion "4.5.6") ver
+  errJson <- assertLeft "bad json" =<< fetchNpmWithHttp httpBadJson (Npm "pkg")
+  assertTrue "json err" (not (T.null errJson))
+  errField <- assertLeft "no version" =<< fetchNpmWithHttp httpNoVer (Npm "pkg")
+  assertTrue "version field" ("version field" `T.isInfixOf` errField)
+  err404 <- assertLeft "404" =<< fetchNpmWithHttp http404 (Npm "pkg")
+  assertTrue "http" ("HTTP 404" `T.isInfixOf` err404)
+  errNet <- assertLeft "net" =<< fetchNpmWithHttp httpNet (Npm "pkg")
+  assertEq "net" "npm net" errNet
