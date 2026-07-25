@@ -3,6 +3,7 @@ module Main (main) where
 import Test.Apply qualified as Apply
 import Test.Assets qualified as Assets
 import Test.CLI qualified as CLI
+import Test.CheckPlan qualified as CheckPlan
 import Test.Config qualified as Config
 import Test.EbuildEdit qualified as EbuildEdit
 import Test.Ecosystems qualified as Ecosystems
@@ -54,6 +55,7 @@ main =
             Apply.unitTests,
             Md5Cache.unitTests,
             Ecosystems.unitTests,
+            CheckPlan.unitTests,
             Properties.tests
           ],
         testGroup
@@ -62,6 +64,7 @@ main =
             Progress.integrationTests,
             Apply.integrationTests,
             Md5Cache.integrationTests,
-            Ecosystems.integrationTests
+            Ecosystems.integrationTests,
+            CheckPlan.integrationTests
           ]
       ]

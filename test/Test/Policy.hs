@@ -126,6 +126,7 @@ import Update.Cargo.Msrv
   )
 import Update.Check
   ( PackageEntry (..),
+    checkPackage,
     groupByPackage,
     groupNewest,
     statusFromCompare,
@@ -286,7 +287,7 @@ tests =
       testCase "Policy Classification" testPolicyClassification,
       testCase "Resolve Map Only" testResolveMapOnly,
       testCase "Group Newest" testGroupNewest,
-      testCase "Check Overlay Statuses" testCheckOverlayStatuses,
+      testCase "Check Package Product Statuses" testCheckPackageProductStatuses,
       testCase "Status From Compare" testStatusFromCompare,
       testCase "Group By Package" testGroupByPackage,
       testCase "Try Http" testTryHttp,
@@ -393,24 +394,27 @@ testGroupNewest = do
       hPutStrLn stderr "missing haskell group"
       exitFailure
 
-testCheckOverlayStatuses :: IO ()
-testCheckOverlayStatuses = do
-  let fetch src = pure $ case src of
-        GitHub "dolthub" "dolt" _ -> Right (parseEbuildVersion "2.1.10")
-        GitHub "ok" "ok" _ -> Right (parseEbuildVersion "1.0.0")
-        GitHub "ahead" "ahead" _ -> Right (parseEbuildVersion "1.5.0")
-        GitHub "fail" "fail" _ -> Left "network down"
-        _ -> Left "unexpected source"
-  reports <-
-    checkWithFakeResolve
-      fetch
-      [ (mkPackageKey "dev-db" "dolt", "dolt", "2.1.6", Just (GitHub "dolthub" "dolt" "v")),
-        (mkPackageKey "dev-util" "okpkg", "okpkg", "1.0.0", Just (GitHub "ok" "ok" "v")),
-        (mkPackageKey "dev-util" "ahead", "ahead", "2.0.0", Just (GitHub "ahead" "ahead" "v")),
-        (mkPackageKey "dev-util" "none", "none", "1.0", Nothing),
-        (mkPackageKey "dev-util" "fail", "fail", "1.0", Just (GitHub "fail" "fail" "v"))
-      ]
-  let statuses = map reportStatus reports
+-- | Drive real 'checkPackage' (resolveSource + statusFromCompare) for each status.
+testCheckPackageProductStatuses :: IO ()
+testCheckPackageProductStatuses = do
+  let mk cat pn ver =
+        PackageEntry
+          { peKey = mkPackageKey cat pn,
+            pePN = pn,
+            peLocal = parseEbuildVersion ver,
+            pePath = "/tmp/" <> T.unpack pn <> ".ebuild"
+          }
+      fetchOutdated _ = pure (Right (parseEbuildVersion "2.1.10"))
+      fetchOk _ = pure (Right (parseEbuildVersion "1.0.0"))
+      fetchAhead _ = pure (Right (parseEbuildVersion "1.5.0"))
+      fetchFail _ = pure (Left "network down")
+      fetchUnused _ = pure (Left "should not fetch")
+  outdated <- checkPackage fetchOutdated (mk "dev-util" "opencode-bin" "2.1.6")
+  ok <- checkPackage fetchOk (mk "dev-util" "opencode-bin" "1.0.0")
+  ahead <- checkPackage fetchAhead (mk "dev-lang" "bun-bin" "2.0.0")
+  unconf <- checkPackage fetchUnused (mk "dev-lang" "haskell" "9.6.1")
+  err <- checkPackage fetchFail (mk "dev-util" "opencode-bin" "1.0.0")
+  let statuses = map reportStatus [outdated, ok, ahead, unconf, err]
   assertTrue "has outdated" (any isOutdated statuses)
   assertTrue "has ok" (any isOk statuses)
   assertTrue "has ahead" (any isAhead statuses)
@@ -425,43 +429,6 @@ testCheckOverlayStatuses = do
     isAhead _ = False
     isErr (FetchError _) = True
     isErr _ = False
-
--- | Check packages with pre-resolved sources (avoids filesystem for unit tests).
-
--- | Check packages with pre-resolved sources (avoids filesystem for unit tests).
-checkWithFakeResolve ::
-  (UpdateSource -> IO (Either T.Text EbuildVersion)) ->
-  [(PackageKey, T.Text, T.Text, Maybe UpdateSource)] ->
-  IO [UpdateReport]
-checkWithFakeResolve fetch = mapM go
-  where
-    go (key, _pn, pv, mSrc) = do
-      let local = parseEbuildVersion pv
-      case mSrc of
-        Nothing ->
-          pure UpdateReport {reportKey = key, reportStatus = Unconfigured}
-        Just src -> do
-          result <- fetch src
-          pure $ case result of
-            Left err ->
-              UpdateReport {reportKey = key, reportStatus = FetchError err}
-            Right remote ->
-              UpdateReport
-                { reportKey = key,
-                  reportStatus = case comparePV local remote of
-                    Just LT ->
-                      Outdated
-                        [ OutdatedLine
-                            { olFrom = local,
-                              olTo = remote,
-                              olLabel = Nothing,
-                              olAssetsReusable = False
-                            }
-                        ]
-                    Just EQ -> Ok local
-                    Just GT -> Ahead local remote
-                    Nothing -> FetchError "incomparable"
-                }
 
 testStatusFromCompare :: IO ()
 testStatusFromCompare = do

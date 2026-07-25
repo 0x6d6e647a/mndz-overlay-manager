@@ -207,6 +207,7 @@ test-suite mndz-overlay-manager-test
         Test.Apply
         Test.Assert
         Test.Assets
+        Test.CheckPlan
         Test.CLI
         Test.Config
         Test.EbuildEdit
