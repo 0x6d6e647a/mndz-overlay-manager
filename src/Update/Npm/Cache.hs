@@ -7,7 +7,9 @@ module Update.Npm.Cache
     mkNpmCacheOps,
     buildNpmDepsTarball,
     fetchNpmEnginesNode,
+    fetchNpmEnginesNodeHttpLbs,
     listNpmVersions,
+    listNpmVersionsHttpLbs,
     hostNodeVersion,
     hostMeetsNodeRequirement,
     nodeVersionTooOldMessage,
@@ -24,7 +26,6 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client
   ( Manager,
-    httpLbs,
     method,
     parseRequest,
     requestHeaders,
@@ -43,7 +44,7 @@ import Update.Go.Version
   ( compareGoVersions,
     parseGoVersionToken,
   )
-import Update.Http (tryHttp)
+import Update.Http (HttpLbs, httpLbsEither)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -242,7 +243,12 @@ parseEnginesNode =
 
 -- | Fetch engines.node for a package version from the npm registry.
 fetchNpmEnginesNode :: Manager -> Text -> Text -> IO (Either Text Text)
-fetchNpmEnginesNode mgr npmPkg pv = do
+fetchNpmEnginesNode mgr =
+  fetchNpmEnginesNodeHttpLbs (httpLbsEither mgr)
+
+-- | Injectable HTTP path for engines.node registry fetch.
+fetchNpmEnginesNodeHttpLbs :: HttpLbs -> Text -> Text -> IO (Either Text Text)
+fetchNpmEnginesNodeHttpLbs http npmPkg pv = do
   let url =
         "https://registry.npmjs.org/"
           <> T.unpack npmPkg
@@ -257,7 +263,7 @@ fetchNpmEnginesNode mgr npmPkg pv = do
                 ("Accept", "application/json")
               ]
           }
-  eres <- tryHttp (httpLbs req mgr)
+  eres <- http req
   pure $ case eres of
     Left err -> Left err
     Right resp ->
@@ -290,7 +296,11 @@ fetchNpmEnginesNode mgr npmPkg pv = do
 
 -- | List published versions from the npm registry (newest-first).
 listNpmVersions :: Manager -> Text -> IO (Either Text [EbuildVersion])
-listNpmVersions mgr npmPkg = do
+listNpmVersions mgr = listNpmVersionsHttpLbs (httpLbsEither mgr)
+
+-- | Injectable HTTP path for npm packument version listing.
+listNpmVersionsHttpLbs :: HttpLbs -> Text -> IO (Either Text [EbuildVersion])
+listNpmVersionsHttpLbs http npmPkg = do
   let url = "https://registry.npmjs.org/" <> T.unpack npmPkg
   req0 <- parseRequest url
   let req =
@@ -301,7 +311,7 @@ listNpmVersions mgr npmPkg = do
                 ("Accept", "application/json")
               ]
           }
-  eres <- tryHttp (httpLbs req mgr)
+  eres <- http req
   pure $ case eres of
     Left err -> Left err
     Right resp ->

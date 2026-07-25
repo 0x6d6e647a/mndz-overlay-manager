@@ -5,6 +5,7 @@ module Update.Go.ModFetch
     GoModFetcher,
     productionGoModFetcher,
     fetchGoModAtTag,
+    fetchGoModAtTagHttpLbs,
     parseGoReqFromMod,
     withGoModCache,
   )
@@ -20,7 +21,6 @@ import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
 import Data.Text.Encoding.Error (lenientDecode)
 import Network.HTTP.Client
   ( Manager,
-    httpLbs,
     method,
     newManager,
     parseRequest,
@@ -32,7 +32,7 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
 import System.FilePath (normalise)
 import Update.Go.Version (parseGoModGoDirective)
-import Update.Http (tryHttp)
+import Update.Http (HttpLbs, httpLbsEither)
 
 -- | Cache key for go.mod at a repository ref.
 data GoModKey = GoModKey
@@ -84,7 +84,12 @@ productionGoModFetcher mToken = do
 
 -- | Fetch go.mod at tag via raw.githubusercontent.com (token optional).
 fetchGoModAtTag :: Manager -> Maybe Text -> GoModKey -> IO (Either Text Text)
-fetchGoModAtTag mgr mToken key = do
+fetchGoModAtTag mgr =
+  fetchGoModAtTagHttpLbs (httpLbsEither mgr)
+
+-- | Injectable HTTP path for go.mod-at-tag fetch.
+fetchGoModAtTagHttpLbs :: HttpLbs -> Maybe Text -> GoModKey -> IO (Either Text Text)
+fetchGoModAtTagHttpLbs http mToken key = do
   let subPath = case gmkSubdir key of
         Nothing -> "go.mod"
         Just sub ->
@@ -99,10 +104,10 @@ fetchGoModAtTag mgr mToken key = do
           <> T.unpack (gmkTag key)
           <> "/"
           <> subPath
-  httpGetText mgr mToken rawUrl
+  httpGetTextHttpLbs http mToken rawUrl
 
-httpGetText :: Manager -> Maybe Text -> String -> IO (Either Text Text)
-httpGetText mgr mToken url = do
+httpGetTextHttpLbs :: HttpLbs -> Maybe Text -> String -> IO (Either Text Text)
+httpGetTextHttpLbs http mToken url = do
   req0 <- parseRequest url
   let authHeaders = case mToken of
         Just t
@@ -118,7 +123,7 @@ httpGetText mgr mToken url = do
               ]
                 <> authHeaders
           }
-  eres <- tryHttp (httpLbs req mgr)
+  eres <- http req
   pure $ case eres of
     Left err -> Left err
     Right resp ->

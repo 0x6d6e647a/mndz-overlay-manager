@@ -38,10 +38,11 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forever, unless, void)
+import Control.Monad (forever, unless, void, when)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy.Char8 qualified as L8
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sort, sortBy)
@@ -57,7 +58,7 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
-import Network.HTTP.Client (newManager)
+import Network.HTTP.Client (newManager, path, queryString, requestHeaders)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Discovery
   ( DiscoveryError (..),
@@ -156,7 +157,11 @@ import Update.EbuildEdit
   )
 import Update.Engines (parseEnginesMinimum)
 import Update.Git (GitOps (..))
-import Update.GitHub (stripAndParse)
+import Update.GitHub
+  ( fetchGitHubWithHttpLbs,
+    listGitHubVersionsWithHttpLbs,
+    stripAndParse,
+  )
 import Update.Go.Lanes
   ( GapLine (..),
     LaneId (..),
@@ -185,7 +190,11 @@ import Update.Go.Lanes
     pattern LaneArm64Plain,
     pattern LaneArm64Tilde,
   )
-import Update.Go.ModFetch (GoModKey (..), withGoModCache)
+import Update.Go.ModFetch
+  ( GoModKey (..),
+    fetchGoModAtTagHttpLbs,
+    withGoModCache,
+  )
 import Update.Go.Plan
   ( PlanOps (..),
     PlanProgress (..),
@@ -240,7 +249,11 @@ import Update.Md5Cache
     readCacheMd5Field,
   )
 import Update.Npm (fetchNpmWith, fetchNpmWithHttp)
-import Update.Npm.Cache (productionNpmCacheOps)
+import Update.Npm.Cache
+  ( fetchNpmEnginesNodeHttpLbs,
+    listNpmVersionsHttpLbs,
+    productionNpmCacheOps,
+  )
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
@@ -303,6 +316,13 @@ tests =
       testCase "Fetch Http With Fake" testFetchHttpWithFake,
       testCase "Fetch Npm Wrong Source" testFetchNpmWrongSource,
       testCase "Fetch Npm With Fake" testFetchNpmWithFake,
+      testCase "Fetch GitHub With Fake" testFetchGitHubWithFake,
+      testCase "List GitHub Versions With Fake" testListGitHubVersionsWithFake,
+      testCase "List GitHub Versions Pagination" testListGitHubVersionsPagination,
+      testCase "GitHub Auth Header" testGitHubAuthHeader,
+      testCase "List Npm Versions With Fake" testListNpmVersionsWithFake,
+      testCase "Fetch Npm Engines With Fake" testFetchNpmEnginesWithFake,
+      testCase "Fetch GoMod At Tag With Fake" testFetchGoModAtTagWithFake,
       testCase "Types Helper Predicates" testTypesHelperPredicates
     ]
 
@@ -611,6 +631,347 @@ testFetchNpmWithFake = do
   assertTrue "http" ("HTTP 404" `T.isInfixOf` err404)
   errNet <- assertLeft "net" =<< fetchNpmWithHttp httpNet (Npm "pkg")
   assertEq "net" "npm net" errNet
+
+------------------------------------------------------------------------
+-- Update.GitHub Fake-HTTP (registry-http-fakes)
+------------------------------------------------------------------------
+
+testFetchGitHubWithFake :: IO ()
+testFetchGitHubWithFake = do
+  -- Latest release success
+  let httpRelease _ =
+        pure (Right (fakeResponse 200 "{\"tag_name\":\"v2.1.0\"}"))
+  verRel <-
+    assertRight "release ok"
+      =<< fetchGitHubWithHttpLbs httpRelease Nothing (GitHub "o" "r" "v")
+  assertEq "release ver" (parseEbuildVersion "2.1.0") verRel
+
+  -- Release fails → max tag fallback
+  let httpFallback req =
+        pure $
+          Right $
+            if "releases" `BSC.isInfixOf` path req
+              then fakeResponse 404 "missing"
+              else
+                fakeResponse
+                  200
+                  "[{\"name\":\"v1.0.0\"},{\"name\":\"v1.2.0\"},{\"name\":\"other\"}]"
+  verFb <-
+    assertRight "tag fallback"
+      =<< fetchGitHubWithHttpLbs httpFallback Nothing (GitHub "o" "r" "v")
+  assertEq "max tag" (parseEbuildVersion "1.2.0") verFb
+
+  -- Non-GitHub source
+  errSrc <-
+    assertLeft "not github"
+      =<< fetchGitHubWithHttpLbs (\_ -> pure (Right (fakeResponse 200 "{}"))) Nothing (Npm "pkg")
+  assertTrue "not github msg" ("not a GitHub source" `T.isInfixOf` errSrc)
+
+  -- HTTP error on release and tags
+  let http500 _ = pure (Right (fakeResponse 500 "boom"))
+  err500 <-
+    assertLeft "http 500"
+      =<< fetchGitHubWithHttpLbs http500 Nothing (GitHub "o" "r" "v")
+  assertTrue "500 msg" ("HTTP 500" `T.isInfixOf` err500)
+
+  -- Network error on release; tags also fail
+  let httpNet _ = pure (Left "gh net")
+  errNet <-
+    assertLeft "net"
+      =<< fetchGitHubWithHttpLbs httpNet Nothing (GitHub "o" "r" "v")
+  assertEq "net" "gh net" errNet
+
+  -- Bad JSON on release → tags path with bad JSON
+  let httpBad _ = pure (Right (fakeResponse 200 "{nope"))
+  errBad <-
+    assertLeft "bad json"
+      =<< fetchGitHubWithHttpLbs httpBad Nothing (GitHub "o" "r" "v")
+  assertTrue "decode err" (not (T.null errBad))
+
+  -- Release 404, tags empty comparable set
+  let httpNoTags req =
+        pure $
+          Right $
+            if "releases" `BSC.isInfixOf` path req
+              then fakeResponse 404 ""
+              else fakeResponse 200 "[{\"name\":\"unrelated\"}]"
+  errNo <-
+    assertLeft "no tags"
+      =<< fetchGitHubWithHttpLbs httpNoTags Nothing (GitHub "o" "r" "v")
+  assertTrue "no comparable" ("no comparable tags" `T.isInfixOf` errNo)
+
+testListGitHubVersionsWithFake :: IO ()
+testListGitHubVersionsWithFake = do
+  let httpOk _ =
+        pure
+          ( Right
+              ( fakeResponse
+                  200
+                  "[{\"name\":\"v1.0.0\"},{\"name\":\"v2.0.0\"},{\"name\":\"skip-me\"}]"
+              )
+          )
+  vers <-
+    assertRight "list ok"
+      =<< listGitHubVersionsWithHttpLbs httpOk Nothing (GitHub "o" "r" "v")
+  assertEq
+    "newest first"
+    [parseEbuildVersion "2.0.0", parseEbuildVersion "1.0.0"]
+    vers
+
+  -- Non-GitHub
+  errSrc <-
+    assertLeft "not github"
+      =<< listGitHubVersionsWithHttpLbs
+        (\_ -> pure (Right (fakeResponse 200 "[]")))
+        Nothing
+        (Http "https://example.com/v" Nothing)
+  assertTrue "not github msg" ("not a GitHub source" `T.isInfixOf` errSrc)
+
+  -- HTTP error
+  let http404 _ = pure (Right (fakeResponse 404 "no"))
+  err404 <-
+    assertLeft "404"
+      =<< listGitHubVersionsWithHttpLbs http404 Nothing (GitHub "o" "r" "v")
+  assertTrue "http 404" ("HTTP 404" `T.isInfixOf` err404)
+
+  -- Network
+  let httpNet _ = pure (Left "list net")
+  errNet <-
+    assertLeft "net"
+      =<< listGitHubVersionsWithHttpLbs httpNet Nothing (GitHub "o" "r" "v")
+  assertEq "net" "list net" errNet
+
+  -- Bad JSON / parse failure
+  let httpBad _ = pure (Right (fakeResponse 200 "{\"not\":\"array\"}"))
+  errBad <-
+    assertLeft "bad"
+      =<< listGitHubVersionsWithHttpLbs httpBad Nothing (GitHub "o" "r" "v")
+  assertTrue "parse tags" ("could not parse tags list" `T.isInfixOf` errBad)
+
+testListGitHubVersionsPagination :: IO ()
+testListGitHubVersionsPagination = do
+  pagesRef <- newIORef ([] :: [BSC.ByteString])
+  let -- Full page (100 tags) then short page (1 tag)
+      page1Tags =
+        "["
+          <> T.intercalate
+            ","
+            [ "{\"name\":\"v0.0." <> T.pack (show n) <> "\"}"
+            | n <- [1 :: Int .. 100]
+            ]
+          <> "]"
+      page2Tags = "[{\"name\":\"v9.9.9\"}]"
+      httpPages req = do
+        let qs = queryString req
+        atomicModifyIORef' pagesRef (\xs -> (xs <> [qs], ()))
+        pure $
+          Right $
+            if "page=2" `BSC.isInfixOf` qs
+              then fakeResponse 200 (L8.pack (T.unpack page2Tags))
+              else fakeResponse 200 (L8.pack (T.unpack page1Tags))
+  vers <-
+    assertRight "paginate"
+      =<< listGitHubVersionsWithHttpLbs httpPages Nothing (GitHub "o" "r" "v")
+  pages <- readIORef pagesRef
+  assertEq "two pages requested" 2 (length pages)
+  assertTrue "page1 query" (any ("page=1" `BSC.isInfixOf`) pages)
+  assertTrue "page2 query" (any ("page=2" `BSC.isInfixOf`) pages)
+  -- Newest-first: v9.9.9 first
+  case vers of
+    (newest : _) -> assertEq "newest is 9.9.9" (parseEbuildVersion "9.9.9") newest
+    [] -> assertTrue "expected versions" False
+  assertEq "101 versions" 101 (length vers)
+
+testGitHubAuthHeader :: IO ()
+testGitHubAuthHeader = do
+  -- With token
+  hasBearerRef <- newIORef False
+  let httpTok req = do
+        let hasBearer =
+              any
+                ( \(k, v) ->
+                    k == "Authorization" && "Bearer secret-token" `BSC.isInfixOf` v
+                )
+                (requestHeaders req)
+        when hasBearer $ writeIORef hasBearerRef True
+        pure (Right (fakeResponse 200 "{\"tag_name\":\"v1.0.0\"}"))
+  void $
+    assertRight "with token"
+      =<< fetchGitHubWithHttpLbs httpTok (Just "secret-token") (GitHub "o" "r" "v")
+  hasBearer <- readIORef hasBearerRef
+  assertTrue "has bearer" hasBearer
+
+  -- Without token / empty token: no Authorization
+  noAuthRef <- newIORef True
+  let httpNo req = do
+        let hasAuth = any (\(k, _) -> k == "Authorization") (requestHeaders req)
+        when hasAuth $ writeIORef noAuthRef False
+        pure (Right (fakeResponse 200 "{\"tag_name\":\"v1.0.0\"}"))
+  void $
+    assertRight "no token"
+      =<< fetchGitHubWithHttpLbs httpNo Nothing (GitHub "o" "r" "v")
+  void $
+    assertRight "empty token"
+      =<< fetchGitHubWithHttpLbs httpNo (Just "") (GitHub "o" "r" "v")
+  noAuth <- readIORef noAuthRef
+  assertTrue "no Authorization header" noAuth
+
+------------------------------------------------------------------------
+-- Update.Npm.Cache registry Fake-HTTP
+------------------------------------------------------------------------
+
+testListNpmVersionsWithFake :: IO ()
+testListNpmVersionsWithFake = do
+  let packument =
+        "{\"versions\":{\"1.0.0\":{},\"2.0.0\":{},\"1.5.0\":{}}}"
+      httpOk _ = pure (Right (fakeResponse 200 packument))
+  vers <- assertRight "list ok" =<< listNpmVersionsHttpLbs httpOk "left-pad"
+  assertEq
+    "newest first"
+    [ parseEbuildVersion "2.0.0",
+      parseEbuildVersion "1.5.0",
+      parseEbuildVersion "1.0.0"
+    ]
+    vers
+
+  let http404 _ = pure (Right (fakeResponse 404 "{}"))
+  err404 <- assertLeft "404" =<< listNpmVersionsHttpLbs http404 "missing"
+  assertTrue "http 404" ("HTTP 404" `T.isInfixOf` err404)
+
+  let httpBad _ = pure (Right (fakeResponse 200 "{nope"))
+  errBad <- assertLeft "bad json" =<< listNpmVersionsHttpLbs httpBad "pkg"
+  assertTrue "decode" (not (T.null errBad))
+
+  let httpNoVers _ = pure (Right (fakeResponse 200 "{\"name\":\"x\"}"))
+  errField <- assertLeft "no versions" =<< listNpmVersionsHttpLbs httpNoVers "pkg"
+  assertTrue "parse versions" ("could not parse npm versions" `T.isInfixOf` errField)
+
+  let httpNet _ = pure (Left "npm list net")
+  errNet <- assertLeft "net" =<< listNpmVersionsHttpLbs httpNet "pkg"
+  assertEq "net" "npm list net" errNet
+
+testFetchNpmEnginesWithFake :: IO ()
+testFetchNpmEnginesWithFake = do
+  let httpOk _ =
+        pure
+          ( Right
+              ( fakeResponse
+                  200
+                  "{\"engines\":{\"node\":\">=20.19.0\"}}"
+              )
+          )
+  eng <-
+    assertRight "engines ok"
+      =<< fetchNpmEnginesNodeHttpLbs httpOk "pkg" "1.0.0"
+  assertEq "min node" "20.19.0" eng
+
+  let httpMissing _ = pure (Right (fakeResponse 200 "{\"name\":\"pkg\"}"))
+  errMiss <-
+    assertLeft "missing engines"
+      =<< fetchNpmEnginesNodeHttpLbs httpMissing "pkg" "1.0.0"
+  assertTrue "missing msg" ("missing engines.node" `T.isInfixOf` errMiss)
+
+  let httpBadEng _ =
+        pure
+          ( Right
+              ( fakeResponse
+                  200
+                  "{\"engines\":{\"node\":\"^18 || >=20\"}}"
+              )
+          )
+  errUnp <-
+    assertLeft "unparseable"
+      =<< fetchNpmEnginesNodeHttpLbs httpBadEng "pkg" "1.0.0"
+  assertTrue "unparseable msg" ("unparseable engines.node" `T.isInfixOf` errUnp)
+
+  let http404 _ = pure (Right (fakeResponse 404 "{}"))
+  err404 <-
+    assertLeft "404"
+      =<< fetchNpmEnginesNodeHttpLbs http404 "pkg" "9.9.9"
+  assertTrue "http 404" ("HTTP 404" `T.isInfixOf` err404)
+
+  let httpNet _ = pure (Left "engines net")
+  errNet <-
+    assertLeft "net"
+      =<< fetchNpmEnginesNodeHttpLbs httpNet "pkg" "1.0.0"
+  assertEq "net" "engines net" errNet
+
+  let httpBadJson _ = pure (Right (fakeResponse 200 "{"))
+  errJson <-
+    assertLeft "bad json"
+      =<< fetchNpmEnginesNodeHttpLbs httpBadJson "pkg" "1.0.0"
+  assertTrue "decode" (not (T.null errJson))
+
+------------------------------------------------------------------------
+-- Update.Go.ModFetch Fake-HTTP
+------------------------------------------------------------------------
+
+testFetchGoModAtTagWithFake :: IO ()
+testFetchGoModAtTagWithFake = do
+  let key =
+        GoModKey
+          { gmkOwner = "o",
+            gmkRepo = "r",
+            gmkTag = "v1.2.3",
+            gmkSubdir = Nothing
+          }
+      keySub =
+        key {gmkSubdir = Just "cmd/tool"}
+      body = "module example.com/r\n\ngo 1.22.0\n"
+      httpOk _ = pure (Right (fakeResponse 200 (L8.pack body)))
+  text <- assertRight "gomod ok" =<< fetchGoModAtTagHttpLbs httpOk Nothing key
+  assertEq "body" (T.pack body) text
+
+  -- Subdir path is requested
+  pathRef <- newIORef ("" :: BSC.ByteString)
+  let httpSub req = do
+        writeIORef pathRef (path req)
+        pure (Right (fakeResponse 200 "module x\ngo 1.21\n"))
+  void $
+    assertRight "subdir"
+      =<< fetchGoModAtTagHttpLbs httpSub Nothing keySub
+  p <- readIORef pathRef
+  assertTrue "subdir in path" ("cmd/tool/go.mod" `BSC.isInfixOf` p)
+
+  -- HTTP error
+  let http404 _ = pure (Right (fakeResponse 404 "missing"))
+  err404 <- assertLeft "404" =<< fetchGoModAtTagHttpLbs http404 Nothing key
+  assertTrue "http 404" ("HTTP 404" `T.isInfixOf` err404)
+
+  -- Network
+  let httpNet _ = pure (Left "gomod net")
+  errNet <- assertLeft "net" =<< fetchGoModAtTagHttpLbs httpNet Nothing key
+  assertEq "net" "gomod net" errNet
+
+  -- Token present / absent
+  tokHdrs <- newIORef False
+  noTokHdrs <- newIORef True
+  let httpTok req = do
+        let hasAuth =
+              any
+                ( \(k, v) ->
+                    k == "Authorization" && "Bearer t0k" `BSC.isInfixOf` v
+                )
+                (requestHeaders req)
+        writeIORef tokHdrs hasAuth
+        pure (Right (fakeResponse 200 "go 1.20\n"))
+      httpNoTok req = do
+        let hasAuth = any (\(k, _) -> k == "Authorization") (requestHeaders req)
+        when hasAuth $ writeIORef noTokHdrs False
+        pure (Right (fakeResponse 200 "go 1.20\n"))
+  void $
+    assertRight "with token"
+      =<< fetchGoModAtTagHttpLbs httpTok (Just "t0k") key
+  void $
+    assertRight "no token"
+      =<< fetchGoModAtTagHttpLbs httpNoTok Nothing key
+  void $
+    assertRight "empty token"
+      =<< fetchGoModAtTagHttpLbs httpNoTok (Just "") key
+  hasTok <- readIORef tokHdrs
+  noTok <- readIORef noTokHdrs
+  assertTrue "bearer set" hasTok
+  assertTrue "no auth when absent" noTok
 
 ------------------------------------------------------------------------
 -- Update.Types pure helpers

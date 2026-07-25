@@ -2,7 +2,9 @@
 
 module Update.GitHub
   ( fetchGitHubWith,
+    fetchGitHubWithHttpLbs,
     listGitHubVersionsWith,
+    listGitHubVersionsWithHttpLbs,
     stripAndParse,
   )
 where
@@ -18,7 +20,6 @@ import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Network.HTTP.Client
   ( Manager,
-    httpLbs,
     method,
     parseRequest,
     requestHeaders,
@@ -28,7 +29,7 @@ import Network.HTTP.Client
 import Network.HTTP.Types (RequestHeaders)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
-import Update.Http (tryHttp)
+import Update.Http (HttpLbs, httpLbsEither)
 import Update.Types (UpdateSource (..))
 
 fetchGitHubWith ::
@@ -36,14 +37,23 @@ fetchGitHubWith ::
   Maybe Text ->
   UpdateSource ->
   IO (Either Text EbuildVersion)
-fetchGitHubWith mgr mToken = \case
+fetchGitHubWith mgr =
+  fetchGitHubWithHttpLbs (httpLbsEither mgr)
+
+-- | Injectable HTTP path for latest release / max-tag fallback.
+fetchGitHubWithHttpLbs ::
+  HttpLbs ->
+  Maybe Text ->
+  UpdateSource ->
+  IO (Either Text EbuildVersion)
+fetchGitHubWithHttpLbs http mToken = \case
   GitHub owner repo prefix -> do
     let commonHeaders = githubHeaders mToken
-    releaseResult <- fetchLatestRelease mgr commonHeaders owner repo prefix
+    releaseResult <- fetchLatestRelease http commonHeaders owner repo prefix
     case releaseResult of
       Right v -> pure (Right v)
       Left _ ->
-        fetchMaxTag mgr commonHeaders owner repo prefix
+        fetchMaxTag http commonHeaders owner repo prefix
   other ->
     pure (Left ("Update.GitHub: not a GitHub source: " <> T.pack (show other)))
 
@@ -66,10 +76,19 @@ listGitHubVersionsWith ::
   Maybe Text ->
   UpdateSource ->
   IO (Either Text [EbuildVersion])
-listGitHubVersionsWith mgr mToken = \case
+listGitHubVersionsWith mgr =
+  listGitHubVersionsWithHttpLbs (httpLbsEither mgr)
+
+-- | Injectable HTTP path for paginated tag listing.
+listGitHubVersionsWithHttpLbs ::
+  HttpLbs ->
+  Maybe Text ->
+  UpdateSource ->
+  IO (Either Text [EbuildVersion])
+listGitHubVersionsWithHttpLbs http mToken = \case
   GitHub owner repo prefix -> do
     let headers = githubHeaders mToken
-    tags <- fetchAllTagNames mgr headers owner repo 1 []
+    tags <- fetchAllTagNames http headers owner repo 1 []
     pure $ case tags of
       Left err -> Left err
       Right allTags ->
@@ -98,14 +117,14 @@ listGitHubVersionsWith mgr mToken = \case
 
 -- | Paginate tags via @page=@ until a short page is returned.
 fetchAllTagNames ::
-  Manager ->
+  HttpLbs ->
   RequestHeaders ->
   Text ->
   Text ->
   Int ->
   [Text] ->
   IO (Either Text [Text])
-fetchAllTagNames mgr headers owner repo page acc = do
+fetchAllTagNames http headers owner repo page acc = do
   let url =
         "https://api.github.com/repos/"
           <> T.unpack owner
@@ -113,7 +132,7 @@ fetchAllTagNames mgr headers owner repo page acc = do
           <> T.unpack repo
           <> "/tags?per_page=100&page="
           <> show page
-  eres <- httpGetJson mgr headers url
+  eres <- httpGetJson http headers url
   case eres of
     Left err -> pure (Left err)
     Right val ->
@@ -123,23 +142,23 @@ fetchAllTagNames mgr headers owner repo page acc = do
           let acc' = acc <> tags
            in if length tags < 100
                 then pure (Right acc')
-                else fetchAllTagNames mgr headers owner repo (page + 1) acc'
+                else fetchAllTagNames http headers owner repo (page + 1) acc'
 
 fetchLatestRelease ::
-  Manager ->
+  HttpLbs ->
   RequestHeaders ->
   Text ->
   Text ->
   Text ->
   IO (Either Text EbuildVersion)
-fetchLatestRelease mgr headers owner repo prefix = do
+fetchLatestRelease http headers owner repo prefix = do
   let url =
         "https://api.github.com/repos/"
           <> T.unpack owner
           <> "/"
           <> T.unpack repo
           <> "/releases/latest"
-  eres <- httpGetJson mgr headers url
+  eres <- httpGetJson http headers url
   pure $ case eres of
     Left err -> Left err
     Right val ->
@@ -148,20 +167,20 @@ fetchLatestRelease mgr headers owner repo prefix = do
         Just tag -> stripAndParse prefix tag
 
 fetchMaxTag ::
-  Manager ->
+  HttpLbs ->
   RequestHeaders ->
   Text ->
   Text ->
   Text ->
   IO (Either Text EbuildVersion)
-fetchMaxTag mgr headers owner repo prefix = do
+fetchMaxTag http headers owner repo prefix = do
   let url =
         "https://api.github.com/repos/"
           <> T.unpack owner
           <> "/"
           <> T.unpack repo
           <> "/tags?per_page=100"
-  eres <- httpGetJson mgr headers url
+  eres <- httpGetJson http headers url
   pure $ case eres of
     Left err -> Left err
     Right val ->
@@ -208,18 +227,18 @@ maximumByPV (x : xs) = Just (foldl' maxPV x xs)
         Nothing -> a
 
 httpGetJson ::
-  Manager ->
+  HttpLbs ->
   RequestHeaders ->
   String ->
   IO (Either Text Value)
-httpGetJson mgr headers url = do
+httpGetJson http headers url = do
   req0 <- parseRequest url
   let req =
         req0
           { method = "GET",
             requestHeaders = headers
           }
-  eres <- tryHttp (httpLbs req mgr)
+  eres <- http req
   pure $ case eres of
     Left err -> Left err
     Right resp ->
