@@ -5,6 +5,7 @@ import Test.Assets qualified as Assets
 import Test.CLI qualified as CLI
 import Test.Config qualified as Config
 import Test.EbuildEdit qualified as EbuildEdit
+import Test.Ecosystems qualified as Ecosystems
 import Test.Gpg qualified as Gpg
 import Test.Lanes qualified as Lanes
 import Test.Md5Cache qualified as Md5Cache
@@ -52,6 +53,7 @@ main =
             Progress.unitTests,
             Apply.unitTests,
             Md5Cache.unitTests,
+            Ecosystems.unitTests,
             Properties.tests
           ],
         testGroup
@@ -59,6 +61,7 @@ main =
           [ Lanes.integrationTests,
             Progress.integrationTests,
             Apply.integrationTests,
-            Md5Cache.integrationTests
+            Md5Cache.integrationTests,
+            Ecosystems.integrationTests
           ]
       ]

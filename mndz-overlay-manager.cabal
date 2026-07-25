@@ -210,6 +210,7 @@ test-suite mndz-overlay-manager-test
         Test.CLI
         Test.Config
         Test.EbuildEdit
+        Test.Ecosystems
         Test.Gpg
         Test.Lanes
         Test.Md5Cache
