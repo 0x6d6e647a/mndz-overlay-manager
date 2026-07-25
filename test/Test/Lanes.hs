@@ -691,6 +691,36 @@ testGoStripAndParseList = do
     Left err -> do
       hPutStrLn stderr (T.unpack err)
       exitFailure
+  -- Empty prefix leaves the tag unchanged.
+  case stripAndParse "" "1.2.3" of
+    Right v -> assertEq "empty prefix" (parseEbuildVersion "1.2.3") v
+    Left err -> do
+      hPutStrLn stderr (T.unpack err)
+      exitFailure
+  -- Non-matching prefix still returns the original tag body (no strip).
+  case stripAndParse "v" "release-1.0.0" of
+    Right v -> assertEq "non-matching tag" (parseEbuildVersion "release-1.0.0") v
+    Left err -> do
+      hPutStrLn stderr (T.unpack err)
+      exitFailure
+  case stripAndParse "v" "v" of
+    Left msg ->
+      assertTrue
+        "empty after strip"
+        ("empty version after stripping" `T.isInfixOf` msg)
+    Right v -> do
+      hPutStrLn stderr $ "expected Left for empty strip, got " <> show v
+      exitFailure
+  case stripAndParse "v" "vnot-numeric" of
+    Right (Raw t) -> assertEq "bad version becomes Raw" "not-numeric" t
+    other -> do
+      hPutStrLn stderr $ "expected Raw version, got " <> show other
+      exitFailure
+  case stripAndParse "v" "v2.0.0-r1" of
+    Right v -> assertEq "revision tag" (Numeric [2, 0, 0] (Just 1)) v
+    Left err -> do
+      hPutStrLn stderr (T.unpack err)
+      exitFailure
 
 testGoPlanIntegrationMocked :: IO ()
 testGoPlanIntegrationMocked = do

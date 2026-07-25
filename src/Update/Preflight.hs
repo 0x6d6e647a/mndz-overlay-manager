@@ -11,7 +11,9 @@ module Update.Preflight
     goAssetsRequiredTools,
     checkToolsOnPath,
     preflightUpdateTools,
+    preflightUpdateToolsWith,
     validateAssetsPath,
+    validateAssetsPathWith,
     AssetsPreflight (..),
   )
 where
@@ -68,9 +70,16 @@ checkToolsOnPath findTool tools = do
   results <- mapM (\t -> (t,) <$> findTool t) tools
   pure [name | (name, path) <- results, isNothing path]
 
--- | Preflight with per-ecosystem tool requirements.
+-- | Preflight with per-ecosystem tool requirements (production PATH lookup).
 preflightUpdateTools :: AssetsPreflight -> IO (Either Text ())
-preflightUpdateTools ap = do
+preflightUpdateTools = preflightUpdateToolsWith findExecutable
+
+-- | Preflight with an injectable executable finder (for Unit tests).
+preflightUpdateToolsWith ::
+  (String -> IO (Maybe FilePath)) ->
+  AssetsPreflight ->
+  IO (Either Text ())
+preflightUpdateToolsWith findTool ap = do
   let baseTools =
         updateRequiredTools
           <> [t | apNeedAssets ap, t <- assetsRequiredTools]
@@ -78,11 +87,11 @@ preflightUpdateTools ap = do
           <> [t | apNeedNpm ap, t <- npmRequiredTools]
           <> [t | apNeedBun ap, t <- bunRequiredTools]
           <> [t | apNeedCargo ap, t <- cargoRequiredTools]
-  missingBase <- checkToolsOnPath findExecutable baseTools
+  missingBase <- checkToolsOnPath findTool baseTools
   missingFetchers <-
     if apNeedCargo ap
       then do
-        foundAny <- checkToolsOnPath findExecutable cargoFetcherTools
+        foundAny <- checkToolsOnPath findTool cargoFetcherTools
         -- missing all fetchers → report the group
         pure
           [ "wget or aria2c"
@@ -99,17 +108,25 @@ preflightUpdateTools ap = do
 
 -- | Validate assets worktree path when assets publish is required.
 validateAssetsPath :: Maybe FilePath -> IO (Either Text FilePath)
-validateAssetsPath = \case
+validateAssetsPath = validateAssetsPathWith doesDirectoryExist isGitWorkTree
+
+-- | Validate assets path with injectable directory / git-tree predicates.
+validateAssetsPathWith ::
+  (FilePath -> IO Bool) ->
+  (FilePath -> IO Bool) ->
+  Maybe FilePath ->
+  IO (Either Text FilePath)
+validateAssetsPathWith dirExists isGitTree = \case
   Nothing ->
     pure $
       Left
         "assets-path is required for packages that publish vendor/deps assets"
   Just path -> do
-    exists <- doesDirectoryExist path
+    exists <- dirExists path
     if not exists
       then pure $ Left ("assets-path is not a directory: " <> T.pack path)
       else do
-        isGit <- isGitWorkTree path
+        isGit <- isGitTree path
         pure $
           if isGit
             then Right path

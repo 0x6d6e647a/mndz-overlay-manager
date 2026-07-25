@@ -9,7 +9,15 @@ import CLI.Jobs
     withWorkSlot,
     workBudgetCapacity,
   )
-import CLI.Parser (ColorMode (..), resolveVerbosity)
+import CLI.Parser
+  ( ColorMode (..),
+    Options (..),
+    parserInfo,
+    resolveColorMode,
+    resolveJobs,
+    resolveVerbosity,
+  )
+import CLI.Parser qualified as CLI
 import CLI.Parser qualified as V
 import CLI.Progress
   ( ActiveJob (..),
@@ -37,7 +45,7 @@ import Config.Types (OverlayConfig (..))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
-import Control.Exception (SomeException, throwIO, try)
+import Control.Exception (SomeException, bracket_, throwIO, try)
 import Control.Monad (forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
@@ -56,6 +64,7 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
+import Options.Applicative (defaultPrefs, execParserPure, getParseResult)
 import Overlay.Discovery
   ( DiscoveryError (..),
     collectEbuilds,
@@ -70,6 +79,7 @@ import Overlay.Version
     prettyVersion,
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
+import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
@@ -278,7 +288,10 @@ tests =
       testCase "No Color Strips Escapes" testNoColorStripsEscapes,
       testCase "Jobs Bound" testJobsBound,
       testCase "Jobs One Serial" testJobsOneSerial,
-      testCase "Work Budget Bound" testWorkBudgetBound
+      testCase "Work Budget Bound" testWorkBudgetBound,
+      testCase "Resolve Color Mode" testResolveColorMode,
+      testCase "Resolve Jobs" testResolveJobs,
+      testCase "Parser Pure Commands" testParserPureCommands
     ]
 
 ------------------------------------------------------------------------
@@ -393,3 +406,123 @@ testWorkBudgetBound = do
   peak <- readIORef maxSeen
   assertTrue "peak <= 2*jobs" (peak <= workBudgetCapacity jobs)
   assertTrue "peak can exceed 1" (peak > 1)
+
+------------------------------------------------------------------------
+-- CLI.Parser pure resolvers and execParserPure
+------------------------------------------------------------------------
+
+testResolveColorMode :: IO ()
+testResolveColorMode = do
+  offFlag <- resolveColorMode True
+  assertEq "--no-color flag" ColorOff offFlag
+  withNoColorEnv (Just "1") $ do
+    offEnv <- resolveColorMode False
+    assertEq "NO_COLOR set" ColorOff offEnv
+  withNoColorEnv (Just "") $ do
+    onEmpty <- resolveColorMode False
+    assertEq "empty NO_COLOR keeps color" ColorOn onEmpty
+  withNoColorEnv Nothing $ do
+    onUnset <- resolveColorMode False
+    assertEq "NO_COLOR unset keeps color" ColorOn onUnset
+
+-- | Temporarily set or clear @NO_COLOR@, restoring the prior value afterward.
+withNoColorEnv :: Maybe String -> IO a -> IO a
+withNoColorEnv mVal action = do
+  prev <- lookupEnv "NO_COLOR"
+  let restore = case prev of
+        Nothing -> unsetEnv "NO_COLOR"
+        Just v -> setEnv "NO_COLOR" v
+      install = case mVal of
+        Nothing -> unsetEnv "NO_COLOR"
+        Just v -> setEnv "NO_COLOR" v
+  bracket_ install restore action
+
+testResolveJobs :: IO ()
+testResolveJobs = do
+  assertEq "explicit positive" 4 =<< resolveJobs (Just 4)
+  assertEq "explicit one" 1 =<< resolveJobs (Just 1)
+  assertEq "zero becomes one" 1 =<< resolveJobs (Just 0)
+  assertEq "negative becomes one" 1 =<< resolveJobs (Just (-3))
+  host <- resolveJobs Nothing
+  assertTrue "default host jobs positive" (host > 0)
+
+testParserPureCommands :: IO ()
+testParserPureCommands = do
+  let parse args = getParseResult (execParserPure defaultPrefs parserInfo args)
+  case parse ["list"] of
+    Just opts -> do
+      assertEq "list cmd" (Just CLI.List) (optCommand opts)
+      assertEq "list no config" Nothing (optConfig opts)
+      assertEq "list no jobs" Nothing (optJobs opts)
+      assertEq "list color on default" False (optNoColor opts)
+    Nothing -> do
+      hPutStrLn stderr "parse list failed"
+      exitFailure
+  case parse ["outdated", "dev-lang/go", "mise"] of
+    Just opts ->
+      assertEq
+        "outdated targets"
+        (Just (CLI.Outdated ["dev-lang/go", "mise"]))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse outdated failed"
+      exitFailure
+  case parse ["update"] of
+    Just opts -> assertEq "update all" (Just (CLI.Update [])) (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse update failed"
+      exitFailure
+  case parse ["update", "dev-util/hk"] of
+    Just opts ->
+      assertEq
+        "update one"
+        (Just (CLI.Update ["dev-util/hk"]))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse update target failed"
+      exitFailure
+  case parse ["gencache"] of
+    Just opts ->
+      assertEq
+        "gencache default"
+        (Just (CLI.Gencache {CLI.gencacheTargets = [], CLI.gencacheForce = False}))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse gencache failed"
+      exitFailure
+  case parse ["gencache", "--force", "dev-lang/go"] of
+    Just opts ->
+      assertEq
+        "gencache force"
+        (Just (CLI.Gencache {CLI.gencacheTargets = ["dev-lang/go"], CLI.gencacheForce = True}))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse gencache --force failed"
+      exitFailure
+  case parse ["--config", "/tmp/om.toml", "--overlay-path", "/tmp/ov", "--jobs", "8", "--no-progress", "--no-color", "-v", "list"] of
+    Just opts -> do
+      assertEq "global config" (Just "/tmp/om.toml") (optConfig opts)
+      assertEq "global overlay" (Just "/tmp/ov") (optOverlayPath opts)
+      assertEq "global jobs" (Just 8) (optJobs opts)
+      assertEq "global no-progress" True (optNoProgress opts)
+      assertEq "global no-color" True (optNoColor opts)
+      assertEq "global -v" V.Info (optVerbosity opts)
+      assertEq "global + list" (Just CLI.List) (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse globals + list failed"
+      exitFailure
+  case parse ["--log-level", "error", "outdated"] of
+    Just opts -> assertEq "log-level error" V.Error (optVerbosity opts)
+    Nothing -> do
+      hPutStrLn stderr "parse log-level failed"
+      exitFailure
+  case parse [] of
+    Just opts -> assertEq "bare no command" Nothing (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse bare failed"
+      exitFailure
+  case parse ["not-a-command"] of
+    Nothing -> pure ()
+    Just opts -> do
+      hPutStrLn stderr $ "expected parse failure, got " <> show opts
+      exitFailure

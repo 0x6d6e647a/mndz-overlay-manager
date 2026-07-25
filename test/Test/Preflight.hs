@@ -228,7 +228,20 @@ import Update.Md5Cache
     readCacheMd5Field,
   )
 import Update.Npm.Cache (productionNpmCacheOps)
-import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
+import Update.Preflight
+  ( AssetsPreflight (..),
+    assetsRequiredTools,
+    bunRequiredTools,
+    cargoFetcherTools,
+    cargoRequiredTools,
+    checkToolsOnPath,
+    goAssetsRequiredTools,
+    goRequiredTools,
+    npmRequiredTools,
+    preflightUpdateToolsWith,
+    updateRequiredTools,
+    validateAssetsPathWith,
+  )
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
   ( ArchCeilings (..),
@@ -253,6 +266,7 @@ import Update.SshAgent
     parseIdentityFiles,
   )
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
+import Update.TextUtil (stripSurroundingQuotes)
 import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
@@ -272,7 +286,12 @@ tests :: TestTree
 tests =
   testGroup
     "Preflight"
-    [ testCase "Preflight Missing Tools" testPreflightMissingTools
+    [ testCase "Preflight Missing Tools" testPreflightMissingTools,
+      testCase "Required Tool List Constants" testRequiredToolListConstants,
+      testCase "Check Tools Multiple Missing" testCheckToolsMultipleMissing,
+      testCase "Validate Assets Path" testValidateAssetsPath,
+      testCase "Preflight Update Tools" testPreflightUpdateTools,
+      testCase "Strip Surrounding Quotes" testStripSurroundingQuotes
     ]
 
 testPreflightMissingTools :: IO ()
@@ -292,3 +311,138 @@ testPreflightMissingTools = do
       (\name -> pure (Just ("/bin/" <> name)))
       updateRequiredTools
   assertEq "none missing" [] none
+
+testRequiredToolListConstants :: IO ()
+testRequiredToolListConstants = do
+  assertEq "update tools" ["git", "ebuild", "egencache", "gpg"] updateRequiredTools
+  assertEq "assets tools" ["xz"] assetsRequiredTools
+  assertEq "go tools" ["go"] goRequiredTools
+  assertEq "npm tools" ["npm"] npmRequiredTools
+  assertEq "bun tools" ["bun"] bunRequiredTools
+  assertEq "cargo tools" ["pycargoebuild"] cargoRequiredTools
+  assertEq "cargo fetchers" ["wget", "aria2c", "aria2"] cargoFetcherTools
+  assertEq "go+assets" ["go", "xz"] goAssetsRequiredTools
+
+testCheckToolsMultipleMissing :: IO ()
+testCheckToolsMultipleMissing = do
+  missing <-
+    checkToolsOnPath
+      ( \name ->
+          pure $
+            if name `elem` ["git", "gpg"]
+              then Nothing
+              else Just ("/usr/bin/" <> name)
+      )
+      updateRequiredTools
+  assertEq "missing git and gpg" ["git", "gpg"] missing
+  emptyList <- checkToolsOnPath (\_ -> pure Nothing) []
+  assertEq "empty tools list" [] emptyList
+
+allPresent :: String -> IO (Maybe FilePath)
+allPresent name = pure (Just ("/bin/" <> name))
+
+missingNamed :: [String] -> String -> IO (Maybe FilePath)
+missingNamed missing name =
+  pure $
+    if name `elem` missing
+      then Nothing
+      else Just ("/bin/" <> name)
+
+basePreflight :: AssetsPreflight
+basePreflight =
+  AssetsPreflight
+    { apNeedAssets = False,
+      apNeedGo = False,
+      apNeedNpm = False,
+      apNeedBun = False,
+      apNeedCargo = False
+    }
+
+testValidateAssetsPath :: IO ()
+testValidateAssetsPath = do
+  none <- validateAssetsPathWith (const (pure True)) (const (pure True)) Nothing
+  errNone <- assertLeft "missing path" none
+  assertTrue "mentions assets-path" ("assets-path is required" `T.isInfixOf` errNone)
+  notDir <-
+    validateAssetsPathWith
+      (\_ -> pure False)
+      (\_ -> pure True)
+      (Just "/tmp/missing-assets")
+  errDir <- assertLeft "not a directory" notDir
+  assertTrue "mentions not a directory" ("not a directory" `T.isInfixOf` errDir)
+  notGit <-
+    validateAssetsPathWith
+      (\_ -> pure True)
+      (\_ -> pure False)
+      (Just "/tmp/assets")
+  errGit <- assertLeft "not git" notGit
+  assertTrue "mentions git work tree" ("git work tree" `T.isInfixOf` errGit)
+  ok <-
+    validateAssetsPathWith
+      (\_ -> pure True)
+      (\_ -> pure True)
+      (Just "/tmp/assets")
+  path <- assertRight "valid assets path" ok
+  assertEq "returns path" "/tmp/assets" path
+
+testPreflightUpdateTools :: IO ()
+testPreflightUpdateTools = do
+  okBase <- preflightUpdateToolsWith allPresent basePreflight
+  assertEq "base tools ok" (Right ()) okBase
+  missEbuild <- preflightUpdateToolsWith (missingNamed ["ebuild"]) basePreflight
+  errEbuild <- assertLeft "missing ebuild" missEbuild
+  assertTrue "lists ebuild" ("ebuild" `T.isInfixOf` errEbuild)
+  let full =
+        basePreflight
+          { apNeedAssets = True,
+            apNeedGo = True,
+            apNeedNpm = True,
+            apNeedBun = True,
+            apNeedCargo = True
+          }
+  okFull <-
+    preflightUpdateToolsWith
+      ( \name ->
+          pure $
+            if name == "aria2"
+              then Nothing
+              else Just ("/bin/" <> name)
+      )
+      full
+  assertEq "cargo ok with one fetcher" (Right ()) okFull
+  missFetchers <-
+    preflightUpdateToolsWith
+      ( \name ->
+          pure $
+            if name `elem` cargoFetcherTools
+              then Nothing
+              else Just ("/bin/" <> name)
+      )
+      full
+  errFetch <- assertLeft "missing cargo fetchers" missFetchers
+  assertTrue
+    "mentions wget or aria2c"
+    ("wget or aria2c" `T.isInfixOf` errFetch)
+  missEco <-
+    preflightUpdateToolsWith
+      (missingNamed ["xz", "go", "npm", "bun", "pycargoebuild"])
+      full
+  errEco <- assertLeft "missing ecosystem tools" missEco
+  assertTrue "lists xz" ("xz" `T.isInfixOf` errEco)
+  assertTrue "lists go" ("go" `T.isInfixOf` errEco)
+  assertTrue "lists npm" ("npm" `T.isInfixOf` errEco)
+  assertTrue "lists bun" ("bun" `T.isInfixOf` errEco)
+  assertTrue "lists pycargoebuild" ("pycargoebuild" `T.isInfixOf` errEco)
+
+testStripSurroundingQuotes :: IO ()
+testStripSurroundingQuotes = do
+  assertEq "double quotes" "hello" (stripSurroundingQuotes "\"hello\"")
+  assertEq "single quotes" "hello" (stripSurroundingQuotes "'hello'")
+  assertEq "unquoted" "hello" (stripSurroundingQuotes "hello")
+  assertEq "mismatched double open" "\"hello" (stripSurroundingQuotes "\"hello")
+  assertEq "mismatched single open" "'hello" (stripSurroundingQuotes "'hello")
+  assertEq "mismatched ends" "\"hello'" (stripSurroundingQuotes "\"hello'")
+  assertEq "empty" "" (stripSurroundingQuotes "")
+  assertEq "single char" "x" (stripSurroundingQuotes "x")
+  assertEq "empty double pair" "" (stripSurroundingQuotes "\"\"")
+  assertEq "inner quotes kept" "he\"llo" (stripSurroundingQuotes "\"he\"llo\"")

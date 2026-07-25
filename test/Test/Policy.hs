@@ -56,6 +56,8 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
+import Network.HTTP.Client (newManager)
+import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Discovery
   ( DiscoveryError (..),
     collectEbuilds,
@@ -73,6 +75,7 @@ import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
+import System.IO.Error (userError)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Tasty (TestTree, testGroup)
@@ -121,7 +124,12 @@ import Update.Cargo.Msrv
     parseRustMinVerFromEbuild,
     parseRustVersionField,
   )
-import Update.Check (PackageEntry (..), groupNewest)
+import Update.Check
+  ( PackageEntry (..),
+    groupByPackage,
+    groupNewest,
+    statusFromCompare,
+  )
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
@@ -210,6 +218,7 @@ import Update.GpgAgent
     teardownGpgHandle,
   )
 import Update.Hardcoded (lookupHardcoded, lookupPolicy)
+import Update.Http (fetchHttpWith, tryHttp)
 import Update.Md5Cache
   ( EgencacheRequest (..),
     GencacheAction (..),
@@ -227,6 +236,7 @@ import Update.Md5Cache
     packageCacheGateError,
     readCacheMd5Field,
   )
+import Update.Npm (fetchNpmWith)
 import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
@@ -276,7 +286,12 @@ tests =
       testCase "Policy Classification" testPolicyClassification,
       testCase "Resolve Map Only" testResolveMapOnly,
       testCase "Group Newest" testGroupNewest,
-      testCase "Check Overlay Statuses" testCheckOverlayStatuses
+      testCase "Check Overlay Statuses" testCheckOverlayStatuses,
+      testCase "Status From Compare" testStatusFromCompare,
+      testCase "Group By Package" testGroupByPackage,
+      testCase "Try Http" testTryHttp,
+      testCase "Fetch Http Wrong Source" testFetchHttpWrongSource,
+      testCase "Fetch Npm Wrong Source" testFetchNpmWrongSource
     ]
 
 ------------------------------------------------------------------------
@@ -447,3 +462,114 @@ checkWithFakeResolve fetch = mapM go
                     Just GT -> Ahead local remote
                     Nothing -> FetchError "incomparable"
                 }
+
+testStatusFromCompare :: IO ()
+testStatusFromCompare = do
+  let local = parseEbuildVersion "1.0.0"
+      newer = parseEbuildVersion "1.1.0"
+      older = parseEbuildVersion "0.9.0"
+      raw = parseEbuildVersion "not-a-version"
+  case statusFromCompare local newer of
+    Outdated [line] -> do
+      assertEq "outdated from" local (olFrom line)
+      assertEq "outdated to" newer (olTo line)
+    other -> do
+      hPutStrLn stderr $ "expected Outdated, got " <> show other
+      exitFailure
+  case statusFromCompare local local of
+    Ok v -> assertEq "ok local" local v
+    other -> do
+      hPutStrLn stderr $ "expected Ok, got " <> show other
+      exitFailure
+  case statusFromCompare local older of
+    Ahead a b -> do
+      assertEq "ahead local" local a
+      assertEq "ahead remote" older b
+    other -> do
+      hPutStrLn stderr $ "expected Ahead, got " <> show other
+      exitFailure
+  case statusFromCompare local raw of
+    FetchError msg ->
+      assertTrue "incomparable message" ("incomparable" `T.isInfixOf` msg)
+    other -> do
+      hPutStrLn stderr $ "expected FetchError, got " <> show other
+      exitFailure
+
+testGroupByPackage :: IO ()
+testGroupByPackage = do
+  let ebuilds =
+        [ Ebuild "dev-lang" "haskell" "9.4.5" "/tmp/haskell-9.4.5.ebuild",
+          Ebuild "dev-lang" "haskell" "9.6.1" "/tmp/haskell-9.6.1.ebuild",
+          Ebuild "app-editors" "vim" "9.0.1234" "/tmp/vim.ebuild"
+        ]
+      byPkg = groupByPackage ebuilds
+      haskellKey = PackageKey "dev-lang/haskell"
+      vimKey = PackageKey "app-editors/vim"
+  assertEq "two packages" 2 (Map.size byPkg)
+  case Map.lookup haskellKey byPkg of
+    Just hs -> assertEq "haskell count" 2 (length hs)
+    Nothing -> do
+      hPutStrLn stderr "missing haskell group"
+      exitFailure
+  case Map.lookup vimKey byPkg of
+    Just vs -> assertEq "vim count" 1 (length vs)
+    Nothing -> do
+      hPutStrLn stderr "missing vim group"
+      exitFailure
+  -- groupNewest keeps newest PV per package (covers pure edges with revisions).
+  let withRev =
+        [ Ebuild "dev-util" "pkg" "1.0" "/tmp/pkg-1.0.ebuild",
+          Ebuild "dev-util" "pkg" "1.0-r1" "/tmp/pkg-1.0-r1.ebuild",
+          Ebuild "dev-util" "pkg" "1.0-r2" "/tmp/pkg-1.0-r2.ebuild"
+        ]
+  case groupNewest withRev of
+    [entry] -> do
+      assertEq "newest rev key" (PackageKey "dev-util/pkg") (peKey entry)
+      assertEq "newest rev" (Numeric [1, 0] (Just 2)) (peLocal entry)
+      assertEq "newest path" "/tmp/pkg-1.0-r2.ebuild" (pePath entry)
+    other -> do
+      hPutStrLn stderr $ "expected one groupNewest entry, got " <> show other
+      exitFailure
+
+testTryHttp :: IO ()
+testTryHttp = do
+  ok <- tryHttp (pure (42 :: Int))
+  assertEq "success" (Right 42) ok
+  err <- tryHttp (throwIO (userError "boom") :: IO Int)
+  case err of
+    Left msg -> assertTrue "exception message" ("boom" `T.isInfixOf` msg)
+    Right n -> do
+      hPutStrLn stderr $ "expected Left, got Right " <> show n
+      exitFailure
+
+testFetchHttpWrongSource :: IO ()
+testFetchHttpWrongSource = do
+  mgr <- newManager tlsManagerSettings
+  err <- fetchHttpWith mgr (Npm "left-pad")
+  case err of
+    Left msg -> assertTrue "not Http source" ("not an Http source" `T.isInfixOf` msg)
+    Right v -> do
+      hPutStrLn stderr $ "expected Left, got Right " <> show v
+      exitFailure
+  errGh <- fetchHttpWith mgr (GitHub "o" "r" "v")
+  case errGh of
+    Left msg -> assertTrue "github not http" ("not an Http source" `T.isInfixOf` msg)
+    Right v -> do
+      hPutStrLn stderr $ "expected Left, got Right " <> show v
+      exitFailure
+
+testFetchNpmWrongSource :: IO ()
+testFetchNpmWrongSource = do
+  mgr <- newManager tlsManagerSettings
+  err <- fetchNpmWith mgr (Http "https://example.com/version" Nothing)
+  case err of
+    Left msg -> assertTrue "not Npm source" ("not an Npm source" `T.isInfixOf` msg)
+    Right v -> do
+      hPutStrLn stderr $ "expected Left, got Right " <> show v
+      exitFailure
+  errGh <- fetchNpmWith mgr (GitHub "o" "r" "v")
+  case errGh of
+    Left msg -> assertTrue "github not npm" ("not an Npm source" `T.isInfixOf` msg)
+    Right v -> do
+      hPutStrLn stderr $ "expected Left, got Right " <> show v
+      exitFailure

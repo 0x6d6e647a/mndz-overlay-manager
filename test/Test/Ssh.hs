@@ -249,6 +249,7 @@ import Update.SshAgent
   ( AgentIdentities (..),
     SshAgentOps (..),
     SshSession (..),
+    defaultIdentityCandidates,
     ensureSshAgent,
     parseIdentityFiles,
   )
@@ -272,7 +273,9 @@ tests :: TestTree
 tests =
   testGroup
     "Ssh"
-    [ testCase "Ssh Agent Reuse" testSshAgentReuse
+    [ testCase "Ssh Agent Reuse" testSshAgentReuse,
+      testCase "Default Identity Candidates" testDefaultIdentityCandidates,
+      testCase "Parse Identity Files Edges" testParseIdentityFilesEdges
     ]
 
 testSshAgentReuse :: IO ()
@@ -325,3 +328,46 @@ testSshAgentReuse = do
       )
       goAssetsRequiredTools
   assertEq "go missing among assets tools" ["go"] missing
+
+testDefaultIdentityCandidates :: IO ()
+testDefaultIdentityCandidates = do
+  let cands = defaultIdentityCandidates "/home/u/.ssh"
+  assertEq
+    "default identity paths"
+    [ "/home/u/.ssh/id_rsa",
+      "/home/u/.ssh/id_ecdsa",
+      "/home/u/.ssh/id_ecdsa_sk",
+      "/home/u/.ssh/id_ed25519",
+      "/home/u/.ssh/id_ed25519_sk",
+      "/home/u/.ssh/id_xmss",
+      "/home/u/.ssh/id_dsa"
+    ]
+    cands
+
+testParseIdentityFilesEdges :: IO ()
+testParseIdentityFilesEdges = do
+  assertEq "empty config" [] (parseIdentityFiles "/home/u" "")
+  assertEq
+    "tilde only home"
+    ["/home/u"]
+    (parseIdentityFiles "/home/u" "IdentityFile ~\n")
+  assertEq
+    "case insensitive keyword"
+    ["/abs/key"]
+    (parseIdentityFiles "/home/u" "identityfile /abs/key\n")
+  assertEq
+    "inline comment stripped"
+    ["/home/u/.ssh/id_ed25519"]
+    (parseIdentityFiles "/home/u" "IdentityFile ~/.ssh/id_ed25519 # comment\n")
+  assertEq
+    "comment only line ignored"
+    []
+    (parseIdentityFiles "/home/u" "# IdentityFile ~/.ssh/skip\nHost *\n")
+  assertEq
+    "non identity keywords ignored"
+    []
+    (parseIdentityFiles "/home/u" "Host github.com\n  User git\n")
+  assertEq
+    "multiple files order preserved"
+    ["/a", "/b"]
+    (parseIdentityFiles "/home/u" "IdentityFile /a\nIdentityFile /b\n")
