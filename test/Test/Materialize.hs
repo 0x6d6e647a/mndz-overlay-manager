@@ -16,7 +16,7 @@ import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (exitFailure)
 import System.FilePath (takeBaseName, (</>))
 import System.IO (hPutStrLn, stderr)
@@ -81,7 +81,12 @@ integrationTests =
       testCase "cargo full-path applyDepsAndAssets success" testCargoFullPathSuccess,
       testCase "cargo reuse-path apply success" testCargoReusePathSuccess,
       testCase "npm full-path materialize progress sequence" testNpmFullPathProgressSequence,
-      testCase "go residual applyDepsAndAssets full path" testGoResidualApplyDepsAndAssets
+      testCase "go residual applyDepsAndAssets full path" testGoResidualApplyDepsAndAssets,
+      testCase "plan fail hard-fails apply" testMaterializePlanFail,
+      testCase "missing assets-path hard-fails" testMaterializeMissingAssetsPath,
+      testCase "missing github token hard-fails" testMaterializeMissingToken,
+      testCase "prune extras on full success" testMaterializePruneExtras,
+      testCase "sidecar SHA512 mismatch hard-fails reuse" testMaterializeSidecarMismatch
     ]
 
 ------------------------------------------------------------------------
@@ -1142,3 +1147,228 @@ testGoResidualApplyDepsAndAssets =
         Nothing
     outcomes <- applyPackagePhase1 env overlayRoot entry
     expectSuccess "go residual" outcomes
+
+------------------------------------------------------------------------
+-- Residual failure / prune / sidecar arms
+------------------------------------------------------------------------
+
+testMaterializePlanFail :: IO ()
+testMaterializePlanFail =
+  withSystemTempDirectory "mndz-mat-plan-fail-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "openspec"
+        pn = "openspec" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "openspec",
+              pePN = pn,
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = pkgDir </> "openspec-1.0.0.ebuild"
+            }
+    createDirectoryIfMissing True assetsRoot
+    seedNpmLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (\_ -> pure (Left "registry unreachable"))
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        unusedCargo
+        (Just overlayRoot)
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (\_ _ -> pure (Right ()))
+        unusedReleaseOps
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectHardFail "plan fail" "runtime-lane plan failed" outcomes
+
+testMaterializeMissingAssetsPath :: IO ()
+testMaterializeMissingAssetsPath =
+  withSystemTempDirectory "mndz-mat-no-assets-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        pkgDir = overlayRoot </> "dev-util" </> "openspec"
+        pn = "openspec" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "openspec",
+              pePN = pn,
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = pkgDir </> "openspec-1.0.0.ebuild"
+            }
+    seedNpmLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["2.0.0", "1.0.0"])
+        unusedGoMod
+        npmEngines
+        unusedBun
+        unusedCargo
+        (Just overlayRoot)
+    env0 <-
+      mkMatEnv
+        cleanGitOps
+        (tmp </> "unused-assets")
+        overlayRoot
+        (\_ _ -> pure (Right ()))
+        releaseMissing
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    let env = env0 {aeAssetsRoot = Nothing}
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectHardFail "missing assets-path" "assets-path" outcomes
+
+testMaterializeMissingToken :: IO ()
+testMaterializeMissingToken =
+  withSystemTempDirectory "mndz-mat-no-token-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "openspec"
+        pn = "openspec" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "openspec",
+              pePN = pn,
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = pkgDir </> "openspec-1.0.0.ebuild"
+            }
+    createDirectoryIfMissing True assetsRoot
+    seedNpmLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["2.0.0", "1.0.0"])
+        unusedGoMod
+        npmEngines
+        unusedBun
+        unusedCargo
+        (Just overlayRoot)
+    env0 <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (\_ _ -> pure (Right ()))
+        releaseMissing
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    let env = env0 {aeGitHubToken = Nothing}
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectHardFail "missing token" "token" outcomes
+
+-- | Extra local ebuild not in plan is pruned after successful materialize.
+testMaterializePruneExtras :: IO ()
+testMaterializePruneExtras =
+  withSystemTempDirectory "mndz-mat-prune-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "openspec"
+        pn = "openspec" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "openspec",
+              pePN = pn,
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = pkgDir </> "openspec-1.0.0.ebuild"
+            }
+        extraName = "openspec-0.5.0.ebuild"
+    createDirectoryIfMissing True assetsRoot
+    seedNpmLocalOk overlayRoot pkgDir pn
+    TIO.writeFile
+      (pkgDir </> extraName)
+      (npmEbuildBody kwPlain ">=net-libs/nodejs-18.0.0[npm]")
+    writeMatchingCachesForPackage overlayRoot "dev-util" pn pkgDir
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["2.0.0", "1.0.0"])
+        unusedGoMod
+        npmEngines
+        unusedBun
+        unusedCargo
+        (Just overlayRoot)
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir depsKind npmAssetBytes)
+        releaseMissing
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    -- Success may be a single ApplySuccess (gap) or success + prune-only success.
+    let oks = [o | o@ApplySuccess {} <- outcomes]
+        fails = [o | o@ApplyHardFail {} <- outcomes]
+    assertTrue "at least one success" (not (null oks))
+    assertEq "no hard fail" 0 (length fails)
+    extraExists <- doesFileExist (pkgDir </> extraName)
+    assertTrue "extra ebuild pruned" (not extraExists)
+
+-- | Reuse path: assets-repo sidecar disagrees with downloaded release asset.
+testMaterializeSidecarMismatch :: IO ()
+testMaterializeSidecarMismatch =
+  withSystemTempDirectory "mndz-mat-sidecar-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "openspec"
+        pn = "openspec" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "openspec",
+              pePN = pn,
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = pkgDir </> "openspec-1.0.0.ebuild"
+            }
+        tarballName = depsTarballName pn "2.0.0"
+        sidecarDir =
+          assetsRoot </> "dev-util" </> "openspec"
+    createDirectoryIfMissing True assetsRoot
+    createDirectoryIfMissing True sidecarDir
+    -- Wrong sidecar SHA512 for the release asset name.
+    TIO.writeFile
+      (sidecarDir </> (tarballName <> ".sha512"))
+      (T.replicate 128 "0" <> "  " <> T.pack tarballName <> "\n")
+    seedNpmLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["2.0.0", "1.0.0"])
+        unusedGoMod
+        npmEngines
+        unusedBun
+        unusedCargo
+        (Just overlayRoot)
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir depsKind npmAssetBytes)
+        (releaseFound depsKind npmAssetBytes)
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectHardFail "sidecar mismatch" "sidecar SHA512" outcomes

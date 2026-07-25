@@ -8,10 +8,14 @@ import CLI.Jobs (newWorkBudget)
 import CLI.Progress (noopMultiHandle)
 import Control.Concurrent.MVar (newMVar)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
+import System.Directory (createDirectoryIfMissing)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertRight, assertTrue)
 import Test.Support (dualArchGoCeilings)
 import Test.Tasty (TestTree, testGroup)
@@ -85,7 +89,11 @@ integrationTests =
     "CheckPlan"
     [ testCase
         "checkOverlayWithDepsPlan multi-package"
-        testCheckOverlayWithDepsPlanMulti
+        testCheckOverlayWithDepsPlanMulti,
+      testCase "contentFix Go content-only reusable" testContentFixGoReusable,
+      testCase "contentFix Npm content-only reusable" testContentFixNpmReusable,
+      testCase "contentFix Bun content-only reusable" testContentFixBunReusable,
+      testCase "contentFix Cargo content-only reusable" testContentFixCargoReusable
     ]
 
 ------------------------------------------------------------------------
@@ -657,3 +665,234 @@ testCheckOverlayWithDepsPlanMulti = do
         )
         reports
     )
+
+------------------------------------------------------------------------
+-- contentFix: same-PV content/Manifest fix → olAssetsReusable (all ecos)
+------------------------------------------------------------------------
+
+assertContentOnlyReusable :: String -> UpdateStatus -> IO ()
+assertContentOnlyReusable label status =
+  case status of
+    Outdated lines_ -> do
+      assertTrue (label <> " non-empty gaps") (not (null lines_))
+      assertTrue
+        (label <> " all content-only reusable")
+        (all olAssetsReusable lines_)
+    other ->
+      assertFailure $ label <> ": expected Outdated reusable, got " <> show other
+
+assertOkStatus :: String -> UpdateStatus -> IO ()
+assertOkStatus label status =
+  case status of
+    Ok _ -> pure ()
+    other -> assertFailure $ label <> ": expected Ok, got " <> show other
+
+-- | Go: present PV with missing Manifest vendor DIST → content-only reusable; fix → Ok.
+testContentFixGoReusable :: IO ()
+testContentFixGoReusable =
+  withSystemTempDirectory "mndz-cf-go-" $ \tmp -> do
+    let pkgDir = tmp </> "dev-util" </> "crush"
+        pn = "crush" :: T.Text
+        ver = "0.84.0" :: T.Text
+        ebuildPath = pkgDir </> "crush-0.84.0.ebuild"
+        body =
+          T.unlines
+            [ "EAPI=8",
+              "inherit go-module",
+              "BDEPEND=\">=dev-lang/go-1.26.5:=\"",
+              "KEYWORDS=\"~amd64 ~arm64\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+            ]
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath body
+    -- Manifest without vendor DIST forces content fix on same PV.
+    TIO.writeFile (pkgDir </> "Manifest") "DIST crush-0.84.0.tar.gz 1 SHA512 dead\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["0.84.0"])
+        (\_ -> pure (Right "module x\ngo 1.26.5\n"))
+        unusedNpm
+        unusedBun
+        unusedCargo
+        Nothing
+    let e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "crush",
+              pePN = pn,
+              peLocal = parseEbuildVersion ver,
+              pePath = ebuildPath
+            }
+        locals = [Ebuild "dev-util" pn ver ebuildPath]
+        src = GitHub "charmbracelet" "crush" "v"
+    report <-
+      checkPackageDeps noopMultiHandle ops e locals src (Go Nothing)
+    assertContentOnlyReusable "go content-fix" (reportStatus report)
+    -- Complete Manifest + good BDEPEND → Ok
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST crush-0.84.0-vendor.tar.xz 1 BLAKE2B aa SHA512 abcdef0123456789\n"
+    reportOk <-
+      checkPackageDeps noopMultiHandle ops e locals src (Go Nothing)
+    assertOkStatus "go content ok" (reportStatus reportOk)
+
+-- | Npm: wrong nodejs BDEPEND on present PV → content-only reusable.
+testContentFixNpmReusable :: IO ()
+testContentFixNpmReusable =
+  withSystemTempDirectory "mndz-cf-npm-" $ \tmp -> do
+    let pkgDir = tmp </> "dev-util" </> "openspec"
+        pn = "openspec" :: T.Text
+        ver = "2.0.0" :: T.Text
+        ebuildPath = pkgDir </> "openspec-2.0.0.ebuild"
+        body =
+          T.unlines
+            [ "EAPI=8",
+              "BDEPEND=\">=net-libs/nodejs-18.0.0[npm]\"",
+              "KEYWORDS=\"~amd64 ~arm64\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/openspec-${PV}/openspec-${PV}-deps.tar.xz\""
+            ]
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath body
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST openspec-2.0.0-deps.tar.xz 1 SHA512 deadbeef\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["2.0.0"])
+        unusedGoMod
+        (\_pkg _pv -> pure (Right "22.0.0"))
+        unusedBun
+        unusedCargo
+        Nothing
+    let e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "openspec",
+              pePN = pn,
+              peLocal = parseEbuildVersion ver,
+              pePath = ebuildPath
+            }
+        locals = [Ebuild "dev-util" pn ver ebuildPath]
+        src = Npm "@fission-ai/openspec"
+    report <-
+      checkPackageDeps noopMultiHandle ops e locals src NpmEco
+    assertContentOnlyReusable "npm content-fix" (reportStatus report)
+    TIO.writeFile
+      ebuildPath
+      ( T.replace
+          ">=net-libs/nodejs-18.0.0[npm]"
+          ">=net-libs/nodejs-22.0.0[npm]"
+          body
+      )
+    reportOk <-
+      checkPackageDeps noopMultiHandle ops e locals src NpmEco
+    assertOkStatus "npm content ok" (reportStatus reportOk)
+
+-- | Bun: missing Manifest deps DIST on present PV → content-only reusable.
+testContentFixBunReusable :: IO ()
+testContentFixBunReusable =
+  withSystemTempDirectory "mndz-cf-bun-" $ \tmp -> do
+    let pkgDir = tmp </> "dev-util" </> "ralph-tui"
+        pn = "ralph-tui" :: T.Text
+        ver = "1.5.0" :: T.Text
+        ebuildPath = pkgDir </> "ralph-tui-1.5.0.ebuild"
+        body =
+          T.unlines
+            [ "EAPI=8",
+              "BDEPEND=\">=dev-lang/bun-bin-1.2.0\"",
+              "KEYWORDS=\"~amd64 ~arm64\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/ralph-tui-${PV}/ralph-tui-${PV}-deps.tar.xz\""
+            ]
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath body
+    TIO.writeFile (pkgDir </> "Manifest") "DIST ralph-tui-1.5.0.tar.gz 1 SHA512 x\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["1.5.0"])
+        unusedGoMod
+        unusedNpm
+        (\_o _r _p _pv -> pure (Right "1.2.0"))
+        unusedCargo
+        (Just tmp)
+    let e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "ralph-tui",
+              pePN = pn,
+              peLocal = parseEbuildVersion ver,
+              pePath = ebuildPath
+            }
+        locals = [Ebuild "dev-util" pn ver ebuildPath]
+        src = GitHub "subsy" "ralph-tui" "v"
+    report <-
+      checkPackageDeps noopMultiHandle ops e locals src Bun
+    assertContentOnlyReusable "bun content-fix" (reportStatus report)
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST ralph-tui-1.5.0-deps.tar.xz 1 SHA512 deadbeef\n"
+    reportOk <-
+      checkPackageDeps noopMultiHandle ops e locals src Bun
+    assertOkStatus "bun content ok" (reportStatus reportOk)
+
+-- | Cargo: wrong RUST_MIN_VER on present PV → content-only reusable.
+testContentFixCargoReusable :: IO ()
+testContentFixCargoReusable =
+  withSystemTempDirectory "mndz-cf-cargo-" $ \tmp -> do
+    let pkgDir = tmp </> "dev-util" </> "hk"
+        pn = "hk" :: T.Text
+        ver = "0.50.0" :: T.Text
+        ebuildPath = pkgDir </> "hk-0.50.0.ebuild"
+        bodyBad =
+          T.unlines
+            [ "EAPI=8",
+              "inherit cargo",
+              "RUST_MIN_VER=\"1.70.0\"",
+              "KEYWORDS=\"~amd64 ~arm64\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/hk-${PV}/hk-${PV}-crates.tar.xz\"",
+              "CRATES=\"\""
+            ]
+        bodyOk =
+          T.replace "1.70.0" "1.85.0" bodyBad
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath bodyBad
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST hk-0.50.0-crates.tar.xz 1 SHA512 deadbeef\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["0.50.0"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        ( \_o _r _p _pv mSub ->
+            pure $
+              case mSub of
+                Nothing -> Right " [package]\nrust-version = \"1.85.0\"\n"
+                _ -> Left "no sub"
+        )
+        Nothing
+    let e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "hk",
+              pePN = pn,
+              peLocal = parseEbuildVersion ver,
+              pePath = ebuildPath
+            }
+        locals = [Ebuild "dev-util" pn ver ebuildPath]
+        src = GitHub "jdx" "hk" "v"
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        ops
+        e
+        locals
+        src
+        (Cargo Nothing Nothing)
+    assertContentOnlyReusable "cargo content-fix" (reportStatus report)
+    TIO.writeFile ebuildPath bodyOk
+    reportOk <-
+      checkPackageDeps
+        noopMultiHandle
+        ops
+        e
+        locals
+        src
+        (Cargo Nothing Nothing)
+    assertOkStatus "cargo content ok" (reportStatus reportOk)

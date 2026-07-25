@@ -236,7 +236,10 @@ import Update.Runtime.Ceilings
     RuntimeCeilings (..),
     RuntimeEbuildMeta (..),
     computeCeilings,
+    discoverBunBinCeilings,
     discoverGoCeilingsWith,
+    discoverNodejsCeilingsWith,
+    discoverRustUnionCeilingsWith,
     emptyCeilings,
     isLiveRuntimeVersion,
     keywordsHasBare,
@@ -298,7 +301,8 @@ integrationTests =
       testCase "Go Mod Probe Early Exit Plain Older" testGoModProbeEarlyExitPlainOlder,
       testCase "Go Mod Probe Early Exit Matches Full Probe" testGoModProbeEarlyExitMatchesFullProbe,
       testCase "Go Mod Probe Early Exit Skips Unparseable Tip" testGoModProbeEarlyExitSkipsUnparseableTip,
-      testCase "Go Plan Progress Coarse Steps" testGoPlanProgressCoarseSteps
+      testCase "Go Plan Progress Coarse Steps" testGoPlanProgressCoarseSteps,
+      testCase "Runtime Ceiling Discover Residual Empty Cache" testRuntimeCeilingDiscoverResidual
     ]
 
 ------------------------------------------------------------------------
@@ -1073,4 +1077,91 @@ testGoModCacheHitNoRefetch = do
   fetches <- readIORef fetchCount
   assertEq "first hit" (Right "mod") r1
   assertEq "second hit" (Right "mod") r2
-  assertEq "single network fetch" 1 fetches
+  assertEq "single fetch on hit" 1 fetches
+
+-- | Empty-cache residual: fake portageq discovers nodejs/rust; bun from overlay dir.
+testRuntimeCeilingDiscoverResidual :: IO ()
+testRuntimeCeilingDiscoverResidual =
+  withSystemTempDirectory "mndz-ceil-residual-" $ \tmp -> do
+    let gentoo = tmp </> "gentoo"
+        overlay = tmp </> "overlay"
+        nodeDir = gentoo </> "net-libs" </> "nodejs"
+        rustDir = gentoo </> "dev-lang" </> "rust"
+        rustBinDir = gentoo </> "dev-lang" </> "rust-bin"
+        bunDir = overlay </> "dev-lang" </> "bun-bin"
+    createDirectoryIfMissing True nodeDir
+    createDirectoryIfMissing True rustDir
+    createDirectoryIfMissing True rustBinDir
+    createDirectoryIfMissing True bunDir
+    TIO.writeFile
+      (nodeDir </> "nodejs-20.0.0.ebuild")
+      "KEYWORDS=\"amd64 arm64\"\n"
+    TIO.writeFile
+      (nodeDir </> "nodejs-22.0.0.ebuild")
+      "KEYWORDS=\"~amd64 ~arm64\"\n"
+    TIO.writeFile
+      (rustDir </> "rust-1.80.0.ebuild")
+      "KEYWORDS=\"amd64\"\n"
+    TIO.writeFile
+      (rustBinDir </> "rust-bin-1.85.0.ebuild")
+      "KEYWORDS=\"~amd64\"\n"
+    TIO.writeFile
+      (bunDir </> "bun-bin-1.1.0.ebuild")
+      "KEYWORDS=\"~amd64 ~arm64\"\n"
+    let portageq args =
+          pure $
+            if args == ["get_repo_path", "/", "gentoo"]
+              then Right (T.pack gentoo)
+              else Left "unexpected portageq"
+    -- Missing package dir → Left (empty discover residual).
+    missing <-
+      discoverNodejsCeilingsWith
+        (\_ -> pure (Right (T.pack (tmp </> "no-gentoo"))))
+    case missing of
+      Left msg ->
+        assertTrue "missing nodejs dir" ("not found" `T.isInfixOf` msg)
+      Right _ -> do
+        hPutStrLn stderr "expected Left for missing nodejs"
+        exitFailure
+    nodeC <-
+      assertRight "nodejs ceilings" =<< discoverNodejsCeilingsWith portageq
+    assertEq
+      "nodejs plain"
+      (Just (parseEbuildVersion "20.0.0"))
+      (acPlain (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch nodeC)))
+    assertEq
+      "nodejs tilde"
+      (Just (parseEbuildVersion "22.0.0"))
+      (acTilde (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch nodeC)))
+    bunC <-
+      assertRight "bun ceilings" =<< discoverBunBinCeilings overlay
+    assertEq
+      "bun tilde only"
+      (Just (parseEbuildVersion "1.1.0"))
+      (acTilde (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch bunC)))
+    assertTrue
+      "bun no plain"
+      (isNothing (acPlain (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch bunC))))
+    rustC <-
+      assertRight "rust union" =<< discoverRustUnionCeilingsWith portageq
+    assertEq "rust union atom" "dev-lang/rust|rust-bin" (rcAtom rustC)
+    assertEq
+      "rust plain from rust"
+      (Just (parseEbuildVersion "1.80.0"))
+      (acPlain (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch rustC)))
+    assertEq
+      "rust tilde from rust-bin"
+      (Just (parseEbuildVersion "1.85.0"))
+      (acTilde (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch rustC)))
+    -- Both rust sides missing → error
+    bothMissing <-
+      discoverRustUnionCeilingsWith
+        (\_ -> pure (Right (T.pack (tmp </> "empty-gentoo"))))
+    case bothMissing of
+      Left msg ->
+        assertTrue
+          "both rust missing"
+          ("neither" `T.isInfixOf` msg || "rust" `T.isInfixOf` msg)
+      Right _ -> do
+        hPutStrLn stderr "expected Left when both rust dirs missing"
+        exitFailure

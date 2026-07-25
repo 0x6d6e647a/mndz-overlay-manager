@@ -87,6 +87,7 @@ import Test.Tasty.HUnit (testCase)
 import Update.Apply
   ( ApplyEnv (..),
     EbuildRunner,
+    applyOverlay,
     applyPackagePhase1Tracked,
     foldExitHardFail,
   )
@@ -301,7 +302,10 @@ integrationTests =
       testCase "Go Multi Pv Stop On Hard Fail" testGoMultiPvStopOnHardFail,
       testCase "Full Path Apply Progress Sequence" testFullPathApplyProgressSequence,
       testCase "Reuse Path Apply Progress Sequence" testReusePathApplyProgressSequence,
-      testCase "Overlay Commit Lock" testOverlayCommitLock
+      testCase "Overlay Commit Lock" testOverlayCommitLock,
+      testCase "Apply Overlay Jobs1 Soft Hard Mix" testApplyOverlayJobs1SoftHardMix,
+      testCase "Apply Overlay Jobs Concurrent" testApplyOverlayJobsConcurrent,
+      testCase "Git Mv Residual Soft Hard Dirty" testGitMvResidualSoftHardDirty
     ]
 
 testNewEbuildFileName :: IO ()
@@ -1607,3 +1611,367 @@ testBdependMissingNeedsFix = do
           ]
   replaced <- assertRight "replace" (ensureGoBdepend "1.26.5" withOld)
   assertTrue "replace matches" (goBdependMatches "1.26.5" replaced)
+
+------------------------------------------------------------------------
+-- applyOverlay multi-package orchestration (jobs=1 and jobs>1)
+------------------------------------------------------------------------
+
+mkDisabledProgressConfig :: IO ProgressConfig
+mkDisabledProgressConfig = do
+  hold <- mkLogHold
+  mkProgressConfig False ColorOff hold (LogAction (\_ -> pure ()))
+
+-- | Seed a GitMv package tree with matching md5-cache for applyOverlay tests.
+seedGitMvPkg ::
+  FilePath ->
+  T.Text ->
+  T.Text ->
+  T.Text ->
+  IO FilePath
+seedGitMvPkg overlayRoot cat pn ver = do
+  let pkgDir = overlayRoot </> T.unpack cat </> T.unpack pn
+      name = T.unpack pn <> "-" <> T.unpack ver <> ".ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile (pkgDir </> name) "EAPI=8\n"
+  TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+  writeMatchingCachesForPackage overlayRoot cat pn pkgDir
+  pure (pkgDir </> name)
+
+-- | Multi-package applyOverlay jobs=1: soft skips + hard fail + success; fold exit.
+testApplyOverlayJobs1SoftHardMix :: IO ()
+testApplyOverlayJobs1SoftHardMix =
+  withSystemTempDirectory "mndz-apply-overlay-j1-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    grokPath <- seedGitMvPkg overlayRoot "dev-util" "grok-build-bin" "0.2.99"
+    openPath <- seedGitMvPkg overlayRoot "dev-util" "opencode-bin" "1.0.0"
+    bunPath <- seedGitMvPkg overlayRoot "dev-lang" "bun-bin" "1.0.0"
+    let unknownPath = overlayRoot </> "app-misc" </> "unknown" </> "unknown-1.0.ebuild"
+    createDirectoryIfMissing True (takeDirectory unknownPath)
+    TIO.writeFile unknownPath "EAPI=8\n"
+    let entries =
+          [ PackageEntry
+              { peKey = mkPackageKey "app-misc" "unknown",
+                pePN = "unknown",
+                peLocal = parseEbuildVersion "1.0",
+                pePath = unknownPath
+              },
+            PackageEntry
+              { peKey = mkPackageKey "dev-util" "grok-build-bin",
+                pePN = "grok-build-bin",
+                peLocal = parseEbuildVersion "0.2.99",
+                pePath = grokPath
+              },
+            PackageEntry
+              { peKey = mkPackageKey "dev-util" "opencode-bin",
+                pePN = "opencode-bin",
+                peLocal = parseEbuildVersion "1.0.0",
+                pePath = openPath
+              },
+            PackageEntry
+              { peKey = mkPackageKey "dev-lang" "bun-bin",
+                pePN = "bun-bin",
+                peLocal = parseEbuildVersion "1.0.0",
+                pePath = bunPath
+              }
+          ]
+        gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              -- Dirty only for bun-bin paths so that package hard-fails.
+              goPathsDirty = \_ paths ->
+                pure $
+                  Right
+                    ( any
+                        (\p -> "bun-bin" `T.isInfixOf` T.pack p)
+                        paths
+                    ),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        ebuildRun pkgDir name = do
+          TIO.writeFile (pkgDir </> "Manifest") ("DIST " <> T.pack name <> " 1\n")
+          pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Left "unused"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 1
+    ceilingsCache <- newMVar Nothing
+    env0 <-
+      mkTestApplyEnv
+        gitOps
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        ebuildRun
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let env =
+          env0
+            { aeJobs = 1,
+              aeFetcher = \src -> pure $ case src of
+                -- grok-build-bin: outdated → success
+                Http {} -> Right (parseEbuildVersion "0.2.101")
+                -- opencode-bin: already at latest → soft skip
+                GitHub "anomalyco" "opencode" _ ->
+                  Right (parseEbuildVersion "1.0.0")
+                -- bun-bin: outdated but dirty → hard fail
+                GitHub "oven-sh" "bun" _ ->
+                  Right (parseEbuildVersion "1.1.0")
+                _ -> Left "unexpected source"
+            }
+    cfg <- mkDisabledProgressConfig
+    outcomes <- applyOverlay cfg env overlayRoot entries Nothing
+    let softs = [o | o@ApplySoftSkip {} <- outcomes]
+        hards = [o | o@ApplyHardFail {} <- outcomes]
+        oks = [o | o@ApplySuccess {} <- outcomes]
+    assertEq "one success (grok)" 1 (length oks)
+    assertTrue "at least two soft skips" (length softs >= 2)
+    assertEq "one hard fail (bun dirty)" 1 (length hards)
+    assertTrue "fold exit hard" (foldExitHardFail outcomes)
+    -- Soft-only subset must not fold hard.
+    assertTrue "soft only no exit" (not (foldExitHardFail softs))
+    -- Not a git work tree short-circuits without package work.
+    let envNotGit = env {aeGitOps = gitOps {goIsWorkTree = \_ -> pure False}}
+    notGit <- applyOverlay cfg envNotGit overlayRoot entries Nothing
+    case notGit of
+      [ApplyHardFail _ msg _ _] ->
+        assertTrue "not git work tree" ("not a git work tree" `T.isInfixOf` msg)
+      other -> do
+        hPutStrLn stderr ("expected not-git hard fail, got: " <> show other)
+        exitFailure
+
+-- | Multi-package applyOverlay with jobs>1 exercises concurrent map + overlay lock.
+testApplyOverlayJobsConcurrent :: IO ()
+testApplyOverlayJobsConcurrent =
+  withSystemTempDirectory "mndz-apply-overlay-j2-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    pathA <- seedGitMvPkg overlayRoot "dev-util" "grok-build-bin" "0.2.99"
+    pathB <- seedGitMvPkg overlayRoot "dev-util" "opencode-bin" "0.9.0"
+    inCritical <- newIORef (0 :: Int)
+    maxInCritical <- newIORef (0 :: Int)
+    let entries =
+          [ PackageEntry
+              { peKey = mkPackageKey "dev-util" "grok-build-bin",
+                pePN = "grok-build-bin",
+                peLocal = parseEbuildVersion "0.2.99",
+                pePath = pathA
+              },
+            PackageEntry
+              { peKey = mkPackageKey "dev-util" "opencode-bin",
+                pePN = "opencode-bin",
+                peLocal = parseEbuildVersion "0.9.0",
+                pePath = pathB
+              }
+          ]
+        gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> do
+                n <- atomicModifyIORef' inCritical (\x -> (x + 1, x + 1))
+                atomicModifyIORef' maxInCritical (\m -> (max m n, ()))
+                threadDelay 20_000
+                atomicModifyIORef' inCritical (\x -> (x - 1, ()))
+                pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        ebuildRun pkgDir name = do
+          TIO.writeFile (pkgDir </> "Manifest") ("DIST " <> T.pack name <> " 1\n")
+          pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Left "unused"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 2
+    ceilingsCache <- newMVar Nothing
+    env0 <-
+      mkTestApplyEnv
+        gitOps
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        ebuildRun
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let env =
+          env0
+            { aeJobs = 2,
+              aeFetcher = \src -> pure $ case src of
+                Http {} -> Right (parseEbuildVersion "0.2.101")
+                GitHub "anomalyco" "opencode" _ ->
+                  Right (parseEbuildVersion "1.0.0")
+                _ -> Left "unexpected"
+            }
+    cfg <- mkDisabledProgressConfig
+    outcomes <- applyOverlay cfg env overlayRoot entries Nothing
+    let oks = [o | o@ApplySuccess {} <- outcomes]
+    assertEq "two concurrent successes" 2 (length oks)
+    peak <- readIORef maxInCritical
+    assertEq "overlay commits serialized under lock" 1 peak
+    assertTrue "no hard fail" (not (foldExitHardFail outcomes))
+
+-- | GitMv residual soft/hard arms: EQ/GT soft-skip, dirty, fetch fail, target exists.
+testGitMvResidualSoftHardDirty :: IO ()
+testGitMvResidualSoftHardDirty =
+  withSystemTempDirectory "mndz-gitmv-residual-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Left "unused"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+        cleanGit =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 1
+    ceilingsCache <- newMVar Nothing
+    -- Soft skip: already at latest (EQ)
+    pathEq <- seedGitMvPkg overlayRoot "dev-util" "opencode-bin" "1.0.0"
+    envEq0 <-
+      mkTestApplyEnv
+        cleanGit
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        (\_ _ -> pure (Right ()))
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let envEq =
+          envEq0
+            { aeFetcher = \_ -> pure (Right (parseEbuildVersion "1.0.0"))
+            }
+        entryEq =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "opencode-bin",
+              pePN = "opencode-bin",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = pathEq
+            }
+    outEq <- applyPackagePhase1 envEq overlayRoot entryEq
+    case outEq of
+      [ApplySoftSkip _ reason] ->
+        assertTrue "EQ soft skip" ("already at latest" `T.isInfixOf` reason)
+      other -> do
+        hPutStrLn stderr ("EQ: expected soft skip, got " <> show other)
+        exitFailure
+    -- Soft skip: local ahead of upstream (GT)
+    let envGt =
+          envEq0
+            { aeFetcher = \_ -> pure (Right (parseEbuildVersion "0.9.0"))
+            }
+    outGt <- applyPackagePhase1 envGt overlayRoot entryEq
+    case outGt of
+      [ApplySoftSkip _ reason] ->
+        assertTrue "GT soft skip" ("ahead of upstream" `T.isInfixOf` reason)
+      other -> do
+        hPutStrLn stderr ("GT: expected soft skip, got " <> show other)
+        exitFailure
+    -- Fetch failure hard-fails
+    let envFetch =
+          envEq0
+            { aeFetcher = \_ -> pure (Left "network down")
+            }
+    outFetch <- applyPackagePhase1 envFetch overlayRoot entryEq
+    case outFetch of
+      [ApplyHardFail _ msg _ _] ->
+        assertTrue "fetch fail" ("fetch failed" `T.isInfixOf` msg)
+      other -> do
+        hPutStrLn stderr ("fetch: expected hard fail, got " <> show other)
+        exitFailure
+    -- Dirty involved paths
+    pathDirty <- seedGitMvPkg overlayRoot "dev-util" "grok-build-bin" "0.2.99"
+    let dirtyGit =
+          cleanGit
+            { goPathsDirty = \_ _ -> pure (Right True)
+            }
+    envDirty0 <-
+      mkTestApplyEnv
+        dirtyGit
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        (\_ _ -> pure (Right ()))
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let envDirty =
+          envDirty0
+            { aeFetcher = \_ -> pure (Right (parseEbuildVersion "0.2.101"))
+            }
+        entryDirty =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "grok-build-bin",
+              pePN = "grok-build-bin",
+              peLocal = parseEbuildVersion "0.2.99",
+              pePath = pathDirty
+            }
+    outDirty <- applyPackagePhase1 envDirty overlayRoot entryDirty
+    case outDirty of
+      [ApplyHardFail _ msg _ _] ->
+        assertTrue
+          "dirty paths"
+          ("dirty" `T.isInfixOf` msg)
+      other -> do
+        hPutStrLn stderr ("dirty: expected hard fail, got " <> show other)
+        exitFailure
+    -- Target ebuild already exists
+    pathExists <- seedGitMvPkg overlayRoot "dev-lang" "deno-bin" "1.0.0"
+    let pkgDirExists = takeDirectory pathExists
+        targetName = "deno-bin-1.1.0.ebuild"
+    TIO.writeFile (pkgDirExists </> targetName) "EAPI=8\n"
+    writeMatchingCachesForPackage overlayRoot "dev-lang" "deno-bin" pkgDirExists
+    envExists0 <-
+      mkTestApplyEnv
+        cleanGit
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        (\_ _ -> pure (Right ()))
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let envExists =
+          envExists0
+            { aeFetcher = \_ -> pure (Right (parseEbuildVersion "1.1.0"))
+            }
+        entryExists =
+          PackageEntry
+            { peKey = mkPackageKey "dev-lang" "deno-bin",
+              pePN = "deno-bin",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = pathExists
+            }
+    outExists <- applyPackagePhase1 envExists overlayRoot entryExists
+    case outExists of
+      [ApplyHardFail _ msg _ _] ->
+        assertTrue
+          "target exists"
+          ("already exists" `T.isInfixOf` msg)
+      other -> do
+        hPutStrLn stderr ("exists: expected hard fail, got " <> show other)
+        exitFailure
