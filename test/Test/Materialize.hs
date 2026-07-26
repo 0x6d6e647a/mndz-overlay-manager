@@ -205,8 +205,12 @@ fakeBunSuccessOps =
         TIO.writeFile (dest </> "bun.lock") "{}"
         pure (Right ()),
       bcoHostBunVersion = pure (Right "1.2.0"),
-      bcoBunInstall = \_clone _cache -> pure (Right ()),
-      bcoTarXz = \_work _entry outPath -> do
+      -- Materialize a minimal install tree so InstallTree packaging (opencode)
+      -- can collect node_modules; BunCache mode ignores these paths when packing.
+      bcoBunInstall = \cloneDir _cache -> do
+        createDirectoryIfMissing True (cloneDir </> "node_modules" </> "dep")
+        pure (Right ()),
+      bcoTarXz = \_work _entries outPath -> do
         BS.writeFile outPath bunAssetBytes
         pure (Right ())
     }
@@ -1149,8 +1153,9 @@ testOpencodePartialReleaseFullPath =
         (Just overlayRoot)
     let bunOps =
           fakeBunSuccessOps
-            { bcoBunInstall = \_ _ -> do
+            { bcoBunInstall = \cloneDir _ -> do
                 atomicModifyIORef' installCalls (\n -> (n + 1, ()))
+                createDirectoryIfMissing True (cloneDir </> "node_modules" </> "dep")
                 pure (Right ())
             }
     env0 <-

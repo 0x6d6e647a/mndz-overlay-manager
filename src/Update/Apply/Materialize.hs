@@ -82,6 +82,7 @@ import Update.Assets.Release
 import Update.Bun.Cache
   ( BunCacheProgress (..),
     buildBunDepsTarball,
+    bunPackagingModeFor,
   )
 import Update.Cargo.Crates
   ( CargoProgress (..),
@@ -960,10 +961,12 @@ materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName step
         Left err -> pure (Left err)
         Right bunReq -> do
           let progress = bunCacheProgress stepsDoneRef mh key
+              packMode = bunPackagingModeFor key
           built <-
             buildBunDepsTarball
               (aeBunCacheOps env)
               progress
+              packMode
               owner
               repo
               prefix

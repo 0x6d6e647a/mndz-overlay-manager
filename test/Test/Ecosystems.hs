@@ -6,7 +6,7 @@ module Test.Ecosystems (unitTests, integrationTests) where
 
 import Control.Concurrent.MVar (newMVar)
 import Control.Monad (void)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -26,8 +26,11 @@ import Update.Apply (ApplyEnv (..), mkEbuildRunner)
 import Update.Bun.Cache
   ( BunCacheOps (..),
     BunCacheProgress (..),
+    BunPackagingMode (..),
     buildBunDepsTarball,
+    bunPackagingModeFor,
     bunVersionTooOldMessage,
+    collectInstallTreeEntries,
     hostMeetsBunRequirement,
     mkBunCacheOps,
     parseEnginesBunFromPackageJson,
@@ -67,6 +70,7 @@ import Update.Process
     ProcessResult (..),
   )
 import Update.Runtime.Ceilings (gentooRepoPath, mkPortageqRunner)
+import Update.Types (PackageKey (..))
 
 unitTests :: TestTree
 unitTests =
@@ -81,7 +85,9 @@ unitTests =
         "bun pure"
         [ testCase "parseEnginesBunFromPackageJson" testParseEnginesBun,
           testCase "hostMeetsBunRequirement" testHostMeetsBunRequirement,
-          testCase "bunVersionTooOldMessage" testBunVersionTooOldMessage
+          testCase "bunVersionTooOldMessage" testBunVersionTooOldMessage,
+          testCase "bunPackagingModeFor opencode vs others" testBunPackagingModeFor,
+          testCase "collectInstallTreeEntries finds node_modules" testCollectInstallTreeEntries
         ],
       testGroup
         "cargo pure"
@@ -96,7 +102,9 @@ unitTests =
         ],
       testGroup
         "bun builder"
-        [ testCase "buildBunDepsTarball success + progress" testBunBuilderSuccess,
+        [ testCase "buildBunDepsTarball BunCache success + progress" testBunBuilderSuccess,
+          testCase "buildBunDepsTarball InstallTree packs node_modules" testBunBuilderInstallTree,
+          testCase "buildBunDepsTarball InstallTree empty tree fails" testBunBuilderInstallTreeEmpty,
           testCase "buildBunDepsTarball host too old" testBunBuilderHostTooOld,
           testCase "buildBunDepsTarball missing lock" testBunBuilderMissingLock,
           testCase "buildBunDepsTarball install failure" testBunBuilderInstallFail
@@ -199,6 +207,41 @@ testBunVersionTooOldMessage = do
   assertTrue "names host" ("1.0.0" `T.isInfixOf` msg)
   assertTrue "names required" ("1.2.3" `T.isInfixOf` msg)
   assertTrue "mentions Bun" ("Bun" `T.isInfixOf` msg)
+
+testBunPackagingModeFor :: IO ()
+testBunPackagingModeFor = do
+  assertEq
+    "opencode is InstallTree"
+    InstallTree
+    (bunPackagingModeFor (PackageKey "dev-util/opencode"))
+  assertEq
+    "ralph-tui is BunCache"
+    BunCache
+    (bunPackagingModeFor (PackageKey "dev-util/ralph-tui"))
+  assertEq
+    "unknown bun package defaults to BunCache"
+    BunCache
+    (bunPackagingModeFor (PackageKey "dev-util/other-bun-pkg"))
+
+testCollectInstallTreeEntries :: IO ()
+testCollectInstallTreeEntries =
+  withSystemTempDirectory "mndz-install-tree-" $ \root -> do
+    createDirectoryIfMissing True (root </> "node_modules" </> "pkg")
+    createDirectoryIfMissing
+      True
+      (root </> "packages" </> "opencode" </> "node_modules" </> "dep")
+    -- Nested under node_modules must not appear as a separate entry.
+    createDirectoryIfMissing
+      True
+      (root </> "node_modules" </> "pkg" </> "node_modules" </> "nested")
+    entries <- collectInstallTreeEntries root
+    assertEq
+      "top-level install-tree members only"
+      ["node_modules", "packages/opencode/node_modules"]
+      entries
+    createDirectoryIfMissing True (root </> "empty")
+    emptyEntries <- collectInstallTreeEntries (root </> "empty")
+    assertEq "no node_modules" ([] :: [FilePath]) emptyEntries
 
 testCrateTarballPrefix :: IO ()
 testCrateTarballPrefix =
@@ -383,8 +426,29 @@ fakeBunSuccessOps =
         pure (Right ()),
       bcoHostBunVersion = pure (Right "1.2.3"),
       bcoBunInstall = \_clone _cache -> pure (Right ()),
-      bcoTarXz = \_work _entry outPath -> do
+      bcoTarXz = \_work _entries outPath -> do
         writeFile outPath "bun-cache-tarball"
+        pure (Right ())
+    }
+
+-- | Clone + install that materializes a minimal install tree for InstallTree tests.
+fakeBunInstallTreeOps :: IORef [(FilePath, [FilePath])] -> BunCacheOps
+fakeBunInstallTreeOps tarCalls =
+  BunCacheOps
+    { bcoClone = \_url _tag dest -> do
+        createDirectoryIfMissing True dest
+        TIO.writeFile (dest </> "bun.lock") "{}"
+        pure (Right ()),
+      bcoHostBunVersion = pure (Right "1.2.3"),
+      bcoBunInstall = \cloneDir _cache -> do
+        createDirectoryIfMissing True (cloneDir </> "node_modules" </> "left-pad")
+        createDirectoryIfMissing
+          True
+          (cloneDir </> "packages" </> "opencode" </> "node_modules" </> "dep")
+        pure (Right ()),
+      bcoTarXz = \work entries outPath -> do
+        atomicModifyIORef' tarCalls (\cs -> ((work, entries) : cs, ()))
+        writeFile outPath "install-tree-tarball"
         pure (Right ())
     }
 
@@ -392,6 +456,7 @@ testBunBuilderSuccess :: IO ()
 testBunBuilderSuccess =
   withSystemTempDirectory "mndz-bun-ok-" $ \outDir -> do
     events <- newIORef ([] :: [T.Text])
+    tarCalls <- newIORef ([] :: [(FilePath, [FilePath])])
     let logEv e = atomicModifyIORef' events (\es -> (e : es, ()))
         progress =
           BunCacheProgress
@@ -402,19 +467,27 @@ testBunBuilderSuccess =
               bcpOnCompressStart = logEv "compress-start",
               bcpOnCompressDone = logEv "compress-done"
             }
+        ops =
+          fakeBunSuccessOps
+            { bcoTarXz = \work entries outPath -> do
+                atomicModifyIORef' tarCalls (\cs -> ((work, entries) : cs, ()))
+                writeFile outPath "bun-cache-tarball"
+                pure (Right ())
+            }
     path <-
       assertRight "bun success"
         =<< buildBunDepsTarball
-          fakeBunSuccessOps
+          ops
           progress
+          BunCache
           "owner"
           "repo"
           "v"
           "0.1.0"
           "1.0.0"
           outDir
-          "repo-0.1.0-bun-cache.tar.xz"
-    assertEq "out path" (outDir </> "repo-0.1.0-bun-cache.tar.xz") path
+          "repo-0.1.0-deps.tar.xz"
+    assertEq "out path" (outDir </> "repo-0.1.0-deps.tar.xz") path
     exists <- doesFileExist path
     assertTrue "tarball written" exists
     evs <- reverse <$> readIORef events
@@ -428,11 +501,18 @@ testBunBuilderSuccess =
         "compress-done"
       ]
       evs
+    calls <- readIORef tarCalls
+    case calls of
+      [(_work, entries)] ->
+        assertEq "BunCache packs top-level bun-cache only" ["bun-cache"] entries
+      other ->
+        assertTrue ("expected one tar call, got " <> show other) False
     void $
       assertRight "noop progress"
         =<< buildBunDepsTarball
           fakeBunSuccessOps
           noopBunProgress
+          BunCache
           "owner"
           "repo"
           "v"
@@ -440,6 +520,60 @@ testBunBuilderSuccess =
           "1.0.0"
           outDir
           "repo-0.1.0-bun-cache-noop.tar.xz"
+
+testBunBuilderInstallTree :: IO ()
+testBunBuilderInstallTree =
+  withSystemTempDirectory "mndz-bun-it-" $ \outDir -> do
+    tarCalls <- newIORef ([] :: [(FilePath, [FilePath])])
+    let ops = fakeBunInstallTreeOps tarCalls
+    path <-
+      assertRight "install-tree success"
+        =<< buildBunDepsTarball
+          ops
+          noopBunProgress
+          InstallTree
+          "anomalyco"
+          "opencode"
+          "v"
+          "1.18.5"
+          "1.0.0"
+          outDir
+          "opencode-1.18.5-deps.tar.xz"
+    assertEq "out path" (outDir </> "opencode-1.18.5-deps.tar.xz") path
+    exists <- doesFileExist path
+    assertTrue "tarball written" exists
+    calls <- readIORef tarCalls
+    case calls of
+      [(_work, entries)] -> do
+        assertTrue "includes root node_modules" ("node_modules" `elem` entries)
+        assertTrue
+          "includes workspace node_modules"
+          ("packages/opencode/node_modules" `elem` entries)
+        assertTrue "does not pack bun-cache only" (entries /= ["bun-cache"])
+      other ->
+        assertTrue ("expected one tar call, got " <> show other) False
+
+testBunBuilderInstallTreeEmpty :: IO ()
+testBunBuilderInstallTreeEmpty = do
+  -- Install succeeds but creates no node_modules (pack must hard-fail).
+  let ops =
+        fakeBunSuccessOps
+          { bcoBunInstall = \_ _ -> pure (Right ())
+          }
+  err <-
+    assertLeft "empty install tree"
+      =<< buildBunDepsTarball
+        ops
+        noopBunProgress
+        InstallTree
+        "o"
+        "r"
+        "v"
+        "0.1.0"
+        "1.0.0"
+        "/tmp"
+        "x.tar.xz"
+  assertTrue "mentions node_modules" ("node_modules" `T.isInfixOf` err)
 
 testBunBuilderHostTooOld :: IO ()
 testBunBuilderHostTooOld = do
@@ -456,6 +590,7 @@ testBunBuilderHostTooOld = do
       =<< buildBunDepsTarball
         ops
         noopBunProgress
+        BunCache
         "o"
         "r"
         "v"
@@ -482,6 +617,7 @@ testBunBuilderMissingLock = do
       =<< buildBunDepsTarball
         ops
         noopBunProgress
+        BunCache
         "o"
         "r"
         "v"
@@ -502,6 +638,7 @@ testBunBuilderInstallFail = do
       =<< buildBunDepsTarball
         ops
         noopBunProgress
+        BunCache
         "o"
         "r"
         "v"
@@ -773,6 +910,7 @@ testBunMkCommandRunner =
         =<< buildBunDepsTarball
           (mkBunCacheOps successRun)
           noopBunProgress
+          BunCache
           "owner"
           "repo"
           "v"
@@ -787,6 +925,7 @@ testBunMkCommandRunner =
         =<< buildBunDepsTarball
           (mkBunCacheOps failRun)
           noopBunProgress
+          BunCache
           "o"
           "r"
           "v"
@@ -1035,6 +1174,7 @@ testApplyEnvFakeEcoOps =
         =<< buildBunDepsTarball
           (aeBunCacheOps env)
           noopBunProgress
+          BunCache
           "o"
           "r"
           "v"
