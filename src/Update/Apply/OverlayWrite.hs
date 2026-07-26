@@ -52,13 +52,13 @@ overlayAfterAssets ::
   [Text] ->
   [SuccessLine] ->
   EbuildVersion ->
-  FileDigests ->
-  FilePath ->
+  -- | Distfile basename + digests pairs (primary first; may include companions).
+  [(FilePath, FileDigests)] ->
   Maybe Text ->
   -- | Optional ebuild body after full-path materialize (cargo pycargoebuild).
   Maybe Text ->
   IO ApplyOutcome
-overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer digests tarballName mReqVer mEbuildBody = do
+overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDigests mReqVer mEbuildBody = do
   let key = peKey entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
@@ -128,40 +128,26 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer digests t
             Left err -> pure $ ApplyHardFail key err True orphan
             Right () -> do
               manText <- TIO.readFile (pkgDir </> "Manifest")
-              case parseManifestVendorSHA512 manText tarballName of
-                Nothing ->
-                  pure $
-                    ApplyHardFail
+              case verifyManifestDigests manText distDigests of
+                Left err -> pure $ ApplyHardFail key err True orphan
+                Right () -> do
+                  newRel <- relativeOverlayPath overlayRoot newPath
+                  manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+                  let unitPaths =
+                        nubOrd $
+                          [newRel, manRel]
+                            <> [ebuildRel | removedTemplate || templatePath /= newPath]
+                      msg = unitCommitMessage key (renderPV targetVer)
+                  committed <-
+                    egencacheAndSignedCommit
+                      env
+                      overlayRoot
                       key
-                      "could not parse distfile SHA512 from Manifest after ebuild manifest"
-                      True
-                      orphan
-                Just manSha
-                  | manSha == digestSHA512 digests -> do
-                      newRel <- relativeOverlayPath overlayRoot newPath
-                      manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-                      let unitPaths =
-                            nubOrd $
-                              [newRel, manRel]
-                                <> [ebuildRel | removedTemplate || templatePath /= newPath]
-                          msg = unitCommitMessage key (renderPV targetVer)
-                      committed <-
-                        egencacheAndSignedCommit
-                          env
-                          overlayRoot
-                          key
-                          unitPaths
-                          msg
-                      pure $ case committed of
-                        Right paths -> ApplySuccess key lines_ paths
-                        Left err -> ApplyHardFail key err True orphan
-                  | otherwise ->
-                      pure $
-                        ApplyHardFail
-                          key
-                          "Manifest SHA512 does not match published distfile"
-                          True
-                          orphan
+                      unitPaths
+                      msg
+                  pure $ case committed of
+                    Right paths -> ApplySuccess key lines_ paths
+                    Left err -> ApplyHardFail key err True orphan
 
 findTemplate :: FilePath -> Text -> EbuildVersion -> FilePath -> IO FilePath
 findTemplate pkgDir pn targetVer fallback = do
@@ -178,3 +164,20 @@ findTemplate pkgDir pn targetVer fallback = do
   pure $ case same of
     (p : _) -> p
     [] -> fallback
+
+-- | Every published distfile's SHA512 must appear in Manifest.
+verifyManifestDigests :: Text -> [(FilePath, FileDigests)] -> Either Text ()
+verifyManifestDigests _ [] =
+  Left "no distfile digests provided for Manifest verification"
+verifyManifestDigests manText distDigests =
+  case [name | (name, digests) <- distDigests, not (shaMatches name digests)] of
+    [] -> Right ()
+    missing ->
+      Left $
+        "Manifest SHA512 does not match published distfile(s): "
+          <> T.intercalate ", " (map (T.pack . takeFileName) missing)
+  where
+    shaMatches name digests =
+      case parseManifestVendorSHA512 manText name of
+        Just manSha -> manSha == digestSHA512 digests
+        Nothing -> False

@@ -7,13 +7,14 @@ module Update.Bun.Cache
     mkBunCacheOps,
     buildBunDepsTarball,
     parseEnginesBunFromPackageJson,
+    parsePackageManagerBun,
     hostBunVersion,
     hostMeetsBunRequirement,
     bunVersionTooOldMessage,
   )
 where
 
-import Data.Aeson (Value, eitherDecode, withObject, (.:), (.:?))
+import Data.Aeson (Value, eitherDecode, withObject, (.:?))
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.ByteString.Lazy qualified as BL
 import Data.Char (isDigit)
@@ -111,25 +112,56 @@ bunVersionTooOldMessage :: Text -> Text -> Text
 bunVersionTooOldMessage host required =
   "host Bun "
     <> host
-    <> " is older than engines.bun requirement "
+    <> " is older than Bun requirement "
     <> required
     <> "; install/upgrade dev-lang/bun-bin to at least "
     <> required
 
+-- | Bun minimum from @package.json@: parseable @engines.bun@ wins; else
+-- @packageManager@ form @bun@X.Y.Z@ (optional build metadata ignored).
 parseEnginesBunFromPackageJson :: Text -> Maybe Text
 parseEnginesBunFromPackageJson body =
   case eitherDecode (BL.fromStrict (TE.encodeUtf8 body)) of
-    Right val -> parseEnginesMinimum =<< parseMaybe parseEnginesBun val
+    Right val -> parseMaybe parseBunRequirement val
     Left _ -> Nothing
 
-parseEnginesBun :: Value -> Parser Text
-parseEnginesBun =
+-- | Parse @packageManager@ value @bun@X.Y.Z@ (optional leading @v@; strip
+-- build metadata after @+@).
+parsePackageManagerBun :: Text -> Maybe Text
+parsePackageManagerBun raw =
+  let t0 = T.strip raw
+   in case T.stripPrefix "bun@" t0 of
+        Nothing -> Nothing
+        Just rest ->
+          let noMeta = T.takeWhile (/= '+') rest
+              noV =
+                if "v" `T.isPrefixOf` noMeta
+                  && T.length noMeta > 1
+                  && isDigit (T.index noMeta 1)
+                  then T.drop 1 noMeta
+                  else noMeta
+              core = T.takeWhile (\c -> c == '.' || isDigit c) noV
+           in case parseGoVersionToken core of
+                Just _ -> Just core
+                Nothing -> Nothing
+
+parseBunRequirement :: Value -> Parser Text
+parseBunRequirement =
   withObject "package.json" $ \o -> do
-    mengines <- o .:? "engines"
-    case mengines of
-      Nothing -> fail "no engines"
-      Just eng ->
-        withObject "engines" (.: "bun") eng
+    mEngines <- o .:? "engines"
+    mFromEngines <- case mEngines of
+      Nothing -> pure Nothing
+      Just eng -> do
+        mBun <- withObject "engines" (.:? "bun") eng
+        pure (parseEnginesMinimum =<< mBun)
+    case mFromEngines of
+      Just v -> pure v
+      Nothing -> do
+        mPm <- o .:? "packageManager"
+        case mPm of
+          Just t
+            | Just v <- parsePackageManagerBun t -> pure v
+          _ -> fail "no parseable engines.bun or packageManager bun@X.Y.Z"
 
 -- | Clone tag → require bun.lock → bun install --frozen-lockfile --cache-dir → tar.
 buildBunDepsTarball ::

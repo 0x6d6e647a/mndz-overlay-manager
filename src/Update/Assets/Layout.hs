@@ -10,6 +10,7 @@ module Update.Assets.Layout
     vendorTarballName,
     depsTarballName,
     cratesTarballName,
+    modelsDistfileName,
     releaseTag,
     releaseName,
     commitMessage,
@@ -77,6 +78,11 @@ depsTarballName = distfileTarballName DepsDist
 -- | Cargo crates distfile basename (always overlay PN).
 cratesTarballName :: Text -> Text -> FilePath
 cratesTarballName = distfileTarballName CratesDist
+
+-- | Models.dev API snapshot basename: @{pn}-{pv}-models.json@.
+modelsDistfileName :: Text -> Text -> FilePath
+modelsDistfileName pn pv =
+  T.unpack pn <> "-" <> T.unpack pv <> "-models.json"
 
 releaseTag :: Text -> Text -> Text
 releaseTag pn pv = pn <> "-" <> pv

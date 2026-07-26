@@ -1,8 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.Assets.Release
-  ( createReleaseWithAssetHttp,
-    createReleaseWithAssetHttpLbs,
+  ( createReleaseWithAssetHttpLbs,
+    createReleaseWithAssetsHttp,
+    createReleaseWithAssetsHttpLbs,
     ReleaseMeta (..),
     -- Lookup / download (reuse path)
     ReleaseAsset (..),
@@ -15,13 +16,16 @@ module Update.Assets.Release
     downloadReleaseAssetHttp,
     downloadReleaseAssetHttpLbs,
     lookupNamedAsset,
+    lookupNamedAssets,
     parseReleaseInfo,
   )
 where
 
 import Data.Aeson (Value, eitherDecode, encode, object, withObject, (.:), (.=))
 import Data.Aeson.Types (Parser, parseMaybe)
+import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as LBS
+import Data.Maybe (catMaybes, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -73,8 +77,8 @@ data ReleaseOps = ReleaseOps
     roGetReleaseByTag :: Text -> Text -> Text -> IO (Either Text (Maybe ReleaseInfo)),
     -- | Download asset body from a browser_download_url to a local path.
     roDownloadAsset :: Text -> FilePath -> IO (Either Text ()),
-    -- | Create a GitHub release and upload one asset (token closed over in production).
-    roCreateReleaseWithAsset :: ReleaseMeta -> FilePath -> IO (Either Text ())
+    -- | Create a GitHub release and upload one or more assets (token closed over in production).
+    roCreateReleaseWithAssets :: ReleaseMeta -> [FilePath] -> IO (Either Text ())
   }
 
 -- | Production ops using the same Bearer token headers as create-release.
@@ -85,41 +89,64 @@ productionReleaseOps token = do
     ReleaseOps
       { roGetReleaseByTag = getReleaseByTagHttp mgr token,
         roDownloadAsset = downloadReleaseAssetHttp mgr token,
-        roCreateReleaseWithAsset = createReleaseWithAssetHttp mgr token
+        roCreateReleaseWithAssets = createReleaseWithAssetsHttp mgr token
       }
 
--- | Create a GitHub release and upload one asset. On upload failure after
--- create, best-effort deletes the release.
-createReleaseWithAssetHttp ::
-  Manager ->
-  Text ->
-  ReleaseMeta ->
-  FilePath ->
-  IO (Either Text ())
-createReleaseWithAssetHttp mgr =
-  createReleaseWithAssetHttpLbs (httpLbsEither mgr)
-
--- | Injectable HTTP path for create + upload (+ best-effort delete on upload fail).
+-- | Injectable HTTP path for create + single upload (list-of-one convenience).
 createReleaseWithAssetHttpLbs ::
   HttpLbs ->
   Text ->
   ReleaseMeta ->
   FilePath ->
   IO (Either Text ())
-createReleaseWithAssetHttpLbs http token meta assetPath = do
+createReleaseWithAssetHttpLbs http token meta path =
+  createReleaseWithAssetsHttpLbs http token meta [path]
+
+-- | Create a GitHub release and upload N assets. On any upload failure after
+-- create, best-effort deletes the release so retries do not leave a partial set.
+createReleaseWithAssetsHttp ::
+  Manager ->
+  Text ->
+  ReleaseMeta ->
+  [FilePath] ->
+  IO (Either Text ())
+createReleaseWithAssetsHttp mgr =
+  createReleaseWithAssetsHttpLbs (httpLbsEither mgr)
+
+-- | Injectable HTTP path for create + multi upload (+ best-effort delete on fail).
+createReleaseWithAssetsHttpLbs ::
+  HttpLbs ->
+  Text ->
+  ReleaseMeta ->
+  [FilePath] ->
+  IO (Either Text ())
+createReleaseWithAssetsHttpLbs http token meta assetPaths = do
   let headers = authHeaders token
   created <- createRelease http headers meta
   case created of
     Left err -> pure (Left err)
     Right (releaseId, uploadUrlTemplate) -> do
-      body <- LBS.readFile assetPath
-      let assetName = takeFileName assetPath
-      uploaded <- uploadAsset http headers uploadUrlTemplate assetName body
+      uploaded <- uploadAllAssets http headers uploadUrlTemplate assetPaths
       case uploaded of
         Right () -> pure (Right ())
         Left err -> do
           _ <- deleteReleaseBestEffortHttp http headers (rmOwner meta) (rmRepo meta) releaseId
           pure (Left err)
+
+uploadAllAssets ::
+  HttpLbs ->
+  RequestHeaders ->
+  Text ->
+  [FilePath] ->
+  IO (Either Text ())
+uploadAllAssets _ _ _ [] = pure (Right ())
+uploadAllAssets http headers uploadUrlTemplate (assetPath : rest) = do
+  body <- LBS.readFile assetPath
+  let assetName = takeFileName assetPath
+  uploaded <- uploadAsset http headers uploadUrlTemplate assetName body
+  case uploaded of
+    Left err -> pure (Left err)
+    Right () -> uploadAllAssets http headers uploadUrlTemplate rest
 
 authHeaders :: Text -> RequestHeaders
 authHeaders token =
@@ -197,13 +224,14 @@ uploadAsset http headers uploadUrlTemplate assetName body = do
         T.unpack base
           <> "?name="
           <> T.unpack (T.pack assetName)
+      contentType = contentTypeForAsset assetName
   req0 <- parseRequest url
   let req =
         req0
           { method = "POST",
             requestHeaders =
               headers
-                <> [ ("Content-Type", "application/x-xz"),
+                <> [ ("Content-Type", contentType),
                      ("Content-Length", encodeUtf8 (T.pack (show (LBS.length body))))
                    ],
             requestBody = RequestBodyLBS body
@@ -220,6 +248,12 @@ uploadAsset http headers uploadUrlTemplate assetName body = do
                 "HTTP "
                   <> T.pack (show code)
                   <> " uploading release asset"
+
+contentTypeForAsset :: FilePath -> ByteString
+contentTypeForAsset name
+  | ".json" `T.isSuffixOf` T.toLower (T.pack name) = "application/json"
+  | ".tar.xz" `T.isSuffixOf` T.toLower (T.pack name) = "application/x-xz"
+  | otherwise = "application/octet-stream"
 
 -- | Best-effort DELETE of a release after a failed asset upload (errors ignored).
 deleteReleaseBestEffortHttp ::
@@ -393,9 +427,37 @@ lookupNamedAsset ::
   Text ->
   IO (Either Text (Maybe Text))
 lookupNamedAsset ops owner repo tag assetName = do
+  eres <- lookupNamedAssets ops owner repo tag [assetName]
+  pure $ case eres of
+    Left err -> Left err
+    Right Nothing -> Right Nothing
+    Right (Just urls) ->
+      case urls of
+        (u : _) -> Right (Just u)
+        [] -> Right Nothing
+
+-- | Lookup release by tag and resolve every required asset basename.
+--
+-- @Right Nothing@ when the tag is missing or any required name is absent
+-- (not-found for multi-asset reuse). Order of returned URLs matches
+-- @assetNames@.
+lookupNamedAssets ::
+  ReleaseOps ->
+  Text ->
+  Text ->
+  Text ->
+  [Text] ->
+  IO (Either Text (Maybe [Text]))
+lookupNamedAssets ops owner repo tag assetNames = do
   eres <- roGetReleaseByTag ops owner repo tag
   pure $ case eres of
     Left err -> Left err
     Right Nothing -> Right Nothing
     Right (Just info) ->
-      Right (raBrowserDownloadUrl <$> findAssetByName info assetName)
+      let resolved =
+            [ raBrowserDownloadUrl <$> findAssetByName info n
+            | n <- assetNames
+            ]
+       in if any isNothing resolved
+            then Right Nothing
+            else Right (Just (catMaybes resolved))

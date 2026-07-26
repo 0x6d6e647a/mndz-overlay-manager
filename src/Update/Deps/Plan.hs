@@ -488,7 +488,7 @@ fetchBunEnginesAtTag mgr mToken owner repo prefix pv = do
                     Just v -> Right v
                     Nothing ->
                       Left
-                        ( "missing or unparseable engines.bun for "
+                        ( "missing or unparseable engines.bun / packageManager bun@ for "
                             <> owner
                             <> "/"
                             <> repo

@@ -442,12 +442,12 @@ testMd5CacheGateBlocksGitMv :: IO ()
 testMd5CacheGateBlocksGitMv =
   withSystemTempDirectory "mndz-gate-gitmv-" $ \tmp -> do
     let overlayRoot = tmp </> "overlay"
-        pkgDir = overlayRoot </> "dev-util" </> "opencode-bin"
-        oldName = "opencode-bin-1.0.ebuild"
+        pkgDir = overlayRoot </> "dev-lang" </> "deno-bin"
+        oldName = "deno-bin-1.0.ebuild"
         entry =
           PackageEntry
-            { peKey = mkPackageKey "dev-util" "opencode-bin",
-              pePN = "opencode-bin",
+            { peKey = mkPackageKey "dev-lang" "deno-bin",
+              pePN = "deno-bin",
               peLocal = parseEbuildVersion "1.0",
               pePath = pkgDir </> oldName
             }

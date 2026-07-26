@@ -87,7 +87,7 @@ parameterizeAssetsSrcUri pn content =
               suffix =
                 firstSuffix
                   afterPn
-                  ["-vendor", "-deps", "-crates", ".tar"]
+                  ["-vendor", "-deps", "-crates", "-models", ".tar"]
            in pkgName <> "-${PV}" <> suffix
 
     firstSuffix t markers =

@@ -192,7 +192,7 @@ isOutdated _ = False
 -- Uses real hardcoded keys so resolveSource + checkPackage run product code.
 testCheckPackageOutdated :: IO ()
 testCheckPackageOutdated = do
-  let e = entry "dev-util" "opencode-bin" "0.1.0"
+  let e = entry "dev-lang" "deno-bin" "0.1.0"
       fetch _ = pure (Right (parseEbuildVersion "0.2.0"))
   report <- checkPackage fetch e
   case reportStatus report of
@@ -203,7 +203,7 @@ testCheckPackageOutdated = do
 
 testCheckPackageOk :: IO ()
 testCheckPackageOk = do
-  let e = entry "dev-util" "opencode-bin" "1.0.0"
+  let e = entry "dev-lang" "deno-bin" "1.0.0"
       fetch _ = pure (Right (parseEbuildVersion "1.0.0"))
   report <- checkPackage fetch e
   case reportStatus report of
@@ -223,7 +223,7 @@ testCheckPackageAhead = do
 
 testCheckPackageFetchError :: IO ()
 testCheckPackageFetchError = do
-  let e = entry "dev-util" "opencode-bin" "1.0.0"
+  let e = entry "dev-lang" "deno-bin" "1.0.0"
       fetch _ = pure (Left "network down")
   report <- checkPackage fetch e
   case reportStatus report of
@@ -608,16 +608,16 @@ testCheckOverlayWithDepsPlanMulti = do
       unusedCargo
       Nothing
   let fetch src = pure $ case src of
-        GitHub "anomalyco" "opencode" _ ->
+        GitHub "denoland" "deno" _ ->
           Right (parseEbuildVersion "0.5.0")
         _ -> Left "unexpected fetch source"
       ebuilds =
         [ -- GitMv: outdated via checkPackage
           Ebuild
-            "dev-util"
-            "opencode-bin"
+            "dev-lang"
+            "deno-bin"
             "0.1.0"
-            "/tmp/opencode-bin-0.1.0.ebuild",
+            "/tmp/deno-bin-0.1.0.ebuild",
           -- DepsAndAssets Go: plan gaps
           Ebuild
             "dev-util"
@@ -657,10 +657,10 @@ testCheckOverlayWithDepsPlanMulti = do
         reports
     )
   assertTrue
-    "opencode outdated"
+    "deno-bin outdated"
     ( any
         ( \r ->
-            reportKey r == PackageKey "dev-util/opencode-bin"
+            reportKey r == PackageKey "dev-lang/deno-bin"
               && isOutdated (reportStatus r)
         )
         reports

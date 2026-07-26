@@ -451,7 +451,7 @@ testApplyProgressSoftSkipHandle = do
           ReleaseOps
             { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
               roDownloadAsset = \_ _ -> pure (Left "unused"),
-              roCreateReleaseWithAsset = \_ _ -> pure (Right ())
+              roCreateReleaseWithAssets = \_ _ -> pure (Right ())
             }
     env0 <-
       mkTestApplyEnv

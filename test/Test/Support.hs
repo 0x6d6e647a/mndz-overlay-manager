@@ -319,6 +319,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeBunCacheOps = productionBunCacheOps,
         aeCargoOps = productionCargoOps,
         aeReleaseOps = releaseOps,
+        aeFetchModelsDev = \_ -> pure (Left "models.dev unused"),
         aeAssetsRoot = assetsRoot,
         aeGitHubToken = Just "tok",
         aeAssetsOwner = "0x6d6e647a",
@@ -388,5 +389,5 @@ unusedReleaseOps =
   ReleaseOps
     { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
       roDownloadAsset = \_ _ -> pure (Left "unused"),
-      roCreateReleaseWithAsset = \_ _ -> pure (Left "unused")
+      roCreateReleaseWithAssets = \_ _ -> pure (Left "unused")
     }

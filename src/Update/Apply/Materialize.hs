@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | DepsAndAssets materialize: plan, distfile, reuse/full publish, step budgets.
 module Update.Apply.Materialize
@@ -11,18 +12,33 @@ module Update.Apply.Materialize
     reusePathMaterializeSteps,
     materializeStepTotalUpper,
     reviseMaterializeStepTotal,
+    fetchModelsDevApiJson,
   )
 where
 
 import CLI.Progress (MultiHandle (..))
 import Control.Concurrent.MVar (withMVar)
+import Control.Exception (SomeException, catch)
 import Control.Monad (when)
+import Data.ByteString.Lazy qualified as LBS
 import Data.Containers.ListUtils (nubOrd)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sortOn)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Network.HTTP.Client
+  ( Manager,
+    httpLbs,
+    method,
+    newManager,
+    parseRequest,
+    requestHeaders,
+    responseBody,
+    responseStatus,
+  )
+import Network.HTTP.Client.TLS (tlsManagerSettings)
+import Network.HTTP.Types (statusCode)
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Version
   ( EbuildVersion (..),
@@ -53,6 +69,7 @@ import Update.Assets.Layout
     commitMessage,
     distfileKindForEcosystem,
     distfileTarballName,
+    modelsDistfileName,
     releaseName,
     releaseTag,
     sidecarPaths,
@@ -60,7 +77,7 @@ import Update.Assets.Layout
 import Update.Assets.Release
   ( ReleaseMeta (..),
     ReleaseOps (..),
-    lookupNamedAsset,
+    lookupNamedAssets,
   )
 import Update.Bun.Cache
   ( BunCacheProgress (..),
@@ -157,7 +174,7 @@ applyDepsAndAssets env overlayRoot entry src eco = do
             False
         ]
     Right plan -> do
-      contentFix <- contentFixNeededEnv env eco src pkgDir (pePN entry) plan
+      contentFix <- contentFixNeededEnv env eco src pkgDir (pePN entry) key plan
       if not (planNeedsWork localPVs contentFix plan)
         then pure [ApplySoftSkip key "already matches runtime-lane plan"]
         else do
@@ -227,17 +244,17 @@ contentFixNeededEnv ::
   UpdateSource ->
   FilePath ->
   Text ->
+  PackageKey ->
   RuntimeLanePlan ->
   IO [EbuildVersion]
-contentFixNeededEnv env eco src pkgDir pn plan =
+contentFixNeededEnv env eco src pkgDir pn key plan =
   concat <$> mapM checkPlanned (glpEbuilds plan)
   where
-    kind = distfileKindForEcosystem eco
     checkPlanned pe = do
       let name = ebuildFileNameWithRev pn (pePV pe)
           path = pkgDir </> name
           pvNoRev = renderPVNoRev (pePV pe)
-          tarball = distfileTarballName kind pn pvNoRev
+          required = requiredAssetBasenames key eco pn pvNoRev
       exists <- doesFileExist path
       paths <-
         if exists
@@ -255,7 +272,7 @@ contentFixNeededEnv env eco src pkgDir pn plan =
         [] -> pure []
         (p : _) -> do
           content <- TIO.readFile p
-          manMissing <- vendorManifestMissing pkgDir tarball
+          manMissing <- anyManifestMissing pkgDir required
           bad <- case eco of
             Go mSub -> do
               mGoVer <- case src of
@@ -273,6 +290,21 @@ contentFixNeededEnv env eco src pkgDir pn plan =
               pure $
                 ebuildNeedsContentFixAtom (peKeywords pe) content mAtom || manMissing
           pure [pePV pe | bad]
+
+-- | Required release asset basenames for a package/PV (primary + companions).
+requiredAssetBasenames :: PackageKey -> EcosystemSpec -> Text -> Text -> [FilePath]
+requiredAssetBasenames key eco pn pvNoRev =
+  let primary = distfileTarballName (distfileKindForEcosystem eco) pn pvNoRev
+      extras =
+        case key of
+          PackageKey "dev-util/opencode" -> [modelsDistfileName pn pvNoRev]
+          _ -> []
+   in primary : extras
+
+anyManifestMissing :: FilePath -> [FilePath] -> IO Bool
+anyManifestMissing pkgDir names = do
+  checks <- mapM (vendorManifestMissing pkgDir) names
+  pure (or checks)
 
 -- | Full required BDEPEND atom for a planned PV, when obtainable.
 fetchRequiredBdependAtom ::
@@ -330,8 +362,14 @@ contentFixNeeded ::
   Text ->
   RuntimeLanePlan ->
   IO [EbuildVersion]
-contentFixNeeded env owner repo prefix mSub =
-  contentFixNeededEnv env (Go mSub) (GitHub owner repo prefix)
+contentFixNeeded env owner repo prefix mSub pkgDir pn =
+  contentFixNeededEnv
+    env
+    (Go mSub)
+    (GitHub owner repo prefix)
+    pkgDir
+    pn
+    (PackageKey (T.pack "legacy/" <> pn))
 
 -- | True when package Manifest lacks a DIST line for the vendor tarball.
 vendorManifestMissing :: FilePath -> FilePath -> IO Bool
@@ -587,10 +625,8 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
   let key = peKey entry
       pn = pePN entry
       pvNoRev = renderPVNoRev targetVer
-      kind = distfileKindForEcosystem eco
-      tarballName = distfileTarballName kind pn pvNoRev
+      assetNames = requiredAssetBasenames key eco pn pvNoRev
       tag = releaseTag pn pvNoRev
-      assetName = T.pack tarballName
       mh = aeMulti env
       remainingAfter = max 0 (remainingPVs - 1)
   case (aeAssetsRoot env, aeGitHubToken env) of
@@ -606,12 +642,12 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
         Just (category, _) -> do
           mhStatus mh key "probing release asset"
           looked <-
-            lookupNamedAsset
+            lookupNamedAssets
               (aeReleaseOps env)
               (aeAssetsOwner env)
               (aeAssetsRepo env)
               tag
-              assetName
+              (map T.pack assetNames)
           case looked of
             Left err ->
               pure $
@@ -620,7 +656,7 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
                   ("release asset lookup failed: " <> err)
                   False
                   False
-            Right (Just downloadUrl) -> do
+            Right (Just downloadUrls) -> do
               done <- readIORef stepsDoneRef
               mhSteps
                 mh
@@ -643,8 +679,7 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
                 category
                 pn
                 pvNoRev
-                tarballName
-                downloadUrl
+                (zip assetNames downloadUrls)
                 stepsDoneRef
             Right Nothing -> do
               done <- readIORef stepsDoneRef
@@ -669,7 +704,7 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
                 category
                 pn
                 pvNoRev
-                tarballName
+                assetNames
                 mh
                 key
                 stepsDoneRef
@@ -709,7 +744,7 @@ fullDepsPublishAndOverlay ::
   Text ->
   Text ->
   Text ->
-  FilePath ->
+  [FilePath] ->
   MultiHandle ->
   PackageKey ->
   IORef Int ->
@@ -727,40 +762,41 @@ fullDepsPublishAndOverlay
   category
   pn
   pvNoRev
-  tarballName
+  assetNames
   mh
   key
   stepsDoneRef =
     withSystemTempDirectory "mndz-deps-out-" $ \outDir -> do
       built <-
-        materializeDistfile
+        materializeDistfiles
           env
           eco
           src
           entry
+          key
+          pn
           pvNoRev
           outDir
-          tarballName
+          assetNames
           stepsDoneRef
           mh
-          key
       case built of
         Left err -> pure $ ApplyHardFail key err False False
-        Right (tarballPath, mReqVer, mEbuildBody) -> do
+        Right (paths, mReqVer, mEbuildBody) -> do
           mhStatus mh key "committing assets"
-          digests <- hashFile tarballPath
-          let sp = sidecarPaths assetsRoot category pn tarballName
-              relSidecars =
-                [ T.unpack category </> T.unpack pn </> tarballName <> ext
-                | ext <- [".sha256", ".sha512", ".b3"]
+          distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
+          let relSidecars =
+                [ T.unpack category </> T.unpack pn </> takeFileName p <> ext
+                | p <- paths,
+                  ext <- [".sha256", ".sha512", ".b3"]
                 ]
-          createDirectoryIfMissing True (takeDirectory (spSha256 sp))
-          writeSidecars
-            tarballPath
-            digests
-            (spSha256 sp)
-            (spSha512 sp)
-            (spB3 sp)
+          mapM_
+            ( \(p, digests) -> do
+                let sp = sidecarPaths assetsRoot category pn (takeFileName p)
+                createDirectoryIfMissing True (takeDirectory (spSha256 sp))
+                writeSidecars p digests (spSha256 sp) (spSha512 sp) (spB3 sp)
+            )
+            distDigests
           let msg = commitMessage category pn (renderPV targetVer)
               meta =
                 ReleaseMeta
@@ -791,10 +827,10 @@ fullDepsPublishAndOverlay
                       markMaterializeStep stepsDoneRef mh key "pushing assets"
                       mhStatus mh key "uploading release asset"
                       uploaded <-
-                        roCreateReleaseWithAsset
+                        roCreateReleaseWithAssets
                           (aeReleaseOps env)
                           meta
-                          tarballPath
+                          paths
                       case uploaded of
                         Left err -> pure (Left err)
                         Right () -> do
@@ -819,8 +855,7 @@ fullDepsPublishAndOverlay
                   keywords
                   lines_
                   targetVer
-                  digests
-                  tarballName
+                  distDigests
                   mReqVer
                   mEbuildBody
               case outcome of
@@ -829,20 +864,59 @@ fullDepsPublishAndOverlay
                 _ -> pure ()
               pure outcome
 
--- | Build vendor/deps/crates tarball; returns path, optional runtime version, optional ebuild body.
-materializeDistfile ::
+-- | Build all required distfiles (primary + companions); paths in asset order.
+materializeDistfiles ::
   ApplyEnv ->
   EcosystemSpec ->
   UpdateSource ->
   PackageEntry ->
+  PackageKey ->
+  Text ->
+  Text ->
+  FilePath ->
+  [FilePath] ->
+  IORef Int ->
+  MultiHandle ->
+  IO (Either Text ([FilePath], Maybe Text, Maybe Text))
+materializeDistfiles env eco src entry key pn pvNoRev outDir assetNames stepsDoneRef mh =
+  case assetNames of
+    [] -> pure (Left "no required assets for materialize")
+    (primaryName : companionNames) -> do
+      primary <-
+        materializePrimaryDistfile
+          env
+          eco
+          src
+          entry
+          key
+          pvNoRev
+          outDir
+          primaryName
+          stepsDoneRef
+          mh
+      case primary of
+        Left err -> pure (Left err)
+        Right (p, mReqVer, mEbuildBody) -> do
+          companions <-
+            materializeCompanionAssets env key pn pvNoRev outDir companionNames
+          pure $ case companions of
+            Left err -> Left err
+            Right extras -> Right (p : extras, mReqVer, mEbuildBody)
+
+-- | Build primary vendor/deps/crates tarball.
+materializePrimaryDistfile ::
+  ApplyEnv ->
+  EcosystemSpec ->
+  UpdateSource ->
+  PackageEntry ->
+  PackageKey ->
   Text ->
   FilePath ->
   FilePath ->
   IORef Int ->
   MultiHandle ->
-  PackageKey ->
   IO (Either Text (FilePath, Maybe Text, Maybe Text))
-materializeDistfile env eco src entry pvNoRev outDir tarballName stepsDoneRef mh key =
+materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName stepsDoneRef mh =
   case (eco, src) of
     (Go mSub, GitHub owner repo prefix) -> do
       built <-
@@ -932,6 +1006,82 @@ materializeDistfile env eco src entry pvNoRev outDir tarballName stepsDoneRef mh
     (Bun, _) -> pure (Left "DepsAndAssets Bun requires a GitHub update source")
     (Cargo {}, _) -> pure (Left "DepsAndAssets Cargo requires a GitHub update source")
 
+-- | Companion distfiles (e.g. models JSON) required beyond the primary tarball.
+materializeCompanionAssets ::
+  ApplyEnv ->
+  PackageKey ->
+  Text ->
+  Text ->
+  FilePath ->
+  [FilePath] ->
+  IO (Either Text [FilePath])
+materializeCompanionAssets _ _ _ _ _ [] = pure (Right [])
+materializeCompanionAssets env key pn pvNoRev outDir names =
+  case key of
+    PackageKey "dev-util/opencode" ->
+      goOpencode names
+    _ ->
+      pure $
+        Left
+          ( "unknown companion assets for "
+              <> let PackageKey k = key in k
+          )
+  where
+    goOpencode [] = pure (Right [])
+    goOpencode (n : rest)
+      | n == modelsDistfileName pn pvNoRev = do
+          fetched <- aeFetchModelsDev env (outDir </> n)
+          case fetched of
+            Left err -> pure (Left err)
+            Right p -> do
+              more <- goOpencode rest
+              pure $ case more of
+                Left err -> Left err
+                Right ps -> Right (p : ps)
+      | otherwise =
+          pure $
+            Left ("unexpected companion distfile for opencode: " <> T.pack n)
+
+-- | GET https://models.dev/api.json → write raw body to dest path.
+fetchModelsDevApiJson :: FilePath -> IO (Either Text FilePath)
+fetchModelsDevApiJson destPath = do
+  mgr <- newManager tlsManagerSettings
+  fetchModelsDevApiJsonWith mgr destPath
+
+fetchModelsDevApiJsonWith :: Manager -> FilePath -> IO (Either Text FilePath)
+fetchModelsDevApiJsonWith mgr destPath = do
+  req0 <- parseRequest "https://models.dev/api.json"
+  let req =
+        req0
+          { method = "GET",
+            requestHeaders =
+              [ ("User-Agent", "mndz-overlay-manager"),
+                ("Accept", "application/json")
+              ]
+          }
+  eres <-
+    (Right <$> httpLbs req mgr)
+      `catch` \(e :: SomeException) -> pure (Left (T.pack (show e)))
+  case eres of
+    Left err -> pure (Left ("models.dev fetch failed: " <> err))
+    Right resp ->
+      let code = statusCode (responseStatus resp)
+       in if code >= 200 && code < 300
+            then do
+              let body = responseBody resp
+              if LBS.null body
+                then pure (Left "models.dev returned empty body")
+                else do
+                  createDirectoryIfMissing True (takeDirectory destPath)
+                  LBS.writeFile destPath body
+                  pure (Right destPath)
+            else
+              pure $
+                Left $
+                  "models.dev HTTP "
+                    <> T.pack (show code)
+                    <> " fetching api.json"
+
 npmCacheProgress :: IORef Int -> MultiHandle -> PackageKey -> NpmCacheProgress
 npmCacheProgress stepsDoneRef mh key =
   NpmCacheProgress
@@ -976,8 +1126,8 @@ reuseDepsReleaseAsset ::
   Text ->
   Text ->
   Text ->
-  FilePath ->
-  Text ->
+  -- | (basename, browser_download_url) for every required asset.
+  [(FilePath, Text)] ->
   IORef Int ->
   IO ApplyOutcome
 reuseDepsReleaseAsset
@@ -993,8 +1143,7 @@ reuseDepsReleaseAsset
   category
   pn
   pvNoRev
-  tarballName
-  downloadUrl
+  namedUrls
   stepsDoneRef = do
     let key = peKey entry
         mh = aeMulti env
@@ -1004,10 +1153,9 @@ reuseDepsReleaseAsset
           Cargo {} -> "verifying crates asset"
           _ -> "verifying deps asset"
     withSystemTempDirectory "mndz-reuse-asset-" $ \tmpDir -> do
-      let dest = tmpDir </> tarballName
       mhStatus mh key "reusing release assets"
-      dl <- roDownloadAsset (aeReleaseOps env) downloadUrl dest
-      case dl of
+      dlResult <- downloadNamedAssets (aeReleaseOps env) tmpDir namedUrls
+      case dlResult of
         Left err ->
           pure $
             ApplyHardFail
@@ -1015,17 +1163,11 @@ reuseDepsReleaseAsset
               ("download of existing release asset failed: " <> err)
               False
               True
-        Right () -> do
-          digests <- hashFile dest
+        Right localPaths -> do
+          distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) localPaths
           markMaterializeStep stepsDoneRef mh key "reusing release assets"
           mhStatus mh key verifyLabel
-          sideCheck <-
-            checkSidecarSha512IfPresent
-              assetsRoot
-              category
-              pn
-              tarballName
-              (digestSHA512 digests)
+          sideCheck <- checkAllSidecars assetsRoot category pn distDigests
           case sideCheck of
             Left err -> pure $ ApplyHardFail key err False True
             Right () -> do
@@ -1064,8 +1206,7 @@ reuseDepsReleaseAsset
                   keywords
                   reusedLines
                   targetVer
-                  digests
-                  tarballName
+                  distDigests
                   mReq
                   Nothing
               case outcome of
@@ -1073,6 +1214,42 @@ reuseDepsReleaseAsset
                   markMaterializeStep stepsDoneRef mh key "regenerating manifest"
                   pure (ApplySuccess k sls paths)
                 other -> pure other
+
+downloadNamedAssets ::
+  ReleaseOps ->
+  FilePath ->
+  [(FilePath, Text)] ->
+  IO (Either Text [FilePath])
+downloadNamedAssets _ _ [] = pure (Right [])
+downloadNamedAssets ops tmpDir ((name, url) : rest) = do
+  let dest = tmpDir </> name
+  dl <- roDownloadAsset ops url dest
+  case dl of
+    Left err -> pure (Left err)
+    Right () -> do
+      more <- downloadNamedAssets ops tmpDir rest
+      pure $ case more of
+        Left err -> Left err
+        Right ps -> Right (dest : ps)
+
+checkAllSidecars ::
+  FilePath ->
+  Text ->
+  Text ->
+  [(FilePath, FileDigests)] ->
+  IO (Either Text ())
+checkAllSidecars _ _ _ [] = pure (Right ())
+checkAllSidecars assetsRoot category pn ((name, digests) : rest) = do
+  sideCheck <-
+    checkSidecarSha512IfPresent
+      assetsRoot
+      category
+      pn
+      name
+      (digestSHA512 digests)
+  case sideCheck of
+    Left err -> pure (Left err)
+    Right () -> checkAllSidecars assetsRoot category pn rest
 
 -- | Optional assets-repo sidecar SHA512 cross-check (only when file exists).
 checkSidecarSha512IfPresent ::

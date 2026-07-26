@@ -117,17 +117,24 @@ import Update.Apply.TestSupport
     signedOverlayCommit,
   )
 import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
-import Update.Assets.Layout (cratesTarballName, depsTarballName, vendorTarballName)
+import Update.Assets.Layout
+  ( cratesTarballName,
+    depsTarballName,
+    modelsDistfileName,
+    vendorTarballName,
+  )
 import Update.Assets.Release
   ( ReleaseAsset (..),
     ReleaseInfo (..),
     ReleaseMeta (..),
     ReleaseOps (..),
     createReleaseWithAssetHttpLbs,
+    createReleaseWithAssetsHttpLbs,
     downloadReleaseAssetHttpLbs,
     findAssetByName,
     getReleaseByTagHttpLbs,
     lookupNamedAsset,
+    lookupNamedAssets,
     parseReleaseInfo,
   )
 import Update.Auth (resolveGitHubToken, resolveGitHubTokenWith)
@@ -296,9 +303,11 @@ tests =
       testCase "Sidecar Line" testSidecarLine,
       testCase "Deps Distfile Names" testDepsDistfileNames,
       testCase "Release Lookup" testReleaseLookup,
+      testCase "Multi-asset Lookup" testMultiAssetLookup,
       testCase "Release HTTP Get By Tag" testReleaseHttpGetByTag,
       testCase "Release HTTP Download" testReleaseHttpDownload,
-      testCase "Release HTTP Create Upload Delete" testReleaseHttpCreateUploadDelete
+      testCase "Release HTTP Create Upload Delete" testReleaseHttpCreateUploadDelete,
+      testCase "Release Multi-asset Upload Partial Delete" testReleaseMultiAssetPartialDelete
     ]
 
 testTokenResolver :: IO ()
@@ -427,6 +436,10 @@ testDepsDistfileNames = do
     "crates"
     "mise-2026.7.5-crates.tar.xz"
     (cratesTarballName "mise" "2026.7.5")
+  assertEq
+    "models"
+    "opencode-1.18.4-models.json"
+    (modelsDistfileName "opencode" "1.18.4")
 
 ------------------------------------------------------------------------
 -- Release lookup / reuse / Manifest content-fix
@@ -482,7 +495,7 @@ testReleaseLookup = do
                   then Right (Just info)
                   else Right Nothing,
             roDownloadAsset = \_ _ -> pure (Right ()),
-            roCreateReleaseWithAsset = \_ _ -> pure (Left "unused create")
+            roCreateReleaseWithAssets = \_ _ -> pure (Left "unused create")
           }
   found <- lookupNamedAsset opsFound "o" "r" "beads-1.0.5" "beads-1.0.5-vendor.tar.xz"
   assertEq "lookup found" (Right (Just "https://example/a")) found
@@ -495,10 +508,65 @@ testReleaseLookup = do
         ReleaseOps
           { roGetReleaseByTag = \_ _ _ -> pure (Left "auth failed"),
             roDownloadAsset = \_ _ -> pure (Left "unused"),
-            roCreateReleaseWithAsset = \_ _ -> pure (Left "unused")
+            roCreateReleaseWithAssets = \_ _ -> pure (Left "unused")
           }
   hard <- lookupNamedAsset opsErr "o" "r" "t" "a"
   assertEq "lookup hard error" (Left "auth failed") hard
+
+testMultiAssetLookup :: IO ()
+testMultiAssetLookup = do
+  let info =
+        ReleaseInfo
+          { riId = 1,
+            riTag = "opencode-1.18.4",
+            riAssets =
+              [ ReleaseAsset "opencode-1.18.4-deps.tar.xz" "https://example/deps",
+                ReleaseAsset "opencode-1.18.4-models.json" "https://example/models"
+              ]
+          }
+      partial =
+        info
+          { riAssets =
+              [ReleaseAsset "opencode-1.18.4-deps.tar.xz" "https://example/deps"]
+          }
+      opsFull =
+        ReleaseOps
+          { roGetReleaseByTag = \_ _ _ -> pure (Right (Just info)),
+            roDownloadAsset = \_ _ -> pure (Right ()),
+            roCreateReleaseWithAssets = \_ _ -> pure (Left "unused")
+          }
+      opsPartial =
+        opsFull {roGetReleaseByTag = \_ _ _ -> pure (Right (Just partial))}
+  both <-
+    lookupNamedAssets
+      opsFull
+      "o"
+      "r"
+      "opencode-1.18.4"
+      ["opencode-1.18.4-deps.tar.xz", "opencode-1.18.4-models.json"]
+  assertEq
+    "both present"
+    (Right (Just ["https://example/deps", "https://example/models"]))
+    both
+  missingModels <-
+    lookupNamedAssets
+      opsPartial
+      "o"
+      "r"
+      "opencode-1.18.4"
+      ["opencode-1.18.4-deps.tar.xz", "opencode-1.18.4-models.json"]
+  assertEq "partial not reusable" (Right Nothing) missingModels
+  single <-
+    lookupNamedAssets
+      opsFull
+      "o"
+      "r"
+      "opencode-1.18.4"
+      ["opencode-1.18.4-deps.tar.xz"]
+  assertEq
+    "single-asset still works"
+    (Right (Just ["https://example/deps"]))
+    single
 
 testReleaseHttpGetByTag :: IO ()
 testReleaseHttpGetByTag = do
@@ -612,5 +680,47 @@ testReleaseHttpCreateUploadDelete =
       assertLeft "create net"
         =<< createReleaseWithAssetHttpLbs httpNet "tok" meta assetPath
     assertEq "net" "create net" errNet
+
+testReleaseMultiAssetPartialDelete :: IO ()
+testReleaseMultiAssetPartialDelete =
+  withSystemTempDirectory "rel-multi" $ \tmp -> do
+    let depsPath = tmp </> "opencode-1.18.4-deps.tar.xz"
+        modelsPath = tmp </> "opencode-1.18.4-models.json"
+    BS.writeFile depsPath "deps"
+    BS.writeFile modelsPath "{}"
+    delRef <- newIORef (0 :: Int)
+    uploadCount <- newIORef (0 :: Int)
+    let meta =
+          ReleaseMeta
+            { rmOwner = "o",
+              rmRepo = "r",
+              rmTag = "opencode-1.18.4",
+              rmName = "dev-util/opencode-1.18.4",
+              rmBody = "dev-util/opencode: 1.18.4",
+              rmTargetCommitish = "main"
+            }
+        createBody =
+          L8.pack
+            "{\"id\":11,\"upload_url\":\"https://uploads.example/assets{?name,label}\"}"
+        http req = do
+          case method req of
+            "DELETE" -> do
+              atomicModifyIORef' delRef (\n -> (n + 1, ()))
+              pure (Right (fakeResponse 204 ""))
+            "POST"
+              | "releases" `BSC.isInfixOf` path req ->
+                  pure (Right (fakeResponse 201 createBody))
+            "POST" -> do
+              n <- atomicModifyIORef' uploadCount (\x -> (x + 1, x + 1))
+              if n == 1
+                then pure (Right (fakeResponse 201 ""))
+                else pure (Right (fakeResponse 500 "second upload fail"))
+            _ -> pure (Right (fakeResponse 500 "unexpected"))
+    err <-
+      assertLeft "second upload fails"
+        =<< createReleaseWithAssetsHttpLbs http "tok" meta [depsPath, modelsPath]
+    assertTrue "upload err" ("uploading release asset" `T.isInfixOf` err)
+    deletes <- readIORef delRef
+    assertEq "delete after partial multi upload" 1 deletes
 
 -- | Dual-arch Go ceilings helper for tests.

@@ -82,7 +82,7 @@ Packages that are not `DepsAndAssets` SHALL continue to use newest-local vs sing
 
 #### Scenario: Binary package format
 
-- **WHEN** `dev-util/opencode-bin` is outdated
+- **WHEN** `dev-util/grok-build-bin` is outdated
 - **THEN** stdout uses a single unlabeled line
 
 ### Requirement: Soft warnings on stderr

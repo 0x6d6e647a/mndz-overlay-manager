@@ -288,10 +288,10 @@ sampleEntries =
         pePath = "/overlay/dev-lang/deno-bin/deno-bin-2.9.2.ebuild"
       },
     PackageEntry
-      { peKey = PackageKey "dev-util/opencode-bin",
-        pePN = "opencode-bin",
+      { peKey = PackageKey "dev-util/grok-build-bin",
+        pePN = "grok-build-bin",
         peLocal = parseEbuildVersion "1.0",
-        pePath = "/overlay/dev-util/opencode-bin/opencode-bin-1.0.ebuild"
+        pePath = "/overlay/dev-util/grok-build-bin/grok-build-bin-1.0.ebuild"
       },
     PackageEntry
       { peKey = PackageKey "bar/foo",
@@ -317,8 +317,8 @@ testTargetResolution = do
   -- bare package name (unambiguous)
   assertEq
     "bare unique"
-    (Right (PackageKey "dev-util/opencode-bin"))
-    (resolveTargetToken sampleEntries "opencode-bin")
+    (Right (PackageKey "dev-util/grok-build-bin"))
+    (resolveTargetToken sampleEntries "grok-build-bin")
   -- ambiguous bare name hard-fails
   case resolveTargetToken sampleEntries "foo" of
     Left (AmbiguousPackage "foo" keys) ->
@@ -336,17 +336,17 @@ testTargetResolution = do
       assertEq
         "all keys set"
         (sort (map packageKeyText keys))
-        ["bar/foo", "baz/foo", "dev-lang/deno-bin", "dev-util/opencode-bin"]
+        ["bar/foo", "baz/foo", "dev-lang/deno-bin", "dev-util/grok-build-bin"]
     Left e -> do
       hPutStrLn stderr $ "all targets: " <> show e
       exitFailure
   -- cat/pn and bare pn together; selected set only those keys
-  case resolveTargets sampleEntries ["dev-lang/deno-bin", "opencode-bin"] of
+  case resolveTargets sampleEntries ["dev-lang/deno-bin", "grok-build-bin"] of
     Right keys -> do
       assertEq
         "selected keys"
         (sort (map packageKeyText keys))
-        ["dev-lang/deno-bin", "dev-util/opencode-bin"]
+        ["dev-lang/deno-bin", "dev-util/grok-build-bin"]
       let selected = [e | e <- sampleEntries, peKey e `elem` keys]
       assertEq "filtered entry count" 2 (length selected)
       assertTrue

@@ -40,10 +40,6 @@ hardcodedPolicies =
         )
         GitMvAndManifest,
       policy
-        "dev-util/opencode-bin"
-        (GitHub "anomalyco" "opencode" "v")
-        GitMvAndManifest,
-      policy
         "dev-db/dolt"
         (GitHub "dolthub" "dolt" "v")
         (DepsAndAssets (Go (Just "go"))),
@@ -62,6 +58,10 @@ hardcodedPolicies =
       policy
         "dev-util/ralph-tui"
         (GitHub "subsy" "ralph-tui" "v")
+        (DepsAndAssets Bun),
+      policy
+        "dev-util/opencode"
+        (GitHub "anomalyco" "opencode" "v")
         (DepsAndAssets Bun),
       policy
         "dev-util/hk"

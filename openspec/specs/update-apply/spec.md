@@ -37,11 +37,11 @@ The library SHALL model a package policy that binds a package key `category/pack
 
 ### Requirement: Hardcoded policy covers known overlay packages
 
-The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay that this manager automates, each with both a source and a technique. At minimum, `dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, and `dev-util/opencode-bin` SHALL use `GitMvAndManifest`. At minimum, `dev-db/dolt`, `dev-util/beads`, and `dev-util/crush` SHALL use `DepsAndAssets` with ecosystem `Go`. At minimum, `dev-util/openspec` SHALL use `DepsAndAssets Npm` and `dev-util/ralph-tui` SHALL use `DepsAndAssets Bun`. At minimum, `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets` with ecosystem `Cargo`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone.
+The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay that this manager automates, each with both a source and a technique. At minimum, `dev-lang/bun-bin`, `dev-lang/deno-bin`, and `dev-util/grok-build-bin` SHALL use `GitMvAndManifest`. At minimum, `dev-db/dolt`, `dev-util/beads`, and `dev-util/crush` SHALL use `DepsAndAssets` with ecosystem `Go`. At minimum, `dev-util/openspec` SHALL use `DepsAndAssets Npm` and both `dev-util/ralph-tui` and `dev-util/opencode` SHALL use `DepsAndAssets Bun`. At minimum, `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets` with ecosystem `Cargo`. The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone.
 
 #### Scenario: Simple binary package is GitMvAndManifest
 
-- **WHEN** policy is resolved for `dev-util/opencode-bin`
+- **WHEN** policy is resolved for `dev-util/grok-build-bin`
 - **THEN** the technique is `GitMvAndManifest`
 
 #### Scenario: Go package is DepsAndAssets Go
@@ -54,10 +54,20 @@ The hardcoded policy map SHALL include an entry for every package known to ship 
 - **WHEN** policy is resolved for `dev-util/openspec`
 - **THEN** the technique is `DepsAndAssets Npm`
 
+#### Scenario: opencode is DepsAndAssets Bun
+
+- **WHEN** policy is resolved for `dev-util/opencode`
+- **THEN** the technique is `DepsAndAssets Bun`
+
 #### Scenario: mise is DepsAndAssets Cargo
 
 - **WHEN** policy is resolved for `dev-util/mise`
 - **THEN** the technique is `DepsAndAssets Cargo`
+
+#### Scenario: opencode-bin is absent
+
+- **WHEN** policy is resolved for `dev-util/opencode-bin`
+- **THEN** no policy entry is returned (unconfigured)
 
 ### Requirement: GitMvAndManifest apply steps
 
@@ -67,8 +77,8 @@ When the ebuild filename changes, staged paths SHALL include at least: the **old
 
 #### Scenario: Rename and manifest for new PV
 
-- **WHEN** newest local ebuild is `opencode-bin-1.17.19.ebuild` and remote PV is `1.17.20`
-- **THEN** the ebuild is renamed to `opencode-bin-1.17.20.ebuild` and `ebuild ./opencode-bin-1.17.20.ebuild manifest` runs with cwd set to the package directory
+- **WHEN** newest local ebuild is `deno-bin-2.9.2.ebuild` and remote PV is `2.9.3`
+- **THEN** the ebuild is renamed to `deno-bin-2.9.3.ebuild` and `ebuild ./deno-bin-2.9.3.ebuild manifest` runs with cwd set to the package directory
 
 #### Scenario: Commit stages old ebuild deletion with new ebuild Manifest and cache
 

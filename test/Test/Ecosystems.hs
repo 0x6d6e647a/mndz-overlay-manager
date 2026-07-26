@@ -154,7 +154,21 @@ testParseEnginesBun = do
     (Just "1.2.3")
     (parseEnginesBunFromPackageJson "{\"engines\":{\"bun\":\">=1.2.3\"}}")
   assertEq
-    "missing engines"
+    "packageManager fallback"
+    (Just "1.3.14")
+    (parseEnginesBunFromPackageJson "{\"packageManager\":\"bun@1.3.14\"}")
+  assertEq
+    "packageManager with build metadata"
+    (Just "1.3.14")
+    (parseEnginesBunFromPackageJson "{\"packageManager\":\"bun@1.3.14+sha512.abc\"}")
+  assertEq
+    "engines.bun wins over packageManager"
+    (Just "1.2.0")
+    ( parseEnginesBunFromPackageJson
+        "{\"engines\":{\"bun\":\">=1.2.0\"},\"packageManager\":\"bun@1.3.14\"}"
+    )
+  assertEq
+    "missing both"
     Nothing
     (parseEnginesBunFromPackageJson "{\"name\":\"x\"}")
   assertEq
@@ -162,9 +176,15 @@ testParseEnginesBun = do
     Nothing
     (parseEnginesBunFromPackageJson "not-json")
   assertEq
-    "complex range rejected"
+    "complex range falls through without packageManager"
     Nothing
     (parseEnginesBunFromPackageJson "{\"engines\":{\"bun\":\"^1.2.3\"}}")
+  assertEq
+    "complex engines falls through to packageManager"
+    (Just "1.3.14")
+    ( parseEnginesBunFromPackageJson
+        "{\"engines\":{\"bun\":\"^1.2.3\"},\"packageManager\":\"bun@1.3.14\"}"
+    )
 
 testHostMeetsBunRequirement :: IO ()
 testHostMeetsBunRequirement = do

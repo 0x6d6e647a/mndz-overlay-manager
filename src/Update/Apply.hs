@@ -11,6 +11,7 @@ module Update.Apply
     productionEbuildRunner,
     mkEbuildRunner,
     ApplyEnv (..),
+    fetchModelsDevApiJson,
     -- | Exported for 'Update.Apply.TestSupport' and direct unit tests.
     applyPackagePhase1,
     -- | Exported for multi-progress terminal-handle unit tests.
@@ -33,7 +34,7 @@ import Update.Apply.Env
     productionEbuildRunner,
   )
 import Update.Apply.GitMv (applyGitMv)
-import Update.Apply.Materialize (applyDepsAndAssets)
+import Update.Apply.Materialize (applyDepsAndAssets, fetchModelsDevApiJson)
 import Update.Check (PackageEntry (..))
 import Update.Git (GitOps (..))
 import Update.Hardcoded (lookupPolicy)

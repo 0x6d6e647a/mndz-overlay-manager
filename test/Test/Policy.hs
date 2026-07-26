@@ -344,10 +344,16 @@ testHardcodedGrok = do
 
 testPolicyClassification :: IO ()
 testPolicyClassification = do
-  case lookupPolicy (PackageKey "dev-util/opencode-bin") of
-    Just (PackagePolicy _ GitMvAndManifest) -> pure ()
+  case lookupPolicy (PackageKey "dev-util/opencode") of
+    Just (PackagePolicy (GitHub "anomalyco" "opencode" "v") (DepsAndAssets Bun)) ->
+      pure ()
     other -> do
       hPutStrLn stderr $ "opencode technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/opencode-bin") of
+    Nothing -> pure ()
+    other -> do
+      hPutStrLn stderr $ "opencode-bin should be absent: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/mise") of
     Just (PackagePolicy (GitHub "jdx" "mise" "v") (DepsAndAssets (Cargo Nothing Nothing))) ->
@@ -440,11 +446,11 @@ testCheckPackageProductStatuses = do
       fetchAhead _ = pure (Right (parseEbuildVersion "1.5.0"))
       fetchFail _ = pure (Left "network down")
       fetchUnused _ = pure (Left "should not fetch")
-  outdated <- checkPackage fetchOutdated (mk "dev-util" "opencode-bin" "2.1.6")
-  ok <- checkPackage fetchOk (mk "dev-util" "opencode-bin" "1.0.0")
+  outdated <- checkPackage fetchOutdated (mk "dev-lang" "deno-bin" "2.1.6")
+  ok <- checkPackage fetchOk (mk "dev-lang" "deno-bin" "1.0.0")
   ahead <- checkPackage fetchAhead (mk "dev-lang" "bun-bin" "2.0.0")
   unconf <- checkPackage fetchUnused (mk "dev-lang" "haskell" "9.6.1")
-  err <- checkPackage fetchFail (mk "dev-util" "opencode-bin" "1.0.0")
+  err <- checkPackage fetchFail (mk "dev-lang" "deno-bin" "1.0.0")
   let statuses = map reportStatus [outdated, ok, ahead, unconf, err]
   assertTrue "has outdated" (any isOutdated statuses)
   assertTrue "has ok" (any isOk statuses)

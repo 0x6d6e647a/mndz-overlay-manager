@@ -41,6 +41,11 @@ When at least one selected package will attempt a `DepsAndAssets` apply (includi
 - **WHEN** the user runs `update dev-util/ralph-tui` and ralph-tui will attempt full-path bun cache construction
 - **THEN** preflight requires `bun` and `xz` on `PATH`
 
+#### Scenario: bun required for opencode full path
+
+- **WHEN** the user runs `update dev-util/opencode` and opencode will attempt full-path bun cache construction
+- **THEN** preflight requires `bun` and `xz` on `PATH`
+
 #### Scenario: pycargoebuild required when cargo package selected
 
 - **WHEN** the user runs `update dev-util/mise` and mise uses `DepsAndAssets Cargo`
@@ -48,7 +53,7 @@ When at least one selected package will attempt a `DepsAndAssets` apply (includi
 
 #### Scenario: Binary package skips language tools
 
-- **WHEN** the user runs `update dev-util/opencode-bin` and no `DepsAndAssets` package is selected
+- **WHEN** the user runs `update dev-util/grok-build-bin` and no `DepsAndAssets` package is selected
 - **THEN** preflight does not fail solely because `go`, `npm`, `bun`, or `pycargoebuild` is missing from `PATH`
 
 #### Scenario: Assets path required for deps packages

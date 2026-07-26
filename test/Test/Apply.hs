@@ -312,8 +312,8 @@ testNewEbuildFileName :: IO ()
 testNewEbuildFileName = do
   assertEq
     "filename"
-    "opencode-bin-1.17.20.ebuild"
-    (newEbuildFileName "opencode-bin" (parseEbuildVersion "1.17.20"))
+    "deno-bin-1.17.20.ebuild"
+    (newEbuildFileName "deno-bin" (parseEbuildVersion "1.17.20"))
   assertEq
     "render strips rev for filename base"
     "0.2.99"
@@ -572,13 +572,13 @@ testReuseVsFullPublish =
               roDownloadAsset = \_url dest -> do
                 BS.writeFile dest assetBytes
                 pure (Right ()),
-              roCreateReleaseWithAsset = \_ _ -> pure (Left "should not create on reuse")
+              roCreateReleaseWithAssets = \_ _ -> pure (Left "should not create on reuse")
             }
         releaseMissing =
           ReleaseOps
             { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
               roDownloadAsset = \_ _ -> pure (Left "should not download"),
-              roCreateReleaseWithAsset = \_ _ -> pure (Right ())
+              roCreateReleaseWithAssets = \_ _ -> pure (Right ())
             }
     assetsLock <- newMVar ()
     overlayLock <- newMVar ()
@@ -864,7 +864,7 @@ testGoMultiPvSequentialCommits =
               roDownloadAsset = \_url dest -> do
                 BS.writeFile dest assetBytes
                 pure (Right ()),
-              roCreateReleaseWithAsset = \_ _ -> pure (Left "should not create on reuse")
+              roCreateReleaseWithAssets = \_ _ -> pure (Left "should not create on reuse")
             }
     assetsLock <- newMVar ()
     overlayLock <- newMVar ()
@@ -1015,7 +1015,7 @@ testGoMultiPvStopOnHardFail =
               roDownloadAsset = \_url dest -> do
                 BS.writeFile dest assetBytes
                 pure (Right ()),
-              roCreateReleaseWithAsset = \_ _ -> pure (Left "should not create on reuse")
+              roCreateReleaseWithAssets = \_ _ -> pure (Left "should not create on reuse")
             }
     assetsLock <- newMVar ()
     overlayLock <- newMVar ()
@@ -1210,7 +1210,7 @@ testFullPathApplyProgressSequence =
           ReleaseOps
             { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
               roDownloadAsset = \_ _ -> pure (Left "should not download"),
-              roCreateReleaseWithAsset = \_ _ -> pure (Right ())
+              roCreateReleaseWithAssets = \_ _ -> pure (Right ())
             }
         vendorOps =
           VendorOps
@@ -1394,7 +1394,7 @@ testReusePathApplyProgressSequence =
               roDownloadAsset = \_url dest -> do
                 BS.writeFile dest assetBytes
                 pure (Right ()),
-              roCreateReleaseWithAsset = \_ _ -> pure (Left "should not create on reuse")
+              roCreateReleaseWithAssets = \_ _ -> pure (Left "should not create on reuse")
             }
     assetsLock <- newMVar ()
     overlayLock <- newMVar ()
@@ -1643,7 +1643,7 @@ testApplyOverlayJobs1SoftHardMix =
   withSystemTempDirectory "mndz-apply-overlay-j1-" $ \tmp -> do
     let overlayRoot = tmp </> "overlay"
     grokPath <- seedGitMvPkg overlayRoot "dev-util" "grok-build-bin" "0.2.99"
-    openPath <- seedGitMvPkg overlayRoot "dev-util" "opencode-bin" "1.0.0"
+    openPath <- seedGitMvPkg overlayRoot "dev-lang" "deno-bin" "1.0.0"
     bunPath <- seedGitMvPkg overlayRoot "dev-lang" "bun-bin" "1.0.0"
     let unknownPath = overlayRoot </> "app-misc" </> "unknown" </> "unknown-1.0.ebuild"
     createDirectoryIfMissing True (takeDirectory unknownPath)
@@ -1662,8 +1662,8 @@ testApplyOverlayJobs1SoftHardMix =
                 pePath = grokPath
               },
             PackageEntry
-              { peKey = mkPackageKey "dev-util" "opencode-bin",
-                pePN = "opencode-bin",
+              { peKey = mkPackageKey "dev-lang" "deno-bin",
+                pePN = "deno-bin",
                 peLocal = parseEbuildVersion "1.0.0",
                 pePath = openPath
               },
@@ -1719,8 +1719,8 @@ testApplyOverlayJobs1SoftHardMix =
               aeFetcher = \src -> pure $ case src of
                 -- grok-build-bin: outdated → success
                 Http {} -> Right (parseEbuildVersion "0.2.101")
-                -- opencode-bin: already at latest → soft skip
-                GitHub "anomalyco" "opencode" _ ->
+                -- deno-bin: already at latest → soft skip
+                GitHub "denoland" "deno" _ ->
                   Right (parseEbuildVersion "1.0.0")
                 -- bun-bin: outdated but dirty → hard fail
                 GitHub "oven-sh" "bun" _ ->
@@ -1754,7 +1754,7 @@ testApplyOverlayJobsConcurrent =
   withSystemTempDirectory "mndz-apply-overlay-j2-" $ \tmp -> do
     let overlayRoot = tmp </> "overlay"
     pathA <- seedGitMvPkg overlayRoot "dev-util" "grok-build-bin" "0.2.99"
-    pathB <- seedGitMvPkg overlayRoot "dev-util" "opencode-bin" "0.9.0"
+    pathB <- seedGitMvPkg overlayRoot "dev-lang" "deno-bin" "0.9.0"
     inCritical <- newIORef (0 :: Int)
     maxInCritical <- newIORef (0 :: Int)
     let entries =
@@ -1765,8 +1765,8 @@ testApplyOverlayJobsConcurrent =
                 pePath = pathA
               },
             PackageEntry
-              { peKey = mkPackageKey "dev-util" "opencode-bin",
-                pePN = "opencode-bin",
+              { peKey = mkPackageKey "dev-lang" "deno-bin",
+                pePN = "deno-bin",
                 peLocal = parseEbuildVersion "0.9.0",
                 pePath = pathB
               }
@@ -1813,7 +1813,7 @@ testApplyOverlayJobsConcurrent =
             { aeJobs = 2,
               aeFetcher = \src -> pure $ case src of
                 Http {} -> Right (parseEbuildVersion "0.2.101")
-                GitHub "anomalyco" "opencode" _ ->
+                GitHub "denoland" "deno" _ ->
                   Right (parseEbuildVersion "1.0.0")
                 _ -> Left "unexpected"
             }
@@ -1850,7 +1850,7 @@ testGitMvResidualSoftHardDirty =
     budget <- newWorkBudget 1
     ceilingsCache <- newMVar Nothing
     -- Soft skip: already at latest (EQ)
-    pathEq <- seedGitMvPkg overlayRoot "dev-util" "opencode-bin" "1.0.0"
+    pathEq <- seedGitMvPkg overlayRoot "dev-lang" "deno-bin" "1.0.0"
     envEq0 <-
       mkTestApplyEnv
         cleanGit
@@ -1867,8 +1867,8 @@ testGitMvResidualSoftHardDirty =
             }
         entryEq =
           PackageEntry
-            { peKey = mkPackageKey "dev-util" "opencode-bin",
-              pePN = "opencode-bin",
+            { peKey = mkPackageKey "dev-lang" "deno-bin",
+              pePN = "deno-bin",
               peLocal = parseEbuildVersion "1.0.0",
               pePath = pathEq
             }

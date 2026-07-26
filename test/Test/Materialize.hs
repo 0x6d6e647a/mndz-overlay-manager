@@ -37,7 +37,7 @@ import Update.Apply
   )
 import Update.Apply.TestSupport (fullPathMaterializeSteps)
 import Update.Assets.Hash (digestSHA512, hashBytes)
-import Update.Assets.Layout (cratesTarballName, depsTarballName)
+import Update.Assets.Layout (cratesTarballName, depsTarballName, modelsDistfileName)
 import Update.Assets.Release
   ( ReleaseAsset (..),
     ReleaseInfo (..),
@@ -78,6 +78,9 @@ integrationTests =
       testCase "npm reuse-path apply success" testNpmReusePathSuccess,
       testCase "bun full-path applyDepsAndAssets success" testBunFullPathSuccess,
       testCase "bun reuse-path apply success" testBunReusePathSuccess,
+      testCase "opencode multi-asset full path" testOpencodeMultiAssetFullPath,
+      testCase "opencode multi-asset reuse path" testOpencodeMultiAssetReusePath,
+      testCase "opencode partial release does not reuse" testOpencodePartialReleaseFullPath,
       testCase "cargo full-path applyDepsAndAssets success" testCargoFullPathSuccess,
       testCase "cargo reuse-path apply success" testCargoReusePathSuccess,
       testCase "npm full-path materialize progress sequence" testNpmFullPathProgressSequence,
@@ -275,7 +278,7 @@ releaseMissing =
   ReleaseOps
     { roGetReleaseByTag = \_ _ _ -> pure (Right Nothing),
       roDownloadAsset = \_ _ -> pure (Left "should not download"),
-      roCreateReleaseWithAsset = \_ _ -> pure (Right ())
+      roCreateReleaseWithAssets = \_ _ -> pure (Right ())
     }
 
 -- | Release exists for any tag; asset name is @tag <> kindSuffix@.
@@ -299,7 +302,7 @@ releaseFound kindSuffix assetBytes =
       roDownloadAsset = \_url dest -> do
         BS.writeFile dest assetBytes
         pure (Right ()),
-      roCreateReleaseWithAsset = \_ _ -> pure (Left "should not create on reuse")
+      roCreateReleaseWithAssets = \_ _ -> pure (Left "should not create on reuse")
     }
 
 recordingMulti :: IORef [T.Text] -> MultiHandle
@@ -414,6 +417,23 @@ bunEbuildBody keywords bdepend =
       "SRC_URI=\"https://github.com/subsy/ralph-tui/archive/v${PV}.tar.gz\"",
       "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/ralph-tui-${PV}/ralph-tui-${PV}-deps.tar.xz\""
     ]
+
+opencodeEbuildBody :: T.Text -> T.Text -> T.Text
+opencodeEbuildBody keywords bdepend =
+  T.unlines
+    [ "EAPI=8",
+      "inherit shell-completion",
+      "DESCRIPTION=\"opencode test\"",
+      "BDEPEND=\"" <> bdepend <> "\"",
+      "RDEPEND=\"sys-apps/ripgrep\"",
+      "KEYWORDS=\"" <> keywords <> "\"",
+      "SRC_URI=\"https://github.com/anomalyco/opencode/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+      "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/opencode-${PV}/opencode-${PV}-deps.tar.xz\"",
+      "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/opencode-${PV}/opencode-${PV}-models.json\""
+    ]
+
+modelsAssetBytes :: BS.ByteString
+modelsAssetBytes = encodeUtf8 "{\"models\":[]}"
 
 cargoEbuildBody :: T.Text -> T.Text -> T.Text
 cargoEbuildBody keywords msrv =
@@ -899,6 +919,258 @@ testBunSoftSkip =
         Nothing
     outcomes <- applyPackagePhase1 env overlayRoot entry
     expectSoftSkip "bun skip" "already matches" outcomes
+
+------------------------------------------------------------------------
+-- opencode multi-asset (deps + models)
+------------------------------------------------------------------------
+
+seedOpencodeLocalOk :: FilePath -> FilePath -> T.Text -> IO ()
+seedOpencodeLocalOk overlayRoot pkgDir pn = do
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile
+    (pkgDir </> "opencode-1.0.0.ebuild")
+    (opencodeEbuildBody kwPlain ">=dev-lang/bun-bin-1.1.0")
+  TIO.writeFile
+    (pkgDir </> "Manifest")
+    ( T.unlines
+        [ "DIST " <> T.pack (depsTarballName pn "1.0.0") <> " 1 SHA512 deadbeef",
+          "DIST " <> T.pack (modelsDistfileName pn "1.0.0") <> " 1 SHA512 deadbeef"
+        ]
+    )
+  writeMatchingCachesForPackage overlayRoot "dev-util" pn pkgDir
+
+fakeModelsFetch :: BS.ByteString -> FilePath -> IO (Either T.Text FilePath)
+fakeModelsFetch bytes dest = do
+  BS.writeFile dest bytes
+  pure (Right dest)
+
+-- | Manifest DIST lines for deps + models matching published digests.
+opencodeManifestRunner ::
+  FilePath ->
+  BS.ByteString ->
+  BS.ByteString ->
+  FilePath ->
+  FilePath ->
+  IO (Either T.Text ())
+opencodeManifestRunner pkgDir depsBytes modelsBytes _pkg name = do
+  let base = T.pack (takeBaseName name)
+      depsName = base <> depsKind
+      modelsName = base <> "-models.json"
+      depsDig = hashBytes depsBytes
+      modelsDig = hashBytes modelsBytes
+  TIO.writeFile
+    (pkgDir </> "Manifest")
+    ( T.unlines
+        [ "DIST " <> depsName <> " 1 SHA512 " <> digestSHA512 depsDig,
+          "DIST " <> modelsName <> " 1 SHA512 " <> digestSHA512 modelsDig
+        ]
+    )
+  pure (Right ())
+
+releaseBothOpencode :: BS.ByteString -> BS.ByteString -> ReleaseOps
+releaseBothOpencode depsBytes modelsBytes =
+  ReleaseOps
+    { roGetReleaseByTag = \_ _ tag ->
+        pure $
+          Right $
+            Just
+              ReleaseInfo
+                { riId = 1,
+                  riTag = tag,
+                  riAssets =
+                    [ ReleaseAsset
+                        { raName = tag <> depsKind,
+                          raBrowserDownloadUrl = "https://example/" <> tag <> "/deps"
+                        },
+                      ReleaseAsset
+                        { raName = tag <> "-models.json",
+                          raBrowserDownloadUrl = "https://example/" <> tag <> "/models"
+                        }
+                    ]
+                },
+      roDownloadAsset = \url dest -> do
+        if "models" `T.isInfixOf` url
+          then BS.writeFile dest modelsBytes
+          else BS.writeFile dest depsBytes
+        pure (Right ()),
+      roCreateReleaseWithAssets = \_ _ -> pure (Left "should not create on reuse")
+    }
+
+releaseDepsOnlyOpencode :: ReleaseOps
+releaseDepsOnlyOpencode =
+  ReleaseOps
+    { roGetReleaseByTag = \_ _ tag ->
+        pure $
+          Right $
+            Just
+              ReleaseInfo
+                { riId = 1,
+                  riTag = tag,
+                  riAssets =
+                    [ ReleaseAsset
+                        { raName = tag <> depsKind,
+                          raBrowserDownloadUrl = "https://example/" <> tag <> "/deps"
+                        }
+                    ]
+                },
+      roDownloadAsset = \_ _ -> pure (Left "should not download partial"),
+      roCreateReleaseWithAssets = \_ _ -> pure (Right ())
+    }
+
+testOpencodeMultiAssetFullPath :: IO ()
+testOpencodeMultiAssetFullPath =
+  withSystemTempDirectory "mndz-mat-opencode-full-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "opencode"
+        pn = "opencode" :: T.Text
+        local = parseEbuildVersion "1.0.0"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "opencode",
+              pePN = pn,
+              peLocal = local,
+              pePath = pkgDir </> "opencode-1.0.0.ebuild"
+            }
+    createDirectoryIfMissing True assetsRoot
+    seedOpencodeLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["2.0.0", "1.0.0"])
+        unusedGoMod
+        unusedNpm
+        (\_o _r _p pv -> pure (Right (if pv == "2.0.0" then "1.2.0" else "1.1.0")))
+        unusedCargo
+        (Just overlayRoot)
+    env0 <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (opencodeManifestRunner pkgDir bunAssetBytes modelsAssetBytes)
+        releaseMissing
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    let env = env0 {aeFetchModelsDev = fakeModelsFetch modelsAssetBytes}
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectSuccess "opencode full multi-asset" outcomes
+    -- Sidecars for both distfiles
+    let sideDir = assetsRoot </> "dev-util" </> "opencode"
+    depsSide <- doesFileExist (sideDir </> "opencode-2.0.0-deps.tar.xz.sha512")
+    modelsSide <- doesFileExist (sideDir </> "opencode-2.0.0-models.json.sha512")
+    assertTrue "deps sidecar" depsSide
+    assertTrue "models sidecar" modelsSide
+
+testOpencodeMultiAssetReusePath :: IO ()
+testOpencodeMultiAssetReusePath =
+  withSystemTempDirectory "mndz-mat-opencode-reuse-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "opencode"
+        pn = "opencode" :: T.Text
+        local = parseEbuildVersion "1.0.0"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "opencode",
+              pePN = pn,
+              peLocal = local,
+              pePath = pkgDir </> "opencode-1.0.0.ebuild"
+            }
+    installCalls <- newIORef (0 :: Int)
+    createDirectoryIfMissing True assetsRoot
+    seedOpencodeLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["2.0.0", "1.0.0"])
+        unusedGoMod
+        unusedNpm
+        (\_o _r _p pv -> pure (Right (if pv == "2.0.0" then "1.2.0" else "1.1.0")))
+        unusedCargo
+        (Just overlayRoot)
+    let bunOps =
+          fakeBunSuccessOps
+            { bcoBunInstall = \_ _ -> do
+                atomicModifyIORef' installCalls (\n -> (n + 1, ()))
+                pure (Left "bun install should not run on reuse")
+            }
+    env0 <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (opencodeManifestRunner pkgDir bunAssetBytes modelsAssetBytes)
+        (releaseBothOpencode bunAssetBytes modelsAssetBytes)
+        depsOps
+        fakeNpmSuccessOps
+        bunOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    let env = env0 {aeFetchModelsDev = \_ -> pure (Left "models should not fetch on reuse")}
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    case outcomes of
+      [ApplySuccess _ sls _] -> do
+        assertTrue "reuse marks lines" (all slAssetsReused sls)
+        n <- readIORef installCalls
+        assertEq "bun install skipped on multi reuse" 0 n
+      other -> do
+        hPutStrLn stderr ("opencode reuse: expected success, got " <> show other)
+        exitFailure
+
+testOpencodePartialReleaseFullPath :: IO ()
+testOpencodePartialReleaseFullPath =
+  withSystemTempDirectory "mndz-mat-opencode-partial-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "opencode"
+        pn = "opencode" :: T.Text
+        local = parseEbuildVersion "1.0.0"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "opencode",
+              pePN = pn,
+              peLocal = local,
+              pePath = pkgDir </> "opencode-1.0.0.ebuild"
+            }
+    installCalls <- newIORef (0 :: Int)
+    createDirectoryIfMissing True assetsRoot
+    seedOpencodeLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["2.0.0", "1.0.0"])
+        unusedGoMod
+        unusedNpm
+        (\_o _r _p pv -> pure (Right (if pv == "2.0.0" then "1.2.0" else "1.1.0")))
+        unusedCargo
+        (Just overlayRoot)
+    let bunOps =
+          fakeBunSuccessOps
+            { bcoBunInstall = \_ _ -> do
+                atomicModifyIORef' installCalls (\n -> (n + 1, ()))
+                pure (Right ())
+            }
+    env0 <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (opencodeManifestRunner pkgDir bunAssetBytes modelsAssetBytes)
+        releaseDepsOnlyOpencode
+        depsOps
+        fakeNpmSuccessOps
+        bunOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    let env = env0 {aeFetchModelsDev = fakeModelsFetch modelsAssetBytes}
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectSuccess "opencode partial → full materialize" outcomes
+    n <- readIORef installCalls
+    assertTrue "bun install ran when models missing" (n > 0)
 
 ------------------------------------------------------------------------
 -- cargo

@@ -1,31 +1,4 @@
-## Purpose
-
-Bun deps cache tarball from GitHub tag, Bun requirement probing (`engines.bun` or `packageManager` fallback), bun-bin BDEPEND, overlay bun-bin ceilings, host Bun gate, and enablement of `dev-util/ralph-tui` and `dev-util/opencode` under `DepsAndAssets Bun`.
-
-## Requirements
-
-### Requirement: Bun cache tarball from GitHub tag
-
-For `DepsAndAssets Bun` full-path materialization of PV, the program SHALL: (1) clone the package’s GitHub source into a temporary directory and check out the tag formed by the source tag prefix plus that PV; (2) require a `bun.lock` at the repository root and hard-fail if missing; (3) run `bun install --frozen-lockfile --cache-dir <bun-cache-path>` with the cache directory outside or beside the clone as needed so the cache can be packaged; (4) create `{pn}-{pv}-deps.tar.xz` whose top-level entry is `bun-cache/`, using xz compression suitable for large artifacts (including multi-threaded xz settings equivalent to `XZ_OPT=-T0 -9`). The program SHALL implement this in Haskell orchestration and SHALL NOT invoke overlay Python helper scripts. The temporary clone SHALL be removed when the PV attempt finishes.
-
-#### Scenario: Tarball layout for ralph-tui
-
-- **WHEN** bun cache construction succeeds for PN `ralph-tui` at PV `0.12.0`
-- **THEN** the output file is named `ralph-tui-0.12.0-deps.tar.xz` and unpacking yields a top-level `bun-cache` directory
-
-#### Scenario: Missing lockfile hard-fails
-
-- **WHEN** the checked-out tag has no `bun.lock` at the repository root
-- **THEN** materialization hard-fails before assets publish
-
-### Requirement: Bun source and technique pairing
-
-Apply for `DepsAndAssets Bun` SHALL require `UpdateSource` to be `GitHub`. If the technique is `DepsAndAssets Bun` but the source is not `GitHub`, apply SHALL hard-fail without publishing assets.
-
-#### Scenario: Wrong source type
-
-- **WHEN** technique is `DepsAndAssets Bun` and source is `Npm`
-- **THEN** apply hard-fails before materialization
+## MODIFIED Requirements
 
 ### Requirement: engines.bun requirement probe
 
@@ -79,23 +52,7 @@ After determining the Bun requirement for a PV on the full materialize path, the
 - **WHEN** the probe requires `1.3.6` and the host Bun is older
 - **THEN** full-path materialize hard-fails without publishing assets
 
-### Requirement: Overlay bun-bin ceilings
-
-Bun runtime-lane ceilings SHALL be read from `{overlay-path}/dev-lang/bun-bin` non-live ebuilds. Because overlay packages conventionally use tilde KEYWORDS only, plain ceilings MAY be absent so that only tilde lanes produce targets; KEYWORDS assembly SHALL still follow runtime-lanes rules.
-
-#### Scenario: Tilde-only bun-bin
-
-- **WHEN** bun-bin ebuilds declare only `~amd64` and `~arm64`
-- **THEN** planned package KEYWORDS for a single collapsed PV may be `~amd64 ~arm64` without bare arches
-
-### Requirement: ralph-tui enabled end-to-end
-
-`dev-util/ralph-tui` SHALL use runtime lanes against overlay `dev-lang/bun-bin`, GitHub candidates under the shared candidate rule, deps asset publish/reuse, and overlay apply as specified for `DepsAndAssets Bun`. The package SHALL NOT soft-skip solely because deps assets are required.
-
-#### Scenario: No longer unsupported
-
-- **WHEN** policy is resolved and apply runs for an outdated `dev-util/ralph-tui`
-- **THEN** the program does not soft-skip with reason unsupported deps assets
+## ADDED Requirements
 
 ### Requirement: Models companion distfile for opencode
 

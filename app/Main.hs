@@ -41,6 +41,7 @@ import System.Exit (ExitCode (..), exitWith)
 import Update.Apply
   ( ApplyEnv (..),
     applyOverlay,
+    fetchModelsDevApiJson,
     foldExitHardFail,
     productionEbuildRunner,
   )
@@ -231,7 +232,7 @@ runUpdate rt pkgArgs = do
                   ReleaseOps
                     { roGetReleaseByTag = \_ _ _ -> pure (Left "GitHub token required"),
                       roDownloadAsset = \_ _ -> pure (Left "GitHub token required"),
-                      roCreateReleaseWithAsset = \_ _ -> pure (Left "GitHub token required")
+                      roCreateReleaseWithAssets = \_ _ -> pure (Left "GitHub token required")
                     }
             let env =
                   ApplyEnv
@@ -244,6 +245,7 @@ runUpdate rt pkgArgs = do
                       aeBunCacheOps = productionBunCacheOps,
                       aeCargoOps = productionCargoOps,
                       aeReleaseOps = releaseOps,
+                      aeFetchModelsDev = fetchModelsDevApiJson,
                       aeAssetsRoot = assetsRoot,
                       aeGitHubToken = token,
                       aeAssetsOwner = "0x6d6e647a",
