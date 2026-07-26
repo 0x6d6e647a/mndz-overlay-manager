@@ -658,10 +658,10 @@ testCargoContentFix = do
 
 testGoKeywordsAssembly :: IO ()
 testGoKeywordsAssembly = do
-  -- All four lanes → bare amd64 arm64 (plain membership wins; no tilde tokens)
+  -- All four lanes → tilde tokens only (plain membership does not emit bare)
   assertEq
-    "all four lanes bare both arches"
-    ["amd64", "arm64"]
+    "all four lanes tilde both arches"
+    ["~amd64", "~arm64"]
     (assembleKeywords [LaneAmd64Plain, LaneAmd64Tilde, LaneArm64Plain, LaneArm64Tilde])
   -- Tilde-only membership
   assertEq "amd64 tilde only" ["~amd64"] (assembleKeywords [LaneAmd64Tilde])
@@ -670,23 +670,23 @@ testGoKeywordsAssembly = do
     "both arches tilde only"
     ["~amd64", "~arm64"]
     (assembleKeywords [LaneAmd64Tilde, LaneArm64Tilde])
-  -- Plain-only membership
-  assertEq "amd64 plain only" ["amd64"] (assembleKeywords [LaneAmd64Plain])
-  assertEq "arm64 plain only" ["arm64"] (assembleKeywords [LaneArm64Plain])
-  -- Plain + tilde on same arch → bare only (never both)
+  -- Plain-only membership still emits tilde tokens
+  assertEq "amd64 plain only" ["~amd64"] (assembleKeywords [LaneAmd64Plain])
+  assertEq "arm64 plain only" ["~arm64"] (assembleKeywords [LaneArm64Plain])
+  -- Plain + tilde on same arch → single ~arch (never bare, never both)
   assertEq
-    "plain wins over tilde amd64"
-    ["amd64"]
+    "plain and tilde same arch → ~arch"
+    ["~amd64"]
     (assembleKeywords [LaneAmd64Plain, LaneAmd64Tilde])
   -- Deterministic order: amd64 before arm64
   assertEq
-    "order amd64 then arm64"
-    ["amd64", "arm64"]
+    "order ~amd64 then ~arm64"
+    ["~amd64", "~arm64"]
     (assembleKeywords [LaneArm64Plain, LaneAmd64Plain])
-  -- Staggered: plain amd64 only + tilde amd64 on other PV is per-call; mixed tiers across arches
+  -- Staggered tiers across arches: always tilde tokens
   assertEq
-    "tilde amd64 + plain arm64"
-    ["~amd64", "arm64"]
+    "tilde amd64 + plain arm64 → both tilde"
+    ["~amd64", "~arm64"]
     (assembleKeywords [LaneAmd64Tilde, LaneArm64Plain, LaneArm64Tilde])
 
 testSetKeywords :: IO ()
@@ -699,21 +699,22 @@ testSetKeywords = do
           ]
       fixedTilde = setKeywords ["~amd64", "~arm64"] base
   assertTrue "match dual tilde" (keywordsMatch ["~amd64", "~arm64"] fixedTilde)
-  -- Apply writes bare tokens when the plan includes them (plain-lane membership).
+  assertTrue "writes dual tilde" ("KEYWORDS=\"~amd64 ~arm64\"" `T.isInfixOf` fixedTilde)
+  -- setKeywords can still write bare tokens (low-level); plans use tilde only.
   let fixedBare = setKeywords ["amd64", "arm64"] base
   assertTrue "match dual bare" (keywordsMatch ["amd64", "arm64"] fixedBare)
   assertTrue "writes bare amd64" ("KEYWORDS=\"amd64 arm64\"" `T.isInfixOf` fixedBare)
-  -- Drift: planned bare vs existing tilde needs content-fix.
+  -- Drift: existing bare vs planned tilde needs content-fix.
   assertTrue
-    "tilde vs bare drift"
-    (not (keywordsMatch ["amd64"] base))
+    "bare vs tilde drift"
+    (not (keywordsMatch ["~amd64"] (setKeywords ["amd64"] base)))
   assertTrue
-    "content-fix on ~ → bare upgrade"
+    "content-fix on bare → ~ upgrade"
     ( ebuildNeedsContentFix
-        ["amd64"]
+        ["~amd64"]
         ( T.unlines
             [ "inherit go-module",
-              "KEYWORDS=\"~amd64\"",
+              "KEYWORDS=\"amd64\"",
               "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/pkg-${PV}/pkg-${PV}-vendor.tar.xz\""
             ]
         )
@@ -725,5 +726,5 @@ testSetKeywords = do
             "",
             "DESCRIPTION=\"y\""
           ]
-      inserted = setKeywords ["amd64"] noKw
-  assertTrue "inserted bare" (keywordsMatch ["amd64"] inserted)
+      inserted = setKeywords ["~amd64"] noKw
+  assertTrue "inserted tilde" (keywordsMatch ["~amd64"] inserted)

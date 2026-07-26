@@ -547,9 +547,9 @@ testGoLaneCollapse = do
   case collapsed of
     [pe] -> do
       assertEq "pv" (parseEbuildVersion "0.84.0") (pePV pe)
-      assertEq "bare dual keywords" ["amd64", "arm64"] (peKeywords pe)
-      assertTrue "no ~amd64" ("~amd64" `notElem` peKeywords pe)
-      assertTrue "no ~arm64" ("~arm64" `notElem` peKeywords pe)
+      assertEq "tilde dual keywords" ["~amd64", "~arm64"] (peKeywords pe)
+      assertTrue "no bare amd64" ("amd64" `notElem` peKeywords pe)
+      assertTrue "no bare arm64" ("arm64" `notElem` peKeywords pe)
     _ -> exitFailure
   let divergent =
         [ LaneTarget LaneAmd64Plain (Just (parseEbuildVersion "1.26.5")) (Just (parseEbuildVersion "0.84.0")) (Just "1.26.5"),
@@ -561,16 +561,18 @@ testGoLaneCollapse = do
   assertEq "arch divergent count" 2 (length divCollapsed)
   case [pe | pe <- divCollapsed, pePV pe == parseEbuildVersion "0.84.0"] of
     [pe] -> do
-      assertEq "0.84 bare amd64" ["amd64"] (peKeywords pe)
+      assertEq "0.84 ~amd64" ["~amd64"] (peKeywords pe)
       assertTrue "0.84 no arm64" ("arm64" `notElem` peKeywords pe)
       assertTrue "0.84 no ~arm64" ("~arm64" `notElem` peKeywords pe)
+      assertTrue "0.84 no bare amd64" ("amd64" `notElem` peKeywords pe)
     other -> do
       hPutStrLn stderr $ "0.84 ebuild: " <> show other
       exitFailure
   case [pe | pe <- divCollapsed, pePV pe == parseEbuildVersion "0.82.0"] of
     [pe] -> do
-      assertEq "0.82 bare arm64" ["arm64"] (peKeywords pe)
+      assertEq "0.82 ~arm64" ["~arm64"] (peKeywords pe)
       assertTrue "0.82 no amd64" ("amd64" `notElem` peKeywords pe)
+      assertTrue "0.82 no bare arm64" ("arm64" `notElem` peKeywords pe)
     other -> do
       hPutStrLn stderr $ "0.82 ebuild: " <> show other
       exitFailure
@@ -593,12 +595,12 @@ testGoLaneCollapse = do
       stagCollapsed = collapsePlannedEbuilds staggered
   assertEq "staggered count" 2 (length stagCollapsed)
   case [pe | pe <- stagCollapsed, pePV pe == parseEbuildVersion "0.75.0"] of
-    [pe] -> assertEq "0.75 bare amd64 only" ["amd64"] (peKeywords pe)
+    [pe] -> assertEq "0.75 ~amd64 only" ["~amd64"] (peKeywords pe)
     other -> do
       hPutStrLn stderr $ "0.75 ebuild: " <> show other
       exitFailure
   case [pe | pe <- stagCollapsed, pePV pe == parseEbuildVersion "0.82.0"] of
-    [pe] -> assertEq "0.82 ~amd64 + bare arm64" ["~amd64", "arm64"] (peKeywords pe)
+    [pe] -> assertEq "0.82 ~amd64 + ~arm64" ["~amd64", "~arm64"] (peKeywords pe)
     other -> do
       hPutStrLn stderr $ "0.82 staggered ebuild: " <> show other
       exitFailure
@@ -612,10 +614,10 @@ testGoLaneCollapse = do
   case collapsePlannedEbuilds fourDistinct of
     pes ->
       assertEq
-        "four keywords bare/tilde by lane"
-        [ ["amd64"],
+        "four keywords always tilde by arch membership"
+        [ ["~amd64"],
           ["~amd64"],
-          ["arm64"],
+          ["~arm64"],
           ["~arm64"]
         ]
         (map peKeywords (sortByPv pes))
@@ -789,9 +791,9 @@ testGoPlanIntegrationMocked = do
     assertTrue
       "has 0.84"
       (parseEbuildVersion "0.84.0" `elem` glpUniquePVs plan)
-    -- Plain lanes → bare KEYWORDS; tilde-only lanes → ~KEYWORDS
+    -- Any lane membership → tilde KEYWORDS only (plain still selects PV/arches)
     case [pe | pe <- glpEbuilds plan, pePV pe == parseEbuildVersion "0.82.0"] of
-      [pe] -> assertEq "0.82 plain bare dual" ["amd64", "arm64"] (peKeywords pe)
+      [pe] -> assertEq "0.82 plain dual tilde" ["~amd64", "~arm64"] (peKeywords pe)
       other -> do
         hPutStrLn stderr $ "plan 0.82 ebuild: " <> show other
         exitFailure

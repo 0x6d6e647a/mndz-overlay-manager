@@ -463,11 +463,7 @@ goEbuildBody keywords goAtom =
       "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
     ]
 
--- | Plain dual-arch keywords (runtime req under plain ceiling).
-kwPlain :: T.Text
-kwPlain = "amd64 arm64"
-
--- | Tilde dual-arch keywords (runtime req only under tilde ceiling).
+-- | Tilde dual-arch keywords (overlay tilde-only policy; any lane membership).
 kwTilde :: T.Text
 kwTilde = "~amd64 ~arm64"
 
@@ -475,13 +471,13 @@ kwTilde = "~amd64 ~arm64"
 -- npm
 ------------------------------------------------------------------------
 
--- | Local ebuild already matches plan for 1.0.0 (plain lanes); only 2.0.0 is a gap.
+-- | Local ebuild already matches plan for 1.0.0 (KEYWORDS tilde; plain-ceiling engines); only 2.0.0 is a gap.
 seedNpmLocalOk :: FilePath -> FilePath -> T.Text -> IO ()
 seedNpmLocalOk overlayRoot pkgDir pn = do
   createDirectoryIfMissing True pkgDir
   TIO.writeFile
     (pkgDir </> "openspec-1.0.0.ebuild")
-    (npmEbuildBody kwPlain ">=net-libs/nodejs-20.0.0[npm]")
+    (npmEbuildBody kwTilde ">=net-libs/nodejs-20.0.0[npm]")
   TIO.writeFile
     (pkgDir </> "Manifest")
     ("DIST " <> T.pack (depsTarballName pn "1.0.0") <> " 1 SHA512 deadbeef\n")
@@ -765,7 +761,7 @@ seedBunLocalOk overlayRoot pkgDir pn = do
   createDirectoryIfMissing True pkgDir
   TIO.writeFile
     (pkgDir </> "ralph-tui-1.0.0.ebuild")
-    (bunEbuildBody kwPlain ">=dev-lang/bun-bin-1.1.0")
+    (bunEbuildBody kwTilde ">=dev-lang/bun-bin-1.1.0")
   TIO.writeFile
     (pkgDir </> "Manifest")
     ("DIST " <> T.pack (depsTarballName pn "1.0.0") <> " 1 SHA512 deadbeef\n")
@@ -933,7 +929,7 @@ seedOpencodeLocalOk overlayRoot pkgDir pn = do
   createDirectoryIfMissing True pkgDir
   TIO.writeFile
     (pkgDir </> "opencode-1.0.0.ebuild")
-    (opencodeEbuildBody kwPlain ">=dev-lang/bun-bin-1.1.0")
+    (opencodeEbuildBody kwTilde ">=dev-lang/bun-bin-1.1.0")
   TIO.writeFile
     (pkgDir </> "Manifest")
     ( T.unlines
@@ -1184,7 +1180,7 @@ testOpencodePartialReleaseFullPath =
 seedCargoLocalOk :: FilePath -> FilePath -> T.Text -> IO ()
 seedCargoLocalOk overlayRoot pkgDir pn = do
   createDirectoryIfMissing True pkgDir
-  TIO.writeFile (pkgDir </> "hk-0.40.0.ebuild") (cargoEbuildBody kwPlain "1.80.0")
+  TIO.writeFile (pkgDir </> "hk-0.40.0.ebuild") (cargoEbuildBody kwTilde "1.80.0")
   TIO.writeFile
     (pkgDir </> "Manifest")
     ("DIST " <> T.pack (cratesTarballName pn "0.40.0") <> " 1 SHA512 deadbeef\n")
@@ -1374,10 +1370,10 @@ testGoResidualApplyDepsAndAssets =
             }
     createDirectoryIfMissing True pkgDir
     createDirectoryIfMissing True assetsRoot
-    -- Local already content-ok under plain lanes (go 1.26.3); remote needs 1.26.5 tilde.
+    -- Local already content-ok (go 1.26.3 plain ceiling; tilde KEYWORDS); remote needs 1.26.5 tilde.
     TIO.writeFile
       (pkgDir </> "crush-0.80.0.ebuild")
-      (goEbuildBody kwPlain ">=dev-lang/go-1.26.3:=")
+      (goEbuildBody kwTilde ">=dev-lang/go-1.26.3:=")
     TIO.writeFile
       (pkgDir </> "Manifest")
       "DIST crush-0.80.0-vendor.tar.xz 1 SHA512 deadbeef\n"
@@ -1569,7 +1565,7 @@ testMaterializePruneExtras =
     seedNpmLocalOk overlayRoot pkgDir pn
     TIO.writeFile
       (pkgDir </> extraName)
-      (npmEbuildBody kwPlain ">=net-libs/nodejs-18.0.0[npm]")
+      (npmEbuildBody kwTilde ">=net-libs/nodejs-18.0.0[npm]")
     writeMatchingCachesForPackage overlayRoot "dev-util" pn pkgDir
     depsOps <-
       mkDepsPlanOps

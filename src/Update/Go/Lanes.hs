@@ -225,21 +225,17 @@ selectAllLaneTargets :: RuntimeCeilings -> [VersionCandidate] -> [LaneTarget]
 selectAllLaneTargets ceilings candidates =
   map (selectLaneTarget ceilings candidates) (lanesFromCeilings ceilings)
 
--- | KEYWORDS tokens from lane membership (plain → bare arch; tilde-only → @~arch@).
+-- | KEYWORDS tokens from lane membership: any plain or tilde lane for an arch
+-- emits @~arch@ (never bare). Plain vs tilde lanes still select PVs and arch set;
+-- overlay packages are testing-only (GURU-aligned tilde-only policy).
 assembleKeywords :: [LaneId] -> [Text]
 assembleKeywords lanes =
-  [ token
+  [ "~" <> arch
   | arch <- arches,
-    Just token <- [tokenForArch arch]
+    any (\l -> liArch l == arch) lanes
   ]
   where
     arches = sort (nubOrd (map liArch lanes))
-    tokenForArch arch
-      | any (\l -> liArch l == arch && liTier l == Plain) lanes =
-          Just arch
-      | any (\l -> liArch l == arch && liTier l == Tilde) lanes =
-          Just ("~" <> arch)
-      | otherwise = Nothing
 
 -- | Collapse lane targets to unique planned ebuilds with KEYWORDS.
 collapsePlannedEbuilds :: [LaneTarget] -> [PlannedEbuild]
