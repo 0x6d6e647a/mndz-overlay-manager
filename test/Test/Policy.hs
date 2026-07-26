@@ -387,6 +387,16 @@ testPolicyClassification = do
     other -> do
       hPutStrLn stderr $ "beads technique: " <> show other
       exitFailure
+  case lookupPolicy (PackageKey "dev-db/badger") of
+    Just
+      ( PackagePolicy
+          (GitHub "dgraph-io" "badger" "v")
+          (DepsAndAssets (Go Nothing))
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "badger technique: " <> show other
+      exitFailure
   case lookupPolicy (PackageKey "dev-util/openspec") of
     Just (PackagePolicy (Npm "@fission-ai/openspec") (DepsAndAssets NpmEco)) -> pure ()
     other -> do

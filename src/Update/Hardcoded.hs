@@ -52,6 +52,10 @@ hardcodedPolicies =
         (GitHub "charmbracelet" "crush" "v")
         (DepsAndAssets (Go Nothing)),
       policy
+        "dev-db/badger"
+        (GitHub "dgraph-io" "badger" "v")
+        (DepsAndAssets (Go Nothing)),
+      policy
         "dev-util/openspec"
         (Npm "@fission-ai/openspec")
         (DepsAndAssets NpmEco),

@@ -308,6 +308,32 @@ testEbuildEdit = do
     "already parameterized unchanged path"
     already
     (parameterizeAssetsSrcUri "beads" already)
+  -- Companion non-assets SRC_URI (e.g. jemalloc USE block) must survive
+  -- assets parameterization for packages like dev-db/badger.
+  let jemallocCompanion =
+        "SRC_URI+=\" jemalloc? ( https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 )\""
+      badgerFrozen =
+        T.unlines
+          [ "SRC_URI=\"https://github.com/dgraph-io/badger/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/badger-4.9.4/badger-4.9.4-vendor.tar.xz\"",
+            jemallocCompanion
+          ]
+      badgerFixed = parameterizeAssetsSrcUri "badger" badgerFrozen
+  assertEq "badger frozen not parameterized" False (assetsSrcUriParameterized badgerFrozen)
+  assertTrue "badger fixed parameterized" (assetsSrcUriParameterized badgerFixed)
+  assertTrue
+    "badger vendor URL uses ${PV}"
+    ( "https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/badger-${PV}/badger-${PV}-vendor.tar.xz"
+        `T.isInfixOf` badgerFixed
+    )
+  assertTrue
+    "jemalloc companion unchanged"
+    (jemallocCompanion `T.isInfixOf` badgerFixed)
+  assertTrue
+    "github source archive preserved"
+    ( "https://github.com/dgraph-io/badger/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz"
+        `T.isInfixOf` badgerFixed
+    )
   let rev1 = nextRevisionVersion (parseEbuildVersion "2.1.6")
   assertEq "r1" (Numeric [2, 1, 6] (Just 1)) rev1
   let planned = parseEbuildVersion "2.1.6"
