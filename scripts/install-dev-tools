@@ -38,13 +38,15 @@ mkdir -p "${BIN_DIR}" "${TMP_DIR}"
 export TMPDIR="${TMP_DIR}"
 
 echo "Installing dev tools into ${BIN_DIR} (TMPDIR=${TMPDIR}) ..."
+# --ignore-project skips cabal.project jobs/semaphore; pass them explicitly.
 cabal install "${TOOLS[@]}" \
   --ignore-project \
+  -j \
+  --semaphore \
   "${CONSTRAINTS[@]}" \
   --installdir="${BIN_DIR}" \
   --install-method=copy \
   --overwrite-policy=always
-
 missing=0
 for tool in "${TOOLS[@]}"; do
   if [[ ! -x "${BIN_DIR}/${tool}" ]]; then

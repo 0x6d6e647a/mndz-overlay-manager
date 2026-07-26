@@ -34,11 +34,26 @@ Current pins (verified on GHC 9.10.3): ormolu `0.8.1.1`, hlint `3.10`, stan `0.2
 | File | Role |
 |------|------|
 | `hk.pkl` | Hook steps and ordering |
-| `cabal.project` | Package root + tool version constraints |
+| `cabal.project` | Package root, tool version constraints, multi-core build defaults |
 | `scripts/install-dev-tools` | Installs tools; pins must match `cabal.project` |
 | `weeder.toml` | Dead-code roots / root-modules |
 | `.stan.toml` | Stan include/exclude baseline |
 | `mndz-overlay-manager.cabal` | Components; HIE flags in `common warnings` |
+
+### Multi-core Cabal builds
+
+Project Cabal builds default to **all host logical CPUs** and the **GHC jobserver semaphore**:
+
+- `cabal.project` sets `jobs: $ncpus` and `semaphore: True` (package-level jobs + coordinated module-level parallelism).
+- `$ncpus` is a Cabal token expanded on the machine that runs the build (laptops and high core-count hosts share the same file).
+- Bare `cabal build all` / `cabal test all` in the quality pipeline inherit these settings; hk does not need extra `-j` flags.
+
+**Overrides** (when a build is memory-hungry or you want fewer jobs):
+
+- CLI: `cabal build all -j4` (or any positive `N`)
+- Per-machine file: `cabal.project.local` with e.g. `jobs: 8` (gitignored; not committed)
+
+**`./scripts/install-dev-tools`** uses `--ignore-project`, so it does **not** read `cabal.project` jobs/semaphore. The script passes `-j --semaphore` explicitly so tool installs still use host-CPU parallelism.
 
 ## Developer onboarding
 
@@ -64,10 +79,11 @@ From the repository root:
 
 This installs pinned versions of **ormolu**, **hlint**, **stan**, and **weeder** into `.tools/bin`.
 
-- First run can take several minutes (`ghc-lib-parser` and friends are large).
+- First run can take several minutes (`ghc-lib-parser` and friends are large); the script enables multi-core Cabal builds (`-j --semaphore`).
 - The script sets `TMPDIR=.tools/tmp` so builds do not fill a small `/tmp` tmpfs.
 - Re-run after changing version pins in `cabal.project` / `scripts/install-dev-tools`.
 - If install fails with disk/tmp errors: ensure home disk has free space; do not rely on a 1G tmpfs `/tmp` for `ghc-lib-parser` builds.
+- If install OOMs on a high core-count machine, cap jobs for that run (edit the script temporarily or set a lower concurrency in your user Cabal config).
 
 ### 2. Enable git hooks
 

@@ -4,6 +4,12 @@ packages: .
 -- includes mndz-overlay-manager-test without a separate --enable-tests step.
 tests: True
 
+-- Multi-core builds: package jobs = host logical CPUs; GHC jobserver shares cores
+-- across concurrent GHC processes for module-level parallelism (GHC 9.8+, cabal 3.12+).
+-- Override with -jN or gitignored cabal.project.local if memory-constrained.
+jobs: $ncpus
+semaphore: True
+
 -- Dev quality tools installed into .tools/bin via scripts/install-dev-tools.
 -- Pins are set to versions known to build with the project GHC (see script header).
 constraints:
