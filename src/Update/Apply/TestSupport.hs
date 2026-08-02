@@ -12,6 +12,8 @@ module Update.Apply.TestSupport
     markSuccessLinesReused,
     signedOverlayCommit,
     materializePlan,
+    orderNeedPlannedUnits,
+    overlayAfterAssets,
     fullPathMaterializeSteps,
     reusePathMaterializeSteps,
     materializeStepTotalUpper,
@@ -30,6 +32,8 @@ import Update.Apply.Materialize
     markSuccessLinesReused,
     materializePlan,
     materializeStepTotalUpper,
+    orderNeedPlannedUnits,
     reusePathMaterializeSteps,
     reviseMaterializeStepTotal,
   )
+import Update.Apply.OverlayWrite (overlayAfterAssets)

@@ -15,7 +15,7 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
-import Overlay.Version (EbuildVersion, parseEbuildVersion)
+import Overlay.Version (EbuildVersion, parseEbuildVersion, renderPV)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (exitFailure)
 import System.FilePath (takeBaseName, (</>))
@@ -35,7 +35,15 @@ import Update.Apply
   ( ApplyEnv (..),
     applyPackagePhase1,
   )
-import Update.Apply.TestSupport (fullPathMaterializeSteps)
+import Update.Apply.Errors
+  ( ApplyUnitError (..),
+    applyUnitErrorMessage,
+  )
+import Update.Apply.TestSupport
+  ( fullPathMaterializeSteps,
+    orderNeedPlannedUnits,
+    overlayAfterAssets,
+  )
 import Update.Assets.Hash (digestSHA512, hashBytes)
 import Update.Assets.Layout (cratesTarballName, depsTarballName, modelsDistfileName)
 import Update.Assets.Release
@@ -48,6 +56,7 @@ import Update.Cargo.Crates (CargoOps (..))
 import Update.Check (PackageEntry (..))
 import Update.Deps.Plan (DepsPlanOps (..))
 import Update.Git (GitOps (..))
+import Update.Go.Lanes (PlannedEbuild (..))
 import Update.Go.ModFetch (GoModKey (..))
 import Update.Go.Plan (PlanOps (..))
 import Update.Go.Vendor (VendorOps (..))
@@ -55,6 +64,7 @@ import Update.Npm.Cache (NpmCacheOps (..))
 import Update.Runtime.Ceilings (RuntimeCeilings (..))
 import Update.Types
   ( ApplyOutcome (..),
+    EcosystemSpec (..),
     SuccessLine (..),
     UpdateSource (..),
     mkPackageKey,
@@ -67,7 +77,10 @@ unitTests =
     [ testCase "npm soft-skip when plan already matches" testNpmSoftSkip,
       testCase "bun soft-skip when plan already matches" testBunSoftSkip,
       testCase "cargo soft-skip when plan already matches" testCargoSoftSkip,
-      testCase "npm builder failure hard-fails materialize" testNpmBuilderHardFail
+      testCase "npm builder failure hard-fails materialize" testNpmBuilderHardFail,
+      testCase "orderNeedPlannedUnits missing before content-fix" testOrderNeedMissingBeforeContentFix,
+      testCase "orderNeedPlannedUnits content-fix-only ascending PV" testOrderNeedContentFixOnlyAscending,
+      testCase "missing template path hard-fails without IOException" testMissingTemplateHardFail
     ]
 
 integrationTests :: TestTree
@@ -395,6 +408,108 @@ expectHardFail label needle outcomes =
     other -> do
       hPutStrLn stderr (label <> ": expected HardFail, got " <> show other)
       exitFailure
+
+------------------------------------------------------------------------
+-- Multi-PV unit order + missing template hard-fail
+------------------------------------------------------------------------
+
+planned :: EbuildVersion -> PlannedEbuild
+planned pv = PlannedEbuild {pePV = pv, peKeywords = ["~amd64"], peLanes = []}
+
+-- | Missing newer PV before content-fix of older local PV.
+testOrderNeedMissingBeforeContentFix :: IO ()
+testOrderNeedMissingBeforeContentFix = do
+  let older = parseEbuildVersion "0.82.0"
+      newer = parseEbuildVersion "0.88.0"
+      local = [older]
+      -- Input deliberately content-fix-first (today's PV-only sort order).
+      input = [planned older, planned newer]
+      ordered = orderNeedPlannedUnits local input
+  assertEq
+    "missing newer PV before content-fix older"
+    [newer, older]
+    (map pePV ordered)
+
+-- | Content-fix-only multi-PV keeps ascending PV order.
+testOrderNeedContentFixOnlyAscending :: IO ()
+testOrderNeedContentFixOnlyAscending = do
+  let pvLow = parseEbuildVersion "0.10.0"
+      pvHigh = parseEbuildVersion "0.20.0"
+      local = [pvLow, pvHigh]
+      input = [planned pvHigh, planned pvLow]
+      ordered = orderNeedPlannedUnits local input
+  assertEq
+    "content-fix-only ascending PV"
+    [pvLow, pvHigh]
+    (map pePV ordered)
+
+-- | Missing template/donor path → ApplyHardFail, not uncaught IOException.
+testMissingTemplateHardFail :: IO ()
+testMissingTemplateHardFail =
+  withSystemTempDirectory "mndz-missing-template-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "crush"
+        pn = "crush" :: T.Text
+        targetVer = parseEbuildVersion "0.88.0"
+        missingPath = pkgDir </> "crush-0.82.0-r4.ebuild"
+        key = mkPackageKey "dev-util" "crush"
+        entry =
+          PackageEntry
+            { peKey = key,
+              pePN = pn,
+              peLocal = parseEbuildVersion "0.82.0",
+              pePath = missingPath
+            }
+        digests = hashBytes (encodeUtf8 "unused")
+    createDirectoryIfMissing True pkgDir
+    createDirectoryIfMissing True assetsRoot
+    -- Package dir exists but has no ebuilds; pePath is absent on disk.
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["0.88.0"])
+        unusedGoMod
+        npmEngines
+        unusedBun
+        unusedCargo
+        (Just overlayRoot)
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (\_ _ -> pure (Right ()))
+        unusedReleaseOps
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    outcome <-
+      overlayAfterAssets
+        env
+        overlayRoot
+        entry
+        (Go Nothing)
+        ["~amd64"]
+        []
+        targetVer
+        [("crush-0.88.0-vendor.tar.xz", digests)]
+        (Just "1.26.5")
+        Nothing
+    case outcome of
+      ApplyHardFail k msg _ _ -> do
+        assertEq "hard-fail key" key k
+        assertEq
+          "structured missing-donor message"
+          ( applyUnitErrorMessage
+              (ApplyMissingDonorTemplate key (renderPV targetVer) missingPath)
+          )
+          msg
+      other -> do
+        hPutStrLn stderr ("expected ApplyHardFail, got: " <> show other)
+        exitFailure
 
 ------------------------------------------------------------------------
 -- Ebuild donors

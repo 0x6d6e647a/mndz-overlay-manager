@@ -8,6 +8,7 @@ module Update.Apply.Materialize
     goPublishAndOverlay,
     markSuccessLinesReused,
     materializePlan,
+    orderNeedPlannedUnits,
     fullPathMaterializeSteps,
     reusePathMaterializeSteps,
     materializeStepTotalUpper,
@@ -59,6 +60,7 @@ import Update.Apply.Commit (egencacheAndSignedCommit, pruneCommitMessage)
 import Update.Apply.Env (ApplyEnv (..))
 import Update.Apply.Errors
   ( ApplyUnitError (..),
+    applyUnitErrorMessage,
     applyUnitHardFail,
   )
 import Update.Apply.GitMv (requirePackageMd5Cache)
@@ -403,14 +405,8 @@ materializeDepsPlan env overlayRoot entry src eco plan localPVs contentFix planD
               <> contentFix
           )
       planned = [pe | pe <- glpEbuilds plan, any (samePV (pePV pe)) needPVs]
-      sortedPlanned =
-        sortOn
-          ( \pe ->
-              case pePV pe of
-                Numeric comps _ -> comps
-                Raw _ -> []
-          )
-          planned
+      -- Missing PVs before pure content-fix; ascending PV within each group.
+      sortedPlanned = orderNeedPlannedUnits localPVs planned
       nPVs = length sortedPlanned
   when (nPVs > 0) $
     mhSteps mh key (materializeStepTotalUpper planDone nPVs)
@@ -470,6 +466,24 @@ materializeDepsPlan env overlayRoot entry src eco plan localPVs contentFix planD
         _ -> do
           more <- materializeUntilFail stepsDoneRef rest
           pure (r : more)
+
+-- | Order planned units that need work: **missing** PVs first (no local
+-- non-live same-PV ebuild), then pure **content-fix** PVs; ascending numeric
+-- PV within each group. A missing PV is classified as missing even if also
+-- content-related.
+orderNeedPlannedUnits ::
+  [EbuildVersion] ->
+  [PlannedEbuild] ->
+  [PlannedEbuild]
+orderNeedPlannedUnits localPVs =
+  sortOn
+    ( \pe ->
+        let missing = not (any (samePV (pePV pe)) localPVs)
+            pvKey = case pePV pe of
+              Numeric comps _ -> comps
+              Raw _ -> []
+         in (if missing then (0 :: Int) else 1, pvKey)
+    )
 
 -- | Legacy Go-only entry used by tests.
 materializePlan ::
@@ -978,32 +992,46 @@ materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName step
             Left err -> Left err
             Right p -> Right (p, Just bunReq, Nothing)
     (Cargo mLock mPkg, GitHub owner repo prefix) -> do
-      donorPath <- findTemplate (takeDirectory (pePath entry)) (pePN entry) (parseEbuildVersion pvNoRev) (pePath entry)
-      donorContent <- TIO.readFile donorPath
-      let progress = cargoCratesProgress stepsDoneRef mh key
-      built <-
-        buildCargoCratesTarball
-          (aeCargoOps env)
-          progress
-          owner
-          repo
-          prefix
-          pvNoRev
-          mLock
-          mPkg
-          donorContent
+      let plannedPv = parseEbuildVersion pvNoRev
+      donorPath <-
+        findTemplate
+          (takeDirectory (pePath entry))
           (pePN entry)
-          outDir
-          tarballName
-      pure $ case built of
-        Left err -> Left err
-        Right
-          CargoResult
-            { crTarballPath = p,
-              crMsrv = msrv,
-              crEbuildBody = body
-            } ->
-            Right (p, Just msrv, Just body)
+          plannedPv
+          (pePath entry)
+      donorExists <- doesFileExist donorPath
+      if not donorExists
+        then
+          pure $
+            Left $
+              applyUnitErrorMessage $
+                ApplyMissingDonorTemplate key (renderPV plannedPv) donorPath
+        else do
+          donorContent <- TIO.readFile donorPath
+          let progress = cargoCratesProgress stepsDoneRef mh key
+          built <-
+            buildCargoCratesTarball
+              (aeCargoOps env)
+              progress
+              owner
+              repo
+              prefix
+              pvNoRev
+              mLock
+              mPkg
+              donorContent
+              (pePN entry)
+              outDir
+              tarballName
+          pure $ case built of
+            Left err -> Left err
+            Right
+              CargoResult
+                { crTarballPath = p,
+                  crMsrv = msrv,
+                  crEbuildBody = body
+                } ->
+                Right (p, Just msrv, Just body)
     (Go _, _) -> pure (Left "DepsAndAssets Go requires a GitHub update source")
     (NpmEco, _) -> pure (Left "DepsAndAssets Npm requires an Npm update source")
     (Bun, _) -> pure (Left "DepsAndAssets Bun requires a GitHub update source")
@@ -1174,11 +1202,12 @@ reuseDepsReleaseAsset
           case sideCheck of
             Left err -> pure $ ApplyHardFail key err False True
             Right () -> do
-              mReq <- case eco of
-                Go mSub -> case src of
-                  GitHub owner repo prefix ->
-                    fetchGoModVersion env owner repo prefix pvNoRev mSub
-                  _ -> pure Nothing
+              reqResult <- case eco of
+                Go mSub ->
+                  fmap Right $ case src of
+                    GitHub owner repo prefix ->
+                      fetchGoModVersion env owner repo prefix pvNoRev mSub
+                    _ -> pure Nothing
                 Cargo mLock mPkg -> do
                   donorPath <-
                     findTemplate
@@ -1186,37 +1215,76 @@ reuseDepsReleaseAsset
                       (pePN entry)
                       targetVer
                       (pePath entry)
-                  donorContent <- TIO.readFile donorPath
-                  fetchCargoMsrvForPV env src mLock mPkg pvNoRev donorContent
+                  donorExists <- doesFileExist donorPath
+                  if not donorExists
+                    then
+                      pure $
+                        Left $
+                          applyUnitHardFail
+                            key
+                            ( ApplyMissingDonorTemplate
+                                key
+                                (renderPV targetVer)
+                                donorPath
+                            )
+                            False
+                            True
+                    else do
+                      donorContent <- TIO.readFile donorPath
+                      m <-
+                        fetchCargoMsrvForPV
+                          env
+                          src
+                          mLock
+                          mPkg
+                          pvNoRev
+                          donorContent
+                      pure (Right m)
                 _ -> do
                   mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
-                  pure $ case mAtom of
-                    Just atom
-                      | "nodejs-" `T.isInfixOf` atom ->
-                          Just (T.takeWhile (/= '[') (T.drop (T.length (">=net-libs/nodejs-" :: Text)) atom))
-                      | "bun-bin-" `T.isInfixOf` atom ->
-                          Just (T.drop (T.length (">=dev-lang/bun-bin-" :: Text)) atom)
-                      | otherwise -> Nothing
-                    Nothing -> Nothing
-              markMaterializeStep stepsDoneRef mh key verifyLabel
-              mhStatus mh key "regenerating manifest"
-              outcome <-
-                overlayAfterAssets
-                  env
-                  overlayRoot
-                  entry
-                  eco
-                  keywords
-                  reusedLines
-                  targetVer
-                  distDigests
-                  mReq
-                  Nothing
-              case outcome of
-                ApplySuccess k sls paths -> do
-                  markMaterializeStep stepsDoneRef mh key "regenerating manifest"
-                  pure (ApplySuccess k sls paths)
-                other -> pure other
+                  pure $
+                    Right $
+                      case mAtom of
+                        Just atom
+                          | "nodejs-" `T.isInfixOf` atom ->
+                              Just
+                                ( T.takeWhile
+                                    (/= '[')
+                                    ( T.drop
+                                        (T.length (">=net-libs/nodejs-" :: Text))
+                                        atom
+                                    )
+                                )
+                          | "bun-bin-" `T.isInfixOf` atom ->
+                              Just
+                                ( T.drop
+                                    (T.length (">=dev-lang/bun-bin-" :: Text))
+                                    atom
+                                )
+                          | otherwise -> Nothing
+                        Nothing -> Nothing
+              case reqResult of
+                Left failOutcome -> pure failOutcome
+                Right mReq -> do
+                  markMaterializeStep stepsDoneRef mh key verifyLabel
+                  mhStatus mh key "regenerating manifest"
+                  outcome <-
+                    overlayAfterAssets
+                      env
+                      overlayRoot
+                      entry
+                      eco
+                      keywords
+                      reusedLines
+                      targetVer
+                      distDigests
+                      mReq
+                      Nothing
+                  case outcome of
+                    ApplySuccess k sls paths -> do
+                      markMaterializeStep stepsDoneRef mh key "regenerating manifest"
+                      pure (ApplySuccess k sls paths)
+                    other -> pure other
 
 downloadNamedAssets ::
   ReleaseOps ->

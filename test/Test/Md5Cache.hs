@@ -428,6 +428,16 @@ testMd5CacheGencacheDecisions = do
   assertTrue
     "token message identifiable"
     ("token" `T.isInfixOf` applyUnitErrorMessage ApplyMissingGitHubToken)
+  assertTrue
+    "missing donor/template message identifiable"
+    ( "missing donor/template"
+        `T.isInfixOf` applyUnitErrorMessage
+          ( ApplyMissingDonorTemplate
+              key
+              "0.88.0"
+              "/overlay/dev-util/crush/crush-0.82.0-r4.ebuild"
+          )
+    )
   case applyUnitHardFail key ApplyMissingAssetsPath False True of
     ApplyHardFail k msg half assets -> do
       assertEq "hard-fail key" key k
