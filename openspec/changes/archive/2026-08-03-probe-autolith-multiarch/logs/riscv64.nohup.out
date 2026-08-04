@@ -1,0 +1,185 @@
+==> arch=riscv64 platform=linux/riscv64 atom==dev-util/autolith-0.17.2
+==> overlay=/home/mndz/repos/com.github/0x6d6e647a/mndz-overlay distdir=/var/cache/distfiles
+2026-08-03T09:10:33-07:00
+==> creating portage volume container autolith-probe-portage
+==> starting autolith-probe-riscv64
+51a0672eb8ef0130e85348c15f9a399e7068a321cd8cd1eebe41a1d906091b52
+==> container uname -m: riscv64
+==> configuring Portage / overlay
+setup OK arch=riscv
+--- accept_keywords ---
+*/* ~riscv
+dev-util/autolith
+>=dev-lisp/sbcl-2.6.4
+==> emerge --info (first lines)
+Portage 3.0.81.2 (python 3.14.6-final-0, default/linux/riscv/23.0/rv64/lp64d, gcc-16, glibc-2.43-r2, 6.18.41-gentoo-dist-bin riscv64)
+=================================================================
+System uname: Linux-6.18.41-gentoo-dist-bin-riscv64-with-glibc2.43
+KiB Mem:    65553340 total,  51459196 free
+KiB Swap:   83886076 total,  83886076 free
+Timestamp of repository gentoo: Sat, 01 Aug 2026 00:45:00 +0000
+sh bash 5.3_p15
+ld GNU ld (Gentoo 2.46.1 p1) 2.46.1
+app-misc/pax-utils:        1.3.10::gentoo
+app-shells/bash:           5.3_p15::gentoo
+dev-build/autoconf:        2.73-r2::gentoo
+dev-build/automake:        1.18.1-r1::gentoo
+dev-build/libtool:         2.5.4::gentoo
+dev-build/make:            4.4.1-r102::gentoo
+dev-build/meson:           1.11.2::gentoo
+dev-lang/perl:             5.44.0::gentoo
+dev-lang/python:           3.13.14::gentoo, 3.14.6_p1::gentoo
+dev-lang/rust-bin:         1.96.1::gentoo
+sys-apps/baselayout:       2.18-r1::gentoo
+sys-apps/openrc:           0.63.3::gentoo
+sys-apps/sandbox:          2.49::gentoo
+sys-devel/binutils:        2.46.1::gentoo
+sys-devel/binutils-config: 5.6::gentoo
+sys-devel/gcc:             16.1.1_p20260613::gentoo
+sys-devel/gcc-config:      2.12.2::gentoo
+sys-kernel/linux-headers:  7.1::gentoo (virtual/os-headers)
+sys-libs/glibc:            2.43-r2::gentoo
+Repositories:
+
+gentoo
+    location: /var/db/repos/gentoo
+    sync-uri: rsync://rsync.gentoo.org/gentoo-portage
+    priority: -1000
+    volatile: False
+
+mndz
+    location: /var/db/repos/mndz
+    masters: gentoo
+    volatile: True
+
+Binary Repositories:
+
+gentoo
+    location: /var/cache/binhost/gentoo
+    priority: 1
+    sync-uri: https://distfiles.gentoo.org/releases/riscv/binpackages/23.0/rv64_lp64d
+    verify-signature: True
+
+ABI="lp64d"
+ACCEPT_KEYWORDS="riscv ~riscv"
+==> emerge -pv =dev-util/autolith-0.17.2
+!!! Repository 'gentoo' has sync-uri attribute, but is missing sync-type attribute
+
+Performing Global Updates
+(Could take a couple of minutes if you have a lot of binary packages.)
+  .='update pass'  *='binary update'  #='/var/db update'  @='/var/db move'
+  s='/var/db SLOT move'  %='binary move'  S='binary SLOT move'
+  p='update /etc/portage/package.*'
+/var/db/repos/gentoo/profiles/updates/1Q-2026...
+/var/db/repos/gentoo/profiles/updates/1Q-2023.......................
+/var/db/repos/gentoo/profiles/updates/2Q-2022...........
+/var/db/repos/gentoo/profiles/updates/2Q-2024...........
+/var/db/repos/gentoo/profiles/updates/3Q-2025.......
+/var/db/repos/gentoo/profiles/updates/3Q-2021...........
+/var/db/repos/gentoo/profiles/updates/4Q-2024.................................................................................
+/var/db/repos/gentoo/profiles/updates/2Q-2023..............................
+/var/db/repos/gentoo/profiles/updates/3Q-2023...................
+/var/db/repos/gentoo/profiles/updates/4Q-2023........................................
+/var/db/repos/gentoo/profiles/updates/1Q-2020.........
+/var/db/repos/gentoo/profiles/updates/4Q-2025...
+/var/db/repos/gentoo/profiles/updates/1Q-2021.......
+/var/db/repos/gentoo/profiles/updates/1Q-2025...........................
+/var/db/repos/gentoo/profiles/updates/2Q-2021.......
+/var/db/repos/gentoo/profiles/updates/2Q-2020.........
+/var/db/repos/gentoo/profiles/updates/1Q-2024........................................................................................
+/var/db/repos/gentoo/profiles/updates/2Q-2026......
+/var/db/repos/gentoo/profiles/updates/4Q-2022........
+/var/db/repos/gentoo/profiles/updates/3Q-2022.....................
+/var/db/repos/gentoo/profiles/updates/3Q-2020..............
+/var/db/repos/gentoo/profiles/updates/2Q-2025......
+/var/db/repos/gentoo/profiles/updates/4Q-2021.......................................................................
+/var/db/repos/gentoo/profiles/updates/3Q-2024.............
+/var/db/repos/gentoo/profiles/updates/4Q-2020.......
+
+
+!!! Repository 'gentoo' has sync-uri attribute, but is missing sync-type attribute
+
+These are the packages that would be merged, in order:
+
+Calculating dependencies  .. ..... .... . ..... done!
+Dependency resolution took 67.15 s (backtrack: 1/20).
+
+[ebuild  N     ] dev-libs/libatomic_ops-7.10.0::gentoo  531 KiB
+[ebuild  N     ] dev-libs/boehm-gc-8.2.12::gentoo  USE="large threads -cxx -static-libs" 1204 KiB
+[ebuild  N     ] dev-lisp/asdf-3.3.5-r1:0/3.3.5-r1::gentoo  USE="-doc -test" 509 KiB
+[ebuild  N     ] dev-lisp/uiop-3.3.5::gentoo  102 KiB
+[ebuild  N     ] dev-perl/Crypt-URandom-0.550.0::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 24 KiB
+[ebuild  N     ] dev-perl/TimeDate-2.330.0-r1::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 30 KiB
+[ebuild  N     ] dev-perl/Text-Unidecode-1.300.0-r1::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 135 KiB
+[ebuild  N     ] dev-perl/Unicode-EastAsianWidth-12.0.0::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 52 KiB
+[ebuild  N     ] dev-perl/Net-SSLeay-1.960.0-r1::gentoo  USE="-examples -minimal -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 653 KiB
+[ebuild  N     ] dev-perl/IO-Socket-SSL-2.95.0::gentoo  USE="-examples -idn -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 0 KiB
+[ebuild  N     ] virtual/perl-libnet-3.150.0-r3::gentoo  USE="ssl" 0 KiB
+[ebuild  N     ] dev-perl/MailTools-2.220.0::gentoo  USE="-examples -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 0 KiB
+[ebuild  N     ] virtual/perl-Digest-MD5-2.590.0-r1::gentoo  0 KiB
+[ebuild  N     ] virtual/perl-Digest-SHA-6.40.0-r3::gentoo  0 KiB
+[ebuild  N     ] dev-perl/Digest-HMAC-1.50.0::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 0 KiB
+[ebuild  N     ] dev-perl/Authen-SASL-2.200.0::gentoo  USE="-kerberos -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 41 KiB
+[ebuild  N     ] dev-perl/Error-0.170.300-r1::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 0 KiB
+[ebuild  N     ] dev-perl/libintl-perl-1.370.0::gentoo  USE="-examples -minimal -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 571 KiB
+[ebuild  N     ] app-text/texi2html-5.0-r1::gentoo  USE="unicode" 15037 KiB
+[ebuild  N     ] dev-lisp/ecl-26.5.5:0/26.5.5::gentoo  USE="threads unicode -X -cxx -debug -emacs -gengc -precisegc" 7314 KiB
+[ebuild  N     ] dev-debug/strace-7.1::gentoo  USE="ncurses -aio -elfutils -perl (-selinux) -static -test -unwind -verify-sig" 2728 KiB
+[ebuild  N     ] dev-lisp/sbcl-2.6.7:0/2.6.7::gentoo  USE="source (system-bootstrap) threads unicode zstd -debug -doc" 8498 KiB
+[ebuild  N     ] virtual/commonlisp-0-r1::gentoo  0 KiB
+[ebuild  NS    ] app-text/docbook-xml-dtd-4.3-r2:4.3::gentoo [4.1.2-r7:4.1.2::gentoo, 4.2-r3:4.2::gentoo, 4.5-r2:4.5::gentoo] 82 KiB
+[ebuild  N     ] sys-apps/bubblewrap-0.11.2-r1::gentoo  USE="(-selinux) -suid" 114 KiB
+[ebuild  N     ] dev-vcs/git-2.55.0::gentoo  USE="curl gpg iconv nls pcre perl rust safe-directory webdav -cgi -cvs -debug -doc -highlight -keyring -perforce (-selinux) -subversion -test -tk -xinetd" PYTHON_SINGLE_TARGET="python3_14 -python3_12 -python3_13" 8601 KiB
+[ebuild  N     ] dev-util/autolith-0.17.2::mndz  USE="-test" 0 KiB
+
+Total: 27 packages (26 new, 1 in new slot), Size of downloads: 46216 KiB
+
+ * IMPORTANT: 20 news items need reading for repository 'gentoo'.
+ * Use eselect news read to view new items.
+
+==> emerge -1 =dev-util/autolith-0.17.2  (long-running under QEMU)
+!!! Repository 'gentoo' has sync-uri attribute, but is missing sync-type attribute
+
+ * IMPORTANT: 20 news items need reading for repository 'gentoo'.
+ * Use eselect news read to view new items.
+
+
+These are the packages that would be merged, in order:
+
+Calculating dependencies  . ......... . .... done!
+Dependency resolution took 50.56 s (backtrack: 1/20).
+
+[ebuild  N     ] dev-libs/libatomic_ops-7.10.0::gentoo  531 KiB
+[ebuild  N     ] dev-libs/boehm-gc-8.2.12::gentoo  USE="large threads -cxx -static-libs" 1204 KiB
+[ebuild  N     ] dev-lisp/asdf-3.3.5-r1:0/3.3.5-r1::gentoo  USE="-doc -test" 509 KiB
+[ebuild  N     ] dev-lisp/uiop-3.3.5::gentoo  102 KiB
+[ebuild  N     ] dev-perl/Crypt-URandom-0.550.0::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 24 KiB
+[ebuild  N     ] dev-perl/TimeDate-2.330.0-r1::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 30 KiB
+[ebuild  N     ] dev-perl/Text-Unidecode-1.300.0-r1::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 135 KiB
+[ebuild  N     ] dev-perl/Unicode-EastAsianWidth-12.0.0::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 52 KiB
+[ebuild  N     ] dev-perl/Net-SSLeay-1.960.0-r1::gentoo  USE="-examples -minimal -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 653 KiB
+[ebuild  N     ] dev-perl/IO-Socket-SSL-2.95.0::gentoo  USE="-examples -idn -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 0 KiB
+[ebuild  N     ] virtual/perl-libnet-3.150.0-r3::gentoo  USE="ssl" 0 KiB
+[ebuild  N     ] dev-perl/MailTools-2.220.0::gentoo  USE="-examples -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 0 KiB
+[ebuild  N     ] virtual/perl-Digest-MD5-2.590.0-r1::gentoo  0 KiB
+[ebuild  N     ] virtual/perl-Digest-SHA-6.40.0-r3::gentoo  0 KiB
+[ebuild  N     ] dev-perl/Digest-HMAC-1.50.0::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 0 KiB
+[ebuild  N     ] dev-perl/Authen-SASL-2.200.0::gentoo  USE="-kerberos -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 41 KiB
+[ebuild  N     ] dev-perl/Error-0.170.300-r1::gentoo  USE="-test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 0 KiB
+[ebuild  N     ] dev-perl/libintl-perl-1.370.0::gentoo  USE="-examples -minimal -test" PERL_FEATURES="(-debug) -ithreads (-quadmath)" 571 KiB
+[ebuild  N     ] app-text/texi2html-5.0-r1::gentoo  USE="unicode" 15037 KiB
+[ebuild  N     ] dev-lisp/ecl-26.5.5:0/26.5.5::gentoo  USE="threads unicode -X -cxx -debug -emacs -gengc -precisegc" 7314 KiB
+[ebuild  N     ] dev-debug/strace-7.1::gentoo  USE="ncurses -aio -elfutils -perl (-selinux) -static -test -unwind -verify-sig" 2728 KiB
+[ebuild  N     ] dev-lisp/sbcl-2.6.7:0/2.6.7::gentoo  USE="source (system-bootstrap) threads unicode zstd -debug -doc" 8498 KiB
+[ebuild  N     ] virtual/commonlisp-0-r1::gentoo  0 KiB
+[ebuild  NS    ] app-text/docbook-xml-dtd-4.3-r2:4.3::gentoo [4.1.2-r7:4.1.2::gentoo, 4.2-r3:4.2::gentoo, 4.5-r2:4.5::gentoo] 82 KiB
+[ebuild  N     ] sys-apps/bubblewrap-0.11.2-r1::gentoo  USE="(-selinux) -suid" 114 KiB
+[ebuild  N     ] dev-vcs/git-2.55.0::gentoo  USE="curl gpg iconv nls pcre perl rust safe-directory webdav -cgi -cvs -debug -doc -highlight -keyring -perforce (-selinux) -subversion -test -tk -xinetd" PYTHON_SINGLE_TARGET="python3_14 -python3_12 -python3_13" 8601 KiB
+[ebuild  N     ] dev-util/autolith-0.17.2::mndz  USE="-test" 0 KiB
+
+Total: 27 packages (26 new, 1 in new slot), Size of downloads: 46216 KiB
+>>> Verifying ebuild manifests
+
+>>> Jobs: 0 of 27 complete, 1 running                                   Load avg: 2.32, 1.84, 1.05
+>>> Emerging (1 of 27) dev-libs/libatomic_ops-7.10.0::gentoo
+>>> Jobs: 0 of 27 complete, 1 running                                   Load avg: 2.32, 1.84, 1.05

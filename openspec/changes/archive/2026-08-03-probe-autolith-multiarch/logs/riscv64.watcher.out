@@ -1,0 +1,356 @@
+==> progress watcher start 2026-08-03T09:15:40-07:00
+==> progress 2026-08-03T09:15:41-07:00 installed_slots=302 building=[dev-libs ] emerge_procs=2
+==> progress 2026-08-03T09:18:42-07:00 installed_slots=303 building=[dev-libs ] emerge_procs=1
+==> progress 2026-08-03T09:21:43-07:00 installed_slots=303 building=[dev-libs ] emerge_procs=2
+==> progress 2026-08-03T09:24:44-07:00 installed_slots=305 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T09:27:44-07:00 installed_slots=307 building=[dev-perl ] emerge_procs=1
+==> progress 2026-08-03T09:30:45-07:00 installed_slots=309 building=[dev-perl ] emerge_procs=1
+==> progress 2026-08-03T09:33:46-07:00 installed_slots=310 building=[dev-perl ] emerge_procs=1
+==> progress 2026-08-03T09:36:47-07:00 installed_slots=312 building=[virtual ] emerge_procs=1
+==> progress 2026-08-03T09:39:48-07:00 installed_slots=315 building=[virtual ] emerge_procs=2
+==> progress 2026-08-03T09:42:49-07:00 installed_slots=317 building=[dev-perl ] emerge_procs=1
+==> progress 2026-08-03T09:45:49-07:00 installed_slots=319 building=[dev-perl ] emerge_procs=1
+==> progress 2026-08-03T09:48:50-07:00 installed_slots=320 building=[app-text ] emerge_procs=1
+==> progress 2026-08-03T09:51:51-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T09:54:52-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T09:57:53-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:00:53-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:03:54-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:06:55-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:09:56-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:12:57-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:15:58-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:18:58-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:21:59-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:25:00-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:28:01-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:31:02-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:34:02-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:37:03-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:40:04-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:43:05-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:46:06-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:49:06-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:52:07-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:55:08-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T10:58:09-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:01:10-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:04:10-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:07:11-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:10:12-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:13:13-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:16:14-07:00 installed_slots=321 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:19:14-07:00 installed_slots=322 building=[dev-debug ] emerge_procs=1
+==> progress 2026-08-03T11:22:15-07:00 installed_slots=322 building=[dev-debug ] emerge_procs=1
+==> progress 2026-08-03T11:25:16-07:00 installed_slots=322 building=[dev-debug ] emerge_procs=1
+==> progress 2026-08-03T11:28:17-07:00 installed_slots=322 building=[dev-debug ] emerge_procs=1
+==> progress 2026-08-03T11:31:18-07:00 installed_slots=322 building=[dev-debug ] emerge_procs=1
+==> progress 2026-08-03T11:34:19-07:00 installed_slots=322 building=[dev-debug ] emerge_procs=1
+==> progress 2026-08-03T11:37:20-07:00 installed_slots=322 building=[dev-debug ] emerge_procs=2
+==> progress 2026-08-03T11:40:21-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:43:21-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:46:22-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:49:23-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:52:24-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:55:25-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T11:58:26-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:01:27-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:04:27-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:07:28-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:10:29-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:13:30-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:16:31-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:19:31-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:22:32-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:25:33-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:28:34-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:31:35-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:34:36-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:37:36-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:40:37-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:43:38-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:46:39-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:49:40-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:52:40-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:55:41-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T12:58:42-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:01:43-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:04:44-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:07:45-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:10:45-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:13:46-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:16:47-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:19:48-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:22:49-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:25:49-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:28:50-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:31:51-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:34:52-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:37:53-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:40:53-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:43:54-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:46:55-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:49:56-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:52:57-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:55:57-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T13:58:58-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:01:59-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:05:00-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:08:01-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:11:01-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:14:02-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:17:03-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:20:04-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:23:05-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:26:05-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:29:06-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:32:07-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:35:08-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:38:09-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:41:09-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:44:10-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:47:11-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:50:12-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:53:13-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:56:13-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T14:59:14-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:02:15-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:05:16-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:08:17-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:11:17-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:14:18-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:17:19-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:20:20-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:23:21-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:26:21-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:29:22-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:32:23-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:35:24-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:38:25-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:41:25-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:44:26-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:47:27-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:50:28-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:53:29-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:56:29-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T15:59:30-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:02:31-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:05:32-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:08:32-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:11:33-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:14:34-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:17:35-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:20:36-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:23:37-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:26:37-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:29:38-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:32:39-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:35:40-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:38:40-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:41:41-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:44:42-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:47:43-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:50:44-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:53:44-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:56:45-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T16:59:46-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:02:47-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:05:48-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:08:48-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:11:49-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:14:50-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:17:51-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:20:52-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:23:53-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:26:53-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:29:54-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:32:55-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:35:56-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:38:57-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:41:57-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:44:58-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:47:59-07:00 installed_slots=323 building=[dev-lisp ] emerge_procs=1
+==> progress 2026-08-03T17:51:00-07:00 installed_slots=325 building=[app-text ] emerge_procs=1
+==> progress 2026-08-03T17:54:01-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T17:57:02-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T18:00:03-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T18:03:04-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T18:06:05-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T18:09:06-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T18:12:07-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T18:15:08-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T18:18:09-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T18:21:10-07:00 installed_slots=327 building=[dev-vcs ] emerge_procs=1
+==> progress 2026-08-03T18:24:10-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:27:13-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:30:16-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:33:19-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:36:22-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:39:26-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:42:29-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:45:31-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:48:32-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:51:32-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:54:33-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T18:57:34-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:00:35-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:03:35-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:06:36-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:09:37-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:12:38-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:15:38-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:18:39-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:21:40-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:24:40-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:27:41-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:30:42-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:33:43-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:36:44-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:39:44-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:42:45-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:45:46-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:48:47-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:51:48-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:54:48-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T19:57:49-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:00:50-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:03:51-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:06:51-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:09:52-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:12:53-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:15:54-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:18:55-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:21:55-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:24:56-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:27:57-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:30:58-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:33:59-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:37:00-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:40:00-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:43:01-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:46:02-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:49:03-07:00 installed_slots=328 building=[dev-util ] emerge_procs=1
+==> progress 2026-08-03T20:52:04-07:00 installed_slots=328 building=[dev-util ] emerge_procs=0
+==> FAILED emerge on riscv64 (emerge exited, package missing)
+   Compiling idna v1.1.0
+   Compiling bincode v1.3.3
+   Compiling url v2.5.8
+   Compiling heed-types v0.21.0
+   Compiling errno v0.3.14
+   Compiling page_size v0.6.0
+   Compiling crossbeam-channel v0.5.15
+   Compiling arrayref v0.3.9
+   Compiling arrayvec v0.7.6
+   Compiling file-id v0.2.3
+   Compiling either v1.15.0
+   Compiling constant_time_eq v0.4.2
+   Compiling fff-search v0.9.6 (/var/tmp/portage/dev-util/autolith-0.17.2/work/fff/crates/fff-core)
+   Compiling rustc-hash v2.1.2
+   Compiling fff-notify-debouncer-full v0.9.4
+   Compiling rayon v1.11.0
+   Compiling tracing-appender v0.2.4
+   Compiling signal-hook-registry v1.4.8
+   Compiling parking_lot v0.12.5
+   Compiling dirs v5.0.1
+   Compiling ignore v0.4.25
+   Compiling regex v1.12.3
+   Compiling fff-grep v0.9.6 (/var/tmp/portage/dev-util/autolith-0.17.2/work/fff/crates/fff-grep)
+   Compiling memmap2 v0.9.11
+   Compiling pathdiff v0.2.3
+   Compiling fff-query-parser v0.9.6 (/var/tmp/portage/dev-util/autolith-0.17.2/work/fff/crates/fff-query-parser)
+   Compiling glidesort v0.1.2
+   Compiling neo_frizbee v0.11.0
+   Compiling git2 v0.20.4
+   Compiling fff-c v0.9.6 (/var/tmp/portage/dev-util/autolith-0.17.2/work/fff/crates/fff-c)
+    Finished `release` profile [optimized] target(s) in 133m 59s
+ [32m*[0m Building colorlisp native library…
+ [32m*[0m Building cl-exec-sandbox helper…
+ [32m*[0m Fabricating git provenance for image builds…
+ [32m*[0m Building recovery core…
+Installed pristine recovery image at /var/tmp/portage/dev-util/autolith-0.17.2/temp/cores/recovery/autolith-recovery.core.
+ [32m*[0m Building active core…
+Loading Autolith for its preloaded active image.
+Unhandled SIMPLE-ERROR in thread #<SB-THREAD:THREAD tid=190343 "main thread" RUNNING
+                                    {4F5F4E73}>:
+  please implement
+
+Backtrace for: #<SB-THREAD:THREAD tid=190343 "main thread" RUNNING {4F5F4E73}>
+0: (SB-DEBUG::DEBUGGER-DISABLED-HOOK #<SIMPLE-ERROR "please implement" {5B342BE3}> #<unused argument> :QUIT T)
+1: (SB-DEBUG::RUN-HOOK SB-EXT:*INVOKE-DEBUGGER-HOOK* #<SIMPLE-ERROR "please implement" {5B342BE3}>)
+2: (INVOKE-DEBUGGER #<SIMPLE-ERROR "please implement" {5B342BE3}>)
+3: (ERROR "please implement")
+4: (SB-ALIEN-INTERNALS:ALIEN-CALLBACK-ASSEMBLER-WRAPPER #<unused argument> #<unused argument> #<unused argument>)
+5: (SB-ALIEN::%ALIEN-CALLBACK-ALIEN #<ALIEN-TYPE (FUNCTION (:CDECL (SB-ALIEN:SIGNED 32)) SB-SYS:SYSTEM-AREA-POINTER SB-SYS:SYSTEM-AREA-POINTER (SB-ALIEN:SIGNED 32) &REST)> (FUNCTION (:CDECL #1=(SB-ALIEN:SIGNED 32)) SB-SYS:SYSTEM-AREA-POINTER SB-SYS:SYSTEM-AREA-POINTER #1# &REST) #<FUNCTION (LAMBDA (SB-ALIEN::ARGS-POINTER SB-ALIEN::RESULT-POINTER) :IN "/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/.qlot/dists/quicklisp/software/cl+ssl-20260101-git/src/bio.lisp") {5B34127B}>)
+6: (SB-ALIEN::%DEFINE-ALIEN-CALLABLE LISP-WRITE #<FUNCTION (LAMBDA (SB-ALIEN::ARGS-POINTER SB-ALIEN::RESULT-POINTER) :IN "/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/.qlot/dists/quicklisp/software/cl+ssl-20260101-git/src/bio.lisp") {5B34127B}> #<ALIEN-TYPE (FUNCTION (:CDECL (SB-ALIEN:SIGNED 32)) SB-SYS:SYSTEM-AREA-POINTER SB-SYS:SYSTEM-AREA-POINTER (SB-ALIEN:SIGNED 32) &REST)> (FUNCTION (:CDECL #1=(SB-ALIEN:SIGNED 32)) SB-SYS:SYSTEM-AREA-POINTER SB-SYS:SYSTEM-AREA-POINTER #1# &REST))
+7: ("top level form") [toplevel]
+8: (SB-FASL::LOAD-FASL-GROUP #S(SB-FASL::FASL-INPUT :STREAM #<SB-SYS:FD-STREAM for #<(SIMPLE-BASE-STRING 222) file /var/tmp/portage/dev-util/autolith-0.17.2/temp/xdg-cache/common-lisp/sbcl-2.6.7-linux-rv64g/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/.qlot/dists/quicklisp/software/cl+ssl-202... {5B1E696F}> {5B1E6AA3}> :TABLE #(589 #1="/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/.qlot/dists/quicklisp/software/cl+ssl-20260101-git/src/bio.lisp" #<PACKAGE "CFFI"> CFFI::PARSE-DEPRECATED-STRUCT-TYPE #2=#<PACKAGE "CL+SSL"> BIO-METHOD :STRUCT LAMBDA :IN (LAMBDA NIL . #3=(:IN #1#)) #(8 79 0 8 0 1 71 44 1 1 66 40 ...) #4=#() ...) :STACK #(0 #<FUNCTION #5="top level form" {5B34177B}> #<SB-KERNEL:FDEFN CFFI-SYS:%CALLBACK> LISP-WRITE #<ALIEN-TYPE (FUNCTION (:CDECL (SB-ALIEN:SIGNED 32)) SB-SYS:SYSTEM-AREA-POINTER SB-SYS:SYSTEM-AREA-POINTER (SB-ALIEN:SIGNED 32) &REST)> (FUNCTION (:CDECL #6=(SB-ALIEN:SIGNED 32)) SB-SYS:SYSTEM-AREA-POINTER SB-SYS:SYSTEM-AREA-POINTER #6# &REST) #<FUNCTION (LAMBDA (SB-ALIEN::ARGS-POINTER SB-ALIEN::RESULT-POINTER) . #3#) {5B34127B}> #S(SB-C::COMPILED-DEBUG-INFO :NAME #5# :SOURCE #7=#S(SB-C::DEBUG-SOURCE :NAMESTRING #1# :CREATED 3994207992 :START-POSITIONS NIL :PLIST NIL) :EH-LOCS NIL :PACKAGE #2# :FUN-MAP #8=#(12 79 0 12 0 5 71 48 69 36 70 4 ...) :CONTEXTS #4# :REST #5#) 0 NIL #2# #8# ...) :NAME-BUFFER #("BIO-TCLASS-TCLASS" "SIGNEDE-ALIEN-CALLABLESSUEEITION") :PRINT NIL :CODEBLOBS NIL :PARTIAL-SOURCE-INFO #7#))
+9: ((LAMBDA NIL :IN SB-FASL::LOAD-AS-FASL))
+10: (SB-IMPL::CALL-WITH-LOADER-PACKAGE-NAMES #<FUNCTION (LAMBDA NIL :IN SB-FASL::LOAD-AS-FASL) {5B1EB40B}>)
+11: (SB-FASL::LOAD-AS-FASL #<SB-SYS:FD-STREAM for #<(SIMPLE-BASE-STRING 222) file /var/tmp/portage/dev-util/autolith-0.17.2/temp/xdg-cache/common-lisp/sbcl-2.6.7-linux-rv64g/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/.qlot/dists/quicklisp/software/cl+ssl-202... {5B1E696F}> {5B1E6AA3}> NIL NIL)
+12: ((LABELS SB-FASL::LOAD-STREAM-1 :IN LOAD) #<SB-SYS:FD-STREAM for #<(SIMPLE-BASE-STRING 222) file /var/tmp/portage/dev-util/autolith-0.17.2/temp/xdg-cache/common-lisp/sbcl-2.6.7-linux-rv64g/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/.qlot/dists/quicklisp/software/cl+ssl-202... {5B1E696F}> {5B1E6AA3}> T)
+13: (SB-FASL::CALL-WITH-LOAD-BINDINGS #<FUNCTION (LABELS SB-FASL::LOAD-STREAM-1 :IN LOAD) {7EFD9E7FE66B}> #<SB-SYS:FD-STREAM for #<(SIMPLE-BASE-STRING 222) file /var/tmp/portage/dev-util/autolith-0.17.2/temp/xdg-cache/common-lisp/sbcl-2.6.7-linux-rv64g/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/.qlot/dists/quicklisp/software/cl+ssl-202... {5B1E696F}> {5B1E6AA3}> T #<SB-SYS:FD-STREAM for #<(SIMPLE-BASE-STRING 222) file /var/tmp/portage/dev-util/autolith-0.17.2/temp/xdg-cache/common-lisp/sbcl-2.6.7-linux-rv64g/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/.qlot/dists/quicklisp/software/cl+ssl-202... {5B1E696F}> {5B1E6AA3}>)
+14: (LOAD #P#<(SIMPLE-ARRAY CHARACTER (217)) /var/tmp/portage/dev-util/autolith-0.17.2/temp/xdg-cache/common-lisp/sbcl-2.6.7-linux-rv64g/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/.qlot/dists/quicklisp/software/cl+ssl-20260101... {5B38140F}> :VERBOSE NIL :PRINT NIL :IF-DOES-NOT-EXIST :ERROR :EXTERNAL-FORMAT :DEFAULT)
+15: (UIOP/UTILITY:CALL-WITH-MUFFLED-CONDITIONS #<FUNCTION (LAMBDA NIL :IN UIOP/LISP-BUILD:LOAD*) {5B1E604B}> ("Overwriting already existing readtable ~S." #(#:FINALIZERS-OFF-WARNING :ASDF-FINALIZERS)))
+16: ((SB-PCL::EMF ASDF/ACTION:PERFORM) #<unused argument> #<unused argument> #<ASDF/LISP-ACTION:LOAD-OP > #<ASDF/LISP-ACTION:CL-SOURCE-FILE "cl+ssl" "src" "bio">)
+17: ((LAMBDA NIL :IN ASDF/ACTION:CALL-WHILE-VISITING-ACTION))
+18: ((:METHOD ASDF/ACTION:PERFORM-WITH-RESTARTS (ASDF/LISP-ACTION:LOAD-OP ASDF/LISP-ACTION:CL-SOURCE-FILE)) #<ASDF/LISP-ACTION:LOAD-OP > #<ASDF/LISP-ACTION:CL-SOURCE-FILE "cl+ssl" "src" "bio">) [fast-method]
+19: ((:METHOD ASDF/ACTION:PERFORM-WITH-RESTARTS :AROUND (T T)) #<ASDF/LISP-ACTION:LOAD-OP > #<ASDF/LISP-ACTION:CL-SOURCE-FILE "cl+ssl" "src" "bio">) [fast-method]
+20: ((:METHOD ASDF/PLAN:PERFORM-PLAN (T)) #<ASDF/PLAN:SEQUENTIAL-PLAN {50B62B03}>) [fast-method]
+21: ((FLET SB-C::WITH-IT :IN SB-C::%WITH-COMPILATION-UNIT))
+22: ((:METHOD ASDF/PLAN:PERFORM-PLAN :AROUND (T)) #<ASDF/PLAN:SEQUENTIAL-PLAN {50B62B03}>) [fast-method]
+23: ((:METHOD ASDF/OPERATE:OPERATE (ASDF/OPERATION:OPERATION ASDF/COMPONENT:COMPONENT)) #<ASDF/LISP-ACTION:LOAD-OP > #<ASDF/SYSTEM:SYSTEM "autolith"> :PLAN-CLASS NIL :PLAN-OPTIONS NIL) [fast-method]
+24: ((SB-PCL::EMF ASDF/OPERATE:OPERATE) #<unused argument> #<unused argument> #<ASDF/LISP-ACTION:LOAD-OP > #<ASDF/SYSTEM:SYSTEM "autolith">)
+25: ((LAMBDA NIL :IN ASDF/OPERATE:OPERATE))
+26: ((:METHOD ASDF/OPERATE:OPERATE :AROUND (T T)) #<ASDF/LISP-ACTION:LOAD-OP > #<ASDF/SYSTEM:SYSTEM "autolith">) [fast-method]
+27: ((SB-PCL::EMF ASDF/OPERATE:OPERATE) #<unused argument> #<unused argument> ASDF/LISP-ACTION:LOAD-OP :AUTOLITH)
+28: ((LAMBDA NIL :IN ASDF/OPERATE:OPERATE))
+29: ((:METHOD ASDF/OPERATE:OPERATE :AROUND (T T)) ASDF/LISP-ACTION:LOAD-OP :AUTOLITH) [fast-method]
+30: (ASDF/SESSION:CALL-WITH-ASDF-SESSION #<FUNCTION (LAMBDA NIL :IN ASDF/OPERATE:OPERATE) {50B6290B}> :OVERRIDE T :KEY NIL :OVERRIDE-CACHE T :OVERRIDE-FORCING NIL)
+31: ((LAMBDA NIL :IN ASDF/OPERATE:OPERATE))
+32: (ASDF/SESSION:CALL-WITH-ASDF-SESSION #<FUNCTION (LAMBDA NIL :IN ASDF/OPERATE:OPERATE) {50B6285B}> :OVERRIDE NIL :KEY NIL :OVERRIDE-CACHE NIL :OVERRIDE-FORCING NIL)
+33: ((:METHOD ASDF/OPERATE:OPERATE :AROUND (T T)) ASDF/LISP-ACTION:LOAD-OP :AUTOLITH) [fast-method]
+34: (ASDF/OPERATE:LOAD-SYSTEM :AUTOLITH)
+35: ("top level form") [toplevel]
+36: ((FLET "G" :IN SB-C::%COMPILE-IN-LEXENV))
+37: (SB-C::%COMPILE-IN-LEXENV (LET* ((COMMON-LISP-USER::SCRIPT-PATH (TRUENAME *LOAD-TRUENAME*)) (COMMON-LISP-USER::SCRIPT-DIRECTORY (UIOP/PATHNAME:PATHNAME-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-PATH)) (COMMON-LISP-USER::SOURCE-ROOT (UIOP/PATHNAME:PATHNAME-PARENT-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-DIRECTORY)) (COMMON-LISP-USER::VERSION-PATHNAME (MERGE-PATHNAMES "sbcl.version" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::PROJECT-SETUP (MERGE-PATHNAMES ".qlot/setup.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::HOME (USER-HOMEDIR-PATHNAME)) (COMMON-LISP-USER::DATA-HOME (UIOP/PATHNAME:ENSURE-DIRECTORY-PATHNAME (OR # #))) (COMMON-LISP-USER::DEFAULT-CORE (MERGE-PATHNAMES "autolith/active/autolith-active.core" COMMON-LISP-USER::DATA-HOME)) (COMMON-LISP-USER::ARGUMENTS (UIOP/IMAGE:COMMAND-LINE-ARGUMENTS)) (COMMON-LISP-USER::CORE-PATHNAME (PATHNAME (OR # # COMMON-LISP-USER::DEFAULT-CORE)))) (LET ((COMMON-LISP-USER::EXPECTED-VERSION (STRING-TRIM # #))) (UNLESS (STRING= COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)) (ERROR "Active-image builds require pinned SBCL ~A, not ~A." COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)))) (UNLESS (PROBE-FILE COMMON-LISP-USER::PROJECT-SETUP) (ERROR "Active-image builds need locked dependencies; run ./script/bootstrap.")) (FORMAT T "~&Loading Autolith for its preloaded active image.~%") (FINISH-OUTPUT) (LOAD COMMON-LISP-USER::PROJECT-SETUP) (LOAD (MERGE-PATHNAMES "script/build-sandbox.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (UIOP/PACKAGE:SYMBOL-CALL (QUOTE #:QL) (QUOTE #:QUICKLOAD) :CFFI :SILENT T) (LET ((COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (MERGE-PATHNAMES ".guix-profile/lib/" COMMON-LISP-USER::HOME)) (COMMON-LISP-USER::LIBRARY-DIRECTORIES (FIND-SYMBOL "*FOREIGN-LIBRARY-DIRECTORIES*" "CFFI"))) (WHEN (PROBE-FILE COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY) (PUSHNEW COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (SYMBOL-VALUE COMMON-LISP-USER::LIBRARY-DIRECTORIES) :TEST (FUNCTION EQUAL)))) (ASDF/FIND-SYSTEM:LOAD-ASD (MERGE-PATHNAMES "autolith.asd" COMMON-LISP-USER::SOURCE-ROOT)) (ASDF/OPERATE:LOAD-SYSTEM :AUTOLITH) ...) #<NULL-LEXENV> NIL #<SB-C::SOURCE-INFO {50B62383}> 3 NIL T T)
+38: (SB-C:EVAL-WITH-COMPILE-IN-LEXENV (LET* ((COMMON-LISP-USER::SCRIPT-PATH (TRUENAME *LOAD-TRUENAME*)) (COMMON-LISP-USER::SCRIPT-DIRECTORY (UIOP/PATHNAME:PATHNAME-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-PATH)) (COMMON-LISP-USER::SOURCE-ROOT (UIOP/PATHNAME:PATHNAME-PARENT-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-DIRECTORY)) (COMMON-LISP-USER::VERSION-PATHNAME (MERGE-PATHNAMES "sbcl.version" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::PROJECT-SETUP (MERGE-PATHNAMES ".qlot/setup.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::HOME (USER-HOMEDIR-PATHNAME)) (COMMON-LISP-USER::DATA-HOME (UIOP/PATHNAME:ENSURE-DIRECTORY-PATHNAME (OR # #))) (COMMON-LISP-USER::DEFAULT-CORE (MERGE-PATHNAMES "autolith/active/autolith-active.core" COMMON-LISP-USER::DATA-HOME)) (COMMON-LISP-USER::ARGUMENTS (UIOP/IMAGE:COMMAND-LINE-ARGUMENTS)) (COMMON-LISP-USER::CORE-PATHNAME (PATHNAME (OR # # COMMON-LISP-USER::DEFAULT-CORE)))) (LET ((COMMON-LISP-USER::EXPECTED-VERSION (STRING-TRIM # #))) (UNLESS (STRING= COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)) (ERROR "Active-image builds require pinned SBCL ~A, not ~A." COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)))) (UNLESS (PROBE-FILE COMMON-LISP-USER::PROJECT-SETUP) (ERROR "Active-image builds need locked dependencies; run ./script/bootstrap.")) (FORMAT T "~&Loading Autolith for its preloaded active image.~%") (FINISH-OUTPUT) (LOAD COMMON-LISP-USER::PROJECT-SETUP) (LOAD (MERGE-PATHNAMES "script/build-sandbox.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (UIOP/PACKAGE:SYMBOL-CALL (QUOTE #:QL) (QUOTE #:QUICKLOAD) :CFFI :SILENT T) (LET ((COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (MERGE-PATHNAMES ".guix-profile/lib/" COMMON-LISP-USER::HOME)) (COMMON-LISP-USER::LIBRARY-DIRECTORIES (FIND-SYMBOL "*FOREIGN-LIBRARY-DIRECTORIES*" "CFFI"))) (WHEN (PROBE-FILE COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY) (PUSHNEW COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (SYMBOL-VALUE COMMON-LISP-USER::LIBRARY-DIRECTORIES) :TEST (FUNCTION EQUAL)))) (ASDF/FIND-SYSTEM:LOAD-ASD (MERGE-PATHNAMES "autolith.asd" COMMON-LISP-USER::SOURCE-ROOT)) (ASDF/OPERATE:LOAD-SYSTEM :AUTOLITH) ...) #<NULL-LEXENV> #<SB-C::SOURCE-INFO {50B62383}> 3 NIL)
+39: (SB-IMPL::%SIMPLE-EVAL (LET* ((COMMON-LISP-USER::SCRIPT-PATH (TRUENAME *LOAD-TRUENAME*)) (COMMON-LISP-USER::SCRIPT-DIRECTORY (UIOP/PATHNAME:PATHNAME-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-PATH)) (COMMON-LISP-USER::SOURCE-ROOT (UIOP/PATHNAME:PATHNAME-PARENT-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-DIRECTORY)) (COMMON-LISP-USER::VERSION-PATHNAME (MERGE-PATHNAMES "sbcl.version" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::PROJECT-SETUP (MERGE-PATHNAMES ".qlot/setup.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::HOME (USER-HOMEDIR-PATHNAME)) (COMMON-LISP-USER::DATA-HOME (UIOP/PATHNAME:ENSURE-DIRECTORY-PATHNAME (OR # #))) (COMMON-LISP-USER::DEFAULT-CORE (MERGE-PATHNAMES "autolith/active/autolith-active.core" COMMON-LISP-USER::DATA-HOME)) (COMMON-LISP-USER::ARGUMENTS (UIOP/IMAGE:COMMAND-LINE-ARGUMENTS)) (COMMON-LISP-USER::CORE-PATHNAME (PATHNAME (OR # # COMMON-LISP-USER::DEFAULT-CORE)))) (LET ((COMMON-LISP-USER::EXPECTED-VERSION (STRING-TRIM # #))) (UNLESS (STRING= COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)) (ERROR "Active-image builds require pinned SBCL ~A, not ~A." COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)))) (UNLESS (PROBE-FILE COMMON-LISP-USER::PROJECT-SETUP) (ERROR "Active-image builds need locked dependencies; run ./script/bootstrap.")) (FORMAT T "~&Loading Autolith for its preloaded active image.~%") (FINISH-OUTPUT) (LOAD COMMON-LISP-USER::PROJECT-SETUP) (LOAD (MERGE-PATHNAMES "script/build-sandbox.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (UIOP/PACKAGE:SYMBOL-CALL (QUOTE #:QL) (QUOTE #:QUICKLOAD) :CFFI :SILENT T) (LET ((COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (MERGE-PATHNAMES ".guix-profile/lib/" COMMON-LISP-USER::HOME)) (COMMON-LISP-USER::LIBRARY-DIRECTORIES (FIND-SYMBOL "*FOREIGN-LIBRARY-DIRECTORIES*" "CFFI"))) (WHEN (PROBE-FILE COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY) (PUSHNEW COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (SYMBOL-VALUE COMMON-LISP-USER::LIBRARY-DIRECTORIES) :TEST (FUNCTION EQUAL)))) (ASDF/FIND-SYSTEM:LOAD-ASD (MERGE-PATHNAMES "autolith.asd" COMMON-LISP-USER::SOURCE-ROOT)) (ASDF/OPERATE:LOAD-SYSTEM :AUTOLITH) ...) #<NULL-LEXENV>)
+40: (SB-INT:SIMPLE-EVAL-IN-LEXENV (LET* ((COMMON-LISP-USER::SCRIPT-PATH (TRUENAME *LOAD-TRUENAME*)) (COMMON-LISP-USER::SCRIPT-DIRECTORY (UIOP/PATHNAME:PATHNAME-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-PATH)) (COMMON-LISP-USER::SOURCE-ROOT (UIOP/PATHNAME:PATHNAME-PARENT-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-DIRECTORY)) (COMMON-LISP-USER::VERSION-PATHNAME (MERGE-PATHNAMES "sbcl.version" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::PROJECT-SETUP (MERGE-PATHNAMES ".qlot/setup.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::HOME (USER-HOMEDIR-PATHNAME)) (COMMON-LISP-USER::DATA-HOME (UIOP/PATHNAME:ENSURE-DIRECTORY-PATHNAME (OR # #))) (COMMON-LISP-USER::DEFAULT-CORE (MERGE-PATHNAMES "autolith/active/autolith-active.core" COMMON-LISP-USER::DATA-HOME)) (COMMON-LISP-USER::ARGUMENTS (UIOP/IMAGE:COMMAND-LINE-ARGUMENTS)) (COMMON-LISP-USER::CORE-PATHNAME (PATHNAME (OR # # COMMON-LISP-USER::DEFAULT-CORE)))) (LET ((COMMON-LISP-USER::EXPECTED-VERSION (STRING-TRIM # #))) (UNLESS (STRING= COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)) (ERROR "Active-image builds require pinned SBCL ~A, not ~A." COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)))) (UNLESS (PROBE-FILE COMMON-LISP-USER::PROJECT-SETUP) (ERROR "Active-image builds need locked dependencies; run ./script/bootstrap.")) (FORMAT T "~&Loading Autolith for its preloaded active image.~%") (FINISH-OUTPUT) (LOAD COMMON-LISP-USER::PROJECT-SETUP) (LOAD (MERGE-PATHNAMES "script/build-sandbox.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (UIOP/PACKAGE:SYMBOL-CALL (QUOTE #:QL) (QUOTE #:QUICKLOAD) :CFFI :SILENT T) (LET ((COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (MERGE-PATHNAMES ".guix-profile/lib/" COMMON-LISP-USER::HOME)) (COMMON-LISP-USER::LIBRARY-DIRECTORIES (FIND-SYMBOL "*FOREIGN-LIBRARY-DIRECTORIES*" "CFFI"))) (WHEN (PROBE-FILE COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY) (PUSHNEW COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (SYMBOL-VALUE COMMON-LISP-USER::LIBRARY-DIRECTORIES) :TEST (FUNCTION EQUAL)))) (ASDF/FIND-SYSTEM:LOAD-ASD (MERGE-PATHNAMES "autolith.asd" COMMON-LISP-USER::SOURCE-ROOT)) (ASDF/OPERATE:LOAD-SYSTEM :AUTOLITH) ...) #<NULL-LEXENV>)
+41: (SB-EXT:EVAL-TLF (LET* ((COMMON-LISP-USER::SCRIPT-PATH (TRUENAME *LOAD-TRUENAME*)) (COMMON-LISP-USER::SCRIPT-DIRECTORY (UIOP/PATHNAME:PATHNAME-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-PATH)) (COMMON-LISP-USER::SOURCE-ROOT (UIOP/PATHNAME:PATHNAME-PARENT-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-DIRECTORY)) (COMMON-LISP-USER::VERSION-PATHNAME (MERGE-PATHNAMES "sbcl.version" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::PROJECT-SETUP (MERGE-PATHNAMES ".qlot/setup.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::HOME (USER-HOMEDIR-PATHNAME)) (COMMON-LISP-USER::DATA-HOME (UIOP/PATHNAME:ENSURE-DIRECTORY-PATHNAME (OR # #))) (COMMON-LISP-USER::DEFAULT-CORE (MERGE-PATHNAMES "autolith/active/autolith-active.core" COMMON-LISP-USER::DATA-HOME)) (COMMON-LISP-USER::ARGUMENTS (UIOP/IMAGE:COMMAND-LINE-ARGUMENTS)) (COMMON-LISP-USER::CORE-PATHNAME (PATHNAME (OR # # COMMON-LISP-USER::DEFAULT-CORE)))) (LET ((COMMON-LISP-USER::EXPECTED-VERSION (STRING-TRIM # #))) (UNLESS (STRING= COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)) (ERROR "Active-image builds require pinned SBCL ~A, not ~A." COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)))) (UNLESS (PROBE-FILE COMMON-LISP-USER::PROJECT-SETUP) (ERROR "Active-image builds need locked dependencies; run ./script/bootstrap.")) (FORMAT T "~&Loading Autolith for its preloaded active image.~%") (FINISH-OUTPUT) (LOAD COMMON-LISP-USER::PROJECT-SETUP) (LOAD (MERGE-PATHNAMES "script/build-sandbox.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (UIOP/PACKAGE:SYMBOL-CALL (QUOTE #:QL) (QUOTE #:QUICKLOAD) :CFFI :SILENT T) (LET ((COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (MERGE-PATHNAMES ".guix-profile/lib/" COMMON-LISP-USER::HOME)) (COMMON-LISP-USER::LIBRARY-DIRECTORIES (FIND-SYMBOL "*FOREIGN-LIBRARY-DIRECTORIES*" "CFFI"))) (WHEN (PROBE-FILE COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY) (PUSHNEW COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (SYMBOL-VALUE COMMON-LISP-USER::LIBRARY-DIRECTORIES) :TEST (FUNCTION EQUAL)))) (ASDF/FIND-SYSTEM:LOAD-ASD (MERGE-PATHNAMES "autolith.asd" COMMON-LISP-USER::SOURCE-ROOT)) (ASDF/OPERATE:LOAD-SYSTEM :AUTOLITH) ...) 3 NIL)
+42: ((LABELS SB-FASL::EVAL-FORM :IN SB-INT:LOAD-AS-SOURCE) (LET* ((COMMON-LISP-USER::SCRIPT-PATH (TRUENAME *LOAD-TRUENAME*)) (COMMON-LISP-USER::SCRIPT-DIRECTORY (UIOP/PATHNAME:PATHNAME-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-PATH)) (COMMON-LISP-USER::SOURCE-ROOT (UIOP/PATHNAME:PATHNAME-PARENT-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-DIRECTORY)) (COMMON-LISP-USER::VERSION-PATHNAME (MERGE-PATHNAMES "sbcl.version" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::PROJECT-SETUP (MERGE-PATHNAMES ".qlot/setup.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::HOME (USER-HOMEDIR-PATHNAME)) (COMMON-LISP-USER::DATA-HOME (UIOP/PATHNAME:ENSURE-DIRECTORY-PATHNAME (OR # #))) (COMMON-LISP-USER::DEFAULT-CORE (MERGE-PATHNAMES "autolith/active/autolith-active.core" COMMON-LISP-USER::DATA-HOME)) (COMMON-LISP-USER::ARGUMENTS (UIOP/IMAGE:COMMAND-LINE-ARGUMENTS)) (COMMON-LISP-USER::CORE-PATHNAME (PATHNAME (OR # # COMMON-LISP-USER::DEFAULT-CORE)))) (LET ((COMMON-LISP-USER::EXPECTED-VERSION (STRING-TRIM # #))) (UNLESS (STRING= COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)) (ERROR "Active-image builds require pinned SBCL ~A, not ~A." COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)))) (UNLESS (PROBE-FILE COMMON-LISP-USER::PROJECT-SETUP) (ERROR "Active-image builds need locked dependencies; run ./script/bootstrap.")) (FORMAT T "~&Loading Autolith for its preloaded active image.~%") (FINISH-OUTPUT) (LOAD COMMON-LISP-USER::PROJECT-SETUP) (LOAD (MERGE-PATHNAMES "script/build-sandbox.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (UIOP/PACKAGE:SYMBOL-CALL (QUOTE #:QL) (QUOTE #:QUICKLOAD) :CFFI :SILENT T) (LET ((COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (MERGE-PATHNAMES ".guix-profile/lib/" COMMON-LISP-USER::HOME)) (COMMON-LISP-USER::LIBRARY-DIRECTORIES (FIND-SYMBOL "*FOREIGN-LIBRARY-DIRECTORIES*" "CFFI"))) (WHEN (PROBE-FILE COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY) (PUSHNEW COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (SYMBOL-VALUE COMMON-LISP-USER::LIBRARY-DIRECTORIES) :TEST (FUNCTION EQUAL)))) (ASDF/FIND-SYSTEM:LOAD-ASD (MERGE-PATHNAMES "autolith.asd" COMMON-LISP-USER::SOURCE-ROOT)) (ASDF/OPERATE:LOAD-SYSTEM :AUTOLITH) ...) 3)
+43: ((LAMBDA (SB-KERNEL:FORM &KEY :CURRENT-INDEX &ALLOW-OTHER-KEYS) :IN SB-INT:LOAD-AS-SOURCE) (LET* ((COMMON-LISP-USER::SCRIPT-PATH (TRUENAME *LOAD-TRUENAME*)) (COMMON-LISP-USER::SCRIPT-DIRECTORY (UIOP/PATHNAME:PATHNAME-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-PATH)) (COMMON-LISP-USER::SOURCE-ROOT (UIOP/PATHNAME:PATHNAME-PARENT-DIRECTORY-PATHNAME COMMON-LISP-USER::SCRIPT-DIRECTORY)) (COMMON-LISP-USER::VERSION-PATHNAME (MERGE-PATHNAMES "sbcl.version" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::PROJECT-SETUP (MERGE-PATHNAMES ".qlot/setup.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (COMMON-LISP-USER::HOME (USER-HOMEDIR-PATHNAME)) (COMMON-LISP-USER::DATA-HOME (UIOP/PATHNAME:ENSURE-DIRECTORY-PATHNAME (OR # #))) (COMMON-LISP-USER::DEFAULT-CORE (MERGE-PATHNAMES "autolith/active/autolith-active.core" COMMON-LISP-USER::DATA-HOME)) (COMMON-LISP-USER::ARGUMENTS (UIOP/IMAGE:COMMAND-LINE-ARGUMENTS)) (COMMON-LISP-USER::CORE-PATHNAME (PATHNAME (OR # # COMMON-LISP-USER::DEFAULT-CORE)))) (LET ((COMMON-LISP-USER::EXPECTED-VERSION (STRING-TRIM # #))) (UNLESS (STRING= COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)) (ERROR "Active-image builds require pinned SBCL ~A, not ~A." COMMON-LISP-USER::EXPECTED-VERSION (LISP-IMPLEMENTATION-VERSION)))) (UNLESS (PROBE-FILE COMMON-LISP-USER::PROJECT-SETUP) (ERROR "Active-image builds need locked dependencies; run ./script/bootstrap.")) (FORMAT T "~&Loading Autolith for its preloaded active image.~%") (FINISH-OUTPUT) (LOAD COMMON-LISP-USER::PROJECT-SETUP) (LOAD (MERGE-PATHNAMES "script/build-sandbox.lisp" COMMON-LISP-USER::SOURCE-ROOT)) (UIOP/PACKAGE:SYMBOL-CALL (QUOTE #:QL) (QUOTE #:QUICKLOAD) :CFFI :SILENT T) (LET ((COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (MERGE-PATHNAMES ".guix-profile/lib/" COMMON-LISP-USER::HOME)) (COMMON-LISP-USER::LIBRARY-DIRECTORIES (FIND-SYMBOL "*FOREIGN-LIBRARY-DIRECTORIES*" "CFFI"))) (WHEN (PROBE-FILE COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY) (PUSHNEW COMMON-LISP-USER::PROFILE-LIBRARY-DIRECTORY (SYMBOL-VALUE COMMON-LISP-USER::LIBRARY-DIRECTORIES) :TEST (FUNCTION EQUAL)))) (ASDF/FIND-SYSTEM:LOAD-ASD (MERGE-PATHNAMES "autolith.asd" COMMON-LISP-USER::SOURCE-ROOT)) (ASDF/OPERATE:LOAD-SYSTEM :AUTOLITH) ...) :CURRENT-INDEX 3)
+44: (SB-C::%DO-FORMS-FROM-INFO #<FUNCTION (LAMBDA (SB-KERNEL:FORM &KEY :CURRENT-INDEX &ALLOW-OTHER-KEYS) :IN SB-INT:LOAD-AS-SOURCE) {7EFD9E7FCE0B}> #<SB-C::SOURCE-INFO {50B62383}> SB-C::INPUT-ERROR-IN-LOAD)
+45: (SB-INT:LOAD-AS-SOURCE #<SB-SYS:FD-STREAM for "file /var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/script/build-active.lisp" {50B62043}> :VERBOSE NIL :PRINT NIL :CONTEXT "loading")
+46: ((LABELS SB-FASL::LOAD-STREAM-1 :IN LOAD) #<SB-SYS:FD-STREAM for "file /var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/script/build-active.lisp" {50B62043}> NIL)
+47: (SB-FASL::CALL-WITH-LOAD-BINDINGS #<FUNCTION (LABELS SB-FASL::LOAD-STREAM-1 :IN LOAD) {7EFD9E7FC9CB}> #<SB-SYS:FD-STREAM for "file /var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/script/build-active.lisp" {50B62043}> NIL #<SB-SYS:FD-STREAM for "file /var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/script/build-active.lisp" {50B62043}>)
+48: (LOAD #<SB-SYS:FD-STREAM for "file /var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/script/build-active.lisp" {50B62043}> :VERBOSE NIL :PRINT NIL :IF-DOES-NOT-EXIST :ERROR :EXTERNAL-FORMAT :DEFAULT)
+49: ((FLET SB-IMPL::LOAD-SCRIPT :IN SB-IMPL::PROCESS-SCRIPT) #<SB-SYS:FD-STREAM for "file /var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/script/build-active.lisp" {50B62043}>)
+50: ((FLET SB-UNIX::BODY :IN SB-IMPL::PROCESS-SCRIPT))
+51: ((FLET "WITHOUT-INTERRUPTS-BODY-" :IN SB-IMPL::PROCESS-SCRIPT))
+52: (SB-IMPL::PROCESS-SCRIPT "/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2/script/build-active.lisp")
+53: (SB-IMPL::TOPLEVEL-INIT)
+54: ((FLET SB-UNIX::BODY :IN SB-IMPL::START-LISP))
+55: ((FLET "WITHOUT-INTERRUPTS-BODY-3" :IN SB-IMPL::START-LISP))
+56: (SB-IMPL::%START-LISP)
+
+unhandled condition in --disable-debugger mode, quitting
+; 
+; compilation unit aborted
+;   caught 1 fatal ERROR condition
+ [31;01m*[0m ERROR: dev-util/autolith-0.17.2::mndz failed (compile phase):
+ [31;01m*[0m   active core build failed
+ [31;01m*[0m 
+ [31;01m*[0m Call stack:
+ [31;01m*[0m     ebuild.sh, line 143:  Called src_compile
+ [31;01m*[0m   environment, line 514:  Called die
+ [31;01m*[0m The specific snippet of code:
+ [31;01m*[0m       sbcl --noinform --no-userinit --no-sysinit --script "${S}/script/build-active.lisp" "${active_core}" || die "active core build failed";
+ [31;01m*[0m 
+ [31;01m*[0m If you need support, post the output of `emerge --info '=dev-util/autolith-0.17.2::mndz'`,
+ [31;01m*[0m the complete build log and the output of `emerge -pqv '=dev-util/autolith-0.17.2::mndz'`.
+ [31;01m*[0m The complete build log is located at '/var/tmp/portage/dev-util/autolith-0.17.2/temp/build.log'.
+ [31;01m*[0m The ebuild environment file is located at '/var/tmp/portage/dev-util/autolith-0.17.2/temp/environment'.
+ [31;01m*[0m Working directory: '/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2'
+ [31;01m*[0m S: '/var/tmp/portage/dev-util/autolith-0.17.2/work/autolith-0.17.2'
+2026-08-03T20:52:15-07:00
+FAILED
