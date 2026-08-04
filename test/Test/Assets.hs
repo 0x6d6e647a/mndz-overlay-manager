@@ -369,7 +369,8 @@ testTokenResolverIO = do
         OverlayConfig
           { overlayPath = "/tmp/ov",
             assetsPath = Nothing,
-            githubToken = Just "from-config"
+            githubToken = Just "from-config",
+            distfilesPath = Nothing
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "config only" (Just "from-config") =<< resolveGitHubToken cfg
@@ -383,7 +384,8 @@ testTokenResolverIO = do
         OverlayConfig
           { overlayPath = "/tmp/ov",
             assetsPath = Nothing,
-            githubToken = Nothing
+            githubToken = Nothing,
+            distfilesPath = Nothing
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "none" Nothing =<< resolveGitHubToken cfgNoTok

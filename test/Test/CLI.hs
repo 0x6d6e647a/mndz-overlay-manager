@@ -52,7 +52,7 @@ import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (nub, sort, sortBy)
+import Data.List (isInfixOf, nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isNothing)
 import Data.Text qualified as T
@@ -68,7 +68,15 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
-import Options.Applicative (defaultPrefs, execParserPure, getParseResult)
+import Options.Applicative
+  ( ParseError (ShowHelpText),
+    ParserResult (..),
+    defaultPrefs,
+    execParserPure,
+    getParseResult,
+    parserFailure,
+    renderFailure,
+  )
 import Overlay.Discovery
   ( DiscoveryError (..),
     collectEbuilds,
@@ -297,6 +305,7 @@ tests =
       testCase "Resolve Jobs" testResolveJobs,
       testCase "Parser Pure Commands" testParserPureCommands,
       testCase "Parser Residual Edges" testParserResidualEdges,
+      testCase "Help Catalogs Eclean And Distfiles" testHelpCatalogDistfiles,
       testCase "Show Top Level Help Exit 1" testShowTopLevelHelpExit1,
       testCase "Logger Hold And Filter" testLoggerHoldAndFilter
     ]
@@ -506,10 +515,11 @@ testParserPureCommands = do
     Nothing -> do
       hPutStrLn stderr "parse gencache --force failed"
       exitFailure
-  case parse ["--config", "/tmp/om.toml", "--overlay-path", "/tmp/ov", "--jobs", "8", "--no-progress", "--no-color", "-v", "list"] of
+  case parse ["--config", "/tmp/om.toml", "--overlay-path", "/tmp/ov", "--distfiles-path", "/tmp/df", "--jobs", "8", "--no-progress", "--no-color", "-v", "list"] of
     Just opts -> do
       assertEq "global config" (Just "/tmp/om.toml") (optConfig opts)
       assertEq "global overlay" (Just "/tmp/ov") (optOverlayPath opts)
+      assertEq "global distfiles" (Just "/tmp/df") (optDistfilesPath opts)
       assertEq "global jobs" (Just 8) (optJobs opts)
       assertEq "global no-progress" True (optNoProgress opts)
       assertEq "global no-color" True (optNoColor opts)
@@ -517,6 +527,11 @@ testParserPureCommands = do
       assertEq "global + list" (Just CLI.List) (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse globals + list failed"
+      exitFailure
+  case parse ["eclean"] of
+    Just opts -> assertEq "eclean cmd" (Just CLI.Eclean) (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse eclean failed"
       exitFailure
   case parse ["--log-level", "error", "outdated"] of
     Just opts -> assertEq "log-level error" V.Error (optVerbosity opts)
@@ -595,6 +610,26 @@ testParserResidualEdges = do
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update multi failed"
+      exitFailure
+
+-- | Top-level and @eclean --help@ catalog manager distfiles surfaces.
+testHelpCatalogDistfiles :: IO ()
+testHelpCatalogDistfiles = do
+  let topFailure = parserFailure defaultPrefs parserInfo (ShowHelpText Nothing) mempty
+      (topMsg, _) = renderFailure topFailure "mndz-overlay-manager"
+  assertTrue "top help lists eclean" ("eclean" `isInfixOf` topMsg)
+  assertTrue "top help lists distfiles-path" ("distfiles-path" `isInfixOf` topMsg)
+  case execParserPure defaultPrefs parserInfo ["eclean", "--help"] of
+    Failure failure -> do
+      let (msg, _) = renderFailure failure "mndz-overlay-manager"
+      assertTrue "eclean help mentions manager" ("manager" `isInfixOf` msg || "distfiles" `isInfixOf` msg)
+      assertTrue "eclean help mentions private/cache" ("cache" `isInfixOf` msg || "private" `isInfixOf` msg)
+      assertTrue "eclean help mentions system not cleaned" ("system" `isInfixOf` msg)
+    Success _ -> do
+      hPutStrLn stderr "expected eclean --help Failure, got Success"
+      exitFailure
+    CompletionInvoked _ -> do
+      hPutStrLn stderr "expected eclean --help Failure, got CompletionInvoked"
       exitFailure
 
 testShowTopLevelHelpExit1 :: IO ()

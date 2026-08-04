@@ -56,6 +56,11 @@ import Update.Check
     productionFetcherWithToken,
   )
 import Update.Deps.Plan (productionDepsPlanOps, toGoPlanOps)
+import Update.Distfiles
+  ( cleanManagerDistfiles,
+    probeDistfilesDir,
+    resolveDistfilesPath,
+  )
 import Update.Git (isGitWorkTree, productionGitOps)
 import Update.Go.Vendor (productionVendorOps)
 import Update.GpgAgent
@@ -137,6 +142,7 @@ main = do
           Cmd.Outdated pkgs -> runOutdated rt pkgs
           Cmd.Update pkgs -> runUpdate rt pkgs
           Cmd.Gencache targets force -> runGencache rt targets force
+          Cmd.Eclean -> runEclean rt
 
 runList :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runList rt = do
@@ -205,6 +211,15 @@ runUpdate rt pkgArgs = do
       case layoutOk of
         Left err -> dieError (T.unpack err)
         Right () -> pure ()
+      distDir <-
+        liftIO $
+          resolveDistfilesPath
+            (optDistfilesPath (rtOptions rt))
+            (distfilesPath cfg)
+      probeOk <- liftIO $ probeDistfilesDir distDir
+      case probeOk of
+        Left err -> dieError (T.unpack err)
+        Right () -> pure ()
       token <- liftIO (resolveGitHubToken cfg)
       assetsRoot <-
         if needAssets
@@ -238,7 +253,7 @@ runUpdate rt pkgArgs = do
                   ApplyEnv
                     { aeFetcher = fetch,
                       aeGitOps = productionGitOps gpg,
-                      aeEbuildRunner = productionEbuildRunner,
+                      aeEbuildRunner = productionEbuildRunner distDir,
                       aeEgencacheRunner = productionEgencacheRunner,
                       aeVendorOps = productionVendorOps,
                       aeNpmCacheOps = productionNpmCacheOps,
@@ -364,6 +379,21 @@ emitOutcome = \case
       logWarning $
         packageKeyText key
           <> ": assets release may already be published but the overlay update did not complete"
+
+-- | Clean the manager private distfiles cache (never system Portage DISTDIR).
+runEclean :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
+runEclean rt = do
+  cfg <- loadConfigOrDie (optConfig (rtOptions rt))
+  distDir <-
+    liftIO $
+      resolveDistfilesPath
+        (optDistfilesPath (rtOptions rt))
+        (distfilesPath cfg)
+  result <- liftIO (cleanManagerDistfiles distDir)
+  case result of
+    Left err -> dieError (T.unpack err)
+    Right () ->
+      logInfo $ "eclean: cleaned manager distfiles cache at " <> T.pack distDir
 
 runGencache :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> Bool -> m ()
 runGencache rt pkgArgs force = do

@@ -13,11 +13,16 @@ import CLI.Progress (MultiHandle)
 import Control.Concurrent.MVar (MVar)
 import Data.Text (Text)
 import Data.Text qualified as T
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import Update.Assets.Release (ReleaseOps)
 import Update.Bun.Cache (BunCacheOps)
 import Update.Cargo.Crates (CargoOps)
 import Update.Deps.Plan (DepsPlanOps)
+import Update.Distfiles
+  ( ebuildManifestEnv,
+    enrichEbuildManifestError,
+  )
 import Update.Git (GitOps)
 import Update.Go.Plan (PlanOps)
 import Update.Go.Vendor (VendorOps)
@@ -35,24 +40,28 @@ import Update.Types (Fetcher)
 type EbuildRunner = FilePath -> FilePath -> IO (Either Text ())
 
 -- | Build ebuild runner over an injectable command runner (shell mode).
-mkEbuildRunner :: CommandRunner -> EbuildRunner
-mkEbuildRunner run pkgDir ebuildFileName = do
+-- Sets @DISTDIR@ to the effective manager distfiles path and empties
+-- @GENTOO_MIRRORS@; merges onto the full parent environment.
+mkEbuildRunner :: FilePath -> CommandRunner -> EbuildRunner
+mkEbuildRunner distDir run pkgDir ebuildFileName = do
+  env0 <- getEnvironment
   let cmd = "ebuild ./" <> ebuildFileName <> " manifest"
   res <-
     run
       ProcessRequest
         { prMode = ShellCmd cmd,
           prCwd = Just pkgDir,
-          prEnv = Nothing,
+          prEnv = Just (ebuildManifestEnv distDir env0),
           prStdin = ""
         }
   pure $
     if prExitCode res == ExitSuccess
       then Right ()
-      else Left ("ebuild manifest failed: " <> T.pack (prStderr res))
+      else Left (enrichEbuildManifestError distDir (T.pack (prStderr res)))
 
-productionEbuildRunner :: EbuildRunner
-productionEbuildRunner = mkEbuildRunner productionCommandRunner
+-- | Production ebuild runner for the given effective manager distfiles path.
+productionEbuildRunner :: FilePath -> EbuildRunner
+productionEbuildRunner distDir = mkEbuildRunner distDir productionCommandRunner
 
 data ApplyEnv = ApplyEnv
   { aeFetcher :: Fetcher,

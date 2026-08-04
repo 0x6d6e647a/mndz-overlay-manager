@@ -12,7 +12,9 @@ import Toml.Schema (FromValue (..), optKey, parseTableFromValue, reqKey)
 data OverlayConfig = OverlayConfig
   { overlayPath :: FilePath,
     assetsPath :: Maybe FilePath,
-    githubToken :: Maybe Text
+    githubToken :: Maybe Text,
+    -- | Optional private Portage DISTDIR for @ebuild … manifest@ (see @--distfiles-path@).
+    distfilesPath :: Maybe FilePath
   }
   deriving (Eq, Show, Generic)
 
@@ -23,3 +25,4 @@ instance FromValue OverlayConfig where
         <$> reqKey "overlay-path"
         <*> optKey "assets-path"
         <*> optKey "github-token"
+        <*> optKey "distfiles-path"

@@ -40,11 +40,13 @@ data Command
       { gencacheTargets :: [String],
         gencacheForce :: Bool
       }
+  | Eclean
   deriving (Eq, Show)
 
 data Options = Options
   { optConfig :: Maybe FilePath,
     optOverlayPath :: Maybe FilePath,
+    optDistfilesPath :: Maybe FilePath,
     optVerbosity :: Verbosity,
     optJobs :: Maybe Int,
     optNoProgress :: Bool,
@@ -57,8 +59,8 @@ data Options = Options
 -- | Shared footer for command-scoped help: globals live before the subcommand.
 globalsFooter :: String
 globalsFooter =
-  "Global options (e.g. --config, --overlay-path, --jobs) are accepted before \
-  \the subcommand. See mndz-overlay-manager --help for the full list."
+  "Global options (e.g. --config, --overlay-path, --distfiles-path, --jobs) are \
+  \accepted before the subcommand. See mndz-overlay-manager --help for the full list."
 
 -- | Map @-v@ count to verbosity starting from 'Warn'.
 -- Each flag steps Warn → Info → Debug (capped).
@@ -144,6 +146,17 @@ overlayPathParser =
       ( long "overlay-path"
           <> metavar "DIR"
           <> help "Override overlay path from config"
+      )
+
+distfilesPathParser :: Parser (Maybe FilePath)
+distfilesPathParser =
+  optional $
+    strOption
+      ( long "distfiles-path"
+          <> metavar "DIR"
+          <> help
+            "Override manager distfiles cache (default: XDG cache \
+            \mndz/overlay-manager/distfiles)"
       )
 
 updateParser :: Parser Command
@@ -251,6 +264,22 @@ gencacheInfo =
           )
     )
 
+ecleanInfo :: ParserInfo Command
+ecleanInfo =
+  info
+    (pure Eclean)
+    ( fullDesc
+        <> progDesc "Clean the manager private distfiles cache"
+        <> footer
+          ( "Delete the manager private Portage distfiles cache used by update \
+            \(default under XDG cache mndz/overlay-manager/distfiles). Does not \
+            \clean system Portage distfiles (/var/cache/distfiles); refuse if \
+            \the effective path is the system DISTDIR. Override with global \
+            \--distfiles-path before the subcommand. No subcommand-local flags. "
+              <> globalsFooter
+          )
+    )
+
 commandParser :: Parser (Maybe Command)
 commandParser =
   optional $
@@ -259,6 +288,7 @@ commandParser =
           <> command "outdated" outdatedInfo
           <> command "update" updateInfo
           <> command "gencache" gencacheInfo
+          <> command "eclean" ecleanInfo
           <> metavar "COMMAND"
       )
 
@@ -266,6 +296,7 @@ optionsParser :: Parser Options
 optionsParser = do
   optConfig <- configParser
   optOverlayPath <- overlayPathParser
+  optDistfilesPath <- distfilesPathParser
   optVerbosity <- verbosityParser
   optJobs <- jobsParser
   optNoProgress <- noProgressParser

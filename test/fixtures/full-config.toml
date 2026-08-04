@@ -1,3 +1,4 @@
 overlay-path = "/tmp/overlay"
 assets-path = "/tmp/assets"
 github-token = "secret-token"
+distfiles-path = "/tmp/distfiles"

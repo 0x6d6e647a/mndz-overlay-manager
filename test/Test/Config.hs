@@ -289,6 +289,7 @@ testConfigLoadSuccess = do
   assertEq "path key" "test/fixtures/populated-overlay" (overlayPath cfg)
   assertEq "assets optional absent" Nothing (assetsPath cfg)
   assertEq "token optional absent" Nothing (githubToken cfg)
+  assertEq "distfiles optional absent" Nothing (distfilesPath cfg)
 
 testConfigOptionalKeys :: IO ()
 testConfigOptionalKeys = do
@@ -296,6 +297,7 @@ testConfigOptionalKeys = do
   assertEq "path" "/tmp/overlay" (overlayPath cfg)
   assertEq "assets" (Just "/tmp/assets") (assetsPath cfg)
   assertEq "token" (Just "secret-token") (githubToken cfg)
+  assertEq "distfiles" (Just "/tmp/distfiles") (distfilesPath cfg)
 
 testConfigLoadMissing :: IO ()
 testConfigLoadMissing = do

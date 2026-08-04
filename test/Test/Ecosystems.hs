@@ -1069,10 +1069,10 @@ testSimpleRunnersMk =
           _ -> pure (failResult ("unexpected ebuild req: " <> show req))
         ebuildFail _ = pure (failResult "ebuild died")
     assertRight "ebuild ok"
-      =<< mkEbuildRunner ebuildOk overlay "pkg-1.0.ebuild"
+      =<< mkEbuildRunner (tmp </> "distfiles") ebuildOk overlay "pkg-1.0.ebuild"
     ebuildErr <-
       assertLeft "ebuild fail"
-        =<< mkEbuildRunner ebuildFail overlay "pkg-1.0.ebuild"
+        =<< mkEbuildRunner (tmp </> "distfiles") ebuildFail overlay "pkg-1.0.ebuild"
     assertTrue "ebuild err" ("ebuild manifest failed" `T.isInfixOf` ebuildErr)
     -- portageq success + failure
     let pqOk = mkPortageqRunner $ \req -> case execCmd req of

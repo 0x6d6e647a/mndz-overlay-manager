@@ -1,6 +1,6 @@
 # mndz-overlay-manager
 
-Haskell CLI for managing a Gentoo overlay: list ebuilds, check for outdated packages, apply updates with Manifest regeneration and GPG-signed commits, and maintain Portage `metadata/md5-cache`.
+Haskell CLI for managing a Gentoo overlay: list ebuilds, check for outdated packages, apply updates with Manifest regeneration and GPG-signed commits, maintain Portage `metadata/md5-cache`, and reclaim the manager’s private distfiles cache.
 
 ## Prerequisites
 
@@ -43,8 +43,20 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 | `overlay-path` | yes | Root of the Gentoo overlay (must be a git work tree for `update` and `gencache`) |
 | `assets-path` | no | Git work tree for vendor/deps asset sidecars (required when `update` will publish assets) |
 | `github-token` | no | GitHub API token for authenticated fetch / release publish |
+| `distfiles-path` | no | Private Portage `DISTDIR` for `ebuild … manifest` during `update` (default: XDG cache path below) |
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then `github-token` in the config. Prefer env vars in shared environments; the program never logs the raw token.
+
+### Manager distfiles (private DISTDIR)
+
+By default, `update` runs Portage `ebuild … manifest` with `DISTDIR` set to a **private, operator-owned cache** so fetches do not land in sticky system `/var/cache/distfiles` (where root/`portage` ownership and the sticky bit commonly cause `EPERM` rename failures mid-apply).
+
+Default path (XDG cache):
+
+- `$XDG_CACHE_HOME/mndz/overlay-manager/distfiles` when `XDG_CACHE_HOME` is set and non-empty
+- otherwise `~/.cache/mndz/overlay-manager/distfiles`
+
+Override with config key `distfiles-path` or global `--distfiles-path DIR` (CLI wins over config over the default). You *may* point this at the system Portage DISTDIR if you accept sticky/ownership risk; `eclean` will refuse that path.
 
 ### Example
 
@@ -52,6 +64,7 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 overlay-path = "/path/to/mndz-overlay"
 assets-path = "/path/to/mndz-overlay-assets"
 # github-token = "ghp_..."   # optional; prefer GITHUB_TOKEN / GH_TOKEN
+# distfiles-path = "/path/to/private-distfiles"  # optional; default is XDG cache
 ```
 
 ## Commands
@@ -64,6 +77,7 @@ Global options apply **before** the subcommand (for example `mndz-overlay-manage
 |--------|---------|
 | `--config` / `-c FILE.toml` | Config path (overrides the XDG default) |
 | `--overlay-path DIR` | Use this overlay root instead of `overlay-path` from config |
+| `--distfiles-path DIR` | Use this directory as the manager private Portage DISTDIR (overrides `distfiles-path` / XDG default) |
 | `--jobs N` | Max concurrent package jobs (default: host CPU count); mainly affects `outdated` and `update` |
 | `-v` / `--verbose` | Increase log verbosity from warn (repeatable: `-v` → info, `-vv` → debug) |
 | `--log-level LEVEL` | Set log level (`error` \| `warn` \| `info` \| `debug`); overrides `-v` when set |
@@ -114,7 +128,7 @@ cabal run mndz-overlay-manager -- --jobs 2 -v update
 cabal run mndz-overlay-manager -- --no-progress update category/package
 ```
 
-Before mutating anything, `update` checks that required tools are on `PATH`, that the overlay `metadata/layout.conf` lists `cache-formats = md5-dict`, and that each package about to be applied has complete matching md5-cache for all non-live ebuilds. When assets publish is needed, it also checks that `assets-path` is a git work tree and a GitHub token can be resolved. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
+Before mutating anything, `update` checks that required tools are on `PATH`, that the overlay `metadata/layout.conf` lists `cache-formats = md5-dict`, that the effective manager distfiles directory supports create-then-rename (Portage’s fetch pattern), and that each package about to be applied has complete matching md5-cache for all non-live ebuilds. When assets publish is needed, it also checks that `assets-path` is a git work tree and a GitHub token can be resolved. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
 
 If md5-cache is **missing**, hard-fail recovery is `gencache category/package`. If `_md5_` **mismatches**, use `gencache --force category/package`, then retry `update`.
 
@@ -144,6 +158,18 @@ cabal run mndz-overlay-manager -- gencache --force crush
 2. Run `gencache` once for the full tree to populate `metadata/md5-cache/` and create a signed commit.
 3. Day-to-day version bumps use `update`, which regenerates package cache and co-commits it with ebuild/Manifest changes.
 4. When `update` reports missing cache, run `gencache category/package`. When it reports `_md5_` mismatch (or after major Gentoo eclass changes), run `gencache --force category/package` (or full-tree `--force`).
+
+### `eclean`
+
+Delete the **manager private distfiles cache** used by `update` for Portage `ebuild … manifest` fetches (default under XDG cache `mndz/overlay-manager/distfiles`). This is **not** Gentoo `app-portage/eclean` and does **not** clean system Portage distfiles under `/var/cache/distfiles`. If the effective path is the system Portage DISTDIR (for example after `--distfiles-path /var/cache/distfiles`), the command refuses, logs an error, and exits `1`. A missing cache directory is a successful no-op.
+
+```bash
+# Clean the default (or config) manager distfiles cache
+cabal run mndz-overlay-manager -- eclean
+
+# Clean an explicit manager cache path
+cabal run mndz-overlay-manager -- --distfiles-path /path/to/private-distfiles eclean
+```
 
 ## Development
 
