@@ -126,6 +126,9 @@ rustCeilings = dualArchCeilings "dev-lang/rust|rust-bin" (Just "1.80.0") (Just "
 goCeilings :: RuntimeCeilings
 goCeilings = dualArchCeilings "dev-lang/go" (Just "1.26.3") (Just "1.26.5")
 
+sbclCeilings :: RuntimeCeilings
+sbclCeilings = dualArchCeilings "dev-lisp/sbcl" (Just "2.6.2") (Just "2.6.6")
+
 mkDepsPlanOps ::
   (UpdateSource -> IO (Either T.Text [EbuildVersion])) ->
   (GoModKey -> IO (Either T.Text T.Text)) ->
@@ -141,6 +144,7 @@ mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
   nodeCache <- newMVar (Just nodeCeilings)
   bunCache <- newMVar (Just bunCeilings)
   rustCache <- newMVar (Just rustCeilings)
+  sbclCache <- newMVar (Just sbclCeilings)
   pure
     DepsPlanOps
       { dpoPortageq = \_ -> pure (Left "portageq unused in Materialize tests"),
@@ -149,11 +153,13 @@ mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
         dpoFetchNpmEngines = fetchNpm,
         dpoFetchBunEngines = fetchBun,
         dpoFetchCargoToml = fetchCargo,
+        dpoFetchSbclVersion = \_ _ _ _ -> pure (Left "sbcl.version unused"),
         dpoWorkBudget = budget,
         dpoGoCeilingsCache = goCache,
         dpoNodeCeilingsCache = nodeCache,
         dpoBunCeilingsCache = bunCache,
         dpoRustCeilingsCache = rustCache,
+        dpoSbclCeilingsCache = sbclCache,
         dpoOverlayRoot = mOverlay,
         dpoManager = mgr
       }

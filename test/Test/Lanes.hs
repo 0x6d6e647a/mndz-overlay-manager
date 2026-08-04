@@ -240,6 +240,7 @@ import Update.Runtime.Ceilings
     discoverGoCeilingsWith,
     discoverNodejsCeilingsWith,
     discoverRustUnionCeilingsWith,
+    discoverSbclCeilingsWith,
     emptyCeilings,
     isLiveRuntimeVersion,
     keywordsHasBare,
@@ -1110,6 +1111,14 @@ testRuntimeCeilingDiscoverResidual =
     TIO.writeFile
       (bunDir </> "bun-bin-1.1.0.ebuild")
       "KEYWORDS=\"~amd64 ~arm64\"\n"
+    let sbclDir = gentoo </> "dev-lisp" </> "sbcl"
+    createDirectoryIfMissing True sbclDir
+    TIO.writeFile
+      (sbclDir </> "sbcl-2.6.2.ebuild")
+      "KEYWORDS=\"amd64\"\n"
+    TIO.writeFile
+      (sbclDir </> "sbcl-2.6.6.ebuild")
+      "KEYWORDS=\"~amd64 ~x86\"\n"
     let portageq args =
           pure $
             if args == ["get_repo_path", "/", "gentoo"]
@@ -1167,3 +1176,14 @@ testRuntimeCeilingDiscoverResidual =
       Right _ -> do
         hPutStrLn stderr "expected Left when both rust dirs missing"
         exitFailure
+    sbclC <-
+      assertRight "sbcl ceilings" =<< discoverSbclCeilingsWith portageq
+    assertEq "sbcl atom" "dev-lisp/sbcl" (rcAtom sbclC)
+    assertEq
+      "sbcl plain"
+      (Just (parseEbuildVersion "2.6.2"))
+      (acPlain (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch sbclC)))
+    assertEq
+      "sbcl tilde"
+      (Just (parseEbuildVersion "2.6.6"))
+      (acTilde (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch sbclC)))

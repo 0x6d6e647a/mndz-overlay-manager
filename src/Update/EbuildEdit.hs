@@ -20,10 +20,13 @@ module Update.EbuildEdit
     ensureGoBdepend,
     ensureNodejsBdepend,
     ensureBunBdepend,
+    ensureSbclAtom,
     ensureRustMinVer,
     ensureCargoAssetsSrcUri,
     ensureEmptyCrates,
     cargoCratesSrcUriLine,
+    sbclBdependAtom,
+    sbclBdependMatches,
     parseKeywordsLine,
     setKeywords,
     keywordsMatch,
@@ -419,6 +422,10 @@ nodejsBdependAtom ver = ">=net-libs/nodejs-" <> ver <> "[npm]"
 bunBdependAtom :: Text -> Text
 bunBdependAtom ver = ">=dev-lang/bun-bin-" <> ver
 
+-- | Portage atom for SBCL floor with subslot and source USE (seed template form).
+sbclBdependAtom :: Text -> Text
+sbclBdependAtom ver = ">=dev-lisp/sbcl-" <> ver <> ":=[source]"
+
 -- | True when the ebuild text mentions a @dev-lang/go@ dependency atom.
 ebuildHasDevLangGoBdepend :: Text -> Bool
 ebuildHasDevLangGoBdepend content =
@@ -432,6 +439,10 @@ goBdependMatches goVer content =
 nodejsBdependMatches :: Text -> Text -> Bool
 nodejsBdependMatches ver content =
   nodejsBdependAtom ver `T.isInfixOf` content
+
+sbclBdependMatches :: Text -> Text -> Bool
+sbclBdependMatches ver content =
+  sbclBdependAtom ver `T.isInfixOf` content
 
 -- | Ensure the ebuild declares @BDEPEND@ with @>=dev-lang/go-<ver>:=@.
 ensureGoBdepend :: Text -> Text -> Either Text Text
@@ -458,6 +469,16 @@ ensureBunBdepend ver =
     "bun-bin"
     "dev-lang/bun-bin"
     (bunBdependAtom ver)
+    ver
+
+-- | Ensure @>=dev-lisp/sbcl-<floor>:=[source]@ (RDEPEND/BDEPEND body).
+-- Replaces every @dev-lisp/sbcl@ atom when present; otherwise inserts BDEPEND.
+ensureSbclAtom :: Text -> Text -> Either Text Text
+ensureSbclAtom ver =
+  ensureBdependAtom
+    "sbcl"
+    "dev-lisp/sbcl"
+    (sbclBdependAtom ver)
     ver
 
 ensureBdependAtom ::

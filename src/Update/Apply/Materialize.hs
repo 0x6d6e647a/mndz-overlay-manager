@@ -110,6 +110,7 @@ import Update.EbuildEdit
     goBdependAtom,
     manifestHasVendorDist,
     nodejsBdependAtom,
+    sbclBdependAtom,
     writeVersionForPlannedPV,
   )
 import Update.Git (GitOps (..), relativeOverlayPath)
@@ -136,6 +137,11 @@ import Update.Go.Vendor
 import Update.Npm.Cache
   ( NpmCacheProgress (..),
     buildNpmDepsTarball,
+  )
+import Update.Sbcl.Deps
+  ( SbclDepsProgress (..),
+    buildSbclDepsTarball,
+    parseSbclVersionFloor,
   )
 import Update.Types
   ( ApplyOutcome (..),
@@ -206,11 +212,13 @@ depsApplyPlanProgress mh key eco doneRef =
         NpmEco -> "discovering nodejs ceilings"
         Bun -> "discovering bun-bin ceilings"
         Cargo {} -> "discovering rust ceilings"
+        Sbcl -> "discovering sbcl ceilings"
       probeLabel = case eco of
         Go _ -> "probing go.mod"
         NpmEco -> "probing engines.node"
         Bun -> "probing engines.bun"
         Cargo {} -> "probing rust-version"
+        Sbcl -> "probing sbcl.version"
    in PlanProgress
         { ppOnCeilingsStart = do
             mhSteps mh key 3
@@ -331,6 +339,12 @@ fetchRequiredBdependAtom env eco src pvNoRev =
         dpoFetchBunEngines (aeDepsPlanOps env) owner repo prefix pvNoRev
       pure $ case eres of
         Right ver -> Just (bunBdependAtom ver)
+        Left _ -> Nothing
+    (Sbcl, GitHub owner repo prefix) -> do
+      eres <-
+        dpoFetchSbclVersion (aeDepsPlanOps env) owner repo prefix pvNoRev
+      pure $ case eres of
+        Right body -> sbclBdependAtom <$> parseSbclVersionFloor body
         Left _ -> Nothing
     (Cargo {}, _) -> pure Nothing
     _ -> pure Nothing
@@ -1032,10 +1046,42 @@ materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName step
                   crEbuildBody = body
                 } ->
                 Right (p, Just msrv, Just body)
+    (Sbcl, GitHub owner repo prefix) -> do
+      floorResult <-
+        dpoFetchSbclVersion (aeDepsPlanOps env) owner repo prefix pvNoRev
+      case floorResult of
+        Left err -> pure (Left err)
+        Right body ->
+          case parseSbclVersionFloor body of
+            Nothing ->
+              pure
+                ( Left
+                    ( "unparseable sbcl.version for "
+                        <> pePN entry
+                        <> "-"
+                        <> pvNoRev
+                    )
+                )
+            Just floorVer -> do
+              let progress = sbclDepsProgress stepsDoneRef mh key
+              built <-
+                buildSbclDepsTarball
+                  (aeSbclDepsOps env)
+                  progress
+                  owner
+                  repo
+                  prefix
+                  pvNoRev
+                  outDir
+                  tarballName
+              pure $ case built of
+                Left err -> Left err
+                Right p -> Right (p, Just floorVer, Nothing)
     (Go _, _) -> pure (Left "DepsAndAssets Go requires a GitHub update source")
     (NpmEco, _) -> pure (Left "DepsAndAssets Npm requires an Npm update source")
     (Bun, _) -> pure (Left "DepsAndAssets Bun requires a GitHub update source")
     (Cargo {}, _) -> pure (Left "DepsAndAssets Cargo requires a GitHub update source")
+    (Sbcl, _) -> pure (Left "DepsAndAssets Sbcl requires a GitHub update source")
 
 -- | Companion distfiles (e.g. models JSON) required beyond the primary tarball.
 materializeCompanionAssets ::
@@ -1144,6 +1190,22 @@ cargoCratesProgress stepsDoneRef mh key =
       cgpOnPycargoDone = markMaterializeStep stepsDoneRef mh key "pycargoebuild"
     }
 
+-- | Full-path SBCL materialize has more host steps than the generic 7-slot
+-- budget (clone, qlot, fff, compress); only clone/compress mark the shared
+-- materialize counters so totals stay aligned with other ecosystems.
+sbclDepsProgress :: IORef Int -> MultiHandle -> PackageKey -> SbclDepsProgress
+sbclDepsProgress stepsDoneRef mh key =
+  SbclDepsProgress
+    { sdpOnCloneStart = mhStatus mh key "cloning upstream",
+      sdpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
+      sdpOnQlotStart = mhStatus mh key "qlot install",
+      sdpOnQlotDone = pure (),
+      sdpOnFffStart = mhStatus mh key "vendoring fff",
+      sdpOnFffDone = pure (),
+      sdpOnCompressStart = mhStatus mh key "compressing tarball",
+      sdpOnCompressDone = markMaterializeStep stepsDoneRef mh key "compressing tarball"
+    }
+
 reuseDepsReleaseAsset ::
   ApplyEnv ->
   FilePath ->
@@ -1240,6 +1302,22 @@ reuseDepsReleaseAsset
                           pvNoRev
                           donorContent
                       pure (Right m)
+                Sbcl ->
+                  case src of
+                    GitHub owner repo prefix -> do
+                      eres <-
+                        dpoFetchSbclVersion
+                          (aeDepsPlanOps env)
+                          owner
+                          repo
+                          prefix
+                          pvNoRev
+                      pure $
+                        Right $
+                          case eres of
+                            Right body -> parseSbclVersionFloor body
+                            Left _ -> Nothing
+                    _ -> pure (Right Nothing)
                 _ -> do
                   mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
                   pure $

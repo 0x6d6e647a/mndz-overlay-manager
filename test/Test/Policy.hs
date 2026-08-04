@@ -294,6 +294,7 @@ import Update.Types
     ecosystemIsCargo,
     ecosystemIsGo,
     ecosystemIsNpm,
+    ecosystemIsSbcl,
     mkPackageKey,
     packageKeyText,
     splitPackageKey,
@@ -370,6 +371,16 @@ testPolicyClassification = do
     Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing (Just "cli")))) -> pure ()
     other -> do
       hPutStrLn stderr $ "usage technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/autolith") of
+    Just
+      ( PackagePolicy
+          (GitHub "luciusmagn" "autolith" "v")
+          (DepsAndAssets Sbcl)
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "autolith technique: " <> show other
       exitFailure
   assertEq "unmapped" Nothing (lookupPolicy (PackageKey "dev-lang/haskell"))
   case lookupPolicy (PackageKey "dev-lang/bun-bin") of
@@ -1001,6 +1012,7 @@ testTypesHelperPredicates = do
   assertTrue
     "deps cargo needs assets"
     (techniqueNeedsAssets (DepsAndAssets (Cargo Nothing Nothing)))
+  assertTrue "deps sbcl needs assets" (techniqueNeedsAssets (DepsAndAssets Sbcl))
   assertTrue "git-mv no assets" (not (techniqueNeedsAssets GitMvAndManifest))
   assertTrue "unsupported no assets" (not (techniqueNeedsAssets (Unsupported "why")))
   -- ecosystem predicates (positive + negative arms)
@@ -1014,6 +1026,9 @@ testTypesHelperPredicates = do
   assertTrue "cargo not bun" (not (ecosystemIsBun (Cargo Nothing Nothing)))
   assertTrue "npm not bun" (not (ecosystemIsBun NpmEco))
   assertTrue "go not cargo" (not (ecosystemIsCargo (Go Nothing)))
+  assertTrue "is sbcl" (ecosystemIsSbcl Sbcl)
+  assertTrue "sbcl not cargo" (not (ecosystemIsCargo Sbcl))
+  assertTrue "cargo not sbcl" (not (ecosystemIsSbcl (Cargo Nothing Nothing)))
   -- splitPackageKey success + Nothing arms
   assertEq
     "split ok"

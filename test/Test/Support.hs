@@ -251,6 +251,7 @@ import Update.Runtime.Ceilings
     parseKeywordsField,
     parseRuntimeEbuildMeta,
   )
+import Update.Sbcl.Deps (productionSbclDepsOps)
 import Update.SshAgent
   ( AgentIdentities (..),
     SshAgentOps (..),
@@ -318,6 +319,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeNpmCacheOps = productionNpmCacheOps,
         aeBunCacheOps = productionBunCacheOps,
         aeCargoOps = productionCargoOps,
+        aeSbclDepsOps = productionSbclDepsOps,
         aeReleaseOps = releaseOps,
         aeFetchModelsDev = \_ -> pure (Left "models.dev unused"),
         aeAssetsRoot = assetsRoot,

@@ -132,6 +132,7 @@ import Update.EbuildEdit
     ensureGoBdepend,
     ensureNodejsBdepend,
     ensureRustMinVer,
+    ensureSbclAtom,
     goBdependAtom,
     goBdependMatches,
     keywordsMatch,
@@ -140,6 +141,7 @@ import Update.EbuildEdit
     nodejsBdependMatches,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
+    sbclBdependMatches,
     setKeywords,
     writeVersionForPlannedPV,
   )
@@ -275,6 +277,7 @@ tests =
     [ testCase "Ebuild Edit" testEbuildEdit,
       testCase "Go Version Parse" testGoVersionParse,
       testCase "Go Bdepend Edit" testGoBdependEdit,
+      testCase "Sbcl Atom Preserve Body" testSbclAtomPreserveBody,
       testCase "Nodejs Bdepend Use Replace" testNodejsBdependUseReplace,
       testCase "Vendor Go Version Gate" testVendorGoVersionGate,
       testCase "Cargo Content Fix" testCargoContentFix,
@@ -499,6 +502,42 @@ testGoBdependEdit = do
 -- | Regression: replacing nodejs atoms must consume full [npm] USE (no [npm]npm]).
 
 -- | Regression: replacing nodejs atoms must consume full [npm] USE (no [npm]npm]).
+testSbclAtomPreserveBody :: IO ()
+testSbclAtomPreserveBody = do
+  let template =
+        T.unlines
+          [ "inherit toolchain-funcs",
+            "",
+            "DESCRIPTION=\"Live agent\"",
+            "SRC_URI=\"https://github.com/luciusmagn/autolith/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/autolith-0.17.2/autolith-0.17.2-deps.tar.xz\"",
+            "KEYWORDS=\"~amd64 ~x86\"",
+            "IUSE=\"test\"",
+            "RESTRICT=\"!test? ( test )\"",
+            "RDEPEND=\"",
+            ">=dev-lisp/sbcl-2.6.4:=[source]",
+            "sys-apps/bubblewrap",
+            "\"",
+            "BDEPEND=\"",
+            "${RDEPEND}",
+            "\"",
+            "src_compile() {",
+            "  einfo private-prefix stamp network-disable",
+            "}"
+          ]
+      withAssets = parameterizeAssetsSrcUri "autolith" template
+  fixed <- assertRight "sbcl atom" (ensureSbclAtom "2.6.4" withAssets)
+  let withKw = setKeywords ["~amd64", "~ppc", "~x86"] fixed
+  assertTrue "floor atom" (sbclBdependMatches "2.6.4" withKw)
+  assertTrue "parameterized deps" (assetsSrcUriParameterized withKw)
+  assertTrue "preserves private body" ("private-prefix stamp network-disable" `T.isInfixOf` withKw)
+  assertTrue "preserves IUSE" ("IUSE=\"test\"" `T.isInfixOf` withKw)
+  assertTrue "preserves RESTRICT" ("RESTRICT=" `T.isInfixOf` withKw)
+  assertTrue "preserves bubblewrap" ("sys-apps/bubblewrap" `T.isInfixOf` withKw)
+  bumped <- assertRight "bump floor" (ensureSbclAtom "2.7.0" withKw)
+  assertTrue "new floor" (sbclBdependMatches "2.7.0" bumped)
+  assertTrue "old floor gone" (not (sbclBdependMatches "2.6.4" bumped))
+
 testNodejsBdependUseReplace :: IO ()
 testNodejsBdependUseReplace = do
   let openspecStyle =

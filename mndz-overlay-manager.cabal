@@ -115,6 +115,7 @@ library
       , Update.Process
       , Update.Resolve
       , Update.Runtime.Ceilings
+      , Update.Sbcl.Deps
       , Update.SshAgent
       , Update.Targets
       , Update.TextUtil

@@ -93,7 +93,8 @@ integrationTests =
       testCase "contentFix Go content-only reusable" testContentFixGoReusable,
       testCase "contentFix Npm content-only reusable" testContentFixNpmReusable,
       testCase "contentFix Bun content-only reusable" testContentFixBunReusable,
-      testCase "contentFix Cargo content-only reusable" testContentFixCargoReusable
+      testCase "contentFix Cargo content-only reusable" testContentFixCargoReusable,
+      testCase "checkPackageDeps Sbcl outdated floor" testCheckPackageDepsSbclOutdated
     ]
 
 ------------------------------------------------------------------------
@@ -127,6 +128,9 @@ bunCeilings = dualArchCeilings "dev-lang/bun-bin" (Just "1.1.0") (Just "1.2.0")
 rustCeilings :: RuntimeCeilings
 rustCeilings = dualArchCeilings "dev-lang/rust|rust-bin" (Just "1.80.0") (Just "1.85.0")
 
+sbclCeilings :: RuntimeCeilings
+sbclCeilings = dualArchCeilings "dev-lisp/sbcl" (Just "2.6.2") (Just "2.6.6")
+
 -- | Fully mocked DepsPlanOps with pre-filled ceiling caches (no portageq / network).
 mkDepsPlanOps ::
   (UpdateSource -> IO (Either T.Text [EbuildVersion])) ->
@@ -143,6 +147,7 @@ mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
   nodeCache <- newMVar (Just nodeCeilings)
   bunCache <- newMVar (Just bunCeilings)
   rustCache <- newMVar (Just rustCeilings)
+  sbclCache <- newMVar (Just sbclCeilings)
   pure
     DepsPlanOps
       { dpoPortageq = \_ -> pure (Left "portageq unused in CheckPlan tests"),
@@ -151,11 +156,13 @@ mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
         dpoFetchNpmEngines = fetchNpm,
         dpoFetchBunEngines = fetchBun,
         dpoFetchCargoToml = fetchCargo,
+        dpoFetchSbclVersion = \_ _ _ _ -> pure (Left "sbcl.version unused"),
         dpoWorkBudget = budget,
         dpoGoCeilingsCache = goCache,
         dpoNodeCeilingsCache = nodeCache,
         dpoBunCeilingsCache = bunCache,
         dpoRustCeilingsCache = rustCache,
+        dpoSbclCeilingsCache = sbclCache,
         dpoOverlayRoot = mOverlay,
         dpoManager = mgr
       }
@@ -269,6 +276,44 @@ testCheckPackageDepsGoOutdated = do
     checkPackageDeps noopMultiHandle ops e locals src (Go Nothing)
   assertTrue "outdated gaps" (isOutdated (reportStatus report))
   assertEq "key" (PackageKey "dev-util/beads") (reportKey report)
+
+testCheckPackageDepsSbclOutdated :: IO ()
+testCheckPackageDepsSbclOutdated = do
+  base <-
+    mkDepsPlanOps
+      (listFixed ["0.18.0", "0.17.2"])
+      unusedGoMod
+      unusedNpm
+      unusedBun
+      unusedCargo
+      Nothing
+  let ops =
+        base
+          { dpoFetchSbclVersion = \_ _ _ pv ->
+              pure $
+                Right $
+                  case pv of
+                    "0.17.2" -> "2.6.4\n"
+                    "0.18.0" -> "2.6.4\n"
+                    _ -> "not-a-version\n"
+          }
+      e = entry "dev-util" "autolith" "0.17.2"
+      locals =
+        [ Ebuild "dev-util" "autolith" "0.17.2" (pePath e)
+        ]
+      src = GitHub "luciusmagn" "autolith" "v"
+  report <-
+    checkPackageDeps noopMultiHandle ops e locals src Sbcl
+  case reportStatus report of
+    Outdated lines_ -> do
+      assertTrue "has gaps" (not (null lines_))
+      assertTrue
+        "sbcl label"
+        (any (maybe False ("dev-lisp/sbcl" `T.isInfixOf`) . olLabel) lines_)
+      assertTrue
+        "targets 0.18.0"
+        (any (\l -> olTo l == parseEbuildVersion "0.18.0") lines_)
+    other -> assertFailure $ "expected Outdated, got " <> show other
 
 testCheckPackageDepsPlanFail :: IO ()
 testCheckPackageDepsPlanFail = do

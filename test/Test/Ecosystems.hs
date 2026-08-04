@@ -70,6 +70,12 @@ import Update.Process
     ProcessResult (..),
   )
 import Update.Runtime.Ceilings (gentooRepoPath, mkPortageqRunner)
+import Update.Sbcl.Deps
+  ( SbclDepsOps (..),
+    SbclDepsProgress (..),
+    buildSbclDepsTarball,
+    parseSbclVersionFloor,
+  )
 import Update.Types (PackageKey (..))
 
 unitTests :: TestTree
@@ -93,6 +99,12 @@ unitTests =
         "cargo pure"
         [ testCase "crateTarballPrefix" testCrateTarballPrefix,
           testCase "maxRustVersionInTree" testMaxRustVersionInTree
+        ],
+      testGroup
+        "sbcl pure"
+        [ testCase "parseSbclVersionFloor" testParseSbclVersionFloor,
+          testCase "buildSbclDepsTarball success + progress" testSbclBuilderSuccess,
+          testCase "buildSbclDepsTarball clone failure" testSbclBuilderCloneFail
         ],
       testGroup
         "npm builder"
@@ -246,6 +258,103 @@ testCollectInstallTreeEntries =
 testCrateTarballPrefix :: IO ()
 testCrateTarballPrefix =
   assertEq "cargo.eclass prefix" "cargo_home/gentoo" crateTarballPrefix
+
+testParseSbclVersionFloor :: IO ()
+testParseSbclVersionFloor = do
+  assertEq "plain" (Just "2.6.4") (parseSbclVersionFloor "2.6.4")
+  assertEq "trim" (Just "2.6.4") (parseSbclVersionFloor "  2.6.4\n")
+  assertEq "empty" Nothing (parseSbclVersionFloor "")
+  assertEq "garbage" Nothing (parseSbclVersionFloor "not-a-version")
+  assertEq "v prefix rejected" Nothing (parseSbclVersionFloor "v2.6.4")
+
+noopSbclProgress :: SbclDepsProgress
+noopSbclProgress =
+  SbclDepsProgress
+    { sdpOnCloneStart = pure (),
+      sdpOnCloneDone = pure (),
+      sdpOnQlotStart = pure (),
+      sdpOnQlotDone = pure (),
+      sdpOnFffStart = pure (),
+      sdpOnFffDone = pure (),
+      sdpOnCompressStart = pure (),
+      sdpOnCompressDone = pure ()
+    }
+
+fakeSbclSuccessOps :: FilePath -> SbclDepsOps
+fakeSbclSuccessOps _tarballPath =
+  SbclDepsOps
+    { sdoClone = \_ _ dest -> do
+        createDirectoryIfMissing True dest
+        TIO.writeFile (dest </> "qlfile") "qlot\n"
+        TIO.writeFile (dest </> "qlfile.lock") "lock\n"
+        createDirectoryIfMissing True (dest </> "native" </> "fff")
+        TIO.writeFile (dest </> "native" </> "fff" </> "commit") "abc\n"
+        pure (Right ()),
+      sdoQlotInstall = \_ _ _ -> pure (Right ()),
+      sdoCopyQlot = \_ stage -> do
+        createDirectoryIfMissing True (stage </> ".qlot")
+        TIO.writeFile (stage </> ".qlot" </> "marker") "ok\n"
+        pure (Right ()),
+      sdoMaterializeFff = \_ stage -> do
+        createDirectoryIfMissing True (stage </> "fff" </> "vendor")
+        pure (Right ()),
+      sdoPackTarball = \_ outPath -> do
+        TIO.writeFile outPath "fake-deps-tarball\n"
+        pure (Right ()),
+      sdoQuicklispSetup = pure (Right "/tmp/quicklisp/setup.lisp")
+    }
+
+testSbclBuilderSuccess :: IO ()
+testSbclBuilderSuccess =
+  withSystemTempDirectory "mndz-sbcl-build-" $ \tmp -> do
+    steps <- newIORef (0 :: Int)
+    let progress =
+          SbclDepsProgress
+            { sdpOnCloneStart = pure (),
+              sdpOnCloneDone = atomicModifyIORef' steps (\n -> (n + 1, ())),
+              sdpOnQlotStart = pure (),
+              sdpOnQlotDone = atomicModifyIORef' steps (\n -> (n + 1, ())),
+              sdpOnFffStart = pure (),
+              sdpOnFffDone = atomicModifyIORef' steps (\n -> (n + 1, ())),
+              sdpOnCompressStart = pure (),
+              sdpOnCompressDone = atomicModifyIORef' steps (\n -> (n + 1, ()))
+            }
+        outDir = tmp </> "out"
+        name = "autolith-0.18.0-deps.tar.xz"
+    path <-
+      assertRight "sbcl build"
+        =<< buildSbclDepsTarball
+          (fakeSbclSuccessOps (outDir </> name))
+          progress
+          "luciusmagn"
+          "autolith"
+          "v"
+          "0.18.0"
+          outDir
+          name
+    assertTrue "tarball exists" =<< doesFileExist path
+    n <- readIORef steps
+    assertEq "progress callbacks" 4 n
+
+testSbclBuilderCloneFail :: IO ()
+testSbclBuilderCloneFail =
+  withSystemTempDirectory "mndz-sbcl-fail-" $ \tmp -> do
+    let ops =
+          (fakeSbclSuccessOps (tmp </> "x"))
+            { sdoClone = \_ _ _ -> pure (Left "clone boom")
+            }
+    err <-
+      assertLeft "clone fail"
+        =<< buildSbclDepsTarball
+          ops
+          noopSbclProgress
+          "o"
+          "r"
+          "v"
+          "0.1.0"
+          tmp
+          "x-deps.tar.xz"
+    assertTrue "clone err" ("clone boom" `T.isInfixOf` err)
 
 testMaxRustVersionInTree :: IO ()
 testMaxRustVersionInTree =

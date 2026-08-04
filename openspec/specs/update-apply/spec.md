@@ -8,7 +8,7 @@ Package policy (hardcoded source + technique), applying updates (`GitMvAndManife
 
 ### Requirement: Package policy model
 
-The library SHALL model a package policy that binds a package key `category/package` to an update source and an update technique. The technique SHALL be one of: `GitMvAndManifest`; `DepsAndAssets` with an ecosystem specification (`Go` with optional go.mod subdirectory, `Npm`, `Bun`, or `Cargo` with optional lock/package subdirectories); or `Unsupported` with a human-readable reason. Policy lookup SHALL use a hardcoded map only. There SHALL NOT be a separate legacy Go-only technique alternative outside `DepsAndAssets`.
+The library SHALL model a package policy that binds a package key `category/package` to an update source and an update technique. The technique SHALL be one of: `GitMvAndManifest`; `DepsAndAssets` with an ecosystem specification (`Go` with optional go.mod subdirectory, `Npm`, `Bun`, `Cargo` with optional lock/package subdirectories, or `Sbcl`); or `Unsupported` with a human-readable reason. Policy lookup SHALL use a hardcoded map only. There SHALL NOT be a separate legacy Go-only technique alternative outside `DepsAndAssets`.
 
 #### Scenario: Supported GitMv technique entry
 
@@ -37,7 +37,7 @@ The library SHALL model a package policy that binds a package key `category/pack
 
 ### Requirement: Hardcoded policy covers known overlay packages
 
-The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay that this manager automates, each with both a source and a technique. At minimum, `dev-lang/bun-bin`, `dev-lang/deno-bin`, and `dev-util/grok-build-bin` SHALL use `GitMvAndManifest`. At minimum, `dev-db/dolt`, `dev-util/beads`, `dev-util/crush`, and `dev-db/badger` SHALL use `DepsAndAssets` with ecosystem `Go`. At minimum, `dev-util/openspec` SHALL use `DepsAndAssets Npm` and both `dev-util/ralph-tui` and `dev-util/opencode` SHALL use `DepsAndAssets Bun`. At minimum, `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets` with ecosystem `Cargo`. The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone.
+The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay that this manager automates, each with both a source and a technique. At minimum, `dev-lang/bun-bin`, `dev-lang/deno-bin`, and `dev-util/grok-build-bin` SHALL use `GitMvAndManifest`. At minimum, `dev-db/dolt`, `dev-util/beads`, `dev-util/crush`, and `dev-db/badger` SHALL use `DepsAndAssets` with ecosystem `Go`. At minimum, `dev-util/openspec` SHALL use `DepsAndAssets Npm` and both `dev-util/ralph-tui` and `dev-util/opencode` SHALL use `DepsAndAssets Bun`. At minimum, `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets` with ecosystem `Cargo`. At minimum, `dev-util/autolith` SHALL use `DepsAndAssets` with ecosystem `Sbcl` and GitHub source `luciusmagn/autolith` with tag prefix `v`. The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone.
 
 #### Scenario: Simple binary package is GitMvAndManifest
 
@@ -69,10 +69,34 @@ The hardcoded policy map SHALL include an entry for every package known to ship 
 - **WHEN** policy is resolved for `dev-util/mise`
 - **THEN** the technique is `DepsAndAssets Cargo`
 
+#### Scenario: autolith is DepsAndAssets Sbcl
+
+- **WHEN** policy is resolved for `dev-util/autolith`
+- **THEN** the technique is `DepsAndAssets Sbcl` and the source is GitHub `luciusmagn/autolith` with tag prefix `v`
+
 #### Scenario: opencode-bin is absent
 
 - **WHEN** policy is resolved for `dev-util/opencode-bin`
 - **THEN** no policy entry is returned (unconfigured)
+
+### Requirement: Hardcoded policy for dev-util/autolith
+
+The hardcoded package policy map SHALL include `dev-util/autolith` with update source GitHub owner `luciusmagn`, repository `autolith`, tag prefix `v`, and technique `DepsAndAssets` with ecosystem `Sbcl`.
+
+#### Scenario: Policy lookup
+
+- **WHEN** the library resolves policy for package key `dev-util/autolith`
+- **THEN** the technique is `DepsAndAssets Sbcl` and the source is GitHub `luciusmagn/autolith` with tag prefix `v`
+
+### Requirement: Preserve Autolith template body on Sbcl apply
+
+When rewriting a `DepsAndAssets Sbcl` ebuild for assets parameterization, SBCL atom alignment, KEYWORDS, or PV filename update, the program SHALL preserve template-owned body that is not those rewritten fields. This includes private-prefix install logic, wrapper generation, identity stamping, network-install disablement, core build steps, `IUSE`/`RESTRICT` test gating, and any non-assets `SRC_URI` companions or `FILESDIR`/`PATCHES` references present on the donor ebuild. The program SHALL NOT strip those constructs when parameterizing deps assets URLs to `${PV}`.
+
+#### Scenario: Template survives PV bump
+
+- **WHEN** apply updates autolith from `0.17.2` to `0.18.0` using the seed ebuild as donor
+- **THEN** the new ebuild still contains the seed’s private layout / stamp / network-disable / test USE structure
+- **AND** the deps assets URL uses `${PV}` for `0.18.0`
 
 ### Requirement: GitMvAndManifest apply steps
 

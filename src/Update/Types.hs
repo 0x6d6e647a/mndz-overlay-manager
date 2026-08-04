@@ -21,6 +21,7 @@ module Update.Types
     ecosystemIsNpm,
     ecosystemIsBun,
     ecosystemIsCargo,
+    ecosystemIsSbcl,
   )
 where
 
@@ -117,6 +118,8 @@ data EcosystemSpec
       { cargoLockSubdir :: Maybe FilePath,
         cargoPackageSubdir :: Maybe FilePath
       }
+  | -- | Autolith-style SBCL deps tarball (@.qlot/@ + vendored fff) and @sbcl.version@ floor.
+    Sbcl
   deriving (Eq, Show)
 
 -- | How (or whether) to apply a version bump in the overlay.
@@ -146,6 +149,10 @@ ecosystemIsBun _ = False
 ecosystemIsCargo :: EcosystemSpec -> Bool
 ecosystemIsCargo Cargo {} = True
 ecosystemIsCargo _ = False
+
+ecosystemIsSbcl :: EcosystemSpec -> Bool
+ecosystemIsSbcl Sbcl = True
+ecosystemIsSbcl _ = False
 
 -- | Hardcoded per-package source and apply technique.
 data PackagePolicy = PackagePolicy

@@ -33,6 +33,7 @@ import Update.EbuildEdit
     ensureGoBdepend,
     ensureNodejsBdepend,
     ensureRustMinVer,
+    ensureSbclAtom,
     parameterizeAssetsSrcUri,
     parseManifestVendorSHA512,
     setKeywords,
@@ -117,6 +118,9 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
                     "could not determine RUST_MIN_VER (no package.rust-version, \
                     \dependency rust-version, or donor RUST_MIN_VER)"
                 )
+            (Sbcl, Just ver) -> pure (ensureSbclAtom ver withKw)
+            (Sbcl, Nothing) ->
+              pure (Left "could not obtain sbcl.version floor for SBCL atom alignment")
           case contentFixed of
             Left err -> pure $ ApplyHardFail key err False orphan
             Right fixed -> do

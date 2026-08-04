@@ -81,6 +81,7 @@ import Update.Preflight
     preflightUpdateTools,
     validateAssetsPath,
   )
+import Update.Sbcl.Deps (productionSbclDepsOps)
 import Update.SshAgent
   ( ensureSshAgent,
     productionSshAgentOps,
@@ -259,6 +260,7 @@ runUpdate rt pkgArgs = do
                       aeNpmCacheOps = productionNpmCacheOps,
                       aeBunCacheOps = productionBunCacheOps,
                       aeCargoOps = productionCargoOps,
+                      aeSbclDepsOps = productionSbclDepsOps,
                       aeReleaseOps = releaseOps,
                       aeFetchModelsDev = fetchModelsDevApiJson,
                       aeAssetsRoot = assetsRoot,

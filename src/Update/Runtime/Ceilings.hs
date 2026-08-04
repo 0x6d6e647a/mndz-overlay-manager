@@ -30,13 +30,16 @@ module Update.Runtime.Ceilings
     discoverNodejsCeilingsWith,
     discoverBunBinCeilings,
     discoverRustUnionCeilingsWith,
+    discoverSbclCeilingsWith,
     mergeCeilingsMax,
     goRuntimeAtom,
     nodejsRuntimeAtom,
     bunBinRuntimeAtom,
     rustUnionRuntimeAtom,
+    sbclRuntimeAtom,
     rustPackageDir,
     rustBinPackageDir,
+    sbclPackageDir,
   )
 where
 
@@ -105,6 +108,9 @@ bunBinRuntimeAtom = "dev-lang/bun-bin"
 -- | Fixed union id for cargo lane labels (rust || rust-bin).
 rustUnionRuntimeAtom :: Text
 rustUnionRuntimeAtom = "dev-lang/rust|rust-bin"
+
+sbclRuntimeAtom :: Text
+sbclRuntimeAtom = "dev-lisp/sbcl"
 
 emptyCeilings :: Text -> RuntimeCeilings
 emptyCeilings atom = RuntimeCeilings {rcAtom = atom, rcByArch = Map.empty}
@@ -185,6 +191,9 @@ rustPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "rust"
 
 rustBinPackageDir :: FilePath -> FilePath
 rustBinPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "rust-bin"
+
+sbclPackageDir :: FilePath -> FilePath
+sbclPackageDir gentooRoot = gentooRoot </> "dev-lisp" </> "sbcl"
 
 -- | Parse KEYWORDS=... from ebuild body into token list.
 -- Shell comments after the assignment (@# …@) are stripped so rust-bin lines like
@@ -380,6 +389,18 @@ discoverBunBinCeilings overlayRoot =
     bunBinRuntimeAtom
     (bunBinPackageDir overlayRoot)
     (Just "bun-bin-")
+
+-- | Discover SBCL ceilings from gentoo @dev-lisp/sbcl@.
+discoverSbclCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)
+discoverSbclCeilingsWith run = do
+  pathResult <- gentooRepoPath run
+  case pathResult of
+    Left err -> pure (Left err)
+    Right gentooRoot ->
+      discoverRuntimeCeilingsInDir
+        sbclRuntimeAtom
+        (sbclPackageDir gentooRoot)
+        (Just "sbcl-")
 
 -- | Discover cargo ceilings: U1 max of gentoo @dev-lang/rust@ ∪ @dev-lang/rust-bin@.
 -- Missing side is ignored; both missing is an error.

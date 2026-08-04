@@ -40,6 +40,7 @@ import Update.EbuildEdit
     ebuildNeedsContentFixAtom,
     manifestHasVendorDist,
     nodejsBdependAtom,
+    sbclBdependAtom,
   )
 import Update.GitHub (fetchGitHubWith)
 import Update.Go.Lanes
@@ -61,6 +62,7 @@ import Update.Hardcoded (lookupPolicy)
 import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
 import Update.Resolve (resolveSource)
+import Update.Sbcl.Deps (parseSbclVersionFloor)
 import Update.Types
   ( EcosystemSpec (..),
     Fetcher,
@@ -252,11 +254,13 @@ depsPlanProgress mh key eco =
         NpmEco -> "discovering nodejs ceilings"
         Bun -> "discovering bun-bin ceilings"
         Cargo {} -> "discovering rust ceilings"
+        Sbcl -> "discovering sbcl ceilings"
       probeLabel = case eco of
         Go _ -> "probing go.mod"
         NpmEco -> "probing engines.node"
         Bun -> "probing engines.bun"
         Cargo {} -> "probing rust-version"
+        Sbcl -> "probing sbcl.version"
    in PlanProgress
         { ppOnCeilingsStart = do
             mhSteps mh key 3
@@ -328,6 +332,11 @@ contentFixPVs depsOps eco src locals plan = do
                   pure $
                     ebuildNeedsCargoContentFix (peKeywords pe) content mMsrv
                       || manMissing
+                Sbcl -> do
+                  mAtom <- fetchSbclAtom depsOps src pvNoRev
+                  pure $
+                    ebuildNeedsContentFixAtom (peKeywords pe) content mAtom
+                      || manMissing
               pure [pePV pe | bad]
 
 fetchGoModForPV ::
@@ -385,6 +394,16 @@ fetchCargoMsrv depsOps src mLock mPkg pvNoRev =
     GitHub owner repo prefix ->
       probeRustVersionFromCargoTomls mPkg mLock $ \mSub ->
         dpoFetchCargoToml depsOps owner repo prefix pvNoRev mSub
+    _ -> pure Nothing
+
+fetchSbclAtom :: DepsPlanOps -> UpdateSource -> Text -> IO (Maybe Text)
+fetchSbclAtom depsOps src pvNoRev =
+  case src of
+    GitHub owner repo prefix -> do
+      eres <- dpoFetchSbclVersion depsOps owner repo prefix pvNoRev
+      pure $ case eres of
+        Right body -> sbclBdependAtom <$> parseSbclVersionFloor body
+        Left _ -> Nothing
     _ -> pure Nothing
 
 statusFromCompare :: EbuildVersion -> EbuildVersion -> UpdateStatus

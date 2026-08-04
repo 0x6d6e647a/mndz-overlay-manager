@@ -78,7 +78,11 @@ hardcodedPolicies =
       policy
         "dev-util/usage"
         (GitHub "jdx" "usage" "v")
-        (DepsAndAssets (Cargo Nothing (Just "cli")))
+        (DepsAndAssets (Cargo Nothing (Just "cli"))),
+      policy
+        "dev-util/autolith"
+        (GitHub "luciusmagn" "autolith" "v")
+        (DepsAndAssets Sbcl)
     ]
   where
     policy key src tech =

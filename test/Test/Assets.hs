@@ -118,8 +118,10 @@ import Update.Apply.TestSupport
   )
 import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
 import Update.Assets.Layout
-  ( cratesTarballName,
+  ( DistfileKind (..),
+    cratesTarballName,
     depsTarballName,
+    distfileKindForEcosystem,
     modelsDistfileName,
     vendorTarballName,
   )
@@ -438,6 +440,14 @@ testDepsDistfileNames = do
     "crates"
     "mise-2026.7.5-crates.tar.xz"
     (cratesTarballName "mise" "2026.7.5")
+  assertEq
+    "autolith deps"
+    "autolith-0.18.0-deps.tar.xz"
+    (depsTarballName "autolith" "0.18.0")
+  assertEq
+    "sbcl kind is deps"
+    DepsDist
+    (distfileKindForEcosystem Sbcl)
   assertEq
     "models"
     "opencode-1.18.4-models.json"

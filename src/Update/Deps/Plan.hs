@@ -63,8 +63,10 @@ import Update.Runtime.Ceilings
     discoverGoCeilingsWith,
     discoverNodejsCeilingsWith,
     discoverRustUnionCeilingsWith,
+    discoverSbclCeilingsWith,
     productionPortageqRunner,
   )
+import Update.Sbcl.Deps (parseSbclVersionFloor)
 import Update.Types (EcosystemSpec (..), UpdateSource (..))
 
 -- | Injectable ops for multi-ecosystem deps planning.
@@ -76,11 +78,14 @@ data DepsPlanOps = DepsPlanOps
     dpoFetchBunEngines :: Text -> Text -> Text -> Text -> IO (Either Text Text),
     -- | Fetch package Cargo.toml body at tag for rust-version probe.
     dpoFetchCargoToml :: Text -> Text -> Text -> Text -> Maybe FilePath -> IO (Either Text Text),
+    -- | Fetch @sbcl.version@ body at tag for SBCL floor probe.
+    dpoFetchSbclVersion :: Text -> Text -> Text -> Text -> IO (Either Text Text),
     dpoWorkBudget :: WorkBudget,
     dpoGoCeilingsCache :: MVar (Maybe RuntimeCeilings),
     dpoNodeCeilingsCache :: MVar (Maybe RuntimeCeilings),
     dpoBunCeilingsCache :: MVar (Maybe RuntimeCeilings),
     dpoRustCeilingsCache :: MVar (Maybe RuntimeCeilings),
+    dpoSbclCeilingsCache :: MVar (Maybe RuntimeCeilings),
     dpoOverlayRoot :: Maybe FilePath,
     dpoManager :: Manager
   }
@@ -106,6 +111,7 @@ productionDepsPlanOps mToken jobs mOverlay = do
   nodeCache <- newMVar Nothing
   bunCache <- newMVar Nothing
   rustCache <- newMVar Nothing
+  sbclCache <- newMVar Nothing
   pure
     DepsPlanOps
       { dpoPortageq = productionPortageqRunner,
@@ -117,11 +123,13 @@ productionDepsPlanOps mToken jobs mOverlay = do
         dpoFetchNpmEngines = fetchNpmEnginesNode mgr,
         dpoFetchBunEngines = fetchBunEnginesAtTag mgr mToken,
         dpoFetchCargoToml = fetchCargoTomlAtTag mgr mToken,
+        dpoFetchSbclVersion = fetchSbclVersionAtTag mgr mToken,
         dpoWorkBudget = budget,
         dpoGoCeilingsCache = goCache,
         dpoNodeCeilingsCache = nodeCache,
         dpoBunCeilingsCache = bunCache,
         dpoRustCeilingsCache = rustCache,
+        dpoSbclCeilingsCache = sbclCache,
         dpoOverlayRoot = mOverlay,
         dpoManager = mgr
       }
@@ -139,6 +147,7 @@ planDepsPackageWithProgress ops progress eco src locals =
     NpmEco -> planNpm ops progress src locals
     Bun -> planBun ops progress src locals
     Cargo mLock mPkg -> planCargo ops progress src mLock mPkg locals
+    Sbcl -> planSbcl ops progress src locals
 
 ------------------------------------------------------------------------
 -- Go
@@ -287,6 +296,42 @@ planCargo ops progress src mLockSub mPkgSub locals =
             probeRustVersion ops owner repo prefix pvText tryPaths
         )
     _ -> pure (Left (PlanFailed "DepsAndAssets Cargo requires a GitHub update source"))
+
+------------------------------------------------------------------------
+-- Sbcl
+------------------------------------------------------------------------
+
+planSbcl ::
+  DepsPlanOps ->
+  PlanProgress ->
+  UpdateSource ->
+  [EbuildVersion] ->
+  IO (Either PlanError RuntimeLanePlan)
+planSbcl ops progress src locals =
+  case src of
+    GitHub owner repo prefix ->
+      planWith
+        ops
+        progress
+        src
+        locals
+        ( discoverCeilingsCached
+            (dpoSbclCeilingsCache ops)
+            (discoverSbclCeilingsWith (dpoPortageq ops))
+        )
+        ( \pv -> do
+            eres <-
+              dpoFetchSbclVersion
+                ops
+                owner
+                repo
+                prefix
+                (renderPVNoRev pv)
+            pure $ case eres of
+              Left _ -> Right Nothing
+              Right body -> Right (parseSbclVersionFloor body)
+        )
+    _ -> pure (Left (PlanFailed "DepsAndAssets Sbcl requires a GitHub update source"))
 
 -- | Probe rust-version from the first readable Cargo.toml among subdirs.
 probeRustVersion ::
@@ -520,6 +565,34 @@ fetchCargoTomlAtTag mgr mToken owner repo prefix pv mSub = do
           <> T.unpack tag
           <> "/"
           <> subPath
+  fetchRawGithubFile mgr mToken url
+
+fetchSbclVersionAtTag ::
+  Manager ->
+  Maybe Text ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  IO (Either Text Text)
+fetchSbclVersionAtTag mgr mToken owner repo prefix pv = do
+  let tag = versionTag prefix pv
+      url =
+        "https://raw.githubusercontent.com/"
+          <> T.unpack owner
+          <> "/"
+          <> T.unpack repo
+          <> "/"
+          <> T.unpack tag
+          <> "/sbcl.version"
+  fetchRawGithubFile mgr mToken url
+
+fetchRawGithubFile ::
+  Manager ->
+  Maybe Text ->
+  String ->
+  IO (Either Text Text)
+fetchRawGithubFile mgr mToken url = do
   req0 <- parseRequest url
   let req =
         req0

@@ -35,6 +35,7 @@ import Update.Process
     ProcessResult (..),
     productionCommandRunner,
   )
+import Update.Sbcl.Deps (SbclDepsOps)
 import Update.Types (Fetcher)
 
 type EbuildRunner = FilePath -> FilePath -> IO (Either Text ())
@@ -72,6 +73,7 @@ data ApplyEnv = ApplyEnv
     aeNpmCacheOps :: NpmCacheOps,
     aeBunCacheOps :: BunCacheOps,
     aeCargoOps :: CargoOps,
+    aeSbclDepsOps :: SbclDepsOps,
     aeReleaseOps :: ReleaseOps,
     -- | Write models.dev API JSON body to the given destination path.
     aeFetchModelsDev :: FilePath -> IO (Either Text FilePath),
