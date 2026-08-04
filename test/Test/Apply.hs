@@ -565,7 +565,8 @@ testReuseVsFullPublish =
                           riAssets =
                             [ ReleaseAsset
                                 { raName = T.pack tarballName,
-                                  raBrowserDownloadUrl = "https://example/vendor"
+                                  raBrowserDownloadUrl = "https://example/vendor",
+                                  raSize = Nothing
                                 }
                             ]
                         },
@@ -857,7 +858,8 @@ testGoMultiPvSequentialCommits =
                                     if "0.82.0" `T.isInfixOf` tag
                                       then "crush-0.82.0-vendor.tar.xz"
                                       else "crush-0.84.0-vendor.tar.xz",
-                                  raBrowserDownloadUrl = "https://example/v"
+                                  raBrowserDownloadUrl = "https://example/v",
+                                  raSize = Nothing
                                 }
                             ]
                         },
@@ -1008,7 +1010,8 @@ testGoMultiPvStopOnHardFail =
                           riAssets =
                             [ ReleaseAsset
                                 { raName = T.pack (T.unpack tag <> "-vendor.tar.xz"),
-                                  raBrowserDownloadUrl = "https://example/v"
+                                  raBrowserDownloadUrl = "https://example/v",
+                                  raSize = Nothing
                                 }
                             ]
                         },
@@ -1387,7 +1390,8 @@ testReusePathApplyProgressSequence =
                           riAssets =
                             [ ReleaseAsset
                                 { raName = T.pack tarballName,
-                                  raBrowserDownloadUrl = "https://example/vendor"
+                                  raBrowserDownloadUrl = "https://example/vendor",
+                                  raSize = Nothing
                                 }
                             ]
                         },

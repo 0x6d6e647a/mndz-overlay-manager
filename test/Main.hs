@@ -5,6 +5,7 @@ import Test.Assets qualified as Assets
 import Test.CLI qualified as CLI
 import Test.CheckPlan qualified as CheckPlan
 import Test.Config qualified as Config
+import Test.DiskSpace qualified as DiskSpace
 import Test.Distfiles qualified as Distfiles
 import Test.EbuildEdit qualified as EbuildEdit
 import Test.Ecosystems qualified as Ecosystems
@@ -46,6 +47,7 @@ main =
           [ Overlay.tests,
             Config.tests,
             Distfiles.tests,
+            DiskSpace.tests,
             Policy.tests,
             Targets.tests,
             Preflight.tests,

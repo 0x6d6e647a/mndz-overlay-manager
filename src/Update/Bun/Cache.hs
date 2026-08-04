@@ -36,6 +36,10 @@ import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import Update.DiskSpace
+  ( MaterializeClass (FullNpmBun),
+    checkPostCloneForClass,
+  )
 import Update.Engines (parseEnginesMinimum)
 import Update.Go.Vendor (githubCloneUrl, versionTag)
 import Update.Go.Version
@@ -232,33 +236,37 @@ buildBunDepsTarball ops progress mode owner repo prefix pv bunReq outDir tarball
               Left err -> pure (Left err)
               Right () -> do
                 bcpOnCloneDone progress
-                let lockPath = cloneDir </> "bun.lock"
-                hasLock <- doesFileExist lockPath
-                if not hasLock
-                  then
-                    pure $
-                      Left
-                        "bun.lock missing at repository root; \
-                        \DepsAndAssets Bun requires a root bun.lock"
-                  else do
-                    bcpOnInstallStart progress
-                    installed <- bcoBunInstall ops cloneDir cacheDir
-                    case installed of
-                      Left err -> pure (Left err)
-                      Right () -> do
-                        bcpOnInstallDone progress
-                        packResult <- packAfterInstall ops mode tmp cloneDir cacheDir
-                        case packResult of
+                spaceOk <- checkPostCloneForClass FullNpmBun cloneDir
+                case spaceOk of
+                  Left err -> pure (Left err)
+                  Right () -> do
+                    let lockPath = cloneDir </> "bun.lock"
+                    hasLock <- doesFileExist lockPath
+                    if not hasLock
+                      then
+                        pure $
+                          Left
+                            "bun.lock missing at repository root; \
+                            \DepsAndAssets Bun requires a root bun.lock"
+                      else do
+                        bcpOnInstallStart progress
+                        installed <- bcoBunInstall ops cloneDir cacheDir
+                        case installed of
                           Left err -> pure (Left err)
-                          Right (workDir, entries) -> do
-                            let outPath = outDir </> tarballName
-                            bcpOnCompressStart progress
-                            compressed <- bcoTarXz ops workDir entries outPath
-                            case compressed of
+                          Right () -> do
+                            bcpOnInstallDone progress
+                            packResult <- packAfterInstall ops mode tmp cloneDir cacheDir
+                            case packResult of
                               Left err -> pure (Left err)
-                              Right () -> do
-                                bcpOnCompressDone progress
-                                pure (Right outPath)
+                              Right (workDir, entries) -> do
+                                let outPath = outDir </> tarballName
+                                bcpOnCompressStart progress
+                                compressed <- bcoTarXz ops workDir entries outPath
+                                case compressed of
+                                  Left err -> pure (Left err)
+                                  Right () -> do
+                                    bcpOnCompressDone progress
+                                    pure (Right outPath)
 
 -- | Resolve tar work directory and relative members after a successful install.
 packAfterInstall ::

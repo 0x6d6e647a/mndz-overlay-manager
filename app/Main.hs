@@ -56,8 +56,15 @@ import Update.Check
     productionFetcherWithToken,
   )
 import Update.Deps.Plan (productionDepsPlanOps, toGoPlanOps)
+import Update.DiskSpace
+  ( DiskGateOk (..),
+    productionDiskSpaceProbe,
+    resolveTempRoot,
+    runDiskSpaceGate,
+  )
 import Update.Distfiles
   ( cleanManagerDistfiles,
+    lookupPortageDistDir,
     probeDistfilesDir,
     resolveDistfilesPath,
   )
@@ -78,6 +85,7 @@ import Update.Md5Cache
 import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight
   ( AssetsPreflight (..),
+    buildUnitPlansForPackages,
     preflightUpdateTools,
     validateAssetsPath,
   )
@@ -235,6 +243,24 @@ runUpdate rt pkgArgs = do
             dieError
               "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
           Just _ -> pure ()
+      -- Disk-space feasibility before concurrent package mutation.
+      diskGate <-
+        liftIO $
+          withStepProgress (rtProgress rt) 1 $ \step -> do
+            shStep step "Checking free disk space"
+            tempRoot <- resolveTempRoot
+            units <- buildUnitPlansForPackages overlayPath distDir selected
+            mPortage <- lookupPortageDistDir
+            runDiskSpaceGate
+              productionDiskSpaceProbe
+              (rtJobs rt)
+              tempRoot
+              distDir
+              mPortage
+              units
+      case diskGate of
+        Left err -> dieError (T.unpack err)
+        Right (DiskGateOk warns) -> mapM_ logWarning warns
       let runApply gpg = do
             assetsLock <- newMVar ()
             overlayLock <- newMVar ()

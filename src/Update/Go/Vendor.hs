@@ -21,6 +21,10 @@ import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import Update.DiskSpace
+  ( MaterializeClass (FullGo),
+    checkPostCloneForClass,
+  )
 import Update.Go.Version
   ( enrichGoModDownloadError,
     goVersionTooOldMessage,
@@ -123,38 +127,42 @@ buildVendorTarball ops progress owner repo prefix pv mSubdir outDir tarballName 
       Left err -> pure (Left err)
       Right () -> do
         vpOnCloneDone progress
-        let goDir = case mSubdir of
-              Nothing -> cloneDir
-              Just sub -> cloneDir </> sub
-        hasMod <- doesFileExist (goDir </> "go.mod")
-        if not hasMod
-          then pure $ Left ("go.mod not found in " <> T.pack goDir)
-          else do
-            modText <- TIO.readFile (goDir </> "go.mod")
-            let mReq = parseGoModGoDirective modText
-            -- Host Go gate + go mod download share the download progress phase.
-            vpOnDownloadStart progress
-            gated <- gateHostGo ops mReq
-            case gated of
-              Left err -> pure (Left err)
-              Right () -> do
-                downloaded <- voGoModDownload ops goDir
-                case downloaded of
+        spaceOk <- checkPostCloneForClass FullGo cloneDir
+        case spaceOk of
+          Left err -> pure (Left err)
+          Right () -> do
+            let goDir = case mSubdir of
+                  Nothing -> cloneDir
+                  Just sub -> cloneDir </> sub
+            hasMod <- doesFileExist (goDir </> "go.mod")
+            if not hasMod
+              then pure $ Left ("go.mod not found in " <> T.pack goDir)
+              else do
+                modText <- TIO.readFile (goDir </> "go.mod")
+                let mReq = parseGoModGoDirective modText
+                -- Host Go gate + go mod download share the download progress phase.
+                vpOnDownloadStart progress
+                gated <- gateHostGo ops mReq
+                case gated of
                   Left err -> pure (Left err)
                   Right () -> do
-                    vpOnDownloadDone progress
-                    vpOnCompressStart progress
-                    tared <- voTarXz ops goDir "go-mod" outPath
-                    case tared of
+                    downloaded <- voGoModDownload ops goDir
+                    case downloaded of
                       Left err -> pure (Left err)
                       Right () -> do
-                        vpOnCompressDone progress
-                        pure $
-                          Right
-                            VendorResult
-                              { vrTarballPath = outPath,
-                                vrGoModVersion = mReq
-                              }
+                        vpOnDownloadDone progress
+                        vpOnCompressStart progress
+                        tared <- voTarXz ops goDir "go-mod" outPath
+                        case tared of
+                          Left err -> pure (Left err)
+                          Right () -> do
+                            vpOnCompressDone progress
+                            pure $
+                              Right
+                                VendorResult
+                                  { vrTarballPath = outPath,
+                                    vrGoModVersion = mReq
+                                  }
 
 -- | If go.mod has a parseable @go@ line, require host Go >= that version.
 gateHostGo :: VendorOps -> Maybe Text -> IO (Either Text ())

@@ -95,6 +95,7 @@ library
       , Update.Cargo.Msrv
       , Update.Check
       , Update.Deps.Plan
+      , Update.DiskSpace
       , Update.Distfiles
       , Update.EbuildEdit
       , Update.Engines
@@ -214,6 +215,7 @@ test-suite mndz-overlay-manager-test
         Test.CheckPlan
         Test.CLI
         Test.Config
+        Test.DiskSpace
         Test.Distfiles
         Test.EbuildEdit
         Test.Ecosystems

@@ -128,7 +128,25 @@ cabal run mndz-overlay-manager -- --jobs 2 -v update
 cabal run mndz-overlay-manager -- --no-progress update category/package
 ```
 
-Before mutating anything, `update` checks that required tools are on `PATH`, that the overlay `metadata/layout.conf` lists `cache-formats = md5-dict`, that the effective manager distfiles directory supports create-then-rename (Portage’s fetch pattern), and that each package about to be applied has complete matching md5-cache for all non-live ebuilds. When assets publish is needed, it also checks that `assets-path` is a git work tree and a GitHub token can be resolved. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
+Before mutating anything, `update` checks that required tools are on `PATH`, that the overlay `metadata/layout.conf` lists `cache-formats = md5-dict`, that the effective manager distfiles directory supports create-then-rename (Portage’s fetch pattern), free space on the **effective temp root** and **manager distfiles** path (see below), and that each package about to be applied has complete matching md5-cache for all non-live ebuilds. When assets publish is needed, it also checks that `assets-path` is a git work tree and a GitHub token can be resolved. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
+
+#### Free space, `TMPDIR`, and concurrent materialize
+
+Heavy `DepsAndAssets` work (clone, language package download, tarball pack) and reuse downloads write under the process temporary directory — **`TMPDIR` when set and usable**, otherwise the system default (often `/tmp`, which may be a small tmpfs). Manager distfile fetches for `ebuild … manifest` write under the effective manager distfiles path (XDG cache by default).
+
+Before concurrent package mutation, `update` estimates peak need from prior overlay **Manifest `DIST` sizes** and/or GitHub release asset **`size`**, multiplied by ecosystem expansion factors, plus a fixed **256 MiB** safety margin. Under `--jobs N` it requires free space for both the largest single unit and the sum of the up to **N** largest unit needs on each hard-check filesystem (temp and manager distfiles; merged when they share one device). Distfiles already present under the manager path do not add reservation.
+
+If free space is insufficient, `update` **hard-fails early** with the path, free vs need, and remediation hints (free space, set `TMPDIR` to roomier disk storage such as `$HOME/local/tmp`, or lower `--jobs`). That is intended to prevent mid-materialize `no space left on device` when the planned concurrent work already cannot fit.
+
+Live **system Portage DISTDIR** (when it differs from the manager path) is **warn-only** if free space there looks tight; it does not hard-fail the command by itself.
+
+```bash
+# Prefer a disk-backed temp root when /tmp is a small tmpfs
+TMPDIR=$HOME/local/tmp cabal run mndz-overlay-manager -- update
+
+# Or reduce concurrent materialize pressure
+cabal run mndz-overlay-manager -- --jobs 1 update
+```
 
 If md5-cache is **missing**, hard-fail recovery is `gencache category/package`. If `_md5_` **mismatches**, use `gencache --force category/package`, then retry `update`.
 

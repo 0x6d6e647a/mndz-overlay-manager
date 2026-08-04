@@ -461,7 +461,7 @@ testReleaseLookup :: IO ()
 testReleaseLookup = do
   let jsonFound =
         encodeUtf8
-          "{\"id\":42,\"tag_name\":\"beads-1.0.5\",\"assets\":[{\"name\":\"beads-1.0.5-vendor.tar.xz\",\"browser_download_url\":\"https://example/a\"},{\"name\":\"other.bin\",\"browser_download_url\":\"https://example/b\"}]}"
+          "{\"id\":42,\"tag_name\":\"beads-1.0.5\",\"assets\":[{\"name\":\"beads-1.0.5-vendor.tar.xz\",\"browser_download_url\":\"https://example/a\",\"size\":1048576},{\"name\":\"other.bin\",\"browser_download_url\":\"https://example/b\"}]}"
       jsonWrongAsset =
         encodeUtf8
           "{\"id\":1,\"tag_name\":\"crush-0.84.0\",\"assets\":[{\"name\":\"notes.txt\",\"browser_download_url\":\"https://example/n\"}]}"
@@ -480,6 +480,14 @@ testReleaseLookup = do
     "find asset"
     (Just "https://example/a")
     (raBrowserDownloadUrl <$> findAssetByName info "beads-1.0.5-vendor.tar.xz")
+  assertEq
+    "asset size"
+    (Just 1048576)
+    (raSize =<< findAssetByName info "beads-1.0.5-vendor.tar.xz")
+  assertEq
+    "missing size field is Nothing"
+    Nothing
+    (raSize =<< findAssetByName info "other.bin")
   assertEq
     "missing asset name"
     Nothing
@@ -532,14 +540,14 @@ testMultiAssetLookup = do
           { riId = 1,
             riTag = "opencode-1.18.4",
             riAssets =
-              [ ReleaseAsset "opencode-1.18.4-deps.tar.xz" "https://example/deps",
-                ReleaseAsset "opencode-1.18.4-models.json" "https://example/models"
+              [ ReleaseAsset "opencode-1.18.4-deps.tar.xz" "https://example/deps" Nothing,
+                ReleaseAsset "opencode-1.18.4-models.json" "https://example/models" Nothing
               ]
           }
       partial =
         info
           { riAssets =
-              [ReleaseAsset "opencode-1.18.4-deps.tar.xz" "https://example/deps"]
+              [ReleaseAsset "opencode-1.18.4-deps.tar.xz" "https://example/deps" Nothing]
           }
       opsFull =
         ReleaseOps

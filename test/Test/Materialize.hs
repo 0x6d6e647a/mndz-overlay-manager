@@ -318,7 +318,8 @@ releaseFound kindSuffix assetBytes =
                   riAssets =
                     [ ReleaseAsset
                         { raName = tag <> kindSuffix,
-                          raBrowserDownloadUrl = "https://example/" <> tag
+                          raBrowserDownloadUrl = "https://example/" <> tag,
+                          raSize = Nothing
                         }
                     ]
                 },
@@ -1101,11 +1102,13 @@ releaseBothOpencode depsBytes modelsBytes =
                   riAssets =
                     [ ReleaseAsset
                         { raName = tag <> depsKind,
-                          raBrowserDownloadUrl = "https://example/" <> tag <> "/deps"
+                          raBrowserDownloadUrl = "https://example/" <> tag <> "/deps",
+                          raSize = Nothing
                         },
                       ReleaseAsset
                         { raName = tag <> "-models.json",
-                          raBrowserDownloadUrl = "https://example/" <> tag <> "/models"
+                          raBrowserDownloadUrl = "https://example/" <> tag <> "/models",
+                          raSize = Nothing
                         }
                     ]
                 },
@@ -1130,7 +1133,8 @@ releaseDepsOnlyOpencode =
                   riAssets =
                     [ ReleaseAsset
                         { raName = tag <> depsKind,
-                          raBrowserDownloadUrl = "https://example/" <> tag <> "/deps"
+                          raBrowserDownloadUrl = "https://example/" <> tag <> "/deps",
+                          raSize = Nothing
                         }
                     ]
                 },

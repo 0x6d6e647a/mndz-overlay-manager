@@ -27,6 +27,10 @@ import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import Update.DiskSpace
+  ( MaterializeClass (FullSbcl),
+    checkPostCloneForClass,
+  )
 import Update.Go.Vendor (githubCloneUrl, versionTag)
 import Update.Process
   ( CommandRunner,
@@ -137,40 +141,44 @@ buildSbclDepsTarball
             Left err -> pure (Left err)
             Right () -> do
               sdpOnCloneDone progress
-              preflightClone cloneDir >>= \case
+              spaceOk <- checkPostCloneForClass FullSbcl cloneDir
+              case spaceOk of
                 Left err -> pure (Left err)
-                Right () -> do
-                  sdpOnQlotStart progress
-                  qlot <- sdoQlotInstall ops cloneDir "sbcl" qlSetup
-                  case qlot of
+                Right () ->
+                  preflightClone cloneDir >>= \case
                     Left err -> pure (Left err)
                     Right () -> do
-                      sdpOnQlotDone progress
-                      qlotOk <- sdoCopyQlot ops cloneDir stageDir
-                      case qlotOk of
+                      sdpOnQlotStart progress
+                      qlot <- sdoQlotInstall ops cloneDir "sbcl" qlSetup
+                      case qlot of
                         Left err -> pure (Left err)
                         Right () -> do
-                          sdpOnFffStart progress
-                          fff <- sdoMaterializeFff ops cloneDir stageDir
-                          case fff of
+                          sdpOnQlotDone progress
+                          qlotOk <- sdoCopyQlot ops cloneDir stageDir
+                          case qlotOk of
                             Left err -> pure (Left err)
                             Right () -> do
-                              sdpOnFffDone progress
-                              sdpOnCompressStart progress
-                              packed <- sdoPackTarball ops stageDir outPath
-                              case packed of
+                              sdpOnFffStart progress
+                              fff <- sdoMaterializeFff ops cloneDir stageDir
+                              case fff of
                                 Left err -> pure (Left err)
                                 Right () -> do
-                                  sdpOnCompressDone progress
-                                  hasTar <- doesFileExist outPath
-                                  pure $
-                                    if hasTar
-                                      then Right outPath
-                                      else
-                                        Left
-                                          ( "SBCL deps pack did not produce tarball at "
-                                              <> T.pack outPath
-                                          )
+                                  sdpOnFffDone progress
+                                  sdpOnCompressStart progress
+                                  packed <- sdoPackTarball ops stageDir outPath
+                                  case packed of
+                                    Left err -> pure (Left err)
+                                    Right () -> do
+                                      sdpOnCompressDone progress
+                                      hasTar <- doesFileExist outPath
+                                      pure $
+                                        if hasTar
+                                          then Right outPath
+                                          else
+                                            Left
+                                              ( "SBCL deps pack did not produce tarball at "
+                                                  <> T.pack outPath
+                                              )
 
 preflightClone :: FilePath -> IO (Either Text ())
 preflightClone root = do

@@ -101,6 +101,13 @@ import Update.Deps.Plan
   ( DepsPlanOps (..),
     planDepsPackageWithProgress,
   )
+import Update.DiskSpace
+  ( checkTempNeedAtAdmit,
+    estimateNeedBytes,
+    getFreeBytes,
+    materializeClassFull,
+    resolveTempRoot,
+  )
 import Update.EbuildEdit
   ( bunBdependAtom,
     ebuildFileNameWithRev,
@@ -794,104 +801,110 @@ fullDepsPublishAndOverlay
   assetNames
   mh
   key
-  stepsDoneRef =
-    withSystemTempDirectory "mndz-deps-out-" $ \outDir -> do
-      built <-
-        materializeDistfiles
-          env
-          eco
-          src
-          entry
-          key
-          pn
-          pvNoRev
-          outDir
-          assetNames
-          stepsDoneRef
-          mh
-      case built of
-        Left err -> pure $ ApplyHardFail key err False False
-        Right (paths, mReqVer, mEbuildBody) -> do
-          mhStatus mh key "committing assets"
-          distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
-          let relSidecars =
-                [ T.unpack category </> T.unpack pn </> takeFileName p <> ext
-                | p <- paths,
-                  ext <- [".sha256", ".sha512", ".b3"]
-                ]
-          mapM_
-            ( \(p, digests) -> do
-                let sp = sidecarPaths assetsRoot category pn (takeFileName p)
-                createDirectoryIfMissing True (takeDirectory (spSha256 sp))
-                writeSidecars p digests (spSha256 sp) (spSha512 sp) (spB3 sp)
-            )
-            distDigests
-          let msg = commitMessage category pn (renderPV targetVer)
-              meta =
-                ReleaseMeta
-                  { rmOwner = aeAssetsOwner env,
-                    rmRepo = aeAssetsRepo env,
-                    rmTag = releaseTag pn pvNoRev,
-                    rmName = releaseName category pn pvNoRev,
-                    rmBody = msg,
-                    rmTargetCommitish = "main"
-                  }
-          pubResult <-
-            withMVar (aeAssetsLock env) $ \() -> do
-              committed <-
-                goAddAndCommit
-                  (aeGitOps env)
-                  assetsRoot
-                  relSidecars
-                  msg
-              case committed of
-                Left err -> pure (Left err)
-                Right () -> do
-                  markMaterializeStep stepsDoneRef mh key "committing assets"
-                  mhStatus mh key "pushing assets"
-                  pushed <- goPush (aeGitOps env) assetsRoot
-                  case pushed of
+  stepsDoneRef = do
+    tempRoot <- resolveTempRoot
+    let admitNeed = estimateNeedBytes (materializeClassFull eco) Nothing
+    admitOk <- checkTempNeedAtAdmit getFreeBytes tempRoot admitNeed
+    case admitOk of
+      Left err -> pure $ ApplyHardFail key err False False
+      Right () ->
+        withSystemTempDirectory "mndz-deps-out-" $ \outDir -> do
+          built <-
+            materializeDistfiles
+              env
+              eco
+              src
+              entry
+              key
+              pn
+              pvNoRev
+              outDir
+              assetNames
+              stepsDoneRef
+              mh
+          case built of
+            Left err -> pure $ ApplyHardFail key err False False
+            Right (paths, mReqVer, mEbuildBody) -> do
+              mhStatus mh key "committing assets"
+              distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
+              let relSidecars =
+                    [ T.unpack category </> T.unpack pn </> takeFileName p <> ext
+                    | p <- paths,
+                      ext <- [".sha256", ".sha512", ".b3"]
+                    ]
+              mapM_
+                ( \(p, digests) -> do
+                    let sp = sidecarPaths assetsRoot category pn (takeFileName p)
+                    createDirectoryIfMissing True (takeDirectory (spSha256 sp))
+                    writeSidecars p digests (spSha256 sp) (spSha512 sp) (spB3 sp)
+                )
+                distDigests
+              let msg = commitMessage category pn (renderPV targetVer)
+                  meta =
+                    ReleaseMeta
+                      { rmOwner = aeAssetsOwner env,
+                        rmRepo = aeAssetsRepo env,
+                        rmTag = releaseTag pn pvNoRev,
+                        rmName = releaseName category pn pvNoRev,
+                        rmBody = msg,
+                        rmTargetCommitish = "main"
+                      }
+              pubResult <-
+                withMVar (aeAssetsLock env) $ \() -> do
+                  committed <-
+                    goAddAndCommit
+                      (aeGitOps env)
+                      assetsRoot
+                      relSidecars
+                      msg
+                  case committed of
                     Left err -> pure (Left err)
                     Right () -> do
-                      markMaterializeStep stepsDoneRef mh key "pushing assets"
-                      mhStatus mh key "uploading release asset"
-                      uploaded <-
-                        roCreateReleaseWithAssets
-                          (aeReleaseOps env)
-                          meta
-                          paths
-                      case uploaded of
+                      markMaterializeStep stepsDoneRef mh key "committing assets"
+                      mhStatus mh key "pushing assets"
+                      pushed <- goPush (aeGitOps env) assetsRoot
+                      case pushed of
                         Left err -> pure (Left err)
                         Right () -> do
-                          markMaterializeStep stepsDoneRef mh key "uploading release asset"
-                          pure (Right ())
-          case pubResult of
-            Left err ->
-              pure $
-                ApplyHardFail
-                  key
-                  ("assets publish failed: " <> err)
-                  False
-                  False
-            Right () -> do
-              mhStatus mh key "regenerating manifest"
-              outcome <-
-                overlayAfterAssets
-                  env
-                  overlayRoot
-                  entry
-                  eco
-                  keywords
-                  lines_
-                  targetVer
-                  distDigests
-                  mReqVer
-                  mEbuildBody
-              case outcome of
-                ApplySuccess {} ->
-                  markMaterializeStep stepsDoneRef mh key "regenerating manifest"
-                _ -> pure ()
-              pure outcome
+                          markMaterializeStep stepsDoneRef mh key "pushing assets"
+                          mhStatus mh key "uploading release asset"
+                          uploaded <-
+                            roCreateReleaseWithAssets
+                              (aeReleaseOps env)
+                              meta
+                              paths
+                          case uploaded of
+                            Left err -> pure (Left err)
+                            Right () -> do
+                              markMaterializeStep stepsDoneRef mh key "uploading release asset"
+                              pure (Right ())
+              case pubResult of
+                Left err ->
+                  pure $
+                    ApplyHardFail
+                      key
+                      ("assets publish failed: " <> err)
+                      False
+                      False
+                Right () -> do
+                  mhStatus mh key "regenerating manifest"
+                  outcome <-
+                    overlayAfterAssets
+                      env
+                      overlayRoot
+                      entry
+                      eco
+                      keywords
+                      lines_
+                      targetVer
+                      distDigests
+                      mReqVer
+                      mEbuildBody
+                  case outcome of
+                    ApplySuccess {} ->
+                      markMaterializeStep stepsDoneRef mh key "regenerating manifest"
+                    _ -> pure ()
+                  pure outcome
 
 -- | Build all required distfiles (primary + companions); paths in asset order.
 materializeDistfiles ::

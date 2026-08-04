@@ -21,7 +21,7 @@ module Update.Assets.Release
   )
 where
 
-import Data.Aeson (Value, eitherDecode, encode, object, withObject, (.:), (.=))
+import Data.Aeson (Value, eitherDecode, encode, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as LBS
@@ -59,7 +59,9 @@ data ReleaseMeta = ReleaseMeta
 -- | One asset attached to a GitHub release.
 data ReleaseAsset = ReleaseAsset
   { raName :: Text,
-    raBrowserDownloadUrl :: Text
+    raBrowserDownloadUrl :: Text,
+    -- | Byte size from the GitHub API @size@ field when present.
+    raSize :: Maybe Integer
   }
   deriving (Eq, Show)
 
@@ -362,7 +364,13 @@ parseReleaseAsset =
   withObject "asset" $ \o -> do
     name <- o .: "name"
     url <- o .: "browser_download_url"
-    pure ReleaseAsset {raName = name, raBrowserDownloadUrl = url}
+    mSize <- o .:? "size"
+    pure
+      ReleaseAsset
+        { raName = name,
+          raBrowserDownloadUrl = url,
+          raSize = mSize
+        }
 
 -- | Find an asset by exact filename.
 findAssetByName :: ReleaseInfo -> Text -> Maybe ReleaseAsset

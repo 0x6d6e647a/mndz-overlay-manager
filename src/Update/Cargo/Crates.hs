@@ -31,6 +31,10 @@ import Update.Cargo.Msrv
     parseRustMinVerFromEbuild,
     parseRustVersionField,
   )
+import Update.DiskSpace
+  ( MaterializeClass (FullCargo),
+    checkPostCloneForClass,
+  )
 import Update.Go.Vendor (githubCloneUrl, versionTag)
 import Update.Process
   ( CommandRunner,
@@ -122,67 +126,71 @@ buildCargoCratesTarball
         Left err -> pure (Left err)
         Right () -> do
           cgpOnCloneDone progress
-          let lockRoot = case mLockSub of
-                Nothing -> cloneDir
-                Just sub -> cloneDir </> sub
-              pkgDir = case mPkgSub of
-                Nothing -> lockRoot
-                Just sub -> cloneDir </> sub
-              -- pycargoebuild rejects workspace roots; run in the package member
-              -- when set (e.g. usage's cli/). Cargo.lock is still resolved upward.
-              pycargoDir = case mPkgSub of
-                Just sub -> cloneDir </> sub
-                Nothing -> lockRoot
-          hasLock <- doesFileExist (lockRoot </> "Cargo.lock")
-          if not hasLock
-            then
-              pure $
-                Left
-                  ( "Cargo.lock not found at "
-                      <> T.pack lockRoot
-                  )
-            else do
-              TIO.writeFile ebuildPath donorContent
-              cgpOnPycargoStart progress
-              tool <-
-                coPycargoebuild
-                  ops
-                  ebuildPath
-                  pycargoDir
-                  outPath
-                  distDir
-              case tool of
-                Left err -> pure (Left err)
-                Right () -> do
-                  cgpOnPycargoDone progress
-                  hasTar <- doesFileExist outPath
-                  if not hasTar
-                    then
-                      pure $
-                        Left
-                          ( "pycargoebuild did not produce crate tarball at "
-                              <> T.pack outPath
-                          )
-                    else do
-                      ebuildBody <- TIO.readFile ebuildPath
-                      rootToml <- readOptionalToml (pkgDir </> "Cargo.toml")
-                      let mRoot = parseRustVersionField =<< rootToml
-                      mDeps <- maxRustVersionInTree lockRoot
-                      let mDonor = parseRustMinVerFromEbuild donorContent
-                      case combineMsrv mRoot mDeps mDonor of
-                        Nothing ->
+          spaceOk <- checkPostCloneForClass FullCargo cloneDir
+          case spaceOk of
+            Left err -> pure (Left err)
+            Right () -> do
+              let lockRoot = case mLockSub of
+                    Nothing -> cloneDir
+                    Just sub -> cloneDir </> sub
+                  pkgDir = case mPkgSub of
+                    Nothing -> lockRoot
+                    Just sub -> cloneDir </> sub
+                  -- pycargoebuild rejects workspace roots; run in the package member
+                  -- when set (e.g. usage's cli/). Cargo.lock is still resolved upward.
+                  pycargoDir = case mPkgSub of
+                    Just sub -> cloneDir </> sub
+                    Nothing -> lockRoot
+              hasLock <- doesFileExist (lockRoot </> "Cargo.lock")
+              if not hasLock
+                then
+                  pure $
+                    Left
+                      ( "Cargo.lock not found at "
+                          <> T.pack lockRoot
+                      )
+                else do
+                  TIO.writeFile ebuildPath donorContent
+                  cgpOnPycargoStart progress
+                  tool <-
+                    coPycargoebuild
+                      ops
+                      ebuildPath
+                      pycargoDir
+                      outPath
+                      distDir
+                  case tool of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                      cgpOnPycargoDone progress
+                      hasTar <- doesFileExist outPath
+                      if not hasTar
+                        then
                           pure $
                             Left
-                              "could not determine RUST_MIN_VER (no package.rust-version, \
-                              \dependency rust-version, or donor RUST_MIN_VER)"
-                        Just msrv ->
-                          pure $
-                            Right
-                              CargoResult
-                                { crTarballPath = outPath,
-                                  crMsrv = msrv,
-                                  crEbuildBody = ebuildBody
-                                }
+                              ( "pycargoebuild did not produce crate tarball at "
+                                  <> T.pack outPath
+                              )
+                        else do
+                          ebuildBody <- TIO.readFile ebuildPath
+                          rootToml <- readOptionalToml (pkgDir </> "Cargo.toml")
+                          let mRoot = parseRustVersionField =<< rootToml
+                          mDeps <- maxRustVersionInTree lockRoot
+                          let mDonor = parseRustMinVerFromEbuild donorContent
+                          case combineMsrv mRoot mDeps mDonor of
+                            Nothing ->
+                              pure $
+                                Left
+                                  "could not determine RUST_MIN_VER (no package.rust-version, \
+                                  \dependency rust-version, or donor RUST_MIN_VER)"
+                            Just msrv ->
+                              pure $
+                                Right
+                                  CargoResult
+                                    { crTarballPath = outPath,
+                                      crMsrv = msrv,
+                                      crEbuildBody = ebuildBody
+                                    }
 
 readOptionalToml :: FilePath -> IO (Maybe Text)
 readOptionalToml path = do
