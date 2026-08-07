@@ -643,7 +643,11 @@ postCloneRemainingEstimate :: MaterializeClass -> Integer
 postCloneRemainingEstimate cls =
   -- Remaining work is roughly on the order of the ecosystem floor body
   -- (not including the command-level margin, which is reapplied here once).
-  floorFor cls + safetyMarginBytes
+  -- FullCargo also stages extracted registry crates + the compressed tarball
+  -- (manager-owned pack), so budget ~2× the floor body after clone.
+  case cls of
+    FullCargo -> 2 * floorCargoTemp + safetyMarginBytes
+    _ -> floorFor cls + safetyMarginBytes
 
 -- | Production helper: resolve temp root and recheck after clone for @cls@.
 checkPostCloneForClass :: MaterializeClass -> FilePath -> IO (Either Text ())

@@ -129,6 +129,7 @@ library
       , Update.Apply.GitMv
       , Update.Apply.Materialize
       , Update.Apply.OverlayWrite
+      , Update.Cargo.Lock
       , Update.DiskSpace.StatVfs
 
     -- LANGUAGE extensions used by modules in this package.

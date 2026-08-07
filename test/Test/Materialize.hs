@@ -244,9 +244,11 @@ fakeCargoSuccessOps =
           (dest </> "Cargo.toml")
           "[package]\nname = \"pkg\"\nrust-version = \"1.85.0\"\n"
         pure (Right ()),
-      coPycargoebuild = \ebuildPath _lockRoot outPath _dist -> do
+      coPycargoebuild = \ebuildPath _lockRoot _outPath _dist -> do
         body <- TIO.readFile ebuildPath
         TIO.writeFile ebuildPath (body <> "\n# pycargoebuild\n")
+        pure (Right ()),
+      coPackCrates = \_lock _dist _stage outPath -> do
         BS.writeFile outPath cargoAssetBytes
         pure (Right ())
     }
@@ -1384,6 +1386,8 @@ testCargoReusePathSuccess =
               pePath = pkgDir </> "hk-0.40.0.ebuild"
             }
     cloneCalls <- newIORef (0 :: Int)
+    pycargoCalls <- newIORef (0 :: Int)
+    packCalls <- newIORef (0 :: Int)
     createDirectoryIfMissing True assetsRoot
     seedCargoLocalOk overlayRoot pkgDir pn
     depsOps <-
@@ -1398,7 +1402,13 @@ testCargoReusePathSuccess =
           fakeCargoSuccessOps
             { coClone = \_ _ _ -> do
                 atomicModifyIORef' cloneCalls (\n -> (n + 1, ()))
-                pure (Left "clone should not run on reuse")
+                pure (Left "clone should not run on reuse"),
+              coPycargoebuild = \_ _ _ _ -> do
+                atomicModifyIORef' pycargoCalls (\n -> (n + 1, ()))
+                pure (Left "pycargo should not run on reuse"),
+              coPackCrates = \_ _ _ _ -> do
+                atomicModifyIORef' packCalls (\n -> (n + 1, ()))
+                pure (Left "pack should not run on reuse")
             }
     env <-
       mkMatEnv
@@ -1419,6 +1429,10 @@ testCargoReusePathSuccess =
         assertTrue "reuse marks lines" (all slAssetsReused sls)
         n <- readIORef cloneCalls
         assertEq "cargo clone skipped on reuse" 0 n
+        p <- readIORef pycargoCalls
+        assertEq "cargo pycargoebuild skipped on reuse" 0 p
+        k <- readIORef packCalls
+        assertEq "cargo pack skipped on reuse" 0 k
       other -> do
         hPutStrLn stderr ("cargo reuse: expected success, got " <> show other)
         exitFailure

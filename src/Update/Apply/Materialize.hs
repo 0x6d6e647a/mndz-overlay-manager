@@ -1200,7 +1200,9 @@ cargoCratesProgress stepsDoneRef mh key =
     { cgpOnCloneStart = mhStatus mh key "cloning upstream",
       cgpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
       cgpOnPycargoStart = mhStatus mh key "pycargoebuild",
-      cgpOnPycargoDone = markMaterializeStep stepsDoneRef mh key "pycargoebuild"
+      cgpOnPycargoDone = markMaterializeStep stepsDoneRef mh key "pycargoebuild",
+      cgpOnPackStart = mhStatus mh key "crates pack",
+      cgpOnPackDone = markMaterializeStep stepsDoneRef mh key "crates pack"
     }
 
 -- | Full-path SBCL materialize has more host steps than the generic 7-slot

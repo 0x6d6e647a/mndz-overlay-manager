@@ -9,9 +9,15 @@ module Update.Cargo.Crates
     buildCargoCratesTarball,
     crateTarballPrefix,
     maxRustVersionInTree,
+    -- Pack helpers (unit-tested)
+    RegistryPackage (..),
+    parseRegistryPackages,
+    cargoChecksumJson,
+    packCratesTarball,
   )
 where
 
+import Control.Monad (when)
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -21,10 +27,19 @@ import System.Directory
     doesDirectoryExist,
     doesFileExist,
     listDirectory,
+    removeFile,
+    renameFile,
   )
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
+import Update.Cargo.Lock
+  ( RegistryPackage (..),
+    crateDirName,
+    crateFilename,
+    parseRegistryPackages,
+  )
 import Update.Cargo.Msrv
   ( combineMsrv,
     maxRustVersion,
@@ -58,15 +73,19 @@ data CargoResult = CargoResult
 
 data CargoOps = CargoOps
   { coClone :: Text -> Text -> FilePath -> IO (Either Text ()),
-    -- | Run pycargoebuild: ebuild path, lock root, tarball out path, temp distdir.
-    coPycargoebuild :: FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+    -- | Run pycargoebuild: ebuild path, lock root / pkg dir, tarball out path, temp distdir.
+    coPycargoebuild :: FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ()),
+    -- | Pack registry crates: lock root, distdir, stage dir, final tarball path.
+    coPackCrates :: FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
   }
 
 data CargoProgress = CargoProgress
   { cgpOnCloneStart :: IO (),
     cgpOnCloneDone :: IO (),
     cgpOnPycargoStart :: IO (),
-    cgpOnPycargoDone :: IO ()
+    cgpOnPycargoDone :: IO (),
+    cgpOnPackStart :: IO (),
+    cgpOnPackDone :: IO ()
   }
 
 -- | Build cargo ops over an injectable command runner (Unit heat surface).
@@ -74,13 +93,15 @@ mkCargoOps :: CommandRunner -> CargoOps
 mkCargoOps run =
   CargoOps
     { coClone = gitCloneTag run,
-      coPycargoebuild = runPycargoebuild run
+      coPycargoebuild = runPycargoebuild run,
+      coPackCrates = packCratesTarball run
     }
 
 productionCargoOps :: CargoOps
 productionCargoOps = mkCargoOps productionCommandRunner
 
--- | Clone @tag@, run @pycargoebuild -c -i -M -f@, return tarball + MSRV + ebuild body.
+-- | Clone @tag@, run pycargoebuild with no-write crate tarball, pack crates, return
+-- tarball + MSRV + ebuild body.
 buildCargoCratesTarball ::
   CargoOps ->
   CargoProgress ->
@@ -117,6 +138,7 @@ buildCargoCratesTarball
     withSystemTempDirectory "mndz-cargo-crates-" $ \tmp -> do
       let cloneDir = tmp </> "src"
           distDir = tmp </> "distdir"
+          stageDir = tmp </> "stage"
           ebuildName = T.unpack pn <> "-" <> T.unpack pv <> ".ebuild"
           ebuildPath = tmp </> ebuildName
       createDirectoryIfMissing True distDir
@@ -163,34 +185,46 @@ buildCargoCratesTarball
                     Left err -> pure (Left err)
                     Right () -> do
                       cgpOnPycargoDone progress
-                      hasTar <- doesFileExist outPath
-                      if not hasTar
-                        then
-                          pure $
-                            Left
-                              ( "pycargoebuild did not produce crate tarball at "
-                                  <> T.pack outPath
-                              )
-                        else do
-                          ebuildBody <- TIO.readFile ebuildPath
-                          rootToml <- readOptionalToml (pkgDir </> "Cargo.toml")
-                          let mRoot = parseRustVersionField =<< rootToml
-                          mDeps <- maxRustVersionInTree lockRoot
-                          let mDonor = parseRustMinVerFromEbuild donorContent
-                          case combineMsrv mRoot mDeps mDonor of
-                            Nothing ->
+                      cgpOnPackStart progress
+                      packed <-
+                        coPackCrates
+                          ops
+                          lockRoot
+                          distDir
+                          stageDir
+                          outPath
+                      case packed of
+                        Left err -> pure (Left err)
+                        Right () -> do
+                          cgpOnPackDone progress
+                          hasTar <- doesFileExist outPath
+                          if not hasTar
+                            then
                               pure $
                                 Left
-                                  "could not determine RUST_MIN_VER (no package.rust-version, \
-                                  \dependency rust-version, or donor RUST_MIN_VER)"
-                            Just msrv ->
-                              pure $
-                                Right
-                                  CargoResult
-                                    { crTarballPath = outPath,
-                                      crMsrv = msrv,
-                                      crEbuildBody = ebuildBody
-                                    }
+                                  ( "cargo crates pack failed: tarball missing at "
+                                      <> T.pack outPath
+                                  )
+                            else do
+                              ebuildBody <- TIO.readFile ebuildPath
+                              rootToml <- readOptionalToml (pkgDir </> "Cargo.toml")
+                              let mRoot = parseRustVersionField =<< rootToml
+                              mDeps <- maxRustVersionInTree lockRoot
+                              let mDonor = parseRustMinVerFromEbuild donorContent
+                              case combineMsrv mRoot mDeps mDonor of
+                                Nothing ->
+                                  pure $
+                                    Left
+                                      "could not determine RUST_MIN_VER (no package.rust-version, \
+                                      \dependency rust-version, or donor RUST_MIN_VER)"
+                                Just msrv ->
+                                  pure $
+                                    Right
+                                      CargoResult
+                                        { crTarballPath = outPath,
+                                          crMsrv = msrv,
+                                          crEbuildBody = ebuildBody
+                                        }
 
 readOptionalToml :: FilePath -> IO (Maybe Text)
 readOptionalToml path = do
@@ -247,6 +281,10 @@ findCargoTomls root = do
             names
       pure (here <> subs)
 
+------------------------------------------------------------------------
+-- pycargoebuild (fetch / license / ebuild; no archive write)
+------------------------------------------------------------------------
+
 runPycargoebuild :: CommandRunner -> FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
 runPycargoebuild run ebuildPath lockRoot tarballPath distDir = do
   let args =
@@ -259,6 +297,7 @@ runPycargoebuild run ebuildPath lockRoot tarballPath distDir = do
           tarballPath,
           "--crate-tarball-prefix",
           T.unpack crateTarballPrefix,
+          "--no-write-crate-tarball",
           "-d",
           distDir,
           lockRoot
@@ -283,6 +322,149 @@ runPycargoebuild run ebuildPath lockRoot tarballPath distDir = do
                      else "\n" <> T.strip (T.pack (prStdout res))
                  )
           )
+
+------------------------------------------------------------------------
+-- Manager-owned crates tarball pack
+------------------------------------------------------------------------
+
+-- | @.cargo-checksum.json@ body for a registry package (lock checksum, empty files).
+cargoChecksumJson :: Text -> Text
+cargoChecksumJson packageChecksum =
+  "{\"package\":\"" <> packageChecksum <> "\",\"files\":{}}"
+
+-- | Stage distdir registry crates under @cargo_home/gentoo/@, write checksum JSON,
+-- and create @{pn}-{pv}-crates.tar.xz@ via system @tar@ with @XZ_OPT=-T0 -9e@.
+-- Writes atomically (temp path then rename). Errors use a pack-specific prefix.
+packCratesTarball ::
+  CommandRunner ->
+  FilePath ->
+  FilePath ->
+  FilePath ->
+  FilePath ->
+  IO (Either Text ())
+packCratesTarball run lockRoot distDir stageDir outPath = do
+  let lockPath = lockRoot </> "Cargo.lock"
+  hasLock <- doesFileExist lockPath
+  if not hasLock
+    then pure $ Left ("cargo crates pack failed: Cargo.lock not found at " <> T.pack lockPath)
+    else do
+      body <- TIO.readFile lockPath
+      case parseRegistryPackages body of
+        Left err -> pure $ Left ("cargo crates pack failed: " <> err)
+        Right pkgs -> stageAndArchive run pkgs distDir stageDir outPath
+
+stageAndArchive ::
+  CommandRunner ->
+  [RegistryPackage] ->
+  FilePath ->
+  FilePath ->
+  FilePath ->
+  IO (Either Text ())
+stageAndArchive run pkgs distDir stageDir outPath = do
+  let gentooDir = stageDir </> "cargo_home" </> "gentoo"
+  createDirectoryIfMissing True gentooDir
+  staged <- stageAll pkgs
+  case staged of
+    Left err -> pure (Left err)
+    Right () -> createArchiveAtomic run stageDir outPath
+  where
+    stageAll [] = pure (Right ())
+    stageAll (p : rest) = do
+      r <- stageOne p
+      case r of
+        Left err -> pure (Left err)
+        Right () -> stageAll rest
+
+    stageOne p = do
+      let cratePath = distDir </> crateFilename p
+          destDir = stageDir </> "cargo_home" </> "gentoo"
+      exists <- doesFileExist cratePath
+      if not exists
+        then
+          pure $
+            Left
+              ( "cargo crates pack failed: missing registry crate "
+                  <> T.pack (crateFilename p)
+                  <> " in distdir "
+                  <> T.pack distDir
+              )
+        else do
+          extracted <- extractCrate run cratePath destDir
+          case extracted of
+            Left err -> pure (Left err)
+            Right () -> do
+              let pkgDir = destDir </> crateDirName p
+                  checksumPath = pkgDir </> ".cargo-checksum.json"
+              pkgExists <- doesDirectoryExist pkgDir
+              if not pkgExists
+                then
+                  pure $
+                    Left
+                      ( "cargo crates pack failed: extract of "
+                          <> T.pack (crateFilename p)
+                          <> " did not produce "
+                          <> T.pack (crateDirName p)
+                      )
+                else do
+                  TIO.writeFile checksumPath (cargoChecksumJson (rpChecksum p))
+                  pure (Right ())
+
+extractCrate :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+extractCrate run cratePath destDir = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "tar" ["-xzf", cratePath, "-C", destDir],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  pure $
+    if prExitCode res == ExitSuccess
+      then Right ()
+      else
+        Left
+          ( "cargo crates pack failed: tar extract "
+              <> T.pack cratePath
+              <> ": "
+              <> T.strip (T.pack (prStderr res))
+          )
+
+createArchiveAtomic :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+createArchiveAtomic run stageDir outPath = do
+  createDirectoryIfMissing True (takeDirectory outPath)
+  let tmpPath = outPath <> ".tmp"
+  -- Drop any leftover partial temp from a previous attempt.
+  tmpExists <- doesFileExist tmpPath
+  when tmpExists (removeFile tmpPath)
+  env0 <- getEnvironment
+  let env' = ("XZ_OPT", "-T0 -9e") : filter ((/= "XZ_OPT") . fst) env0
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "tar" ["-C", stageDir, "-acf", tmpPath, "cargo_home"],
+          prCwd = Nothing,
+          prEnv = Just env',
+          prStdin = ""
+        }
+  if prExitCode res /= ExitSuccess
+    then do
+      tryRemove tmpPath
+      pure $
+        Left
+          ( "cargo crates pack failed: tar archive: "
+              <> T.strip (T.pack (prStderr res))
+          )
+    else do
+      -- Replace any existing final path atomically via rename.
+      finalExists <- doesFileExist outPath
+      when finalExists (removeFile outPath)
+      renameFile tmpPath outPath
+      pure (Right ())
+  where
+    tryRemove p = do
+      e <- doesFileExist p
+      when e (removeFile p)
 
 gitCloneTag :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text ())
 gitCloneTag run url tag dest = do
