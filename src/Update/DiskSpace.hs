@@ -72,9 +72,6 @@ import Data.Ratio (denominator, numerator, (%))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Foreign (Ptr, allocaBytes, peekByteOff)
-import Foreign.C.String (CString, withCString)
-import Foreign.C.Types (CInt (..), CULong (..))
 import System.Directory
   ( doesDirectoryExist,
     doesFileExist,
@@ -92,6 +89,7 @@ import System.Posix.Files
     isSymbolicLink,
   )
 import System.Posix.Types (DeviceID)
+import Update.DiskSpace.StatVfs (freeBytesStatvfs)
 import Update.Types
   ( EcosystemSpec (..),
     PackageKey (..),
@@ -333,25 +331,9 @@ getFreeBytes path = do
           <> T.pack (show e)
     Right n -> Right n
 
--- | Linux glibc @struct statvfs@ is 112 bytes on x86_64; we only read
--- @f_frsize@ (offset 8) and @f_bavail@ (offset 32).
-statvfsBufSize :: Int
-statvfsBufSize = 112
-
+-- | Production free-space probe via portable @statvfs@ binding.
 getFreeBytesStatvfs :: FilePath -> IO Integer
-getFreeBytesStatvfs path =
-  withCString path $ \cpath ->
-    allocaBytes statvfsBufSize $ \pst -> do
-      rc <- c_statvfs cpath pst
-      if rc /= 0
-        then ioError (userError ("statvfs failed for " <> path))
-        else do
-          frsize <- peekByteOff pst 8 :: IO CULong
-          bavail <- peekByteOff pst 32 :: IO CULong
-          pure (toInteger bavail * toInteger frsize)
-
-foreign import ccall unsafe "statvfs"
-  c_statvfs :: CString -> Ptr () -> IO CInt
+getFreeBytesStatvfs = freeBytesStatvfs
 
 -- | Filesystem device id for same-device merge (via @stat@).
 getDeviceId :: FilePath -> IO (Either Text DeviceID)

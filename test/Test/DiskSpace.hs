@@ -31,6 +31,7 @@ import Update.DiskSpace
     floorNpmBunTemp,
     floorReuseTemp,
     floorSbclTemp,
+    getFreeBytes,
     lookupManifestBaselineBySuffix,
     lookupManifestBaselineForClass,
     maxNeed,
@@ -54,7 +55,8 @@ tests =
       testCase "gate passes with ample free" testGatePass,
       testCase "Portage warn does not hard-fail" testPortageWarnOnly,
       testCase "Manifest DIST size parse" testManifestParse,
-      testCase "present distfile zeros need" testPresentDistfileZero
+      testCase "present distfile zeros need" testPresentDistfileZero,
+      testCase "production getFreeBytes smoke" testGetFreeBytesSmoke
     ]
 
 giB :: Integer
@@ -226,3 +228,11 @@ testPresentDistfileZero =
     needMissing <-
       presentDistfileNeed doesFileExist distDir "missing.tar.xz" (100 * 1024 * 1024)
     assertTrue "missing > 0" (needMissing > 0)
+
+-- | Smoke: production @statvfs@ path returns non-negative free bytes.
+testGetFreeBytesSmoke :: IO ()
+testGetFreeBytesSmoke =
+  withSystemTempDirectory "mndz-diskspace-statvfs-" $ \tmp -> do
+    result <- getFreeBytes tmp
+    n <- assertRight "getFreeBytes succeeds" result
+    assertTrue "free bytes non-negative" (n >= 0)
