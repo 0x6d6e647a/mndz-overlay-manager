@@ -1,10 +1,4 @@
-# overlay-test-use Specification
-
-## Purpose
-
-Portage `IUSE=test` + `RESTRICT="!test? ( test )"` convention for non-prebuilt mndz-overlay packages, `src_test` expectations, and mandatory `-rN` revision policy for non-version ebuild content edits. This is overlay product truth, not mndz-overlay-manager runtime behavior.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Overlay test USE and RESTRICT convention
 

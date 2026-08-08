@@ -2,18 +2,18 @@
 
 ## Purpose
 
-Plan and apply multi-PV maintenance for `DepsAndAssets` Go packages from Gentoo `dev-lang/go` keyword/arch ceilings and upstream `go.mod` requirements; exact-set ebuild convergence; lane-labeled reporting.
+Plan multi-PV maintenance for `DepsAndAssets` Go packages from Gentoo `dev-lang/go` keyword/arch ceilings and upstream `go.mod` requirements; KEYWORDS assembly examples; lane-labeled reporting. Exact-set package-directory prune is owned by `runtime-lanes` / `update-apply`.
 
 ## Requirements
 
 ### Requirement: Gentoo dev-lang/go ceilings via portageq
 
-The library SHALL resolve the Gentoo repository path by running `portageq get_repo_path / gentoo` (or an equivalent injectable runner). Under that path’s `dev-lang/go` directory, the library SHALL scan non-live `go-*.ebuild` files (excluding `9999` and other live versions) and, for each ebuild, parse PV and KEYWORDS. The library SHALL discover the set of architectures from those KEYWORDS (all arches present on non-live go ebuilds, not only amd64 and arm64) and compute plain and tilde Go version ceilings for each discovered arch:
+The program SHALL resolve the Gentoo repository path by running `portageq get_repo_path / gentoo` (or an equivalent injectable runner). Under that path’s `dev-lang/go` directory, the program SHALL scan non-live `go-*.ebuild` files (excluding `9999` and other live versions) and, for each ebuild, parse PV and KEYWORDS. The program SHALL discover the set of architectures from those KEYWORDS (all arches present on non-live go ebuilds, not only amd64 and arm64) and compute plain and tilde Go version ceilings for each discovered arch:
 
 - plain arch: maximum Go PV among ebuilds whose KEYWORDS include the bare arch token (e.g. `amd64`) and not only the tilde form
 - tilde arch: maximum Go PV among ebuilds whose KEYWORDS include `~arch` or the bare arch token
 
-If `portageq` fails or the path/package dir is unreadable, ceiling discovery SHALL fail with an error suitable for the caller. The library SHALL NOT read a config-overridden Portage tree path for this capability. Shared ceiling and lane semantics for non-Go ecosystems are defined by `runtime-lanes`; this requirement remains the Go ceiling source.
+If `portageq` fails or the path/package dir is unreadable, ceiling discovery SHALL fail with an error suitable for the caller. The program SHALL NOT read a config-overridden Portage tree path for this capability. Shared ceiling and lane semantics for non-Go ecosystems are defined by `runtime-lanes`; this requirement remains the Go ceiling source.
 
 #### Scenario: Tilde ceiling at least as new as plain
 
@@ -37,7 +37,7 @@ If `portageq` fails or the path/package dir is unreadable, ceiling discovery SHA
 
 ### Requirement: Lane targets from upstream go.mod
 
-For a `DepsAndAssets` Go package, given the Go ceilings for all discovered arches and a list of candidate package versions (non-live overlay PVs union upstream versions newer than max overlay PV, as defined by `runtime-lanes`), the library SHALL determine each lane’s target package PV as the maximum version `v` such that the package’s `go.mod` `go` directive at that version’s tag is parseable and `go_req(v) ≤` that lane’s Go ceiling (using the same Go version comparison rules as host-vs-go.mod gating). The `go.mod` path SHALL honor the package’s configured subdirectory (repository root when unset). Tags with missing or unparseable `go` directives SHALL be skipped for selection. A lane with no ceiling or no qualifying package version SHALL have no target.
+For a `DepsAndAssets` Go package, given the Go ceilings for all discovered arches and a list of candidate package versions (non-live overlay PVs union upstream versions newer than max overlay PV, as defined by `runtime-lanes`), the program SHALL determine each lane’s target package PV as the maximum version `v` such that the package’s `go.mod` `go` directive at that version’s tag is parseable and `go_req(v) ≤` that lane’s Go ceiling (using the same Go version comparison rules as host-vs-go.mod gating). The `go.mod` path SHALL honor the package’s configured subdirectory (repository root when unset). Tags with missing or unparseable `go` directives SHALL be skipped for selection. A lane with no ceiling or no qualifying package version SHALL have no target.
 
 #### Scenario: Older PV under plain ceiling
 
@@ -56,12 +56,12 @@ For a `DepsAndAssets` Go package, given the Go ceilings for all discovered arche
 
 ### Requirement: Unique ebuild set and KEYWORDS assembly
 
-The planner SHALL collapse lane targets to the set of unique package PVs. For each unique PV, the planned ebuild KEYWORDS SHALL be assembled **per arch** for every arch that participates in Go runtime lanes from the tiers of lanes that target that PV:
+The planner SHALL collapse lane targets to the set of unique package PVs. For each unique PV, the planned ebuild KEYWORDS SHALL be assembled **per arch** for every arch that participates in Go runtime lanes from the tiers of lanes that target that PV, following the shared `runtime-lanes` overlay tilde-only KEYWORDS policy (all `DepsAndAssets` ecosystems):
 
 - If at least one **plain** or **tilde** lane for that arch targets the PV, KEYWORDS SHALL include the **tilde** arch token (e.g. `~amd64`) and SHALL NOT include the bare arch token (e.g. `amd64`).
 - Else that arch SHALL be omitted from KEYWORDS.
 
-Plain versus tilde lanes SHALL continue to determine which package PV each lane selects and thus which arches appear on each PV; they SHALL NOT produce bare KEYWORDS tokens on overlay ebuilds. This matches the shared `runtime-lanes` overlay tilde-only KEYWORDS policy (all `DepsAndAssets` ecosystems). When all successful lanes share one PV, the planned set SHALL contain exactly that one PV with the union of per-arch **tilde** tokens under the rules above. Assembly SHALL NOT be limited to a hard-coded amd64/arm64-only arch set when other arches have lanes.
+Plain versus tilde lanes SHALL continue to determine which package PV each lane selects and thus which arches appear on each PV; they SHALL NOT produce bare KEYWORDS tokens on overlay ebuilds. When all successful lanes share one PV, the planned set SHALL contain exactly that one PV with the union of per-arch **tilde** tokens under the rules above. Assembly SHALL NOT be limited to a hard-coded amd64/arm64-only arch set when other arches have lanes.
 
 #### Scenario: Single PV collapse with plain membership
 
@@ -84,20 +84,6 @@ Plain versus tilde lanes SHALL continue to determine which package PV each lane 
 - **WHEN** amd64 plain targets `0.75.0`, amd64 tilde targets `0.82.0`, and both arm64 lanes target `0.82.0`
 - **THEN** `0.75.0` KEYWORDS contain `~amd64` only (for these arches) and `0.82.0` KEYWORDS contain `~amd64` and `~arm64`
 - **AND** no bare `amd64` or bare `arm64` tokens appear
-
-### Requirement: Exact-set package directory
-
-When applying a Go tree-lane plan for a package, after all planned target PVs for that apply attempt have been successfully materialized (ebuild content and required assets for those PVs), the program SHALL ensure the package directory contains exactly those versioned ebuilds for the package name (non-live), and SHALL remove other non-live versioned ebuilds for that package that are not in the planned set. The program SHALL NOT leave older historical versioned ebuilds that are outside the planned set. Live/`9999` ebuilds, if present, SHALL be left untouched. The program SHALL NOT prune away existing ebuilds if a planned target PV failed to materialize in that attempt when pruning would drop a tip without its replacement.
-
-#### Scenario: Converge deletes extras
-
-- **WHEN** the package dir has `crush-0.80.0.ebuild` and `crush-0.82.0.ebuild` and the plan is a single PV `0.84.0` which is successfully applied
-- **THEN** after apply the only non-live crush ebuild is `crush-0.84.0.ebuild`
-
-#### Scenario: No prune on failed target
-
-- **WHEN** the plan requires PV `0.84.0` and materializing that PV hard-fails
-- **THEN** the program does not delete the only remaining older ebuild solely to force an empty package dir
 
 ### Requirement: Lane labels
 

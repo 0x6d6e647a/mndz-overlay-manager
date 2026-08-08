@@ -160,7 +160,7 @@ After a successful `ebuild … manifest` (or equivalent manifest step) for an ap
 
 ### Requirement: Update egencache under overlay lock
 
-On `update`, package-scoped `egencache` for a unit SHALL run inside the same overlay critical section as that unit’s `git add` / signed `git commit` (serialized with other overlay index mutations). The program SHALL NOT run concurrent `egencache` invocations for different packages outside that lock as part of this change.
+On `update`, package-scoped `egencache` for a unit SHALL run inside the same overlay critical section as that unit’s `git add` / signed `git commit` (serialized with other overlay index mutations). The program SHALL NOT run concurrent `egencache` invocations for different packages outside that lock.
 
 #### Scenario: egencache serialized with commit
 

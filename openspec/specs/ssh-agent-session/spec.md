@@ -94,7 +94,7 @@ When no selected package will perform assets `git push` (for example only `GitMv
 
 ### Requirement: Prefer configured git remote transport
 
-Assets `git push` SHALL use the assets worktree’s existing `origin` (or configured) remote URL without rewriting SSH remotes to HTTPS token URLs as part of this change.
+Assets `git push` SHALL use the assets worktree’s existing `origin` (or configured) remote URL without rewriting SSH remotes to HTTPS token URLs.
 
 #### Scenario: SSH remote left intact
 

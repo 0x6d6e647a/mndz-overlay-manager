@@ -8,7 +8,7 @@ Go package update technique: vendor tarball build, assets publish, ebuild SRC_UR
 
 ### Requirement: DepsAndAssets Go technique
 
-The library SHALL support Go packages under the update technique `DepsAndAssets` with ecosystem `Go` and an optional go.mod subdirectory relative to the upstream repository root (unset means repository root). Apply logic SHALL use this subdirectory when running Go module download after clone. There SHALL NOT be a separate legacy Go-only technique constructor outside `DepsAndAssets` with ecosystem `Go`.
+The program SHALL support Go packages under the update technique `DepsAndAssets` with ecosystem `Go` and an optional go.mod subdirectory relative to the upstream repository root (unset means repository root). Apply logic SHALL use this subdirectory when running Go module download after clone. There SHALL NOT be a separate legacy Go-only technique constructor outside `DepsAndAssets` with ecosystem `Go`. Package membership in the hardcoded map is defined by `update-apply`, not by this capability.
 
 #### Scenario: Root go.mod package
 
@@ -19,26 +19,6 @@ The library SHALL support Go packages under the update technique `DepsAndAssets`
 
 - **WHEN** policy for `dev-db/dolt` uses `DepsAndAssets` with ecosystem `Go` and subdirectory `go`
 - **THEN** vendor construction runs in the `go/` directory of the clone
-
-### Requirement: Hardcoded Go packages use DepsAndAssets Go
-
-The hardcoded policy map SHALL set `DepsAndAssets` with ecosystem `Go` for `dev-db/dolt` (subdir `go`), `dev-util/beads` (root), `dev-util/crush` (root), and `dev-db/badger` (root), each with their existing GitHub update sources (`dolthub/dolt`, `gastownhall/beads`, `charmbracelet/crush`, `dgraph-io/badger` with tag prefix `v`). Those packages SHALL NOT remain `Unsupported` solely for vendor assets.
-
-#### Scenario: dolt technique
-
-- **WHEN** policy is resolved for `dev-db/dolt`
-- **THEN** the technique is `DepsAndAssets` with ecosystem `Go` and go.mod subdirectory `go`
-
-#### Scenario: crush technique
-
-- **WHEN** policy is resolved for `dev-util/crush`
-- **THEN** the technique is `DepsAndAssets` with ecosystem `Go` and go.mod at repository root
-
-#### Scenario: badger technique
-
-- **WHEN** policy is resolved for `dev-db/badger`
-- **THEN** the technique is `DepsAndAssets` with ecosystem `Go` and go.mod at repository root
-- **AND** the update source is GitHub `dgraph-io` / `badger` with tag prefix `v`
 
 ### Requirement: Preserve non-assets companion SRC_URI on Go rewrite
 

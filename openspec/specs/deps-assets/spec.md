@@ -6,7 +6,7 @@ Shared `DepsAndAssets` technique for Go vendor, npm/Bun dependency assets, Cargo
 
 ### Requirement: DepsAndAssets technique
 
-The library SHALL support an update technique `DepsAndAssets` parameterized by an ecosystem specification that is one of: `Go` with an optional go.mod subdirectory relative to the repository root (`Nothing` means root); `Npm` with no extra fields (npm package identity comes from `UpdateSource.Npm`); `Bun` (GitHub-sourced, repository-root lockfile); `Cargo` with optional lock and package subdirectories relative to the repository root as specified by the `cargo-crates-assets` capability; or `Sbcl` (GitHub-sourced Autolith-style deps tarball and `sbcl.version` floor as specified by the `sbcl-deps-assets` capability). Apply logic SHALL dispatch materialization, requirement probes, runtime field rendering (`BDEPEND` or `RUST_MIN_VER` or SBCL atoms), and runtime-lane ceiling sources according to the ecosystem.
+The program SHALL support an update technique `DepsAndAssets` parameterized by an ecosystem specification that is one of: `Go` with an optional go.mod subdirectory relative to the repository root (unset means root); `Npm` with no extra fields (npm package identity comes from the npm update source); `Bun` (GitHub-sourced, repository-root lockfile); `Cargo` with optional lock and package subdirectories relative to the repository root as specified by the `cargo-crates-assets` capability; or `Sbcl` (GitHub-sourced Autolith-style deps tarball and `sbcl.version` floor as specified by the `sbcl-deps-assets` capability). Apply logic SHALL dispatch materialization, requirement probes, runtime field rendering (`BDEPEND` or `RUST_MIN_VER` or SBCL atoms), and runtime-lane ceiling sources according to the ecosystem.
 
 #### Scenario: Go ecosystem with subdirectory
 
@@ -78,31 +78,31 @@ For a package name PN and version PV (without revision), the program SHALL name 
 
 ### Requirement: Hardcoded packages use DepsAndAssets
 
-The hardcoded policy map SHALL set `DepsAndAssets` with ecosystem `Go` for `dev-db/dolt` (subdir `go`), `dev-util/beads` (root), and `dev-util/crush` (root); `DepsAndAssets Npm` for `dev-util/openspec` with existing `Npm` source; `DepsAndAssets Bun` for `dev-util/ralph-tui` with existing GitHub source; `DepsAndAssets Cargo` for `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` with existing GitHub sources; and `DepsAndAssets Sbcl` for `dev-util/autolith` with existing GitHub source. Those packages SHALL NOT remain `Unsupported` solely for vendor, deps, crates, or Sbcl deps assets.
+Authoritative technique and source assignments for automated packages SHALL live in `update-apply` (hardcoded policy map). This capability SHALL NOT define a second partial package list. Ecosystem-specific scenarios MAY name packages as examples of technique dispatch without owning the map. Example resolutions below SHALL match the canonical map (including packages previously omitted from this capability’s partial list such as `dev-db/badger` and `dev-util/opencode`).
 
 #### Scenario: openspec technique
 
-- **WHEN** policy is resolved for `dev-util/openspec`
+- **WHEN** policy is resolved for `dev-util/openspec` (as defined by `update-apply`)
 - **THEN** the technique is `DepsAndAssets Npm` and the source is `Npm`
 
 #### Scenario: ralph-tui technique
 
-- **WHEN** policy is resolved for `dev-util/ralph-tui`
+- **WHEN** policy is resolved for `dev-util/ralph-tui` (as defined by `update-apply`)
 - **THEN** the technique is `DepsAndAssets Bun`
 
 #### Scenario: beads technique
 
-- **WHEN** policy is resolved for `dev-util/beads`
+- **WHEN** policy is resolved for `dev-util/beads` (as defined by `update-apply`)
 - **THEN** the technique is `DepsAndAssets` with ecosystem `Go` and no go.mod subdirectory
 
 #### Scenario: mise technique
 
-- **WHEN** policy is resolved for `dev-util/mise`
+- **WHEN** policy is resolved for `dev-util/mise` (as defined by `update-apply`)
 - **THEN** the technique is `DepsAndAssets Cargo`
 
 #### Scenario: autolith technique
 
-- **WHEN** policy is resolved for `dev-util/autolith`
+- **WHEN** policy is resolved for `dev-util/autolith` (as defined by `update-apply`)
 - **THEN** the technique is `DepsAndAssets Sbcl`
 
 ### Requirement: Non-live local ebuild required

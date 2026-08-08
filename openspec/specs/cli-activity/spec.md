@@ -31,7 +31,7 @@ Activity indicators SHALL be enabled only when standard error is a terminal and 
 
 ### Requirement: Multi-progress for concurrent package work
 
-For concurrent per-package work under `outdated` and `update` phase 1, when indicators are enabled the program SHALL show a multi-progress panel consisting of:
+For concurrent per-package work under `outdated` and `update` package-apply, when indicators are enabled the program SHALL show a multi-progress panel consisting of:
 
 1. A top-level determinate progress bar whose done/total counter reflects **packages** that have reached a terminal state over the **total package jobs** for that phase, with a phase label
 2. A row per in-flight package with a spinner, package key (`category/package`), and current step or phase name

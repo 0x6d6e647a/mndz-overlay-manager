@@ -186,9 +186,9 @@ When activity indicators are enabled, `update` SHALL show a sequential preflight
 - **WHEN** the user runs `update` with indicators enabled
 - **THEN** a sequential preflight progress bar is displayed before package mutation work begins
 
-### Requirement: Update phase-one multi-progress when enabled
+### Requirement: Update package-apply multi-progress when enabled
 
-When activity indicators are enabled, `update` phase-1 package apply SHALL show multi-progress (top-level done/total and per-package rows) as specified by `cli-activity`. For `DepsAndAssets` (and similarly long techniques), the package row SHALL update short sub-phase labels and advance per-package step progress during work without requiring nested progress bars. For full-path Go vendor materialize, labels and steps SHALL follow the fine-grained sequence specified by `cli-activity` (clone, go mod download, compress, commit assets, push assets, upload release asset, regenerating manifest). For reuse-path materialize, labels and steps SHALL follow the reuse sequence specified by `cli-activity`.
+When activity indicators are enabled, `update` package-apply work SHALL show multi-progress (top-level done/total and per-package rows) as specified by `cli-activity`. For `DepsAndAssets` (and similarly long techniques), the package row SHALL update short sub-phase labels and advance per-package step progress during work without requiring nested progress bars. For full-path Go vendor materialize, labels and steps SHALL follow the fine-grained sequence specified by `cli-activity` (clone, go mod download, compress, commit assets, push assets, upload release asset, regenerating manifest). For reuse-path materialize, labels and steps SHALL follow the reuse sequence specified by `cli-activity`.
 
 #### Scenario: Go package shows sub-phase label
 
