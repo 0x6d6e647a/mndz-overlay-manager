@@ -25,6 +25,7 @@ import CLI.Progress
     ProgressConfig,
     withMultiProgress,
   )
+import Control.Monad (unless)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Update.Apply.Env
@@ -38,6 +39,7 @@ import Update.Apply.Materialize (applyDepsAndAssets, fetchModelsDevApiJson)
 import Update.Check (PackageEntry (..))
 import Update.Git (GitOps (..))
 import Update.Hardcoded (lookupPolicy)
+import Update.TempWorkspace (cleanupRunSuccess)
 import Update.Types
   ( ApplyOutcome (..),
     PackageKey (..),
@@ -80,7 +82,12 @@ applyOverlay pcfg env overlayRoot entries mFilter = do
                 (aeJobs env')
                 (applyPackagePhase1Tracked env' overlayRoot)
                 selected
-      pure (concat nested)
+      let outcomes = concat nested
+      -- Full-run success: delete run root and empty brand parents.
+      -- Any hard-fail leaves the run root (failed units retained).
+      unless (any outcomeIsHardFail outcomes) $
+        cleanupRunSuccess (aeTempRun env)
+      pure outcomes
 
 applyPackagePhase1Tracked ::
   ApplyEnv ->

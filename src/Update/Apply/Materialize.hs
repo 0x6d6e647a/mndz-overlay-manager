@@ -55,7 +55,6 @@ import System.Directory
     removeFile,
   )
 import System.FilePath (takeDirectory, takeFileName, (</>))
-import System.IO.Temp (withSystemTempDirectory)
 import Update.Apply.Commit (egencacheAndSignedCommit, pruneCommitMessage)
 import Update.Apply.Env (ApplyEnv (..))
 import Update.Apply.Errors
@@ -149,6 +148,13 @@ import Update.Sbcl.Deps
   ( SbclDepsProgress (..),
     buildSbclDepsTarball,
     parseSbclVersionFloor,
+  )
+import Update.TempWorkspace
+  ( UnitDirs (..),
+    UnitKind (..),
+    deleteUnit,
+    ensureUnit,
+    retainUnitError,
   )
 import Update.Types
   ( ApplyOutcome (..),
@@ -807,104 +813,118 @@ fullDepsPublishAndOverlay
     admitOk <- checkTempNeedAtAdmit getFreeBytes tempRoot admitNeed
     case admitOk of
       Left err -> pure $ ApplyHardFail key err False False
-      Right () ->
-        withSystemTempDirectory "mndz-deps-out-" $ \outDir -> do
-          built <-
-            materializeDistfiles
-              env
-              eco
-              src
-              entry
-              key
-              pn
-              pvNoRev
-              outDir
-              assetNames
-              stepsDoneRef
-              mh
-          case built of
-            Left err -> pure $ ApplyHardFail key err False False
-            Right (paths, mReqVer, mEbuildBody) -> do
-              mhStatus mh key "committing assets"
-              distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
-              let relSidecars =
-                    [ T.unpack category </> T.unpack pn </> takeFileName p <> ext
-                    | p <- paths,
-                      ext <- [".sha256", ".sha512", ".b3"]
-                    ]
-              mapM_
-                ( \(p, digests) -> do
-                    let sp = sidecarPaths assetsRoot category pn (takeFileName p)
-                    createDirectoryIfMissing True (takeDirectory (spSha256 sp))
-                    writeSidecars p digests (spSha256 sp) (spSha512 sp) (spB3 sp)
-                )
-                distDigests
-              let msg = commitMessage category pn (renderPV targetVer)
-                  meta =
-                    ReleaseMeta
-                      { rmOwner = aeAssetsOwner env,
-                        rmRepo = aeAssetsRepo env,
-                        rmTag = releaseTag pn pvNoRev,
-                        rmName = releaseName category pn pvNoRev,
-                        rmBody = msg,
-                        rmTargetCommitish = "main"
-                      }
-              pubResult <-
-                withMVar (aeAssetsLock env) $ \() -> do
-                  committed <-
-                    goAddAndCommit
-                      (aeGitOps env)
-                      assetsRoot
-                      relSidecars
-                      msg
-                  case committed of
-                    Left err -> pure (Left err)
-                    Right () -> do
-                      markMaterializeStep stepsDoneRef mh key "committing assets"
-                      mhStatus mh key "pushing assets"
-                      pushed <- goPush (aeGitOps env) assetsRoot
-                      case pushed of
-                        Left err -> pure (Left err)
-                        Right () -> do
-                          markMaterializeStep stepsDoneRef mh key "pushing assets"
-                          mhStatus mh key "uploading release asset"
-                          uploaded <-
-                            roCreateReleaseWithAssets
-                              (aeReleaseOps env)
-                              meta
-                              paths
-                          case uploaded of
-                            Left err -> pure (Left err)
-                            Right () -> do
-                              markMaterializeStep stepsDoneRef mh key "uploading release asset"
-                              pure (Right ())
-              case pubResult of
-                Left err ->
-                  pure $
-                    ApplyHardFail
-                      key
-                      ("assets publish failed: " <> err)
-                      False
-                      False
-                Right () -> do
-                  mhStatus mh key "regenerating manifest"
-                  outcome <-
-                    overlayAfterAssets
-                      env
-                      overlayRoot
-                      entry
-                      eco
-                      keywords
-                      lines_
-                      targetVer
-                      distDigests
-                      mReqVer
-                      mEbuildBody
-                  case outcome of
-                    ApplySuccess {} ->
-                      markMaterializeStep stepsDoneRef mh key "regenerating manifest"
-                    _ -> pure ()
-                  pure outcome
+      Right () -> do
+        unit <-
+          ensureUnit (aeTempRun env) category pn pvNoRev UnitFull
+        built <-
+          materializeDistfiles
+            env
+            eco
+            src
+            entry
+            key
+            pn
+            pvNoRev
+            (udWork unit)
+            (udOut unit)
+            assetNames
+            stepsDoneRef
+            mh
+        case built of
+          Left err ->
+            pure $
+              ApplyHardFail key (retainUnitError unit err) False False
+          Right (paths, mReqVer, mEbuildBody) -> do
+            mhStatus mh key "committing assets"
+            distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
+            let relSidecars =
+                  [ T.unpack category </> T.unpack pn </> takeFileName p <> ext
+                  | p <- paths,
+                    ext <- [".sha256", ".sha512", ".b3"]
+                  ]
+            mapM_
+              ( \(p, digests) -> do
+                  let sp = sidecarPaths assetsRoot category pn (takeFileName p)
+                  createDirectoryIfMissing True (takeDirectory (spSha256 sp))
+                  writeSidecars p digests (spSha256 sp) (spSha512 sp) (spB3 sp)
+              )
+              distDigests
+            let msg = commitMessage category pn (renderPV targetVer)
+                meta =
+                  ReleaseMeta
+                    { rmOwner = aeAssetsOwner env,
+                      rmRepo = aeAssetsRepo env,
+                      rmTag = releaseTag pn pvNoRev,
+                      rmName = releaseName category pn pvNoRev,
+                      rmBody = msg,
+                      rmTargetCommitish = "main"
+                    }
+            pubResult <-
+              withMVar (aeAssetsLock env) $ \() -> do
+                committed <-
+                  goAddAndCommit
+                    (aeGitOps env)
+                    assetsRoot
+                    relSidecars
+                    msg
+                case committed of
+                  Left err -> pure (Left err)
+                  Right () -> do
+                    markMaterializeStep stepsDoneRef mh key "committing assets"
+                    mhStatus mh key "pushing assets"
+                    pushed <- goPush (aeGitOps env) assetsRoot
+                    case pushed of
+                      Left err -> pure (Left err)
+                      Right () -> do
+                        markMaterializeStep stepsDoneRef mh key "pushing assets"
+                        mhStatus mh key "uploading release asset"
+                        uploaded <-
+                          roCreateReleaseWithAssets
+                            (aeReleaseOps env)
+                            meta
+                            paths
+                        case uploaded of
+                          Left err -> pure (Left err)
+                          Right () -> do
+                            markMaterializeStep stepsDoneRef mh key "uploading release asset"
+                            pure (Right ())
+            case pubResult of
+              Left err ->
+                pure $
+                  ApplyHardFail
+                    key
+                    (retainUnitError unit ("assets publish failed: " <> err))
+                    False
+                    False
+              Right () -> do
+                mhStatus mh key "regenerating manifest"
+                outcome <-
+                  overlayAfterAssets
+                    env
+                    overlayRoot
+                    entry
+                    eco
+                    keywords
+                    lines_
+                    targetVer
+                    distDigests
+                    mReqVer
+                    mEbuildBody
+                case outcome of
+                  ApplySuccess {} -> do
+                    markMaterializeStep stepsDoneRef mh key "regenerating manifest"
+                    deleteUnit unit
+                    pure outcome
+                  ApplySoftSkip {} -> do
+                    deleteUnit unit
+                    pure outcome
+                  ApplyHardFail k failMsg half assetsPub ->
+                    pure $
+                      ApplyHardFail
+                        k
+                        (retainUnitError unit failMsg)
+                        half
+                        assetsPub
 
 -- | Build all required distfiles (primary + companions); paths in asset order.
 materializeDistfiles ::
@@ -915,12 +935,15 @@ materializeDistfiles ::
   PackageKey ->
   Text ->
   Text ->
+  -- | Unit @work/@.
+  FilePath ->
+  -- | Unit @out/@.
   FilePath ->
   [FilePath] ->
   IORef Int ->
   MultiHandle ->
   IO (Either Text ([FilePath], Maybe Text, Maybe Text))
-materializeDistfiles env eco src entry key pn pvNoRev outDir assetNames stepsDoneRef mh =
+materializeDistfiles env eco src entry key pn pvNoRev workDir outDir assetNames stepsDoneRef mh =
   case assetNames of
     [] -> pure (Left "no required assets for materialize")
     (primaryName : companionNames) -> do
@@ -932,6 +955,7 @@ materializeDistfiles env eco src entry key pn pvNoRev outDir assetNames stepsDon
           entry
           key
           pvNoRev
+          workDir
           outDir
           primaryName
           stepsDoneRef
@@ -955,10 +979,11 @@ materializePrimaryDistfile ::
   Text ->
   FilePath ->
   FilePath ->
+  FilePath ->
   IORef Int ->
   MultiHandle ->
   IO (Either Text (FilePath, Maybe Text, Maybe Text))
-materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName stepsDoneRef mh =
+materializePrimaryDistfile env eco src entry key pvNoRev workDir outDir tarballName stepsDoneRef mh =
   case (eco, src) of
     (Go mSub, GitHub owner repo prefix) -> do
       built <-
@@ -970,6 +995,7 @@ materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName step
           prefix
           pvNoRev
           mSub
+          workDir
           outDir
           tarballName
       pure $ case built of
@@ -990,6 +1016,7 @@ materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName step
               npmPkg
               pvNoRev
               nodeReq
+              workDir
               outDir
               tarballName
           pure $ case built of
@@ -1013,6 +1040,7 @@ materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName step
               prefix
               pvNoRev
               bunReq
+              workDir
               outDir
               tarballName
           pure $ case built of
@@ -1048,6 +1076,7 @@ materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName step
               mPkg
               donorContent
               (pePN entry)
+              workDir
               outDir
               tarballName
           pure $ case built of
@@ -1085,6 +1114,7 @@ materializePrimaryDistfile env eco src entry key pvNoRev outDir tarballName step
                   repo
                   prefix
                   pvNoRev
+                  workDir
                   outDir
                   tarballName
               pure $ case built of
@@ -1260,124 +1290,150 @@ reuseDepsReleaseAsset
           Go _ -> "verifying vendor asset"
           Cargo {} -> "verifying crates asset"
           _ -> "verifying deps asset"
-    withSystemTempDirectory "mndz-reuse-asset-" $ \tmpDir -> do
-      mhStatus mh key "reusing release assets"
-      dlResult <- downloadNamedAssets (aeReleaseOps env) tmpDir namedUrls
-      case dlResult of
-        Left err ->
-          pure $
-            ApplyHardFail
-              key
-              ("download of existing release asset failed: " <> err)
-              False
-              True
-        Right localPaths -> do
-          distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) localPaths
-          markMaterializeStep stepsDoneRef mh key "reusing release assets"
-          mhStatus mh key verifyLabel
-          sideCheck <- checkAllSidecars assetsRoot category pn distDigests
-          case sideCheck of
-            Left err -> pure $ ApplyHardFail key err False True
-            Right () -> do
-              reqResult <- case eco of
-                Go mSub ->
-                  fmap Right $ case src of
-                    GitHub owner repo prefix ->
-                      fetchGoModVersion env owner repo prefix pvNoRev mSub
-                    _ -> pure Nothing
-                Cargo mLock mPkg -> do
-                  donorPath <-
-                    findTemplate
-                      (takeDirectory (pePath entry))
-                      (pePN entry)
-                      targetVer
-                      (pePath entry)
-                  donorExists <- doesFileExist donorPath
-                  if not donorExists
-                    then
-                      pure $
-                        Left $
-                          applyUnitHardFail
-                            key
-                            ( ApplyMissingDonorTemplate
-                                key
-                                (renderPV targetVer)
-                                donorPath
-                            )
-                            False
-                            True
-                    else do
-                      donorContent <- TIO.readFile donorPath
-                      m <-
-                        fetchCargoMsrvForPV
-                          env
-                          src
-                          mLock
-                          mPkg
-                          pvNoRev
-                          donorContent
-                      pure (Right m)
-                Sbcl ->
-                  case src of
-                    GitHub owner repo prefix -> do
-                      eres <-
-                        dpoFetchSbclVersion
-                          (aeDepsPlanOps env)
-                          owner
-                          repo
-                          prefix
-                          pvNoRev
-                      pure $
-                        Right $
-                          case eres of
-                            Right body -> parseSbclVersionFloor body
-                            Left _ -> Nothing
-                    _ -> pure (Right Nothing)
-                _ -> do
-                  mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
-                  pure $
-                    Right $
-                      case mAtom of
-                        Just atom
-                          | "nodejs-" `T.isInfixOf` atom ->
-                              Just
-                                ( T.takeWhile
-                                    (/= '[')
-                                    ( T.drop
-                                        (T.length (">=net-libs/nodejs-" :: Text))
-                                        atom
-                                    )
-                                )
-                          | "bun-bin-" `T.isInfixOf` atom ->
-                              Just
-                                ( T.drop
-                                    (T.length (">=dev-lang/bun-bin-" :: Text))
-                                    atom
-                                )
-                          | otherwise -> Nothing
-                        Nothing -> Nothing
-              case reqResult of
-                Left failOutcome -> pure failOutcome
-                Right mReq -> do
-                  markMaterializeStep stepsDoneRef mh key verifyLabel
-                  mhStatus mh key "regenerating manifest"
-                  outcome <-
-                    overlayAfterAssets
-                      env
-                      overlayRoot
-                      entry
-                      eco
-                      keywords
-                      reusedLines
-                      targetVer
-                      distDigests
-                      mReq
-                      Nothing
-                  case outcome of
-                    ApplySuccess k sls paths -> do
-                      markMaterializeStep stepsDoneRef mh key "regenerating manifest"
-                      pure (ApplySuccess k sls paths)
-                    other -> pure other
+    unit <-
+      ensureUnit (aeTempRun env) category pn pvNoRev UnitReuse
+    mhStatus mh key "reusing release assets"
+    dlResult <- downloadNamedAssets (aeReleaseOps env) (udOut unit) namedUrls
+    case dlResult of
+      Left err ->
+        pure $
+          ApplyHardFail
+            key
+            ( retainUnitError
+                unit
+                ("download of existing release asset failed: " <> err)
+            )
+            False
+            True
+      Right localPaths -> do
+        distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) localPaths
+        markMaterializeStep stepsDoneRef mh key "reusing release assets"
+        mhStatus mh key verifyLabel
+        sideCheck <- checkAllSidecars assetsRoot category pn distDigests
+        case sideCheck of
+          Left err ->
+            pure $
+              ApplyHardFail key (retainUnitError unit err) False True
+          Right () -> do
+            reqResult <- case eco of
+              Go mSub ->
+                fmap Right $ case src of
+                  GitHub owner repo prefix ->
+                    fetchGoModVersion env owner repo prefix pvNoRev mSub
+                  _ -> pure Nothing
+              Cargo mLock mPkg -> do
+                donorPath <-
+                  findTemplate
+                    (takeDirectory (pePath entry))
+                    (pePN entry)
+                    targetVer
+                    (pePath entry)
+                donorExists <- doesFileExist donorPath
+                if not donorExists
+                  then
+                    pure $
+                      Left $
+                        applyUnitHardFail
+                          key
+                          ( ApplyMissingDonorTemplate
+                              key
+                              (renderPV targetVer)
+                              donorPath
+                          )
+                          False
+                          True
+                  else do
+                    donorContent <- TIO.readFile donorPath
+                    m <-
+                      fetchCargoMsrvForPV
+                        env
+                        src
+                        mLock
+                        mPkg
+                        pvNoRev
+                        donorContent
+                    pure (Right m)
+              Sbcl ->
+                case src of
+                  GitHub owner repo prefix -> do
+                    eres <-
+                      dpoFetchSbclVersion
+                        (aeDepsPlanOps env)
+                        owner
+                        repo
+                        prefix
+                        pvNoRev
+                    pure $
+                      Right $
+                        case eres of
+                          Right body -> parseSbclVersionFloor body
+                          Left _ -> Nothing
+                  _ -> pure (Right Nothing)
+              _ -> do
+                mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
+                pure $
+                  Right $
+                    case mAtom of
+                      Just atom
+                        | "nodejs-" `T.isInfixOf` atom ->
+                            Just
+                              ( T.takeWhile
+                                  (/= '[')
+                                  ( T.drop
+                                      (T.length (">=net-libs/nodejs-" :: Text))
+                                      atom
+                                  )
+                              )
+                        | "bun-bin-" `T.isInfixOf` atom ->
+                            Just
+                              ( T.drop
+                                  (T.length (">=dev-lang/bun-bin-" :: Text))
+                                  atom
+                              )
+                        | otherwise -> Nothing
+                      Nothing -> Nothing
+            case reqResult of
+              Left failOutcome -> do
+                -- Donor-template hard-fail is structured; attach unit path.
+                case failOutcome of
+                  ApplyHardFail k failMsg half assetsPub ->
+                    pure $
+                      ApplyHardFail
+                        k
+                        (retainUnitError unit failMsg)
+                        half
+                        assetsPub
+                  other -> pure other
+              Right mReq -> do
+                markMaterializeStep stepsDoneRef mh key verifyLabel
+                mhStatus mh key "regenerating manifest"
+                outcome <-
+                  overlayAfterAssets
+                    env
+                    overlayRoot
+                    entry
+                    eco
+                    keywords
+                    reusedLines
+                    targetVer
+                    distDigests
+                    mReq
+                    Nothing
+                case outcome of
+                  ApplySuccess k sls paths -> do
+                    markMaterializeStep stepsDoneRef mh key "regenerating manifest"
+                    deleteUnit unit
+                    pure (ApplySuccess k sls paths)
+                  ApplySoftSkip k reason -> do
+                    deleteUnit unit
+                    pure (ApplySoftSkip k reason)
+                  ApplyHardFail k failMsg half assetsPub ->
+                    pure $
+                      ApplyHardFail
+                        k
+                        (retainUnitError unit failMsg)
+                        half
+                        assetsPub
 
 downloadNamedAssets ::
   ReleaseOps ->

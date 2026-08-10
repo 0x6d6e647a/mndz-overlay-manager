@@ -341,6 +341,7 @@ testSbclBuilderSuccess =
           "v"
           "0.18.0"
           outDir
+          outDir
           name
     assertTrue "tarball exists" =<< doesFileExist path
     n <- readIORef steps
@@ -362,6 +363,7 @@ testSbclBuilderCloneFail =
           "r"
           "v"
           "0.1.0"
+          tmp
           tmp
           "x-deps.tar.xz"
     assertTrue "clone err" ("clone boom" `T.isInfixOf` err)
@@ -520,6 +522,7 @@ testNpmBuilderSuccess =
           "1.0.0"
           "18.0.0"
           outDir
+          outDir
           "left-pad-1.0.0-npm-cache.tar.xz"
     assertEq "out path" (outDir </> "left-pad-1.0.0-npm-cache.tar.xz") path
     exists <- doesFileExist path
@@ -545,10 +548,11 @@ testNpmBuilderSuccess =
           "1.0.0"
           "18.0.0"
           outDir
+          outDir
           "left-pad-1.0.0-npm-cache-noop.tar.xz"
 
 testNpmBuilderHostTooOld :: IO ()
-testNpmBuilderHostTooOld = do
+testNpmBuilderHostTooOld = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   packCalls <- newIORef (0 :: Int)
   let ops =
         fakeNpmSuccessOps
@@ -565,7 +569,8 @@ testNpmBuilderHostTooOld = do
         "pkg"
         "1.0.0"
         "20.19.0"
-        "/tmp"
+        tmp
+        tmp
         "x.tar.xz"
   assertTrue "mentions host" ("16.0.0" `T.isInfixOf` err)
   assertTrue "mentions required" ("20.19.0" `T.isInfixOf` err)
@@ -573,7 +578,7 @@ testNpmBuilderHostTooOld = do
   assertEq "pack not called" 0 n
 
 testNpmBuilderPackFail :: IO ()
-testNpmBuilderPackFail = do
+testNpmBuilderPackFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   let ops =
         fakeNpmSuccessOps
           { ncoNpmPack = \_ _ _ -> pure (Left "npm pack failed: boom")
@@ -586,7 +591,8 @@ testNpmBuilderPackFail = do
         "pkg"
         "1.0.0"
         "18.0.0"
-        "/tmp"
+        tmp
+        tmp
         "x.tar.xz"
   assertTrue "error bubbled" ("boom" `T.isInfixOf` err)
 
@@ -663,6 +669,7 @@ testBunBuilderSuccess =
           "0.1.0"
           "1.0.0"
           outDir
+          outDir
           "repo-0.1.0-deps.tar.xz"
     assertEq "out path" (outDir </> "repo-0.1.0-deps.tar.xz") path
     exists <- doesFileExist path
@@ -696,6 +703,7 @@ testBunBuilderSuccess =
           "0.1.0"
           "1.0.0"
           outDir
+          outDir
           "repo-0.1.0-bun-cache-noop.tar.xz"
 
 testBunBuilderInstallTree :: IO ()
@@ -715,6 +723,7 @@ testBunBuilderInstallTree =
           "1.18.5"
           "1.0.0"
           outDir
+          outDir
           "opencode-1.18.5-deps.tar.xz"
     assertEq "out path" (outDir </> "opencode-1.18.5-deps.tar.xz") path
     exists <- doesFileExist path
@@ -731,7 +740,7 @@ testBunBuilderInstallTree =
         assertTrue ("expected one tar call, got " <> show other) False
 
 testBunBuilderInstallTreeEmpty :: IO ()
-testBunBuilderInstallTreeEmpty = do
+testBunBuilderInstallTreeEmpty = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   -- Install succeeds but creates no node_modules (pack must hard-fail).
   let ops =
         fakeBunSuccessOps
@@ -748,12 +757,13 @@ testBunBuilderInstallTreeEmpty = do
         "v"
         "0.1.0"
         "1.0.0"
-        "/tmp"
+        tmp
+        tmp
         "x.tar.xz"
   assertTrue "mentions node_modules" ("node_modules" `T.isInfixOf` err)
 
 testBunBuilderHostTooOld :: IO ()
-testBunBuilderHostTooOld = do
+testBunBuilderHostTooOld = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   cloneCalls <- newIORef (0 :: Int)
   let ops =
         fakeBunSuccessOps
@@ -773,7 +783,8 @@ testBunBuilderHostTooOld = do
         "v"
         "0.1.0"
         "1.2.3"
-        "/tmp"
+        tmp
+        tmp
         "x.tar.xz"
   assertTrue "names host" ("0.9.0" `T.isInfixOf` err)
   assertTrue "names required" ("1.2.3" `T.isInfixOf` err)
@@ -781,7 +792,7 @@ testBunBuilderHostTooOld = do
   assertEq "clone not called" 0 n
 
 testBunBuilderMissingLock :: IO ()
-testBunBuilderMissingLock = do
+testBunBuilderMissingLock = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   let ops =
         fakeBunSuccessOps
           { bcoClone = \_ _ dest -> do
@@ -800,12 +811,13 @@ testBunBuilderMissingLock = do
         "v"
         "0.1.0"
         "1.0.0"
-        "/tmp"
+        tmp
+        tmp
         "x.tar.xz"
   assertTrue "mentions bun.lock" ("bun.lock" `T.isInfixOf` err)
 
 testBunBuilderInstallFail :: IO ()
-testBunBuilderInstallFail = do
+testBunBuilderInstallFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   let ops =
         fakeBunSuccessOps
           { bcoBunInstall = \_ _ -> pure (Left "bun install failed: offline")
@@ -821,7 +833,8 @@ testBunBuilderInstallFail = do
         "v"
         "0.1.0"
         "1.0.0"
-        "/tmp"
+        tmp
+        tmp
         "x.tar.xz"
   assertTrue "error bubbled" ("offline" `T.isInfixOf` err)
 
@@ -885,6 +898,7 @@ testCargoBuilderSuccess =
           donorEbuild
           "pkg"
           outDir
+          outDir
           "pkg-0.1.0-crates.tar.xz"
     assertEq
       "tarball path"
@@ -919,10 +933,11 @@ testCargoBuilderSuccess =
           donorEbuild
           "pkg"
           outDir
+          outDir
           "pkg-0.1.0-crates-noop.tar.xz"
 
 testCargoBuilderCloneFail :: IO ()
-testCargoBuilderCloneFail = do
+testCargoBuilderCloneFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   let ops =
         CargoOps
           { coClone = \_ _ _ -> pure (Left "git clone failed: offline"),
@@ -941,14 +956,15 @@ testCargoBuilderCloneFail = do
       Nothing
       donorEbuild
       "pkg"
-      "/tmp"
+      tmp
+      tmp
       "x.tar.xz"
   case result of
     Left err -> assertTrue "error bubbled" ("offline" `T.isInfixOf` err)
     Right _ -> fail "expected clone failure"
 
 testCargoBuilderMissingLock :: IO ()
-testCargoBuilderMissingLock = do
+testCargoBuilderMissingLock = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   let ops =
         CargoOps
           { coClone = \_ _ dest -> do
@@ -969,14 +985,15 @@ testCargoBuilderMissingLock = do
       Nothing
       donorEbuild
       "pkg"
-      "/tmp"
+      tmp
+      tmp
       "x.tar.xz"
   case result of
     Left err -> assertTrue "mentions Cargo.lock" ("Cargo.lock" `T.isInfixOf` err)
     Right _ -> fail "expected missing Cargo.lock failure"
 
 testCargoBuilderPycargoFail :: IO ()
-testCargoBuilderPycargoFail = do
+testCargoBuilderPycargoFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   packCalls <- newIORef (0 :: Int)
   let ops =
         fakeCargoSuccessOps
@@ -997,7 +1014,8 @@ testCargoBuilderPycargoFail = do
       Nothing
       donorEbuild
       "pkg"
-      "/tmp"
+      tmp
+      tmp
       "x.tar.xz"
   case result of
     Left err -> do
@@ -1008,7 +1026,7 @@ testCargoBuilderPycargoFail = do
     Right _ -> fail "expected pycargoebuild failure"
 
 testCargoBuilderPackFail :: IO ()
-testCargoBuilderPackFail = do
+testCargoBuilderPackFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   let ops =
         fakeCargoSuccessOps
           { coPackCrates = \_ _ _ _ ->
@@ -1026,7 +1044,8 @@ testCargoBuilderPackFail = do
       Nothing
       donorEbuild
       "pkg"
-      "/tmp"
+      tmp
+      tmp
       "x.tar.xz"
   case result of
     Left err -> do
@@ -1205,6 +1224,7 @@ testNpmMkCommandRunner =
           "1.0.0"
           "18.0.0"
           outDir
+          outDir
           "left-pad-1.0.0-npm-cache.tar.xz"
     assertEq "out path" (outDir </> "left-pad-1.0.0-npm-cache.tar.xz") path
     exists <- doesFileExist path
@@ -1217,6 +1237,7 @@ testNpmMkCommandRunner =
           "pkg"
           "1.0.0"
           "18.0.0"
+          outDir
           outDir
           "x.tar.xz"
     assertTrue "host node error" ("could not determine host Node version" `T.isInfixOf` err)
@@ -1254,6 +1275,7 @@ testBunMkCommandRunner =
           "0.1.0"
           "1.0.0"
           outDir
+          outDir
           "repo-0.1.0-bun-cache.tar.xz"
     exists <- doesFileExist path
     assertTrue "bun tarball" exists
@@ -1268,6 +1290,7 @@ testBunMkCommandRunner =
           "v"
           "0.1.0"
           "1.0.0"
+          outDir
           outDir
           "x.tar.xz"
     assertTrue "clone error" ("git clone failed" `T.isInfixOf` err)
@@ -1309,6 +1332,7 @@ testVendorMkCommandRunner =
           "0.1.0"
           Nothing
           outDir
+          outDir
           "pkg-0.1.0-vendor.tar.xz"
     assertEq "go.mod version" (Just "1.22.0") (vrGoModVersion res)
     exists <- doesFileExist (vrTarballPath res)
@@ -1322,6 +1346,7 @@ testVendorMkCommandRunner =
         "v"
         "0.1.0"
         Nothing
+        outDir
         outDir
         "x.tar.xz"
     case vendorFail of
@@ -1381,6 +1406,7 @@ testCargoMkCommandRunner =
           donorEbuild
           "pkg"
           outDir
+          outDir
           "pkg-0.1.0-crates.tar.xz"
     assertEq "msrv" "1.85.0" (crMsrv res)
     exists <- doesFileExist (crTarballPath res)
@@ -1397,6 +1423,7 @@ testCargoMkCommandRunner =
         Nothing
         donorEbuild
         "pkg"
+        outDir
         outDir
         "x.tar.xz"
     case cargoFail of
@@ -1517,6 +1544,7 @@ testApplyEnvFakeEcoOps =
           "1.0.0"
           "18.0.0"
           outDir
+          outDir
           "pkg-npm.tar.xz"
     bunPath <-
       assertRight "env bun"
@@ -1529,6 +1557,7 @@ testApplyEnvFakeEcoOps =
           "v"
           "0.1.0"
           "1.0.0"
+          outDir
           outDir
           "pkg-bun.tar.xz"
     cargoRes <-
@@ -1544,6 +1573,7 @@ testApplyEnvFakeEcoOps =
           Nothing
           donorEbuild
           "pkg"
+          outDir
           outDir
           "pkg-crates.tar.xz"
     assertTrue "npm via env" =<< doesFileExist npmPath

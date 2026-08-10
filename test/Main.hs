@@ -22,6 +22,7 @@ import Test.Properties qualified as Properties
 import Test.Ssh qualified as Ssh
 import Test.Targets qualified as Targets
 import Test.Tasty (defaultMain, testGroup)
+import Test.TempWorkspace qualified as TempWorkspace
 
 -- Test taxonomy (Unit vs Integration) — design D3 / CONTRIBUTING.
 --
@@ -48,6 +49,7 @@ main =
             Config.tests,
             Distfiles.tests,
             DiskSpace.tests,
+            TempWorkspace.tests,
             Policy.tests,
             Targets.tests,
             Preflight.tests,

@@ -38,7 +38,6 @@ import System.Directory (createDirectoryIfMissing, listDirectory)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
-import System.IO.Temp (withSystemTempDirectory)
 import Update.Engines (parseEnginesMinimum)
 import Update.Go.Version
   ( compareGoVersions,
@@ -131,16 +130,20 @@ nodeVersionTooOldMessage host required =
     <> required
 
 -- | Registry-only: npm pack → npm --cache install → tar npm-cache/.
+-- Pack and @npm-cache/@ live under unit @workDir@; tarball under @outDir@.
 buildNpmDepsTarball ::
   NpmCacheOps ->
   NpmCacheProgress ->
   Text ->
   Text ->
   Text ->
+  -- | Unit @work/@ (pack + npm-cache).
+  FilePath ->
+  -- | Unit @out/@ (staged tarball).
   FilePath ->
   FilePath ->
   IO (Either Text FilePath)
-buildNpmDepsTarball ops progress npmPkg pv nodeReq outDir tarballName = do
+buildNpmDepsTarball ops progress npmPkg pv nodeReq workDir outDir tarballName = do
   hostResult <- ncoHostNodeVersion ops
   case hostResult of
     Left err -> pure (Left err)
@@ -155,30 +158,31 @@ buildNpmDepsTarball ops progress npmPkg pv nodeReq outDir tarballName = do
                   <> " to engines.node "
                   <> nodeReq
               )
-        Just True ->
-          withSystemTempDirectory "mndz-npm-cache-" $ \tmp -> do
-            ncpOnPackStart progress
-            packed <- ncoNpmPack ops npmPkg pv tmp
-            case packed of
-              Left err -> pure (Left err)
-              Right tgz -> do
-                ncpOnPackDone progress
-                let cacheDir = tmp </> "npm-cache"
-                createDirectoryIfMissing True cacheDir
-                ncpOnInstallStart progress
-                installed <- ncoNpmInstallCache ops tgz cacheDir
-                case installed of
-                  Left err -> pure (Left err)
-                  Right () -> do
-                    ncpOnInstallDone progress
-                    let outPath = outDir </> tarballName
-                    ncpOnCompressStart progress
-                    compressed <- ncoTarXz ops tmp "npm-cache" outPath
-                    case compressed of
-                      Left err -> pure (Left err)
-                      Right () -> do
-                        ncpOnCompressDone progress
-                        pure (Right outPath)
+        Just True -> do
+          createDirectoryIfMissing True workDir
+          createDirectoryIfMissing True outDir
+          ncpOnPackStart progress
+          packed <- ncoNpmPack ops npmPkg pv workDir
+          case packed of
+            Left err -> pure (Left err)
+            Right tgz -> do
+              ncpOnPackDone progress
+              let cacheDir = workDir </> "npm-cache"
+              createDirectoryIfMissing True cacheDir
+              ncpOnInstallStart progress
+              installed <- ncoNpmInstallCache ops tgz cacheDir
+              case installed of
+                Left err -> pure (Left err)
+                Right () -> do
+                  ncpOnInstallDone progress
+                  let outPath = outDir </> tarballName
+                  ncpOnCompressStart progress
+                  compressed <- ncoTarXz ops workDir "npm-cache" outPath
+                  case compressed of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                      ncpOnCompressDone progress
+                      pure (Right outPath)
 
 npmPack :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text FilePath)
 npmPack run npmPkg pv workDir = do

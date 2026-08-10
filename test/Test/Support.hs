@@ -260,6 +260,7 @@ import Update.SshAgent
     parseIdentityFiles,
   )
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
+import Update.TempWorkspace (openRunRoot)
 import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
@@ -301,6 +302,7 @@ mkTestApplyEnv ::
   IO ApplyEnv
 mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLock overlayLock = do
   depsBase <- productionDepsPlanOps (Just "tok") 1 Nothing
+  tempRun <- openRunRoot
   let depsOps =
         depsBase
           { dpoPortageq = poPortageq planOps,
@@ -331,7 +333,8 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeJobs = 1,
         aeMulti = noopMultiHandle,
         aePlanOps = planOps,
-        aeDepsPlanOps = depsOps
+        aeDepsPlanOps = depsOps,
+        aeTempRun = tempRun
       }
 
 -- | Write a matching md5-dict cache file for one ebuild.

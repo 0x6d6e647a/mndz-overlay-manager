@@ -1098,6 +1098,7 @@ testVendorProgressEventOrder =
         "0.1.0"
         Nothing
         outDir
+        outDir
         "pkg-0.1.0-vendor.tar.xz"
     case result of
       Left err -> do
@@ -1125,6 +1126,7 @@ testVendorProgressEventOrder =
         "v"
         "0.1.0"
         Nothing
+        outDir
         outDir
         "pkg-0.1.0-vendor-noop.tar.xz"
 

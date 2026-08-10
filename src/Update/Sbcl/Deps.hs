@@ -26,7 +26,6 @@ import System.Directory
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.IO.Temp (withSystemTempDirectory)
 import Update.DiskSpace
   ( MaterializeClass (FullSbcl),
     checkPostCloneForClass,
@@ -104,6 +103,7 @@ parseSbclVersionFloor body =
             && all (\p -> not (T.null p) && T.all isDigit p) parts
 
 -- | Clone tag → qlot install → fff vendor → pack @{pn}-{pv}-deps.tar.xz@.
+-- Clone and stage live under unit @workDir@; tarball under @outDir@.
 buildSbclDepsTarball ::
   SbclDepsOps ->
   SbclDepsProgress ->
@@ -111,6 +111,9 @@ buildSbclDepsTarball ::
   Text ->
   Text ->
   Text ->
+  -- | Unit @work/@ (clone + stage).
+  FilePath ->
+  -- | Unit @out/@ (staged tarball).
   FilePath ->
   FilePath ->
   IO (Either Text FilePath)
@@ -121,64 +124,65 @@ buildSbclDepsTarball
   repo
   prefix
   pv
+  workDir
   outDir
   tarballName = do
     createDirectoryIfMissing True outDir
+    createDirectoryIfMissing True workDir
     let tag = versionTag prefix pv
         url = githubCloneUrl owner repo
         outPath = outDir </> tarballName
+        cloneDir = workDir </> "src"
+        stageDir = workDir </> "stage"
     qlResult <- sdoQuicklispSetup ops
     case qlResult of
       Left err -> pure (Left err)
-      Right qlSetup ->
-        withSystemTempDirectory "mndz-sbcl-deps-" $ \tmp -> do
-          let cloneDir = tmp </> "src"
-              stageDir = tmp </> "stage"
-          createDirectoryIfMissing True stageDir
-          sdpOnCloneStart progress
-          cloned <- sdoClone ops url tag cloneDir
-          case cloned of
-            Left err -> pure (Left err)
-            Right () -> do
-              sdpOnCloneDone progress
-              spaceOk <- checkPostCloneForClass FullSbcl cloneDir
-              case spaceOk of
-                Left err -> pure (Left err)
-                Right () ->
-                  preflightClone cloneDir >>= \case
-                    Left err -> pure (Left err)
-                    Right () -> do
-                      sdpOnQlotStart progress
-                      qlot <- sdoQlotInstall ops cloneDir "sbcl" qlSetup
-                      case qlot of
-                        Left err -> pure (Left err)
-                        Right () -> do
-                          sdpOnQlotDone progress
-                          qlotOk <- sdoCopyQlot ops cloneDir stageDir
-                          case qlotOk of
-                            Left err -> pure (Left err)
-                            Right () -> do
-                              sdpOnFffStart progress
-                              fff <- sdoMaterializeFff ops cloneDir stageDir
-                              case fff of
-                                Left err -> pure (Left err)
-                                Right () -> do
-                                  sdpOnFffDone progress
-                                  sdpOnCompressStart progress
-                                  packed <- sdoPackTarball ops stageDir outPath
-                                  case packed of
-                                    Left err -> pure (Left err)
-                                    Right () -> do
-                                      sdpOnCompressDone progress
-                                      hasTar <- doesFileExist outPath
-                                      pure $
-                                        if hasTar
-                                          then Right outPath
-                                          else
-                                            Left
-                                              ( "SBCL deps pack did not produce tarball at "
-                                                  <> T.pack outPath
-                                              )
+      Right qlSetup -> do
+        createDirectoryIfMissing True stageDir
+        sdpOnCloneStart progress
+        cloned <- sdoClone ops url tag cloneDir
+        case cloned of
+          Left err -> pure (Left err)
+          Right () -> do
+            sdpOnCloneDone progress
+            spaceOk <- checkPostCloneForClass FullSbcl cloneDir
+            case spaceOk of
+              Left err -> pure (Left err)
+              Right () ->
+                preflightClone cloneDir >>= \case
+                  Left err -> pure (Left err)
+                  Right () -> do
+                    sdpOnQlotStart progress
+                    qlot <- sdoQlotInstall ops cloneDir "sbcl" qlSetup
+                    case qlot of
+                      Left err -> pure (Left err)
+                      Right () -> do
+                        sdpOnQlotDone progress
+                        qlotOk <- sdoCopyQlot ops cloneDir stageDir
+                        case qlotOk of
+                          Left err -> pure (Left err)
+                          Right () -> do
+                            sdpOnFffStart progress
+                            fff <- sdoMaterializeFff ops cloneDir stageDir
+                            case fff of
+                              Left err -> pure (Left err)
+                              Right () -> do
+                                sdpOnFffDone progress
+                                sdpOnCompressStart progress
+                                packed <- sdoPackTarball ops stageDir outPath
+                                case packed of
+                                  Left err -> pure (Left err)
+                                  Right () -> do
+                                    sdpOnCompressDone progress
+                                    hasTar <- doesFileExist outPath
+                                    pure $
+                                      if hasTar
+                                        then Right outPath
+                                        else
+                                          Left
+                                            ( "SBCL deps pack did not produce tarball at "
+                                                <> T.pack outPath
+                                            )
 
 preflightClone :: FilePath -> IO (Either Text ())
 preflightClone root = do

@@ -614,6 +614,7 @@ testVendorGoVersionGate = do
       "0.1.0"
       Nothing
       "/tmp"
+      "/tmp"
       "pkg-0.1.0-vendor.tar.xz"
   case older of
     Left msg -> do
@@ -636,6 +637,7 @@ testVendorGoVersionGate = do
         "v"
         "0.1.0"
         Nothing
+        outDir
         outDir
         "pkg-0.1.0-vendor.tar.xz"
     case ok of

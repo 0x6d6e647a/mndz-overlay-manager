@@ -96,6 +96,7 @@ import Update.SshAgent
     teardownSshSession,
   )
 import Update.Targets (resolveTargets, targetErrorMessage)
+import Update.TempWorkspace (openRunRoot)
 import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
@@ -264,6 +265,7 @@ runUpdate rt pkgArgs = do
       let runApply gpg = do
             assetsLock <- newMVar ()
             overlayLock <- newMVar ()
+            tempRun <- openRunRoot
             fetch <- productionFetcherWithToken token
             depsOps <- productionDepsPlanOps token (rtJobs rt) (Just overlayPath)
             let planOps = toGoPlanOps depsOps
@@ -298,7 +300,8 @@ runUpdate rt pkgArgs = do
                       aeJobs = rtJobs rt,
                       aeMulti = noopMultiHandle,
                       aePlanOps = planOps,
-                      aeDepsPlanOps = depsOps
+                      aeDepsPlanOps = depsOps,
+                      aeTempRun = tempRun
                     }
             applyOverlay (rtProgress rt) env overlayPath entries mFilter
       let pcfg = rtProgress rt

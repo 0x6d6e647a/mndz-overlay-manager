@@ -35,7 +35,6 @@ import System.Directory
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.IO.Temp (withSystemTempDirectory)
 import Update.DiskSpace
   ( MaterializeClass (FullNpmBun),
     checkPostCloneForClass,
@@ -196,6 +195,7 @@ parseBunRequirement =
           _ -> fail "no parseable engines.bun or packageManager bun@X.Y.Z"
 
 -- | Clone tag → require bun.lock → bun install → pack per 'BunPackagingMode'.
+-- Clone and bun-cache live under unit @workDir@; tarball under @outDir@.
 buildBunDepsTarball ::
   BunCacheOps ->
   BunCacheProgress ->
@@ -205,10 +205,13 @@ buildBunDepsTarball ::
   Text ->
   Text ->
   Text ->
+  -- | Unit @work/@ (clone + bun-cache).
+  FilePath ->
+  -- | Unit @out/@ (staged tarball).
   FilePath ->
   FilePath ->
   IO (Either Text FilePath)
-buildBunDepsTarball ops progress mode owner repo prefix pv bunReq outDir tarballName = do
+buildBunDepsTarball ops progress mode owner repo prefix pv bunReq workDir outDir tarballName = do
   hostResult <- bcoHostBunVersion ops
   case hostResult of
     Left err -> pure (Left err)
@@ -223,50 +226,53 @@ buildBunDepsTarball ops progress mode owner repo prefix pv bunReq outDir tarball
                   <> " to engines.bun "
                   <> bunReq
               )
-        Just True ->
-          withSystemTempDirectory "mndz-bun-cache-" $ \tmp -> do
-            let cloneDir = tmp </> "src"
-                cacheDir = tmp </> "bun-cache"
-                tag = versionTag prefix pv
-                url = githubCloneUrl owner repo
-            createDirectoryIfMissing True cacheDir
-            bcpOnCloneStart progress
-            cloned <- bcoClone ops url tag cloneDir
-            case cloned of
-              Left err -> pure (Left err)
-              Right () -> do
-                bcpOnCloneDone progress
-                spaceOk <- checkPostCloneForClass FullNpmBun cloneDir
-                case spaceOk of
-                  Left err -> pure (Left err)
-                  Right () -> do
-                    let lockPath = cloneDir </> "bun.lock"
-                    hasLock <- doesFileExist lockPath
-                    if not hasLock
-                      then
-                        pure $
-                          Left
-                            "bun.lock missing at repository root; \
-                            \DepsAndAssets Bun requires a root bun.lock"
-                      else do
-                        bcpOnInstallStart progress
-                        installed <- bcoBunInstall ops cloneDir cacheDir
-                        case installed of
-                          Left err -> pure (Left err)
-                          Right () -> do
-                            bcpOnInstallDone progress
-                            packResult <- packAfterInstall ops mode tmp cloneDir cacheDir
-                            case packResult of
-                              Left err -> pure (Left err)
-                              Right (workDir, entries) -> do
-                                let outPath = outDir </> tarballName
-                                bcpOnCompressStart progress
-                                compressed <- bcoTarXz ops workDir entries outPath
-                                case compressed of
-                                  Left err -> pure (Left err)
-                                  Right () -> do
-                                    bcpOnCompressDone progress
-                                    pure (Right outPath)
+        Just True -> do
+          createDirectoryIfMissing True workDir
+          createDirectoryIfMissing True outDir
+          let cloneDir = workDir </> "src"
+              cacheDir = workDir </> "bun-cache"
+              tag = versionTag prefix pv
+              url = githubCloneUrl owner repo
+          createDirectoryIfMissing True cacheDir
+          bcpOnCloneStart progress
+          cloned <- bcoClone ops url tag cloneDir
+          case cloned of
+            Left err -> pure (Left err)
+            Right () -> do
+              bcpOnCloneDone progress
+              spaceOk <- checkPostCloneForClass FullNpmBun cloneDir
+              case spaceOk of
+                Left err -> pure (Left err)
+                Right () -> do
+                  let lockPath = cloneDir </> "bun.lock"
+                  hasLock <- doesFileExist lockPath
+                  if not hasLock
+                    then
+                      pure $
+                        Left
+                          "bun.lock missing at repository root; \
+                          \DepsAndAssets Bun requires a root bun.lock"
+                    else do
+                      bcpOnInstallStart progress
+                      installed <- bcoBunInstall ops cloneDir cacheDir
+                      case installed of
+                        Left err -> pure (Left err)
+                        Right () -> do
+                          bcpOnInstallDone progress
+                          packResult <-
+                            packAfterInstall ops mode workDir cloneDir cacheDir
+                          case packResult of
+                            Left err -> pure (Left err)
+                            Right (tarWorkDir, entries) -> do
+                              let outPath = outDir </> tarballName
+                              bcpOnCompressStart progress
+                              compressed <-
+                                bcoTarXz ops tarWorkDir entries outPath
+                              case compressed of
+                                Left err -> pure (Left err)
+                                Right () -> do
+                                  bcpOnCompressDone progress
+                                  pure (Right outPath)
 
 -- | Resolve tar work directory and relative members after a successful install.
 packAfterInstall ::

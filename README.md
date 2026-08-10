@@ -132,7 +132,23 @@ Before mutating anything, `update` checks that required tools are on `PATH`, tha
 
 #### Free space, `TMPDIR`, and concurrent materialize
 
-Heavy `DepsAndAssets` work (clone, language package download, tarball pack) and reuse downloads write under the process temporary directory — **`TMPDIR` when set and usable**, otherwise the system default (often `/tmp`, which may be a small tmpfs). Manager distfile fetches for `ebuild … manifest` write under the effective manager distfiles path (XDG cache by default).
+Heavy `DepsAndAssets` work (clone, language package download, tarball pack) and reuse downloads write under a **product temporary workspace** on the effective temp root — **`TMPDIR` when set and usable**, otherwise the system default (often `/tmp`, which may be a small tmpfs). Free-space checks still measure that root’s filesystem (not a separate device for the workspace subdirectory). Manager distfile fetches for `ebuild … manifest` write under the effective manager distfiles path (XDG cache by default), not under the temp workspace.
+
+Layout (one run root per `update` process that opens heavy temp work):
+
+```text
+$TMPDIR/mndz/overlay-manager/<run-id>/
+  <category>/<package>/<pv>-full|reuse/
+    out/    # staged distfiles / downloaded assets
+    work/   # clones, language caches, pack stages
+```
+
+Lifecycle:
+
+- A unit that **succeeds** or **soft-skips** is deleted immediately (so concurrent `--jobs` reclaim space as packages finish).
+- A unit that **hard-fails** is **retained**; the error message includes the absolute unit path for investigation.
+- If the whole run has **no hard-fail**, the run root is removed and empty `mndz/overlay-manager` / `mndz` brand directories under the temp root are pruned.
+- Residuals after a hard-fail or process crash may be removed manually (for example `rm -rf "$TMPDIR/mndz/overlay-manager/<run-id>"`).
 
 Before concurrent package mutation, `update` estimates peak need from prior overlay **Manifest `DIST` sizes** and/or GitHub release asset **`size`**, multiplied by ecosystem expansion factors, plus a fixed **256 MiB** safety margin. Under `--jobs N` it requires free space for both the largest single unit and the sum of the up to **N** largest unit needs on each hard-check filesystem (temp and manager distfiles; merged when they share one device). Distfiles already present under the manager path do not add reservation.
 

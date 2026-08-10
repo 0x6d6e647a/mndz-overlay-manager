@@ -36,6 +36,7 @@ import Update.Process
     productionCommandRunner,
   )
 import Update.Sbcl.Deps (SbclDepsOps)
+import Update.TempWorkspace (RunRoot)
 import Update.Types (Fetcher)
 
 type EbuildRunner = FilePath -> FilePath -> IO (Either Text ())
@@ -87,5 +88,7 @@ data ApplyEnv = ApplyEnv
     aeJobs :: Int,
     aeMulti :: MultiHandle,
     aePlanOps :: PlanOps,
-    aeDepsPlanOps :: DepsPlanOps
+    aeDepsPlanOps :: DepsPlanOps,
+    -- | Product temp workspace run root for heavy materialize scratch.
+    aeTempRun :: RunRoot
   }
