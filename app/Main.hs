@@ -15,7 +15,6 @@ import CLI.Progress
   ( ProgressConfig,
     StepHandle (..),
     mkProgressConfig,
-    noopMultiHandle,
     pauseActivePanel,
     progressEnabled,
     resumeActivePanel,
@@ -25,7 +24,6 @@ import CLI.Progress
 import Colog (LogAction, Message, WithLog, logError, logInfo, logWarning, usingLoggerT)
 import Config.Loader (configErrorMessage, loadConfig)
 import Config.Types (OverlayConfig (..))
-import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -38,17 +36,9 @@ import Overlay.Types (Ebuild, ebuildAtom, ebuildCategory, ebuildPackage)
 import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (EbuildVersion (..), prettyVersion)
 import System.Exit (ExitCode (..), exitWith)
-import Update.Apply
-  ( ApplyEnv (..),
-    applyOverlay,
-    fetchModelsDevApiJson,
-    foldExitHardFail,
-    productionEbuildRunner,
-  )
+import Update.Apply (foldExitHardFail)
 import Update.Assets.Release (ReleaseOps (..), productionReleaseOps)
 import Update.Auth (resolveGitHubToken)
-import Update.Bun.Cache (productionBunCacheOps)
-import Update.Cargo.Crates (productionCargoOps)
 import Update.Check
   ( PackageEntry (..),
     checkOverlayWithDepsPlan,
@@ -60,64 +50,44 @@ import Update.CheckCache
     flushCheckCache,
     openCheckCache,
   )
-import Update.Deps.Plan (productionDepsPlanOps, toGoPlanOps)
-import Update.DiskSpace
-  ( DiskGateOk (..),
-    productionDiskSpaceProbe,
-    resolveTempRoot,
-    runDiskSpaceGate,
-  )
+import Update.Deps.Plan (productionDepsPlanOps)
+import Update.DiskSpace (productionDiskSpaceProbe)
 import Update.Distfiles
   ( cleanManagerDistfiles,
-    lookupPortageDistDir,
     probeDistfilesDir,
     resolveDistfilesPath,
   )
 import Update.Git (isGitWorkTree, productionGitOps)
-import Update.Go.Vendor (productionVendorOps)
 import Update.GpgAgent
   ( newGpgHandle,
     productionGpgAgentOps,
     teardownGpgHandle,
   )
-import Update.Hardcoded (lookupPolicy)
 import Update.Md5Cache
   ( checkLayoutCacheFormats,
     gencachePackages,
     preflightGencache,
     productionEgencacheRunner,
   )
-import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight
   ( AssetsPreflight (..),
-    buildUnitPlansForPackages,
     preflightUpdateTools,
-    validateAssetsPath,
   )
-import Update.Sbcl.Deps (productionSbclDepsOps)
-import Update.SshAgent
-  ( ensureSshAgent,
-    productionSshAgentOps,
-    teardownSshSession,
+import Update.Spine
+  ( UpdateSpineDeps (..),
+    UpdateSpineResult (..),
+    runUpdatePhases,
   )
+import Update.SshAgent (productionSshAgentOps)
 import Update.Targets (resolveTargets, targetErrorMessage)
-import Update.TempWorkspace (openRunRoot)
 import Update.Types
   ( ApplyOutcome (..),
-    EcosystemSpec (..),
     OutdatedLine (..),
     PackageKey (..),
-    PackagePolicy (..),
     SuccessLine (..),
     UpdateReport (..),
-    UpdateTechnique (..),
-    ecosystemIsBun,
-    ecosystemIsCargo,
-    ecosystemIsGo,
-    ecosystemIsNpm,
     mkPackageKey,
     packageKeyText,
-    techniqueNeedsAssets,
   )
 import Update.Types qualified as U
 
@@ -216,24 +186,20 @@ runUpdate rt refresh pkgArgs = do
       mapM_ (logError . targetErrorMessage) errs
       liftIO $ exitWith (ExitFailure 1)
     Right keys -> do
-      let mFilter = if null pkgArgs then Nothing else Just keys
-          selected = case mFilter of
-            Nothing -> entries
-            Just ks -> [e | e <- entries, peKey e `elem` ks]
-          needAssets = any entryNeedsAssets selected
-          needGo = any (entryNeedsEco ecosystemIsGo) selected
-          needNpm = any (entryNeedsEco ecosystemIsNpm) selected
-          needBun = any (entryNeedsEco ecosystemIsBun) selected
-          needCargo = any (entryNeedsEco ecosystemIsCargo) selected
-          assetsPf =
+      let selected =
+            if null pkgArgs
+              then entries
+              else [e | e <- entries, peKey e `elem` keys]
+          -- Spine tools only; language/assets tools come after plan.
+          spinePf =
             AssetsPreflight
-              { apNeedAssets = needAssets,
-                apNeedGo = needGo,
-                apNeedNpm = needNpm,
-                apNeedBun = needBun,
-                apNeedCargo = needCargo
+              { apNeedAssets = False,
+                apNeedGo = False,
+                apNeedNpm = False,
+                apNeedBun = False,
+                apNeedCargo = False
               }
-      preflightOk <- liftIO $ runPreflightSteps (rtProgress rt) assetsPf
+      preflightOk <- liftIO $ runSpineToolSteps (rtProgress rt) spinePf
       case preflightOk of
         Left err -> dieError (T.unpack err)
         Right () -> pure ()
@@ -251,157 +217,75 @@ runUpdate rt refresh pkgArgs = do
         Left err -> dieError (T.unpack err)
         Right () -> pure ()
       token <- liftIO (resolveGitHubToken cfg)
-      assetsRoot <-
-        if needAssets
-          then
-            liftIO (validateAssetsPath (assetsPath cfg)) >>= \case
-              Left err -> dieError (T.unpack err)
-              Right p -> pure (Just p)
-          else pure Nothing
-      when needAssets $
-        case token of
-          Nothing ->
-            dieError
-              "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
-          Just _ -> pure ()
-      -- Disk-space feasibility before concurrent package mutation.
-      diskGate <-
-        liftIO $
-          withStepProgress (rtProgress rt) 1 $ \step -> do
-            shStep step "Checking free disk space"
-            tempRoot <- resolveTempRoot
-            units <- buildUnitPlansForPackages overlayPath distDir selected
-            mPortage <- lookupPortageDistDir
-            runDiskSpaceGate
-              productionDiskSpaceProbe
-              (rtJobs rt)
-              tempRoot
-              distDir
-              mPortage
-              units
-      case diskGate of
-        Left err -> dieError (T.unpack err)
-        Right (DiskGateOk warns) -> mapM_ logWarning warns
+      -- Open check cache before plan phase.
       (cache, cacheWarn) <-
         liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayPath
       mapM_ logWarning cacheWarn
-      let runApply gpg = do
-            assetsLock <- newMVar ()
-            overlayLock <- newMVar ()
-            tempRun <- openRunRoot
-            fetch <- productionFetcherWithToken token
-            depsOps <- productionDepsPlanOps token (rtJobs rt) (Just overlayPath)
-            let planOps = toGoPlanOps depsOps
-            releaseOps <- case token of
-              Just t -> productionReleaseOps t
-              Nothing ->
-                pure
-                  ReleaseOps
-                    { roGetReleaseByTag = \_ _ _ -> pure (Left "GitHub token required"),
-                      roDownloadAsset = \_ _ -> pure (Left "GitHub token required"),
-                      roCreateReleaseWithAssets = \_ _ -> pure (Left "GitHub token required")
-                    }
-            let env =
-                  ApplyEnv
-                    { aeFetcher = fetch,
-                      aeGitOps = productionGitOps gpg,
-                      aeEbuildRunner = productionEbuildRunner distDir,
-                      aeEgencacheRunner = productionEgencacheRunner,
-                      aeVendorOps = productionVendorOps,
-                      aeNpmCacheOps = productionNpmCacheOps,
-                      aeBunCacheOps = productionBunCacheOps,
-                      aeCargoOps = productionCargoOps,
-                      aeSbclDepsOps = productionSbclDepsOps,
-                      aeReleaseOps = releaseOps,
-                      aeFetchModelsDev = fetchModelsDevApiJson,
-                      aeAssetsRoot = assetsRoot,
-                      aeGitHubToken = token,
-                      aeAssetsOwner = "0x6d6e647a",
-                      aeAssetsRepo = "mndz-overlay-assets",
-                      aeAssetsLock = assetsLock,
-                      aeOverlayLock = overlayLock,
-                      aeJobs = rtJobs rt,
-                      aeMulti = noopMultiHandle,
-                      aePlanOps = planOps,
-                      aeDepsPlanOps = depsOps,
-                      aeTempRun = tempRun,
-                      aeCheckCache = cache
-                    }
-            applyOverlay (rtProgress rt) env overlayPath entries mFilter
+      fetch <- liftIO (productionFetcherWithToken token)
+      depsOps <-
+        liftIO (productionDepsPlanOps token (rtJobs rt) (Just overlayPath))
+      releaseOps <-
+        liftIO $
+          case token of
+            Just t -> productionReleaseOps t
+            Nothing ->
+              pure
+                ReleaseOps
+                  { roGetReleaseByTag = \_ _ _ -> pure (Left "GitHub token required"),
+                    roDownloadAsset = \_ _ -> pure (Left "GitHub token required"),
+                    roCreateReleaseWithAssets = \_ _ -> pure (Left "GitHub token required")
+                  }
       let pcfg = rtProgress rt
           gpgOps =
             productionGpgAgentOps
               (pauseActivePanel pcfg)
               (resumeActivePanel pcfg)
-      outcomes <-
+      spineResult <-
         liftIO $
           bracket
             (newGpgHandle gpgOps)
             teardownGpgHandle
             ( \gpg ->
-                if needAssets
-                  then
-                    bracket
-                      (ensureSshAgent productionSshAgentOps)
-                      ( \case
-                          Left _ -> pure ()
-                          Right sess -> teardownSshSession productionSshAgentOps sess
-                      )
-                      ( \case
-                          Left err ->
-                            pure
-                              [ ApplyHardFail
-                                  (PackageKey "")
-                                  ("SSH agent setup failed: " <> err)
-                                  False
-                                  False
-                              ]
-                          Right _sess -> runApply gpg
-                      )
-                  else runApply gpg
+                let deps =
+                      UpdateSpineDeps
+                        { usdJobs = rtJobs rt,
+                          usdProgress = pcfg,
+                          usdFetcher = fetch,
+                          usdDepsPlanOps = depsOps,
+                          usdReleaseOps = releaseOps,
+                          usdDiskProbe = productionDiskSpaceProbe,
+                          usdGitOps = productionGitOps gpg,
+                          usdCheckCache = cache,
+                          usdAssetsOwner = "0x6d6e647a",
+                          usdAssetsRepo = "mndz-overlay-assets",
+                          usdGitHubToken = token,
+                          usdAssetsPathCfg = assetsPath cfg,
+                          usdDistDir = distDir,
+                          usdOverlayRoot = overlayPath,
+                          usdSshOps = productionSshAgentOps
+                        }
+                 in runUpdatePhases deps entries ebuilds selected
             )
-      liftIO (flushCheckCache cache)
-      mSummary <- liftIO (cacheSummaryLine cache)
-      mapM_ logInfo mSummary
-      case outcomes of
-        [ApplyHardFail (PackageKey "") msg _ _] ->
-          dieError (T.unpack msg)
-        _ -> do
-          mapM_ emitOutcome outcomes
-          when (foldExitHardFail outcomes) $
-            liftIO $
-              exitWith (ExitFailure 1)
+      case spineResult of
+        Left err -> dieError (T.unpack err)
+        Right res -> do
+          mapM_ logWarning (usrWarnings res)
+          mapM_ logInfo (usrCacheSummary res)
+          case usrOutcomes res of
+            [ApplyHardFail (PackageKey "") msg _ _] ->
+              dieError (T.unpack msg)
+            outcomes -> do
+              mapM_ emitOutcome outcomes
+              when (foldExitHardFail outcomes) $
+                liftIO $
+                  exitWith (ExitFailure 1)
 
--- | Sequential preflight step bar covering tool checks (and counting conditional steps).
-runPreflightSteps :: ProgressConfig -> AssetsPreflight -> IO (Either T.Text ())
-runPreflightSteps pcfg ap = do
-  let needAssets = apNeedAssets ap
-      stepDescs =
-        ["Checking required tools"]
-          <> ["Validating assets path" | needAssets]
-          <> ["Resolving GitHub credentials" | needAssets]
-          <> ["Preparing SSH agent" | needAssets]
-      total = length stepDescs
-  withStepProgress pcfg total $ \step -> do
+-- | Spine-tool preflight step (git/ebuild/egencache/gpg only).
+runSpineToolSteps :: ProgressConfig -> AssetsPreflight -> IO (Either T.Text ())
+runSpineToolSteps pcfg ap =
+  withStepProgress pcfg 1 $ \step -> do
     shStep step "Checking required tools"
-    tools <- preflightUpdateTools ap
-    case tools of
-      Left err -> pure (Left err)
-      Right () -> do
-        mapM_ (shStep step) (drop 1 stepDescs)
-        pure (Right ())
-
-entryNeedsAssets :: PackageEntry -> Bool
-entryNeedsAssets e =
-  case lookupPolicy (peKey e) of
-    Just p -> techniqueNeedsAssets (policyTechnique p)
-    Nothing -> False
-
-entryNeedsEco :: (EcosystemSpec -> Bool) -> PackageEntry -> Bool
-entryNeedsEco ecoPred e =
-  case lookupPolicy (peKey e) of
-    Just (PackagePolicy _ (DepsAndAssets eco)) -> ecoPred eco
-    _ -> False
+    preflightUpdateTools ap
 
 emitOutcome :: (WithLog env Message m, MonadIO m) => ApplyOutcome -> m ()
 emitOutcome = \case

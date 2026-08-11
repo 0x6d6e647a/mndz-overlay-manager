@@ -15,7 +15,8 @@ module Update.Preflight
     validateAssetsPath,
     validateAssetsPathWith,
     AssetsPreflight (..),
-    buildUnitPlansForPackages,
+    assetsPreflightFromPlan,
+    buildGitMvUnitPlans,
   )
 where
 
@@ -23,18 +24,20 @@ import Data.Maybe (catMaybes, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (doesDirectoryExist, doesFileExist, findExecutable)
-import System.FilePath (takeDirectory, (</>))
-import Update.Assets.Layout
-  ( DistfileKind (..),
-    distfileKindForEcosystem,
+import System.FilePath ((</>))
+import Update.Apply.Plan
+  ( ClassifiedPvUnit (..),
+    ClassifyPackageResult (..),
+    PackagePlanResult (..),
+    PlannedWork (..),
+    needsWorkCargo,
+    needsWorkDepsAssets,
   )
-import Update.Check (PackageEntry (..))
 import Update.DiskSpace
   ( MaterializeClass (..),
     UnitDiskPlan (..),
     estimateNeedBytes,
     lookupManifestBaselineForClass,
-    materializeClassFull,
     mdeName,
     mdeSize,
     parseManifestDistEntries,
@@ -42,10 +45,11 @@ import Update.DiskSpace
     readManifestMaybe,
   )
 import Update.Git (isGitWorkTree)
-import Update.Hardcoded (lookupPolicy)
 import Update.Types
-  ( PackagePolicy (..),
-    UpdateTechnique (..),
+  ( PackageKey (..),
+    ecosystemIsBun,
+    ecosystemIsGo,
+    ecosystemIsNpm,
     splitPackageKey,
   )
 
@@ -87,6 +91,35 @@ data AssetsPreflight = AssetsPreflight
     apNeedCargo :: Bool
   }
   deriving (Eq, Show)
+
+-- | Derive tool/assets preflight from plan + classify results (A2).
+--
+-- Language tools only for full-path ecosystems among classified units;
+-- cargo tools when any cargo package needs work (P1, including reuse-only);
+-- assets/token/xz when any DepsAndAssets package needs work.
+assetsPreflightFromPlan ::
+  [PackagePlanResult] ->
+  [ClassifyPackageResult] ->
+  AssetsPreflight
+assetsPreflightFromPlan planResults classifyResults =
+  let needAssets = any needsWorkDepsAssets planResults
+      needCargo = any needsWorkCargo planResults
+      fullUnits =
+        [ u
+        | ClassifyOk _ us <- classifyResults,
+          u <- us,
+          cpuClass u /= ReusePath
+        ]
+      needGo = any (ecosystemIsGo . cpuEco) fullUnits
+      needNpm = any (ecosystemIsNpm . cpuEco) fullUnits
+      needBun = any (ecosystemIsBun . cpuEco) fullUnits
+   in AssetsPreflight
+        { apNeedAssets = needAssets,
+          apNeedGo = needGo,
+          apNeedNpm = needNpm,
+          apNeedBun = needBun,
+          apNeedCargo = needCargo
+        }
 
 -- | Check that each tool name is findable on PATH.
 -- Returns missing tool names (empty list means success).
@@ -157,95 +190,56 @@ validateAssetsPathWith dirExists isGitTree = \case
             then Right path
             else Left ("assets-path is not a git work tree: " <> T.pack path)
 
--- | Conservative disk unit plans for selected packages (full-path overestimate
--- when reuse is unknown; Manifest baseline when present).
-buildUnitPlansForPackages ::
+-- | Dist-oriented units for GitMv packages that need work.
+buildGitMvUnitPlans ::
   FilePath ->
   FilePath ->
-  [PackageEntry] ->
+  [PackagePlanResult] ->
   IO [UnitDiskPlan]
-buildUnitPlansForPackages overlayRoot distDir entries =
-  catMaybes <$> mapM (planOne overlayRoot distDir) entries
+buildGitMvUnitPlans overlayRoot distDir planResults =
+  catMaybes
+    <$> mapM
+      ( \case
+          PlanNeedsWork key PlannedGitMv {} ->
+            gitMvUnit overlayRoot distDir key
+          _ -> pure Nothing
+      )
+      planResults
 
-planOne :: FilePath -> FilePath -> PackageEntry -> IO (Maybe UnitDiskPlan)
-planOne overlayRoot distDir entry =
-  case lookupPolicy (peKey entry) of
-    Nothing -> pure Nothing
-    Just (PackagePolicy _ (Unsupported _)) -> pure Nothing
-    Just (PackagePolicy _ GitMvAndManifest) -> do
-      mContent <- readManifestMaybe (pkgDir entry)
-      let mBase = mContent >>= (`lookupManifestBaselineForClass` GitMvFetch)
-          rawNeed = estimateNeedBytes GitMvFetch mBase
-      distNeed <- case mContent of
-        Just content -> do
-          let dists = parseManifestDistEntries content
-          needs <-
-            mapM
-              ( \e ->
-                  presentDistfileNeed
-                    doesFileExist
-                    distDir
-                    (T.unpack (mdeName e))
-                    (mdeSize e)
-              )
-              dists
-          pure $
-            if null dists
-              then rawNeed
-              else sum needs
-        Nothing -> pure rawNeed
+gitMvUnit :: FilePath -> FilePath -> PackageKey -> IO (Maybe UnitDiskPlan)
+gitMvUnit overlayRoot distDir key = do
+  let dir = case splitPackageKey key of
+        Just (cat, pn) -> overlayRoot </> T.unpack cat </> T.unpack pn
+        Nothing -> overlayRoot
+  mContent <- readManifestMaybe dir
+  let mBase = mContent >>= (`lookupManifestBaselineForClass` GitMvFetch)
+      rawNeed = estimateNeedBytes GitMvFetch mBase
+  distNeed <- case mContent of
+    Just content -> do
+      let dists = parseManifestDistEntries content
+      needs <-
+        mapM
+          ( \e ->
+              presentDistfileNeed
+                doesFileExist
+                distDir
+                (T.unpack (mdeName e))
+                (mdeSize e)
+          )
+          dists
       pure $
-        if distNeed <= 0
-          then Nothing
-          else
-            Just
-              UnitDiskPlan
-                { udpKey = peKey entry,
-                  udpClass = GitMvFetch,
-                  udpTempNeed = 0,
-                  udpDistNeed = distNeed
-                }
-    Just (PackagePolicy _ (DepsAndAssets eco)) -> do
-      let cls = materializeClassFull eco
-      mContent <- readManifestMaybe (pkgDir entry)
-      let mBase = mContent >>= (`lookupManifestBaselineForClass` cls)
-          tempNeed = estimateNeedBytes cls mBase
-          kind = distfileKindForEcosystem eco
-          suffix = case kind of
-            VendorDist -> "-vendor.tar.xz"
-            DepsDist -> "-deps.tar.xz"
-            CratesDist -> "-crates.tar.xz"
-      distNeed <- case mBase of
-        Just b -> do
-          names <-
-            case mContent of
-              Just c ->
-                pure
-                  [ T.unpack (mdeName e)
-                  | e <- parseManifestDistEntries c,
-                    suffix `T.isInfixOf` mdeName e
-                  ]
-              Nothing -> pure []
-          if null names
-            then pure (estimateNeedBytes GitMvFetch (Just b))
-            else do
-              needs <-
-                mapM
-                  ( \n ->
-                      presentDistfileNeed doesFileExist distDir n b
-                  )
-                  names
-              pure (maximum (0 : needs))
-        Nothing -> pure (estimateNeedBytes GitMvFetch Nothing)
-      pure $
+        if null dists
+          then rawNeed
+          else sum needs
+    Nothing -> pure rawNeed
+  pure $
+    if distNeed <= 0
+      then Nothing
+      else
         Just
           UnitDiskPlan
-            { udpKey = peKey entry,
-              udpClass = cls,
-              udpTempNeed = tempNeed,
+            { udpKey = key,
+              udpClass = GitMvFetch,
+              udpTempNeed = 0,
               udpDistNeed = distNeed
             }
-  where
-    pkgDir e = case splitPackageKey (peKey e) of
-      Just (cat, pn) -> overlayRoot </> T.unpack cat </> T.unpack pn
-      Nothing -> takeDirectory (pePath e)

@@ -4,12 +4,29 @@ module Test.DiskSpace (tests) where
 
 import Data.Ratio ((%))
 import Data.Text qualified as T
+import Overlay.Version (EbuildVersion, parseEbuildVersion)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertRight, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
+import Update.Apply
+  ( ClassifiedPvUnit (..),
+    ClassifyPackageResult (..),
+    PlannedWork (..),
+    PvDiskEstimate (..),
+    buildUnitPlanFromPvEstimates,
+    buildUnitPlansFromClassified,
+    classifyPackageUnits,
+    estimateFullTempNeed,
+    estimateReuseTempNeed,
+  )
+import Update.Assets.Release
+  ( ReleaseAsset (..),
+    ReleaseInfo (..),
+    ReleaseOps (..),
+  )
 import Update.DiskSpace
   ( DiskGateOk (..),
     DiskSpaceProbe (..),
@@ -40,7 +57,15 @@ import Update.DiskSpace
     runDiskSpaceGate,
     safetyMarginBytes,
   )
-import Update.Types (PackageKey (..))
+import Update.Go.Lanes
+  ( PlannedEbuild (..),
+    RuntimeLanePlan (..),
+  )
+import Update.Types
+  ( EcosystemSpec (..),
+    PackageKey (..),
+    UpdateSource (..),
+  )
 
 tests :: TestTree
 tests =
@@ -56,7 +81,15 @@ tests =
       testCase "Portage warn does not hard-fail" testPortageWarnOnly,
       testCase "Manifest DIST size parse" testManifestParse,
       testCase "present distfile zeros need" testPresentDistfileZero,
-      testCase "production getFreeBytes smoke" testGetFreeBytesSmoke
+      testCase "production getFreeBytes smoke" testGetFreeBytesSmoke,
+      testCase "multi-PV max single PV unit plan" testMultiPvMaxUnit,
+      testCase "mixed reuse and full concurrent sum" testMixedReuseFullConcurrent,
+      testCase "reuse vs full estimate helpers" testReuseFullHelpers,
+      testCase "classified units omit empty" testClassifiedOmitEmpty,
+      testCase "classify asset+size → reuse" testClassifyReuseWithSize,
+      testCase "classify no asset → full" testClassifyFullMissing,
+      testCase "classify probe error → hard-fail" testClassifyProbeError,
+      testCase "gate needs-work only not full inventory" testGateNeedsWorkOnly
     ]
 
 giB :: Integer
@@ -236,3 +269,233 @@ testGetFreeBytesSmoke =
     result <- getFreeBytes tmp
     n <- assertRight "getFreeBytes succeeds" result
     assertTrue "free bytes non-negative" (n >= 0)
+
+testMultiPvMaxUnit :: IO ()
+testMultiPvMaxUnit = do
+  let key = PackageKey "dev-util/crush"
+      estimates =
+        [ PvDiskEstimate FullGo (1 * giB) 0,
+          PvDiskEstimate FullGo (2 * giB) 0,
+          PvDiskEstimate FullGo (3 * giB) 0
+        ]
+  case buildUnitPlanFromPvEstimates key estimates of
+    Nothing -> fail "expected unit plan"
+    Just u -> do
+      assertEq "temp is max not sum" (3 * giB) (udpTempNeed u)
+      assertEq "key" key (udpKey u)
+  -- Concurrent sum for a single package unit is just that unit's need.
+  let units = case buildUnitPlanFromPvEstimates key estimates of
+        Just u -> [u]
+        Nothing -> []
+  assertEq "jobs any → max only" (3 * giB) (concurrentSumNeed 4 (map udpTempNeed units))
+
+testMixedReuseFullConcurrent :: IO ()
+testMixedReuseFullConcurrent = do
+  let reuseNeed = estimateNeedBytes ReusePath (Just (100 * 1024 * 1024))
+      fullNeed = estimateNeedBytes FullGo (Just (100 * 1024 * 1024))
+      units =
+        [ UnitDiskPlan (PackageKey "a/a") ReusePath reuseNeed 0,
+          UnitDiskPlan (PackageKey "b/b") FullGo fullNeed 0
+        ]
+      needs = map udpTempNeed units
+  assertTrue "full > reuse" (fullNeed > reuseNeed)
+  assertEq "jobs 1 is max" (maxNeed needs) (concurrentSumNeed 1 needs)
+  assertEq "jobs 2 is sum" (reuseNeed + fullNeed) (concurrentSumNeed 2 needs)
+  let err =
+        evaluateDiskFeasibility
+          2
+          "/tmp"
+          (reuseNeed + fullNeed - 1)
+          1
+          "/cache/dist"
+          (100 * giB)
+          2
+          False
+          Nothing
+          units
+  case err of
+    Left msg -> assertTrue "concurrent" ("concurrent" `T.isInfixOf` msg)
+    Right _ -> fail "expected concurrent sum failure for mixed units"
+
+testReuseFullHelpers :: IO ()
+testReuseFullHelpers = do
+  let base = 50 * 1024 * 1024
+  assertEq
+    "reuse helper"
+    (estimateNeedBytes ReusePath (Just base))
+    (estimateReuseTempNeed (Just base))
+  assertEq
+    "full helper"
+    (estimateNeedBytes FullGo (Just base))
+    (estimateFullTempNeed (Go Nothing) (Just base))
+
+testClassifiedOmitEmpty :: IO ()
+testClassifiedOmitEmpty = do
+  let key = PackageKey "dev-util/crush"
+      pv = parseEbuildVersion "1.0.0"
+      unit =
+        ClassifiedPvUnit
+          { cpuKey = key,
+            cpuPN = "crush",
+            cpuPV = pv,
+            cpuEco = Go Nothing,
+            cpuClass = FullGo,
+            cpuTempBaseline = Just (10 * 1024 * 1024)
+          }
+      plans = buildUnitPlansFromClassified [unit]
+  case plans of
+    [p] -> assertTrue "temp > 0" (udpTempNeed p > 0)
+    _ -> fail ("expected one unit, got " <> show (length plans))
+
+fakeReleaseOps ::
+  IO (Either T.Text (Maybe ReleaseInfo)) ->
+  ReleaseOps
+fakeReleaseOps getTag =
+  ReleaseOps
+    { roGetReleaseByTag = \_ _ _ -> getTag,
+      roDownloadAsset = \_ _ -> pure (Left "unused"),
+      roCreateReleaseWithAssets = \_ _ -> pure (Left "unused")
+    }
+
+mkDepsWork :: EcosystemSpec -> [EbuildVersion] -> PlannedWork
+mkDepsWork eco needPVs =
+  PlannedDeps
+    { pdEco = eco,
+      pdSource = GitHub "o" "r" "v",
+      pdPlan =
+        RuntimeLanePlan
+          { glpLanes = [],
+            glpEbuilds =
+              [ PlannedEbuild
+                  { pePV = pv,
+                    peKeywords = [],
+                    peLanes = []
+                  }
+              | pv <- needPVs
+              ],
+            glpUniquePVs = needPVs,
+            glpRuntimeAtom = "dev-lang/go"
+          },
+      pdLocalPVs = [],
+      pdContentFix = []
+    }
+
+testClassifyReuseWithSize :: IO ()
+testClassifyReuseWithSize =
+  withSystemTempDirectory "mndz-classify-" $ \tmp -> do
+    let key = PackageKey "dev-util/crush"
+        pn = "crush"
+        pv = parseEbuildVersion "0.84.0"
+        assetName = "crush-0.84.0-vendor.tar.xz"
+        ops =
+          fakeReleaseOps $
+            pure $
+              Right $
+                Just
+                  ReleaseInfo
+                    { riId = 1,
+                      riTag = "crush-0.84.0",
+                      riAssets =
+                        [ ReleaseAsset
+                            { raName = T.pack assetName,
+                              raBrowserDownloadUrl = "https://example/asset",
+                              raSize = Just (42 * 1024 * 1024)
+                            }
+                        ]
+                    }
+    result <-
+      classifyPackageUnits
+        ops
+        "owner"
+        "repo"
+        tmp
+        key
+        pn
+        (mkDepsWork (Go Nothing) [pv])
+    case result of
+      ClassifyOk k [u] -> do
+        assertEq "key" key k
+        assertEq "reuse class" ReusePath (cpuClass u)
+        assertEq "size baseline" (Just (42 * 1024 * 1024)) (cpuTempBaseline u)
+      other -> fail ("unexpected: " <> show other)
+
+testClassifyFullMissing :: IO ()
+testClassifyFullMissing =
+  withSystemTempDirectory "mndz-classify-full-" $ \tmp -> do
+    let key = PackageKey "dev-util/crush"
+        pn = "crush"
+        pv = parseEbuildVersion "0.84.0"
+        ops = fakeReleaseOps (pure (Right Nothing))
+    result <-
+      classifyPackageUnits
+        ops
+        "owner"
+        "repo"
+        tmp
+        key
+        pn
+        (mkDepsWork (Go Nothing) [pv])
+    case result of
+      ClassifyOk _ [u] -> assertEq "full go" FullGo (cpuClass u)
+      other -> fail ("unexpected: " <> show other)
+
+testClassifyProbeError :: IO ()
+testClassifyProbeError =
+  withSystemTempDirectory "mndz-classify-err-" $ \tmp -> do
+    let key = PackageKey "dev-util/crush"
+        pn = "crush"
+        pv = parseEbuildVersion "0.84.0"
+        ops = fakeReleaseOps (pure (Left "network boom"))
+    result <-
+      classifyPackageUnits
+        ops
+        "owner"
+        "repo"
+        tmp
+        key
+        pn
+        (mkDepsWork (Go Nothing) [pv])
+    case result of
+      ClassifyHardFail k msg -> do
+        assertEq "key" key k
+        assertTrue "mentions lookup" ("release asset lookup failed" `T.isInfixOf` msg)
+      other -> fail ("unexpected: " <> show other)
+
+-- | Free space for one needs-work unit passes; full-inventory estimate would fail.
+testGateNeedsWorkOnly :: IO ()
+testGateNeedsWorkOnly = do
+  let oneNeed = estimateNeedBytes FullGo (Just (100 * 1024 * 1024))
+      needsWorkUnits =
+        [UnitDiskPlan (PackageKey "dev-util/crush") FullGo oneNeed 0]
+      inventoryUnits =
+        needsWorkUnits
+          <> [ UnitDiskPlan (PackageKey ("dev-util/pkg" <> T.pack (show n))) FullGo oneNeed 0
+             | n <- [1 .. 5 :: Int]
+             ]
+      free = oneNeed + (10 * 1024 * 1024) -- fits one, not six concurrent
+  case evaluateDiskFeasibility
+    6
+    "/tmp"
+    free
+    1
+    "/cache/dist"
+    (100 * giB)
+    2
+    False
+    Nothing
+    needsWorkUnits of
+    Left err -> fail ("needs-work should pass: " <> T.unpack err)
+    Right _ -> pure ()
+  case evaluateDiskFeasibility
+    6
+    "/tmp"
+    free
+    1
+    "/cache/dist"
+    (100 * giB)
+    2
+    False
+    Nothing
+    inventoryUnits of
+    Left _ -> pure ()
+    Right _ -> fail "full inventory should fail concurrent sum"

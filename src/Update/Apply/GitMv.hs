@@ -3,6 +3,7 @@
 -- | GitMvAndManifest apply path and md5-cache gate before mutation.
 module Update.Apply.GitMv
   ( applyGitMv,
+    applyGitMvWithRemote,
     requirePackageMd5Cache,
     newEbuildFileName,
   )
@@ -67,7 +68,6 @@ applyGitMv ::
   IO ApplyOutcome
 applyGitMv env overlayRoot entry src = do
   let key = peKey entry
-      local = peLocal entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
       pn = pePN entry
@@ -91,40 +91,57 @@ applyGitMv env overlayRoot entry src = do
   case fetched of
     Left err ->
       pure $ ApplyHardFail key ("fetch failed: " <> err) False False
-    Right remote ->
-      case comparePV local remote of
-        Just LT -> do
-          mhStatus mh key "applying"
-          outcome <- gitMvDo env key local remote oldPath pkgDir pn overlayRoot
-          case outcome of
-            ApplySuccess {} -> do
-              fp' <- computeFingerprintFromDir src pkgDir pn
-              storeLatest cache key fp' remote
-            _ -> pure ()
-          pure outcome
-        Just EQ ->
-          pure $ ApplySoftSkip key "already at latest upstream version"
-        Just GT ->
-          pure $
-            ApplySoftSkip
-              key
-              ( "local version is ahead of upstream ("
-                  <> prettyVersion local
-                  <> " > "
-                  <> prettyVersion remote
-                  <> ")"
-              )
-        Nothing ->
-          pure $
-            ApplyHardFail
-              key
-              ( "incomparable versions: local="
-                  <> T.pack (show local)
-                  <> " remote="
-                  <> T.pack (show remote)
-              )
-              False
-              False
+    Right remote -> applyGitMvWithRemote env overlayRoot entry src remote
+
+-- | Mutate using a plan-phase remote version (skip re-fetch).
+applyGitMvWithRemote ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  UpdateSource ->
+  EbuildVersion ->
+  IO ApplyOutcome
+applyGitMvWithRemote env overlayRoot entry src remote = do
+  let key = peKey entry
+      local = peLocal entry
+      oldPath = pePath entry
+      pkgDir = takeDirectory oldPath
+      pn = pePN entry
+      mh = aeMulti env
+      cache = aeCheckCache env
+  case comparePV local remote of
+    Just LT -> do
+      mhStatus mh key "applying"
+      outcome <- gitMvDo env key local remote oldPath pkgDir pn overlayRoot
+      case outcome of
+        ApplySuccess {} -> do
+          fp' <- computeFingerprintFromDir src pkgDir pn
+          storeLatest cache key fp' remote
+        _ -> pure ()
+      pure outcome
+    Just EQ ->
+      pure $ ApplySoftSkip key "already at latest upstream version"
+    Just GT ->
+      pure $
+        ApplySoftSkip
+          key
+          ( "local version is ahead of upstream ("
+              <> prettyVersion local
+              <> " > "
+              <> prettyVersion remote
+              <> ")"
+          )
+    Nothing ->
+      pure $
+        ApplyHardFail
+          key
+          ( "incomparable versions: local="
+              <> T.pack (show local)
+              <> " remote="
+              <> T.pack (show remote)
+          )
+          False
+          False
 
 gitMvDo ::
   ApplyEnv ->

@@ -8,6 +8,7 @@ module Update.Check
     checkOverlayWithDepsPlan,
     checkPackage,
     checkPackageDeps,
+    contentFixPVs,
     productionFetcherWithToken,
     statusFromCompare,
     renderPVNoRev,

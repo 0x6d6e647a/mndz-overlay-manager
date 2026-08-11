@@ -63,12 +63,7 @@ import Overlay.Discovery
   )
 import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Validation (validateOverlay)
-import Overlay.Version
-  ( EbuildVersion (..),
-    comparePV,
-    parseEbuildVersion,
-    prettyVersion,
-  )
+import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, prettyVersion)
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
 import System.Exit (exitFailure)
 import System.FilePath (takeDirectory, (</>))
@@ -79,7 +74,11 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
 import Update.Apply
   ( ApplyEnv (..),
+    ClassifiedPvUnit (..),
+    ClassifyPackageResult (..),
     EbuildRunner,
+    PackagePlanResult (..),
+    PlannedWork (..),
     applyPackagePhase1Tracked,
     foldExitHardFail,
   )
@@ -123,6 +122,7 @@ import Update.Cargo.Msrv
   )
 import Update.Check (PackageEntry (..), groupNewest)
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
+import Update.DiskSpace (MaterializeClass (..))
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
     ebuildHasDevLangGoBdepend,
@@ -146,34 +146,7 @@ import Update.EbuildEdit
 import Update.Engines (parseEnginesMinimum)
 import Update.Git (GitOps (..))
 import Update.GitHub (stripAndParse)
-import Update.Go.Lanes
-  ( GapLine (..),
-    LaneId (..),
-    LaneTarget (..),
-    PlanError (..),
-    PlannedEbuild (..),
-    RuntimeLanePlan (..),
-    VersionCandidate (..),
-    assembleKeywords,
-    buildGapLines,
-    collapsePlannedEbuilds,
-    extrasToDelete,
-    filterCandidateVersions,
-    laneLabel,
-    laneLabelWith,
-    ltLane,
-    maxVersionUnder,
-    missingTargets,
-    planErrorMessage,
-    planFromTargets,
-    planNeedsWork,
-    selectAllLaneTargets,
-    zeroPlannedPVsError,
-    pattern LaneAmd64Plain,
-    pattern LaneAmd64Tilde,
-    pattern LaneArm64Plain,
-    pattern LaneArm64Tilde,
-  )
+import Update.Go.Lanes (GapLine (..), LaneId (..), LaneTarget (..), PlanError (..), PlannedEbuild (..), RuntimeLanePlan (..), VersionCandidate (..), assembleKeywords, buildGapLines, collapsePlannedEbuilds, extrasToDelete, filterCandidateVersions, laneLabel, laneLabelWith, ltLane, maxVersionUnder, missingTargets, planErrorMessage, planFromTargets, planNeedsWork, selectAllLaneTargets, zeroPlannedPVsError, pattern LaneAmd64Plain, pattern LaneAmd64Tilde, pattern LaneArm64Plain, pattern LaneArm64Tilde)
 import Update.Go.ModFetch (GoModKey (..), withGoModCache)
 import Update.Go.Plan
   ( PlanOps (..),
@@ -230,6 +203,7 @@ import Update.Md5Cache
 import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight
   ( AssetsPreflight (..),
+    assetsPreflightFromPlan,
     assetsRequiredTools,
     bunRequiredTools,
     cargoFetcherTools,
@@ -291,7 +265,10 @@ tests =
       testCase "Check Tools Multiple Missing" testCheckToolsMultipleMissing,
       testCase "Validate Assets Path" testValidateAssetsPath,
       testCase "Preflight Update Tools" testPreflightUpdateTools,
-      testCase "Strip Surrounding Quotes" testStripSurroundingQuotes
+      testCase "Strip Surrounding Quotes" testStripSurroundingQuotes,
+      testCase "Assets preflight bare binary needs-work skips go" testAssetsPfBinaryOnly,
+      testCase "Assets preflight reuse-only Go skips go" testAssetsPfReuseOnlyGo,
+      testCase "Assets preflight cargo needs-work requires cargo tools" testAssetsPfCargo
     ]
 
 testPreflightMissingTools :: IO ()
@@ -446,3 +423,86 @@ testStripSurroundingQuotes = do
   assertEq "single char" "x" (stripSurroundingQuotes "x")
   assertEq "empty double pair" "" (stripSurroundingQuotes "\"\"")
   assertEq "inner quotes kept" "he\"llo" (stripSurroundingQuotes "\"he\"llo\"")
+
+emptyDepsPlan :: RuntimeLanePlan
+emptyDepsPlan = planFromTargets []
+
+-- | Up-to-date Go inventory + binary needs work → no go.
+testAssetsPfBinaryOnly :: IO ()
+testAssetsPfBinaryOnly = do
+  let plans =
+        [ PlanSoftSkip (PackageKey "dev-util/crush") "already matches runtime-lane plan",
+          PlanNeedsWork
+            (PackageKey "dev-util/grok-build-bin")
+            (PlannedGitMv (parseEbuildVersion "1.2.3"))
+        ]
+      classify = [ClassifyOk (PackageKey "dev-util/crush") []]
+      pf = assetsPreflightFromPlan plans classify
+  assertEq "no assets" False (apNeedAssets pf)
+  assertEq "no go" False (apNeedGo pf)
+  assertEq "no cargo" False (apNeedCargo pf)
+
+testAssetsPfReuseOnlyGo :: IO ()
+testAssetsPfReuseOnlyGo = do
+  let key = PackageKey "dev-util/crush"
+      pv = parseEbuildVersion "0.84.0"
+      plans =
+        [ PlanNeedsWork
+            key
+            PlannedDeps
+              { pdEco = Go Nothing,
+                pdSource = GitHub "o" "r" "v",
+                pdPlan = emptyDepsPlan,
+                pdLocalPVs = [],
+                pdContentFix = [pv]
+              }
+        ]
+      classify =
+        [ ClassifyOk
+            key
+            [ ClassifiedPvUnit
+                { cpuKey = key,
+                  cpuPN = "crush",
+                  cpuPV = pv,
+                  cpuEco = Go Nothing,
+                  cpuClass = ReusePath,
+                  cpuTempBaseline = Just (10 * 1024 * 1024)
+                }
+            ]
+        ]
+      pf = assetsPreflightFromPlan plans classify
+  assertEq "assets needed" True (apNeedAssets pf)
+  assertEq "reuse-only no go" False (apNeedGo pf)
+
+testAssetsPfCargo :: IO ()
+testAssetsPfCargo = do
+  let key = PackageKey "dev-util/mise"
+      pv = parseEbuildVersion "2025.1.0"
+      plans =
+        [ PlanNeedsWork
+            key
+            PlannedDeps
+              { pdEco = Cargo Nothing Nothing,
+                pdSource = GitHub "o" "r" "v",
+                pdPlan = emptyDepsPlan,
+                pdLocalPVs = [],
+                pdContentFix = [pv]
+              }
+        ]
+      classify =
+        [ ClassifyOk
+            key
+            [ ClassifiedPvUnit
+                { cpuKey = key,
+                  cpuPN = "mise",
+                  cpuPV = pv,
+                  cpuEco = Cargo Nothing Nothing,
+                  cpuClass = ReusePath,
+                  cpuTempBaseline = Just (5 * 1024 * 1024)
+                }
+            ]
+        ]
+      pf = assetsPreflightFromPlan plans classify
+  assertEq "assets" True (apNeedAssets pf)
+  assertEq "cargo P1 even reuse" True (apNeedCargo pf)
+  assertEq "no go" False (apNeedGo pf)

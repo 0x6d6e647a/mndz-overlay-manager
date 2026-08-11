@@ -119,6 +119,7 @@ library
       , Update.Runtime.Ceilings
       , Update.Sbcl.Deps
       , Update.SshAgent
+      , Update.Spine
       , Update.Targets
       , Update.TempWorkspace
       , Update.TextUtil
@@ -131,6 +132,7 @@ library
       , Update.Apply.GitMv
       , Update.Apply.Materialize
       , Update.Apply.OverlayWrite
+      , Update.Apply.Plan
       , Update.Cargo.Lock
       , Update.DiskSpace.StatVfs
 

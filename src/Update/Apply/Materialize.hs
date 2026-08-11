@@ -4,6 +4,7 @@
 -- | DepsAndAssets materialize: plan, distfile, reuse/full publish, step budgets.
 module Update.Apply.Materialize
   ( applyDepsAndAssets,
+    applyDepsAndAssetsFromPlan,
     contentFixNeeded,
     goPublishAndOverlay,
     markSuccessLinesReused,
@@ -219,31 +220,68 @@ applyDepsAndAssets env overlayRoot entry src eco = do
       contentFix <- contentFixNeededEnv env eco src pkgDir pn key plan
       if not (planNeedsWork localPVs contentFix plan)
         then pure [ApplySoftSkip key "already matches runtime-lane plan"]
-        else do
-          cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
-          case cacheGate of
-            Left unitErr -> pure [applyUnitHardFail key unitErr False False]
-            Right () -> do
-              planDone <- readIORef planDoneRef
-              outcomes <-
-                materializeDepsPlan
-                  env
-                  overlayRoot
-                  entry
-                  src
-                  eco
-                  plan
-                  localPVs
-                  contentFix
-                  planDone
-              -- Rewrite fingerprint after any successful apply unit.
-              when (any isApplySuccess outcomes) $ do
-                fp' <- computeFingerprintFromDir src pkgDir pn
-                storeDeps cache key fp' plan
-              pure outcomes
-  where
-    isApplySuccess ApplySuccess {} = True
-    isApplySuccess _ = False
+        else
+          applyDepsAndAssetsFromPlan
+            env
+            overlayRoot
+            entry
+            src
+            eco
+            plan
+            localPVs
+            contentFix
+            =<< readIORef planDoneRef
+
+-- | Mutate using a plan-phase result (skip re-plan / re-content-fix).
+applyDepsAndAssetsFromPlan ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  UpdateSource ->
+  EcosystemSpec ->
+  RuntimeLanePlan ->
+  [EbuildVersion] ->
+  [EbuildVersion] ->
+  Int ->
+  IO [ApplyOutcome]
+applyDepsAndAssetsFromPlan
+  env
+  overlayRoot
+  entry
+  src
+  eco
+  plan
+  localPVs
+  contentFix
+  planDone = do
+    let key = peKey entry
+        pkgDir = takeDirectory (pePath entry)
+        pn = pePN entry
+    if not (planNeedsWork localPVs contentFix plan)
+      then pure [ApplySoftSkip key "already matches runtime-lane plan"]
+      else do
+        cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
+        case cacheGate of
+          Left unitErr -> pure [applyUnitHardFail key unitErr False False]
+          Right () -> do
+            outcomes <-
+              materializeDepsPlan
+                env
+                overlayRoot
+                entry
+                src
+                eco
+                plan
+                localPVs
+                contentFix
+                planDone
+            when (any isApplySuccess outcomes) $ do
+              fp' <- computeFingerprintFromDir src pkgDir pn
+              storeDeps (aeCheckCache env) key fp' plan
+            pure outcomes
+    where
+      isApplySuccess ApplySuccess {} = True
+      isApplySuccess _ = False
 
 -- | Planning progress during update apply (same 3-step model as outdated).
 depsApplyPlanProgress ::
