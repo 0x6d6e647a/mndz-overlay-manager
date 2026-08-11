@@ -478,13 +478,13 @@ testParserPureCommands = do
     Just opts ->
       assertEq
         "outdated targets"
-        (Just (CLI.Outdated ["dev-lang/go", "mise"]))
+        (Just (CLI.Outdated {CLI.outdatedRefresh = False, CLI.outdatedTargets = ["dev-lang/go", "mise"]}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse outdated failed"
       exitFailure
   case parse ["update"] of
-    Just opts -> assertEq "update all" (Just (CLI.Update [])) (optCommand opts)
+    Just opts -> assertEq "update all" (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = []})) (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update failed"
       exitFailure
@@ -492,7 +492,7 @@ testParserPureCommands = do
     Just opts ->
       assertEq
         "update one"
-        (Just (CLI.Update ["dev-util/hk"]))
+        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["dev-util/hk"]}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update target failed"
@@ -589,7 +589,7 @@ testParserResidualEdges = do
       hPutStrLn stderr $ "expected invalid log-level failure, got " <> show opts
       exitFailure
   case parse ["outdated"] of
-    Just opts -> assertEq "outdated all" (Just (CLI.Outdated [])) (optCommand opts)
+    Just opts -> assertEq "outdated all" (Just (CLI.Outdated {CLI.outdatedRefresh = False, CLI.outdatedTargets = []})) (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse outdated bare failed"
       exitFailure
@@ -606,10 +606,28 @@ testParserResidualEdges = do
     Just opts ->
       assertEq
         "update multi"
-        (Just (CLI.Update ["a/b", "c/d"]))
+        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["a/b", "c/d"]}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update multi failed"
+      exitFailure
+  case parse ["outdated", "--refresh", "crush"] of
+    Just opts ->
+      assertEq
+        "outdated refresh"
+        (Just (CLI.Outdated {CLI.outdatedRefresh = True, CLI.outdatedTargets = ["crush"]}))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse outdated --refresh failed"
+      exitFailure
+  case parse ["update", "--refresh"] of
+    Just opts ->
+      assertEq
+        "update refresh"
+        (Just (CLI.Update {CLI.updateRefresh = True, CLI.updateTargets = []}))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse update --refresh failed"
       exitFailure
 
 -- | Top-level and @eclean --help@ catalog manager distfiles surfaces.
@@ -630,6 +648,29 @@ testHelpCatalogDistfiles = do
       exitFailure
     CompletionInvoked _ -> do
       hPutStrLn stderr "expected eclean --help Failure, got CompletionInvoked"
+      exitFailure
+  case execParserPure defaultPrefs parserInfo ["outdated", "--help"] of
+    Failure failure -> do
+      let (msg, _) = renderFailure failure "mndz-overlay-manager"
+      assertTrue "outdated help mentions refresh" ("refresh" `isInfixOf` msg)
+      assertTrue
+        "outdated help does not claim no local flags"
+        (not ("No subcommand-local flags" `isInfixOf` msg))
+    Success _ -> do
+      hPutStrLn stderr "expected outdated --help Failure, got Success"
+      exitFailure
+    CompletionInvoked _ -> do
+      hPutStrLn stderr "expected outdated --help Failure, got CompletionInvoked"
+      exitFailure
+  case execParserPure defaultPrefs parserInfo ["update", "--help"] of
+    Failure failure -> do
+      let (msg, _) = renderFailure failure "mndz-overlay-manager"
+      assertTrue "update help mentions refresh" ("refresh" `isInfixOf` msg)
+    Success _ -> do
+      hPutStrLn stderr "expected update --help Failure, got Success"
+      exitFailure
+    CompletionInvoked _ -> do
+      hPutStrLn stderr "expected update --help Failure, got CompletionInvoked"
       exitFailure
 
 testShowTopLevelHelpExit1 :: IO ()

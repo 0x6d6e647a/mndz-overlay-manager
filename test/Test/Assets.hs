@@ -33,7 +33,7 @@ import CLI.Progress
 import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
 import Config.Loader (ConfigError (..), loadConfig)
-import Config.Types (OverlayConfig (..))
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
@@ -372,7 +372,8 @@ testTokenResolverIO = do
           { overlayPath = "/tmp/ov",
             assetsPath = Nothing,
             githubToken = Just "from-config",
-            distfilesPath = Nothing
+            distfilesPath = Nothing,
+            checkCacheTtl = defaultCheckCacheTtl
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "config only" (Just "from-config") =<< resolveGitHubToken cfg
@@ -387,7 +388,8 @@ testTokenResolverIO = do
           { overlayPath = "/tmp/ov",
             assetsPath = Nothing,
             githubToken = Nothing,
-            distfilesPath = Nothing
+            distfilesPath = Nothing,
+            checkCacheTtl = defaultCheckCacheTtl
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "none" Nothing =<< resolveGitHubToken cfgNoTok

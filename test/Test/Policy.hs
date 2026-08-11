@@ -33,7 +33,7 @@ import CLI.Progress
 import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
 import Config.Loader (ConfigError (..), loadConfig)
-import Config.Types (OverlayConfig (..))
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
@@ -134,6 +134,7 @@ import Update.Check
     groupNewest,
     statusFromCompare,
   )
+import Update.CheckCache (openCheckCache)
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
@@ -467,11 +468,12 @@ testCheckPackageProductStatuses = do
       fetchAhead _ = pure (Right (parseEbuildVersion "1.5.0"))
       fetchFail _ = pure (Left "network down")
       fetchUnused _ = pure (Left "should not fetch")
-  outdated <- checkPackage fetchOutdated (mk "dev-lang" "deno-bin" "2.1.6")
-  ok <- checkPackage fetchOk (mk "dev-lang" "deno-bin" "1.0.0")
-  ahead <- checkPackage fetchAhead (mk "dev-lang" "bun-bin" "2.0.0")
-  unconf <- checkPackage fetchUnused (mk "dev-lang" "haskell" "9.6.1")
-  err <- checkPackage fetchFail (mk "dev-lang" "deno-bin" "1.0.0")
+  (cache, _) <- openCheckCache CacheDisabled False "/tmp"
+  outdated <- checkPackage fetchOutdated cache (mk "dev-lang" "deno-bin" "2.1.6") []
+  ok <- checkPackage fetchOk cache (mk "dev-lang" "deno-bin" "1.0.0") []
+  ahead <- checkPackage fetchAhead cache (mk "dev-lang" "bun-bin" "2.0.0") []
+  unconf <- checkPackage fetchUnused cache (mk "dev-lang" "haskell" "9.6.1") []
+  err <- checkPackage fetchFail cache (mk "dev-lang" "deno-bin" "1.0.0") []
   let statuses = map reportStatus [outdated, ok, ahead, unconf, err]
   assertTrue "has outdated" (any isOutdated statuses)
   assertTrue "has ok" (any isOk statuses)

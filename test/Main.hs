@@ -3,6 +3,7 @@ module Main (main) where
 import Test.Apply qualified as Apply
 import Test.Assets qualified as Assets
 import Test.CLI qualified as CLI
+import Test.CheckCache qualified as CheckCache
 import Test.CheckPlan qualified as CheckPlan
 import Test.Config qualified as Config
 import Test.DiskSpace qualified as DiskSpace
@@ -47,6 +48,7 @@ main =
           "Unit"
           [ Overlay.tests,
             Config.tests,
+            CheckCache.tests,
             Distfiles.tests,
             DiskSpace.tests,
             TempWorkspace.tests,

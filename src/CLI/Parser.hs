@@ -34,8 +34,14 @@ data ColorMode
 
 data Command
   = List
-  | Outdated [String]
-  | Update [String]
+  | Outdated
+      { outdatedRefresh :: Bool,
+        outdatedTargets :: [String]
+      }
+  | Update
+      { updateRefresh :: Bool,
+        updateTargets :: [String]
+      }
   | Gencache
       { gencacheTargets :: [String],
         gencacheForce :: Bool
@@ -159,10 +165,20 @@ distfilesPathParser =
             \mndz/overlay-manager/distfiles)"
       )
 
+refreshParser :: Parser Bool
+refreshParser =
+  switch
+    ( long "refresh"
+        <> help
+          "Ignore check-cache entries and perform live upstream check/plan \
+          \(writes fresh cache entries when caching is enabled)"
+    )
+
 updateParser :: Parser Command
 updateParser =
   Update
-    <$> many
+    <$> refreshParser
+    <*> many
       ( strArgument
           ( metavar "PACKAGE..."
               <> help
@@ -206,7 +222,8 @@ listInfo =
 outdatedParser :: Parser Command
 outdatedParser =
   Outdated
-    <$> many
+    <$> refreshParser
+    <*> many
       ( strArgument
           ( metavar "PACKAGE..."
               <> help
@@ -225,8 +242,9 @@ outdatedInfo =
           ( "Check discovered packages against their update sources and print \
             \outdated lines to stdout. PACKAGE may be category/package or an \
             \unambiguous package name. With no PACKAGE arguments, check all \
-            \discovered packages. Empty inventory is an error. No \
-            \subcommand-local flags. "
+            \discovered packages. Empty inventory is an error. Successful checks \
+            \are cached briefly (see check-cache-ttl); use --refresh to force \
+            \live network checks. "
               <> globalsFooter
           )
     )
@@ -242,7 +260,8 @@ updateInfo =
             \for packages that need work. PACKAGE may be category/package or an \
             \unambiguous package name. With no PACKAGE arguments, update all \
             \packages that need work (outdated non-Go packages and Go packages \
-            \with tree-lane gaps). "
+            \with tree-lane gaps). Uses the shared check cache when valid; \
+            \--refresh forces live fetch/plan. "
               <> globalsFooter
           )
     )

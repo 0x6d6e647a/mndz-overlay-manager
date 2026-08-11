@@ -33,7 +33,7 @@ import CLI.Progress
 import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
 import Config.Loader (ConfigError (..), configErrorMessage, loadConfig)
-import Config.Types (OverlayConfig (..))
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, parseCheckCacheTtl)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
@@ -280,7 +280,10 @@ tests =
       testCase "Config Legacy Keys Rejected" testConfigLegacyKeysRejected,
       testCase "Config Error Messages" testConfigErrorMessages,
       testCase "Config Default Path Via XDG" testConfigDefaultPathViaXdg,
-      testCase "Config Load Invalid Toml" testConfigLoadInvalidToml
+      testCase "Config Load Invalid Toml" testConfigLoadInvalidToml,
+      testCase "Parse Check Cache TTL" testParseCheckCacheTtl,
+      testCase "Config Check Cache TTL Zero" testConfigCheckCacheTtlZero,
+      testCase "Config Check Cache TTL Invalid" testConfigCheckCacheTtlInvalid
     ]
 
 testConfigLoadSuccess :: IO ()
@@ -290,6 +293,7 @@ testConfigLoadSuccess = do
   assertEq "assets optional absent" Nothing (assetsPath cfg)
   assertEq "token optional absent" Nothing (githubToken cfg)
   assertEq "distfiles optional absent" Nothing (distfilesPath cfg)
+  assertEq "check-cache-ttl default" defaultCheckCacheTtl (checkCacheTtl cfg)
 
 testConfigOptionalKeys :: IO ()
 testConfigOptionalKeys = do
@@ -298,6 +302,7 @@ testConfigOptionalKeys = do
   assertEq "assets" (Just "/tmp/assets") (assetsPath cfg)
   assertEq "token" (Just "secret-token") (githubToken cfg)
   assertEq "distfiles" (Just "/tmp/distfiles") (distfilesPath cfg)
+  assertEq "check-cache-ttl 1h" (CacheTtl (60 * 60)) (checkCacheTtl cfg)
 
 testConfigLoadMissing :: IO ()
 testConfigLoadMissing = do
@@ -390,3 +395,38 @@ withEnvVar key mVal action = do
         Nothing -> unsetEnv key
         Just v -> setEnv key v
   bracket_ install restore action
+
+testParseCheckCacheTtl :: IO ()
+testParseCheckCacheTtl = do
+  assertEq "5m" (Right (CacheTtl (5 * 60))) (parseCheckCacheTtl "5m")
+  assertEq "30s" (Right (CacheTtl 30)) (parseCheckCacheTtl "30s")
+  assertEq "1H" (Right (CacheTtl (60 * 60))) (parseCheckCacheTtl "1H")
+  assertEq "2d" (Right (CacheTtl (2 * 24 * 60 * 60))) (parseCheckCacheTtl "2d")
+  assertEq "0" (Right CacheDisabled) (parseCheckCacheTtl "0")
+  assertEq "0s" (Right CacheDisabled) (parseCheckCacheTtl "0s")
+  assertEq "0m" (Right CacheDisabled) (parseCheckCacheTtl "0m")
+  assertTrue "bare 5 rejected" (case parseCheckCacheTtl "5" of Left _ -> True; Right _ -> False)
+  assertTrue "multi rejected" (case parseCheckCacheTtl "1h30m" of Left _ -> True; Right _ -> False)
+  assertTrue "empty rejected" (case parseCheckCacheTtl "" of Left _ -> True; Right _ -> False)
+  assertTrue "unknown unit" (case parseCheckCacheTtl "3w" of Left _ -> True; Right _ -> False)
+
+testConfigCheckCacheTtlZero :: IO ()
+testConfigCheckCacheTtlZero =
+  withSystemTempDirectory "om-cache-ttl0" $ \tmp -> do
+    let path = tmp </> "c.toml"
+    TIO.writeFile path "overlay-path = \"/tmp/ov\"\ncheck-cache-ttl = \"0s\"\n"
+    cfg <- assertRight "zero ttl" =<< loadConfig (Just path)
+    assertEq "disabled" CacheDisabled (checkCacheTtl cfg)
+
+testConfigCheckCacheTtlInvalid :: IO ()
+testConfigCheckCacheTtlInvalid =
+  withSystemTempDirectory "om-cache-ttl-bad" $ \tmp -> do
+    let path = tmp </> "c.toml"
+    TIO.writeFile path "overlay-path = \"/tmp/ov\"\ncheck-cache-ttl = \"1h30m\"\n"
+    err <- assertLeft "invalid ttl" =<< loadConfig (Just path)
+    case err of
+      DecodeError msg ->
+        assertTrue "non-empty decode error" (not (null msg))
+      other -> do
+        hPutStrLn stderr $ "expected DecodeError, got " <> show other
+        exitFailure

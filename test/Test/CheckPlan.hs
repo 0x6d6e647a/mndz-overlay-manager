@@ -6,6 +6,7 @@ module Test.CheckPlan (unitTests, integrationTests) where
 
 import CLI.Jobs (newWorkBudget)
 import CLI.Progress (noopMultiHandle)
+import Config.Types (CheckCacheTtl (..))
 import Control.Concurrent.MVar (newMVar)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -26,6 +27,7 @@ import Update.Check
     checkPackage,
     checkPackageDeps,
   )
+import Update.CheckCache (CheckCacheHandle, openCheckCache)
 import Update.Deps.Plan
   ( DepsPlanOps (..),
     planDepsPackageWithProgress,
@@ -192,6 +194,9 @@ isOutdated :: UpdateStatus -> Bool
 isOutdated (Outdated _) = True
 isOutdated _ = False
 
+disabledCache :: IO CheckCacheHandle
+disabledCache = fst <$> openCheckCache CacheDisabled False "/tmp"
+
 ------------------------------------------------------------------------
 -- checkPackage (GitMvAndManifest / resolveSource path)
 ------------------------------------------------------------------------
@@ -201,7 +206,8 @@ testCheckPackageOutdated :: IO ()
 testCheckPackageOutdated = do
   let e = entry "dev-lang" "deno-bin" "0.1.0"
       fetch _ = pure (Right (parseEbuildVersion "0.2.0"))
-  report <- checkPackage fetch e
+  cache <- disabledCache
+  report <- checkPackage fetch cache e []
   case reportStatus report of
     Outdated [line] -> do
       assertEq "from" (parseEbuildVersion "0.1.0") (olFrom line)
@@ -212,7 +218,8 @@ testCheckPackageOk :: IO ()
 testCheckPackageOk = do
   let e = entry "dev-lang" "deno-bin" "1.0.0"
       fetch _ = pure (Right (parseEbuildVersion "1.0.0"))
-  report <- checkPackage fetch e
+  cache <- disabledCache
+  report <- checkPackage fetch cache e []
   case reportStatus report of
     Ok v -> assertEq "ok" (parseEbuildVersion "1.0.0") v
     other -> assertFailure $ "expected Ok, got " <> show other
@@ -221,7 +228,8 @@ testCheckPackageAhead :: IO ()
 testCheckPackageAhead = do
   let e = entry "dev-lang" "bun-bin" "2.0.0"
       fetch _ = pure (Right (parseEbuildVersion "1.5.0"))
-  report <- checkPackage fetch e
+  cache <- disabledCache
+  report <- checkPackage fetch cache e []
   case reportStatus report of
     Ahead local remote -> do
       assertEq "local" (parseEbuildVersion "2.0.0") local
@@ -232,7 +240,8 @@ testCheckPackageFetchError :: IO ()
 testCheckPackageFetchError = do
   let e = entry "dev-lang" "deno-bin" "1.0.0"
       fetch _ = pure (Left "network down")
-  report <- checkPackage fetch e
+  cache <- disabledCache
+  report <- checkPackage fetch cache e []
   case reportStatus report of
     FetchError msg -> assertTrue "error text" ("network down" `T.isInfixOf` msg)
     other -> assertFailure $ "expected FetchError, got " <> show other
@@ -241,7 +250,8 @@ testCheckPackageUnconfigured :: IO ()
 testCheckPackageUnconfigured = do
   let e = entry "dev-lang" "haskell" "9.6.1"
       fetch _ = pure (Left "should not be called")
-  report <- checkPackage fetch e
+  cache <- disabledCache
+  report <- checkPackage fetch cache e []
   assertEq "unconfigured" Unconfigured (reportStatus report)
 
 ------------------------------------------------------------------------
@@ -272,8 +282,9 @@ testCheckPackageDepsGoOutdated = do
         [ Ebuild "dev-util" "beads" "0.80.0" (pePath e)
         ]
       src = GitHub "gastownhall" "beads" "v"
+  cache <- disabledCache
   report <-
-    checkPackageDeps noopMultiHandle ops e locals src (Go Nothing)
+    checkPackageDeps noopMultiHandle ops cache e locals src (Go Nothing)
   assertTrue "outdated gaps" (isOutdated (reportStatus report))
   assertEq "key" (PackageKey "dev-util/beads") (reportKey report)
 
@@ -302,8 +313,9 @@ testCheckPackageDepsSbclOutdated = do
         [ Ebuild "dev-util" "autolith" "0.17.2" (pePath e)
         ]
       src = GitHub "luciusmagn" "autolith" "v"
+  cache <- disabledCache
   report <-
-    checkPackageDeps noopMultiHandle ops e locals src Sbcl
+    checkPackageDeps noopMultiHandle ops cache e locals src Sbcl
   case reportStatus report of
     Outdated lines_ -> do
       assertTrue "has gaps" (not (null lines_))
@@ -328,8 +340,9 @@ testCheckPackageDepsPlanFail = do
   let e = entry "dev-util" "openspec" "0.1.0"
       locals = [Ebuild "dev-util" "openspec" "0.1.0" (pePath e)]
       src = Npm "@fission-ai/openspec"
+  cache <- disabledCache
   report <-
-    checkPackageDeps noopMultiHandle ops e locals src NpmEco
+    checkPackageDeps noopMultiHandle ops cache e locals src NpmEco
   case reportStatus report of
     FetchError msg ->
       assertTrue
@@ -682,8 +695,9 @@ testCheckOverlayWithDepsPlanMulti = do
             "9.6.1"
             "/tmp/haskell-9.6.1.ebuild"
         ]
+  cache <- disabledCache
   reports <-
-    checkOverlayWithDepsPlan 2 noopMultiHandle fetch ops ebuilds
+    checkOverlayWithDepsPlan 2 noopMultiHandle fetch ops cache ebuilds
   let statuses = map reportStatus reports
   assertEq "four packages" 4 (length reports)
   assertTrue "has outdated" (any isOutdated statuses)
@@ -769,15 +783,16 @@ testContentFixGoReusable =
             }
         locals = [Ebuild "dev-util" pn ver ebuildPath]
         src = GitHub "charmbracelet" "crush" "v"
+    cache <- disabledCache
     report <-
-      checkPackageDeps noopMultiHandle ops e locals src (Go Nothing)
+      checkPackageDeps noopMultiHandle ops cache e locals src (Go Nothing)
     assertContentOnlyReusable "go content-fix" (reportStatus report)
     -- Complete Manifest + good BDEPEND → Ok
     TIO.writeFile
       (pkgDir </> "Manifest")
       "DIST crush-0.84.0-vendor.tar.xz 1 BLAKE2B aa SHA512 abcdef0123456789\n"
     reportOk <-
-      checkPackageDeps noopMultiHandle ops e locals src (Go Nothing)
+      checkPackageDeps noopMultiHandle ops cache e locals src (Go Nothing)
     assertOkStatus "go content ok" (reportStatus reportOk)
 
 -- | Npm: wrong nodejs BDEPEND on present PV → content-only reusable.
@@ -817,8 +832,9 @@ testContentFixNpmReusable =
             }
         locals = [Ebuild "dev-util" pn ver ebuildPath]
         src = Npm "@fission-ai/openspec"
+    cache <- disabledCache
     report <-
-      checkPackageDeps noopMultiHandle ops e locals src NpmEco
+      checkPackageDeps noopMultiHandle ops cache e locals src NpmEco
     assertContentOnlyReusable "npm content-fix" (reportStatus report)
     TIO.writeFile
       ebuildPath
@@ -828,7 +844,7 @@ testContentFixNpmReusable =
           body
       )
     reportOk <-
-      checkPackageDeps noopMultiHandle ops e locals src NpmEco
+      checkPackageDeps noopMultiHandle ops cache e locals src NpmEco
     assertOkStatus "npm content ok" (reportStatus reportOk)
 
 -- | Bun: missing Manifest deps DIST on present PV → content-only reusable.
@@ -866,14 +882,15 @@ testContentFixBunReusable =
             }
         locals = [Ebuild "dev-util" pn ver ebuildPath]
         src = GitHub "subsy" "ralph-tui" "v"
+    cache <- disabledCache
     report <-
-      checkPackageDeps noopMultiHandle ops e locals src Bun
+      checkPackageDeps noopMultiHandle ops cache e locals src Bun
     assertContentOnlyReusable "bun content-fix" (reportStatus report)
     TIO.writeFile
       (pkgDir </> "Manifest")
       "DIST ralph-tui-1.5.0-deps.tar.xz 1 SHA512 deadbeef\n"
     reportOk <-
-      checkPackageDeps noopMultiHandle ops e locals src Bun
+      checkPackageDeps noopMultiHandle ops cache e locals src Bun
     assertOkStatus "bun content ok" (reportStatus reportOk)
 
 -- | Cargo: wrong RUST_MIN_VER on present PV → content-only reusable.
@@ -922,10 +939,12 @@ testContentFixCargoReusable =
             }
         locals = [Ebuild "dev-util" pn ver ebuildPath]
         src = GitHub "jdx" "hk" "v"
+    cache <- disabledCache
     report <-
       checkPackageDeps
         noopMultiHandle
         ops
+        cache
         e
         locals
         src
@@ -936,6 +955,7 @@ testContentFixCargoReusable =
       checkPackageDeps
         noopMultiHandle
         ops
+        cache
         e
         locals
         src

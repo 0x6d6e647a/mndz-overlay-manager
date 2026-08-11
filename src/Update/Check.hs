@@ -29,6 +29,16 @@ import System.Directory (doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 import Update.Assets.Layout (distfileKindForEcosystem, distfileTarballName)
 import Update.Cargo.Msrv (probeRustVersionFromCargoTomls)
+import Update.CheckCache
+  ( CheckCacheHandle,
+    computeFingerprint,
+    lookupDeps,
+    lookupLatest,
+    recordFetch,
+    recordHit,
+    storeDeps,
+    storeLatest,
+  )
 import Update.Deps.Plan
   ( DepsPlanOps (..),
     planDepsPackageWithProgress,
@@ -135,30 +145,32 @@ checkOverlayWithDepsPlan ::
   MultiHandle ->
   Fetcher ->
   DepsPlanOps ->
+  CheckCacheHandle ->
   [Ebuild] ->
   IO [UpdateReport]
-checkOverlayWithDepsPlan jobs mh fetch depsOps ebuilds = do
+checkOverlayWithDepsPlan jobs mh fetch depsOps cache ebuilds = do
   let entries = sortOn (packageKeyText . peKey) (groupNewest ebuilds)
       byPkg = groupByPackage ebuilds
-  mapConcurrentlyN jobs (checkOne mh fetch depsOps byPkg) entries
+  mapConcurrentlyN jobs (checkOne mh fetch depsOps cache byPkg) entries
 
 checkOne ::
   MultiHandle ->
   Fetcher ->
   DepsPlanOps ->
+  CheckCacheHandle ->
   Map.Map PackageKey [Ebuild] ->
   PackageEntry ->
   IO UpdateReport
-checkOne mh fetch depsOps byPkg entry = do
+checkOne mh fetch depsOps cache byPkg entry = do
   let key = peKey entry
   mhStart mh key
   let locals = Map.findWithDefault [] key byPkg
   report <- case lookupPolicy key of
     Just (PackagePolicy src (DepsAndAssets eco)) ->
-      checkPackageDeps mh depsOps entry locals src eco
+      checkPackageDeps mh depsOps cache entry locals src eco
     _ -> do
       mhStatus mh key "fetching"
-      checkPackage fetch entry
+      checkPackage fetch cache entry locals
   case reportStatus report of
     Outdated _ -> mhSuccess mh key
     Ok _ -> mhSuccess mh key
@@ -175,77 +187,130 @@ shortReason t =
         else oneLine
 
 -- | Resolve, fetch, and compare one package (latest-only path).
-checkPackage :: Fetcher -> PackageEntry -> IO UpdateReport
-checkPackage fetch entry = do
+checkPackage ::
+  Fetcher ->
+  CheckCacheHandle ->
+  PackageEntry ->
+  [Ebuild] ->
+  IO UpdateReport
+checkPackage fetch cache entry locals = do
   let key = peKey entry
       local = peLocal entry
   case resolveSource key of
     Nothing ->
       pure UpdateReport {reportKey = key, reportStatus = Unconfigured}
     Just src -> do
-      result <- fetch src
-      pure $ case result of
-        Left err ->
-          UpdateReport {reportKey = key, reportStatus = FetchError err}
-        Right remote ->
-          UpdateReport
-            { reportKey = key,
-              reportStatus = statusFromCompare local remote
-            }
+      let ebuilds =
+            if null locals
+              then
+                [ Ebuild
+                    { ebuildCategory = "",
+                      ebuildPackage = pePN entry,
+                      ebuildVersion = renderPVNoRev (peLocal entry),
+                      ebuildPath = pePath entry
+                    }
+                ]
+              else locals
+      fp <- computeFingerprint src ebuilds
+      mCached <- lookupLatest cache key fp
+      case mCached of
+        Just remote -> do
+          recordHit cache
+          pure
+            UpdateReport
+              { reportKey = key,
+                reportStatus = statusFromCompare local remote
+              }
+        Nothing -> do
+          recordFetch cache
+          result <- fetch src
+          case result of
+            Left err ->
+              pure UpdateReport {reportKey = key, reportStatus = FetchError err}
+            Right remote -> do
+              storeLatest cache key fp remote
+              pure
+                UpdateReport
+                  { reportKey = key,
+                    reportStatus = statusFromCompare local remote
+                  }
 
 -- | Runtime-lane outdated check for DepsAndAssets packages.
 checkPackageDeps ::
   MultiHandle ->
   DepsPlanOps ->
+  CheckCacheHandle ->
   PackageEntry ->
   [Ebuild] ->
   UpdateSource ->
   EcosystemSpec ->
   IO UpdateReport
-checkPackageDeps mh depsOps entry locals src eco = do
+checkPackageDeps mh depsOps cache entry locals src eco = do
   let key = peKey entry
       progress = depsPlanProgress mh key eco
       localPVs = localNonLivePVs locals
-  planResult <-
-    planDepsPackageWithProgress depsOps progress eco src localPVs
-  case planResult of
-    Left err ->
-      pure
-        UpdateReport
-          { reportKey = key,
-            reportStatus = FetchError (planErrorMessage err)
-          }
-    Right plan -> do
-      contentFix <- contentFixPVs depsOps eco src locals plan
-      let missing = missingTargets localPVs plan
-          needsWork = missing <> contentFix
-          gaps =
-            if planNeedsWork localPVs contentFix plan
-              then buildGapLines localPVs needsWork plan
-              else []
-          contentFixSet = contentFix
-          isContentOnly toPV =
-            any (samePV toPV) contentFixSet
-              && not (any (samePV toPV) missing)
-      pure $
-        UpdateReport
-          { reportKey = key,
-            reportStatus =
-              if null gaps
-                then case localPVs of
-                  (v : _) -> Ok v
-                  [] -> Ok (peLocal entry)
-                else
-                  Outdated
-                    [ OutdatedLine
-                        { olFrom = glFrom g,
-                          olTo = glTo g,
-                          olLabel = Just (glLabel g),
-                          olAssetsReusable = isContentOnly (glTo g)
-                        }
-                    | g <- gaps
-                    ]
-          }
+  fp <- computeFingerprint src locals
+  mCached <- lookupDeps cache key fp
+  case mCached of
+    Just plan -> do
+      recordHit cache
+      reportFromDepsPlan depsOps eco src entry locals localPVs plan
+    Nothing -> do
+      recordFetch cache
+      planResult <-
+        planDepsPackageWithProgress depsOps progress eco src localPVs
+      case planResult of
+        Left err ->
+          pure
+            UpdateReport
+              { reportKey = key,
+                reportStatus = FetchError (planErrorMessage err)
+              }
+        Right plan -> do
+          storeDeps cache key fp plan
+          reportFromDepsPlan depsOps eco src entry locals localPVs plan
+
+reportFromDepsPlan ::
+  DepsPlanOps ->
+  EcosystemSpec ->
+  UpdateSource ->
+  PackageEntry ->
+  [Ebuild] ->
+  [EbuildVersion] ->
+  RuntimeLanePlan ->
+  IO UpdateReport
+reportFromDepsPlan depsOps eco src entry locals localPVs plan = do
+  let key = peKey entry
+  contentFix <- contentFixPVs depsOps eco src locals plan
+  let missing = missingTargets localPVs plan
+      needsWork = missing <> contentFix
+      gaps =
+        if planNeedsWork localPVs contentFix plan
+          then buildGapLines localPVs needsWork plan
+          else []
+      contentFixSet = contentFix
+      isContentOnly toPV =
+        any (samePV toPV) contentFixSet
+          && not (any (samePV toPV) missing)
+  pure $
+    UpdateReport
+      { reportKey = key,
+        reportStatus =
+          if null gaps
+            then case localPVs of
+              (v : _) -> Ok v
+              [] -> Ok (peLocal entry)
+            else
+              Outdated
+                [ OutdatedLine
+                    { olFrom = glFrom g,
+                      olTo = glTo g,
+                      olLabel = Just (glLabel g),
+                      olAssetsReusable = isContentOnly (glTo g)
+                    }
+                | g <- gaps
+                ]
+      }
 
 depsPlanProgress :: MultiHandle -> PackageKey -> EcosystemSpec -> PlanProgress
 depsPlanProgress mh key eco =

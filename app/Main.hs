@@ -55,6 +55,11 @@ import Update.Check
     groupNewest,
     productionFetcherWithToken,
   )
+import Update.CheckCache
+  ( cacheSummaryLine,
+    flushCheckCache,
+    openCheckCache,
+  )
 import Update.Deps.Plan (productionDepsPlanOps, toGoPlanOps)
 import Update.DiskSpace
   ( DiskGateOk (..),
@@ -149,8 +154,8 @@ main = do
       usingLoggerT logger $
         case cmd of
           Cmd.List -> runList rt
-          Cmd.Outdated pkgs -> runOutdated rt pkgs
-          Cmd.Update pkgs -> runUpdate rt pkgs
+          Cmd.Outdated refresh pkgs -> runOutdated rt refresh pkgs
+          Cmd.Update refresh pkgs -> runUpdate rt refresh pkgs
           Cmd.Gencache targets force -> runGencache rt targets force
           Cmd.Eclean -> runEclean rt
 
@@ -159,9 +164,10 @@ runList rt = do
   ebuilds <- loadValidatedEbuilds (rtOptions rt)
   liftIO $ mapM_ (T.putStrLn . ebuildAtom) ebuilds
 
-runOutdated :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> m ()
-runOutdated rt pkgArgs = do
-  (cfg, ebuilds) <- loadValidatedEbuildsWithConfig (rtOptions rt)
+runOutdated ::
+  (WithLog env Message m, MonadIO m) => Runtime -> Bool -> [String] -> m ()
+runOutdated rt refresh pkgArgs = do
+  (cfg, overlayResolved, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
   case resolveTargets entries tokens of
@@ -179,15 +185,29 @@ runOutdated rt pkgArgs = do
           total = length selectedEntries
       token <- liftIO (resolveGitHubToken cfg)
       fetch <- liftIO (productionFetcherWithToken token)
-      depsOps <- liftIO (productionDepsPlanOps token (rtJobs rt) (Just (overlayPath cfg)))
+      depsOps <-
+        liftIO (productionDepsPlanOps token (rtJobs rt) (Just overlayResolved))
+      (cache, cacheWarn) <-
+        liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayResolved
+      mapM_ logWarning cacheWarn
       reports <-
         liftIO $
           withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
-            checkOverlayWithDepsPlan (rtJobs rt) mh fetch depsOps filteredEbuilds
+            checkOverlayWithDepsPlan
+              (rtJobs rt)
+              mh
+              fetch
+              depsOps
+              cache
+              filteredEbuilds
+      liftIO (flushCheckCache cache)
+      mSummary <- liftIO (cacheSummaryLine cache)
+      mapM_ logInfo mSummary
       mapM_ emitReport reports
 
-runUpdate :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> m ()
-runUpdate rt pkgArgs = do
+runUpdate ::
+  (WithLog env Message m, MonadIO m) => Runtime -> Bool -> [String] -> m ()
+runUpdate rt refresh pkgArgs = do
   (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
@@ -262,6 +282,9 @@ runUpdate rt pkgArgs = do
       case diskGate of
         Left err -> dieError (T.unpack err)
         Right (DiskGateOk warns) -> mapM_ logWarning warns
+      (cache, cacheWarn) <-
+        liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayPath
+      mapM_ logWarning cacheWarn
       let runApply gpg = do
             assetsLock <- newMVar ()
             overlayLock <- newMVar ()
@@ -301,7 +324,8 @@ runUpdate rt pkgArgs = do
                       aeMulti = noopMultiHandle,
                       aePlanOps = planOps,
                       aeDepsPlanOps = depsOps,
-                      aeTempRun = tempRun
+                      aeTempRun = tempRun,
+                      aeCheckCache = cache
                     }
             applyOverlay (rtProgress rt) env overlayPath entries mFilter
       let pcfg = rtProgress rt
@@ -336,6 +360,9 @@ runUpdate rt pkgArgs = do
                       )
                   else runApply gpg
             )
+      liftIO (flushCheckCache cache)
+      mSummary <- liftIO (cacheSummaryLine cache)
+      mapM_ logInfo mSummary
       case outcomes of
         [ApplyHardFail (PackageKey "") msg _ _] ->
           dieError (T.unpack msg)
@@ -509,14 +536,6 @@ loadValidatedEbuilds ::
 loadValidatedEbuilds opts = do
   (_, _, ebuilds) <- loadValidatedEbuildsFull opts
   pure ebuilds
-
-loadValidatedEbuildsWithConfig ::
-  (WithLog env Message m, MonadIO m) =>
-  Options ->
-  m (OverlayConfig, [Ebuild])
-loadValidatedEbuildsWithConfig opts = do
-  (cfg, _, ebuilds) <- loadValidatedEbuildsFull opts
-  pure (cfg, ebuilds)
 
 loadValidatedEbuildsFull ::
   (WithLog env Message m, MonadIO m) =>

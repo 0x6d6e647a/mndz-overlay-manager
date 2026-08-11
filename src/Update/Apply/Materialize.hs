@@ -96,6 +96,13 @@ import Update.Cargo.Msrv
     probeRustVersionFromCargoTomls,
   )
 import Update.Check (PackageEntry (..))
+import Update.CheckCache
+  ( computeFingerprintFromDir,
+    lookupDeps,
+    recordFetch,
+    recordHit,
+    storeDeps,
+  )
 import Update.Deps.Plan
   ( DepsPlanOps (..),
     planDepsPackageWithProgress,
@@ -176,16 +183,25 @@ applyDepsAndAssets env overlayRoot entry src eco = do
   let key = peKey entry
       mh = aeMulti env
       pkgDir = takeDirectory (pePath entry)
+      cache = aeCheckCache env
+      pn = pePN entry
   planDoneRef <- newIORef (0 :: Int)
   let progress = depsApplyPlanProgress mh key eco planDoneRef
-  localPVs <- listLocalNonLivePVs pkgDir (pePN entry)
-  planResult <-
-    planDepsPackageWithProgress
-      (aeDepsPlanOps env)
-      progress
-      eco
-      src
-      localPVs
+  localPVs <- listLocalNonLivePVs pkgDir pn
+  fp <- computeFingerprintFromDir src pkgDir pn
+  mCached <- lookupDeps cache key fp
+  planResult <- case mCached of
+    Just plan -> do
+      recordHit cache
+      pure (Right plan)
+    Nothing -> do
+      recordFetch cache
+      planDepsPackageWithProgress
+        (aeDepsPlanOps env)
+        progress
+        eco
+        src
+        localPVs
   case planResult of
     Left err ->
       pure
@@ -196,7 +212,11 @@ applyDepsAndAssets env overlayRoot entry src eco = do
             False
         ]
     Right plan -> do
-      contentFix <- contentFixNeededEnv env eco src pkgDir (pePN entry) key plan
+      -- Persist successful live plans; cache hits leave the existing entry.
+      case mCached of
+        Nothing -> storeDeps cache key fp plan
+        Just _ -> pure ()
+      contentFix <- contentFixNeededEnv env eco src pkgDir pn key plan
       if not (planNeedsWork localPVs contentFix plan)
         then pure [ApplySoftSkip key "already matches runtime-lane plan"]
         else do
@@ -205,16 +225,25 @@ applyDepsAndAssets env overlayRoot entry src eco = do
             Left unitErr -> pure [applyUnitHardFail key unitErr False False]
             Right () -> do
               planDone <- readIORef planDoneRef
-              materializeDepsPlan
-                env
-                overlayRoot
-                entry
-                src
-                eco
-                plan
-                localPVs
-                contentFix
-                planDone
+              outcomes <-
+                materializeDepsPlan
+                  env
+                  overlayRoot
+                  entry
+                  src
+                  eco
+                  plan
+                  localPVs
+                  contentFix
+                  planDone
+              -- Rewrite fingerprint after any successful apply unit.
+              when (any isApplySuccess outcomes) $ do
+                fp' <- computeFingerprintFromDir src pkgDir pn
+                storeDeps cache key fp' plan
+              pure outcomes
+  where
+    isApplySuccess ApplySuccess {} = True
+    isApplySuccess _ = False
 
 -- | Planning progress during update apply (same 3-step model as outdated).
 depsApplyPlanProgress ::

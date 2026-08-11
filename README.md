@@ -44,6 +44,7 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 | `assets-path` | no | Git work tree for vendor/deps asset sidecars (required when `update` will publish assets) |
 | `github-token` | no | GitHub API token for authenticated fetch / release publish |
 | `distfiles-path` | no | Private Portage `DISTDIR` for `ebuild … manifest` during `update` (default: XDG cache path below) |
+| `check-cache-ttl` | no | How long successful outdated-check / plan results are reused (human duration, default **5m**). Single unit: `s` / `m` / `h` / `d` (for example `30s`, `5m`, `1h`). **`0` or `0s` disables** the check cache (never read, never write) |
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then `github-token` in the config. Prefer env vars in shared environments; the program never logs the raw token.
 
@@ -65,7 +66,19 @@ overlay-path = "/path/to/mndz-overlay"
 assets-path = "/path/to/mndz-overlay-assets"
 # github-token = "ghp_..."   # optional; prefer GITHUB_TOKEN / GH_TOKEN
 # distfiles-path = "/path/to/private-distfiles"  # optional; default is XDG cache
+# check-cache-ttl = "5m"  # optional; default 5m; use "0s" to disable
 ```
+
+### Check cache (outdated / update)
+
+`outdated` and `update` share an on-disk **check cache** of successful latest-version fetches and DepsAndAssets runtime-lane plans so a common inspect-then-apply workflow does not repeat upstream discovery within the TTL.
+
+Default location (XDG cache):
+
+- `$XDG_CACHE_HOME/mndz/overlay-manager/check-cache/` when `XDG_CACHE_HOME` is set and non-empty
+- otherwise `~/.cache/mndz/overlay-manager/check-cache/`
+
+One JSON file per overlay is named `<friendly>-<hash12>.json` (sanitized overlay directory basename plus a short hash of the absolute overlay path). Entries are invalidated when the package’s local non-live versions, update source, or ebuild/Manifest content change. Use `--refresh` on either command to ignore existing entries for reads and force live network work (fresh entries are still written when caching is enabled).
 
 ## Commands
 
@@ -99,6 +112,8 @@ Compare discovered packages to their configured update sources and report packag
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name (same form as `update` / `gencache`). With no arguments, every discovered package is checked. With one or more targets, only the selected packages are checked.
 
+**Flags:** `--refresh` forces live check/plan work (ignores the check cache for reads).
+
 ```bash
 # All discovered packages
 cabal run mndz-overlay-manager -- outdated
@@ -107,6 +122,9 @@ cabal run mndz-overlay-manager -- -v --jobs 4 outdated
 # One or more packages
 cabal run mndz-overlay-manager -- outdated dev-util/crush
 cabal run mndz-overlay-manager -- outdated crush dolt
+
+# Force live network checks
+cabal run mndz-overlay-manager -- outdated --refresh
 ```
 
 ### `update`
@@ -114,6 +132,8 @@ cabal run mndz-overlay-manager -- outdated crush dolt
 Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, regenerate package-scoped Portage `egencache` md5-cache, and create GPG-signed git commits in the overlay (ebuild/Manifest and `metadata/md5-cache/` paths together). For packages under the **DepsAndAssets** technique (Go vendor, npm/Bun deps, Cargo crates, or Sbcl/Autolith deps), it may also materialize cache/vendor/crates/deps tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token and the extra runtime tools above: `xz` plus `go` / `npm` / `bun` / `pycargoebuild`+fetcher / `sbcl`+`cargo`+Quicklisp as applicable). Reusing an existing assets release does not require `go`/`npm`/`bun`/`sbcl`/`cargo` for those ecosystems; Cargo packages still require `pycargoebuild` and a fetcher in preflight whenever selected.
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every package that needs work is selected (outdated non-deps packages and DepsAndAssets packages with runtime-lane gaps). Explicit targets that do not need work are soft-skipped.
+
+**Flags:** `--refresh` forces live latest fetch / deps plan (ignores the check cache for reads). After a successful apply, the package’s cache entry is rewritten with the post-apply fingerprint when caching is enabled.
 
 ```bash
 # All packages that need work
@@ -126,6 +146,7 @@ cabal run mndz-overlay-manager -- update crush dolt
 # Common operator flags
 cabal run mndz-overlay-manager -- --jobs 2 -v update
 cabal run mndz-overlay-manager -- --no-progress update category/package
+cabal run mndz-overlay-manager -- update --refresh
 ```
 
 Before mutating anything, `update` checks that required tools are on `PATH`, that the overlay `metadata/layout.conf` lists `cache-formats = md5-dict`, that the effective manager distfiles directory supports create-then-rename (Portage’s fetch pattern), free space on the **effective temp root** and **manager distfiles** path (see below), and that each package about to be applied has complete matching md5-cache for all non-live ebuilds. When assets publish is needed, it also checks that `assets-path` is a git work tree and a GitHub token can be resolved. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.

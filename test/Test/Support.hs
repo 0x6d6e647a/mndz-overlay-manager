@@ -42,7 +42,7 @@ import CLI.Progress
 import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
 import Config.Loader (ConfigError (..), loadConfig)
-import Config.Types (OverlayConfig (..))
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
@@ -128,6 +128,7 @@ import Update.Cargo.Msrv
     parseRustVersionField,
   )
 import Update.Check (PackageEntry (..), groupNewest)
+import Update.CheckCache (openCheckCache)
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
@@ -311,6 +312,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
             dpoWorkBudget = poWorkBudget planOps,
             dpoGoCeilingsCache = poCeilingsCache planOps
           }
+  (cache, _) <- openCheckCache CacheDisabled False "/tmp"
   pure
     ApplyEnv
       { aeFetcher = \_ -> pure (Left "unused"),
@@ -334,7 +336,8 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeMulti = noopMultiHandle,
         aePlanOps = planOps,
         aeDepsPlanOps = depsOps,
-        aeTempRun = tempRun
+        aeTempRun = tempRun,
+        aeCheckCache = cache
       }
 
 -- | Write a matching md5-dict cache file for one ebuild.

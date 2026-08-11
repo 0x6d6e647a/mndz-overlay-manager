@@ -18,6 +18,7 @@ import System.Exit (ExitCode (..))
 import Update.Assets.Release (ReleaseOps)
 import Update.Bun.Cache (BunCacheOps)
 import Update.Cargo.Crates (CargoOps)
+import Update.CheckCache (CheckCacheHandle)
 import Update.Deps.Plan (DepsPlanOps)
 import Update.Distfiles
   ( ebuildManifestEnv,
@@ -90,5 +91,7 @@ data ApplyEnv = ApplyEnv
     aePlanOps :: PlanOps,
     aeDepsPlanOps :: DepsPlanOps,
     -- | Product temp workspace run root for heavy materialize scratch.
-    aeTempRun :: RunRoot
+    aeTempRun :: RunRoot,
+    -- | Shared check cache (disabled handle is a no-op).
+    aeCheckCache :: CheckCacheHandle
   }

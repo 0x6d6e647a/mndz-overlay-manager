@@ -21,6 +21,13 @@ import Update.Apply.Errors
     applyUnitHardFail,
   )
 import Update.Check (PackageEntry (..))
+import Update.CheckCache
+  ( computeFingerprintFromDir,
+    lookupLatest,
+    recordFetch,
+    recordHit,
+    storeLatest,
+  )
 import Update.Git (GitOps (..), relativeOverlayPath)
 import Update.Md5Cache (inspectPackageCache)
 import Update.Types
@@ -65,8 +72,22 @@ applyGitMv env overlayRoot entry src = do
       pkgDir = takeDirectory oldPath
       pn = pePN entry
       mh = aeMulti env
+      cache = aeCheckCache env
   mhStatus mh key "fetching"
-  fetched <- aeFetcher env src
+  fp <- computeFingerprintFromDir src pkgDir pn
+  mCached <- lookupLatest cache key fp
+  fetched <- case mCached of
+    Just remote -> do
+      recordHit cache
+      pure (Right remote)
+    Nothing -> do
+      recordFetch cache
+      result <- aeFetcher env src
+      case result of
+        Right remote -> do
+          storeLatest cache key fp remote
+          pure (Right remote)
+        Left err -> pure (Left err)
   case fetched of
     Left err ->
       pure $ ApplyHardFail key ("fetch failed: " <> err) False False
@@ -74,7 +95,13 @@ applyGitMv env overlayRoot entry src = do
       case comparePV local remote of
         Just LT -> do
           mhStatus mh key "applying"
-          gitMvDo env key local remote oldPath pkgDir pn overlayRoot
+          outcome <- gitMvDo env key local remote oldPath pkgDir pn overlayRoot
+          case outcome of
+            ApplySuccess {} -> do
+              fp' <- computeFingerprintFromDir src pkgDir pn
+              storeLatest cache key fp' remote
+            _ -> pure ()
+          pure outcome
         Just EQ ->
           pure $ ApplySoftSkip key "already at latest upstream version"
         Just GT ->
