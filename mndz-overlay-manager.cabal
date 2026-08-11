@@ -113,6 +113,7 @@ library
       , Update.Md5Cache
       , Update.Npm
       , Update.Npm.Cache
+      , Update.Pack.XzTar
       , Update.Preflight
       , Update.Process
       , Update.Resolve

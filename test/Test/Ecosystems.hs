@@ -6,8 +6,11 @@ module Test.Ecosystems (unitTests, integrationTests) where
 
 import Control.Concurrent.MVar (newMVar)
 import Control.Monad (void)
+import Data.ByteString qualified as BS
+import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf)
+import Data.Maybe (mapMaybe)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory (createDirectoryIfMissing, doesFileExist)
@@ -67,6 +70,13 @@ import Update.Npm.Cache
     hostMeetsNodeRequirement,
     mkNpmCacheOps,
     nodeVersionTooOldMessage,
+  )
+import Update.Pack.XzTar
+  ( isXzMagic,
+    packTarXzAtomic,
+    verifyXzFile,
+    xzMagicPrefix,
+    xzOptValue,
   )
 import Update.Process
   ( ProcessMode (..),
@@ -136,7 +146,13 @@ unitTests =
           testCase "buildCargoCratesTarball pycargo failure" testCargoBuilderPycargoFail,
           testCase "buildCargoCratesTarball pack failure" testCargoBuilderPackFail,
           testCase "packCratesTarball tiny fixture" testPackCratesTarballFixture,
-          testCase "packCratesTarball missing crate" testPackCratesTarballMissingCrate
+          testCase "packCratesTarball missing crate" testPackCratesTarballMissingCrate,
+          testCase "packCratesTarball records XZ_OPT and -J / .xz temp" testPackCratesTarballXzArgv
+        ],
+      testGroup
+        "xz pack helpers"
+        [ testCase "verifyXzFile rejects plain tar, accepts xz magic" testVerifyXzFile,
+          testCase "packTarXzAtomic temp path is not bare .tmp" testPackTarXzAtomicTempSuffix
         ],
       testGroup
         "production CommandRunner adapters"
@@ -1094,6 +1110,10 @@ testPackCratesTarballFixture =
       =<< packCratesTarball productionCommandRunner lockRoot distDir stageDir outPath
     exists <- doesFileExist outPath
     assertTrue "tarball exists" exists
+    -- Final body must be real xz (would fail under the old .tmp bare-suffix bug).
+    header <- BS.readFile outPath
+    assertTrue "xz magic on packed crates" (isXzMagic header)
+    assertRight "verifyXzFile on pack fixture" =<< verifyXzFile outPath
     -- Inspect members via tar -tf
     res <-
       productionCommandRunner
@@ -1170,6 +1190,114 @@ testPackCratesTarballMissingCrate =
     exists <- doesFileExist outPath
     assertTrue "no partial final path" (not exists)
 
+testPackCratesTarballXzArgv :: IO ()
+testPackCratesTarballXzArgv =
+  withSystemTempDirectory "mndz-cargo-pack-argv-" $ \tmp -> do
+    let lockRoot = tmp </> "src"
+        distDir = tmp </> "distdir"
+        stageDir = tmp </> "stage"
+        outPath = tmp </> "pkg-0.1.0-crates.tar.xz"
+    createDirectoryIfMissing True lockRoot
+    createDirectoryIfMissing True distDir
+    TIO.writeFile
+      (lockRoot </> "Cargo.lock")
+      "version = 4\n"
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    let run req = do
+          atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
+          case prMode req of
+            ExecCmd "tar" args -> do
+              for_ (tarArchivePath args) writeFakeXz
+              pure (okResult "")
+            _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+    assertRight "empty registry pack"
+      =<< packCratesTarball run lockRoot distDir stageDir outPath
+    reqs <- reverse <$> readIORef reqsRef
+    let tarReqs =
+          [ r
+          | r <- reqs,
+            case prMode r of
+              ExecCmd "tar" _ -> True
+              _ -> False
+          ]
+    assertTrue "at least one tar pack" (not (null tarReqs))
+    let packReq = last tarReqs
+    case prMode packReq of
+      ExecCmd "tar" args -> do
+        let hasJ = "-cJf" `elem` args || any ("J" `isInfixOf`) args
+            archivePaths = mapMaybe archivePathFromArgs [args]
+            allXzOrForced =
+              hasJ
+                || all
+                  ( \p ->
+                      ".xz" `T.isSuffixOf` T.pack p
+                        || ".xz.partial" `T.isSuffixOf` T.pack p
+                  )
+                  archivePaths
+        assertTrue "forced xz (-J) or archive path ends with .xz" allXzOrForced
+        assertTrue
+          "no bare .tmp archive path"
+          (not (any (\p -> ".tmp" `T.isSuffixOf` T.pack p && not (".xz" `isInfixOf` p)) archivePaths))
+      _ -> fail "expected tar ExecCmd"
+    case prEnv packReq of
+      Nothing -> fail "expected XZ_OPT env on pack tar"
+      Just env ->
+        case lookup "XZ_OPT" env of
+          Nothing -> fail "XZ_OPT missing"
+          Just v -> do
+            assertTrue "XZ_OPT has -T0" ("-T0" `isInfixOf` v)
+            assertTrue "XZ_OPT has -9e" ("-9e" `isInfixOf` v)
+            assertEq "XZ_OPT exact preset" xzOptValue v
+
+testVerifyXzFile :: IO ()
+testVerifyXzFile =
+  withSystemTempDirectory "mndz-xz-verify-" $ \tmp -> do
+    let plain = tmp </> "plain.tar.xz"
+        good = tmp </> "good.tar.xz"
+    -- Minimal POSIX ustar-ish bytes (not xz).
+    BS.writeFile plain "ustar\0fake-plain-tar-body"
+    writeFakeXz good
+    err <- assertLeft "plain tar rejected" =<< verifyXzFile plain
+    assertTrue "mentions plain tar / non-xz" ("not xz-compressed" `T.isInfixOf` err)
+    assertTrue "mentions plain tar" ("plain tar" `T.isInfixOf` err)
+    assertRight "xz magic accepted" =<< verifyXzFile good
+    assertTrue "isXzMagic pure" (isXzMagic xzMagicPrefix)
+    assertTrue "isXzMagic rejects plain" (not (isXzMagic "ustar"))
+
+testPackTarXzAtomicTempSuffix :: IO ()
+testPackTarXzAtomicTempSuffix =
+  withSystemTempDirectory "mndz-xz-atomic-" $ \tmp -> do
+    let stage = tmp </> "stage"
+        outPath = tmp </> "out.tar.xz"
+        entryDir = stage </> "cargo_home"
+    createDirectoryIfMissing True entryDir
+    TIO.writeFile (entryDir </> "marker") "ok\n"
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    let run req = do
+          atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
+          case prMode req of
+            ExecCmd "tar" args -> do
+              for_ (tarArchivePath args) writeFakeXz
+              pure (okResult "")
+            _ -> pure (failResult "unexpected")
+    assertRight "atomic pack"
+      =<< packTarXzAtomic run "test pack" Nothing (Just stage) ["cargo_home"] outPath
+    reqs <- readIORef reqsRef
+    let args =
+          concat
+            [ a
+            | r <- reqs,
+              ExecCmd "tar" a <- [prMode r]
+            ]
+    case tarArchivePath args of
+      Nothing -> fail "no archive path in tar argv"
+      Just p -> do
+        assertTrue "temp keeps .xz before .partial" (".xz.partial" `isInfixOf` p || ".xz" `isInfixOf` p)
+        assertTrue "not bare .tmp only" (p /= (outPath <> ".tmp"))
+        assertTrue "-cJf present" ("-cJf" `elem` args)
+    exists <- doesFileExist outPath
+    assertTrue "final path exists" exists
+
 ------------------------------------------------------------------------
 -- Production mk*Ops / runners via scripted CommandRunner
 ------------------------------------------------------------------------
@@ -1195,23 +1323,41 @@ execCmd req = case prMode req of
   ExecCmd cmd args -> Just (cmd, args)
   ShellCmd _ -> Nothing
 
+-- | Archive path argument after @-cJf@ / @-acf@ / @-f@.
+tarArchivePath :: [String] -> Maybe FilePath
+tarArchivePath = go
+  where
+    go [] = Nothing
+    go ("-cJf" : p : _) = Just p
+    go ("-acf" : p : _) = Just p
+    go ("-f" : p : _) = Just p
+    go (_ : rest) = go rest
+
+archivePathFromArgs :: [String] -> Maybe FilePath
+archivePathFromArgs = tarArchivePath
+
+-- | Minimal bytes that pass 'verifyXzFile' (xz magic only).
+writeFakeXz :: FilePath -> IO ()
+writeFakeXz path = BS.writeFile path xzMagicPrefix
+
 testNpmMkCommandRunner :: IO ()
 testNpmMkCommandRunner =
   withSystemTempDirectory "mndz-npm-mk-" $ \outDir -> do
-    let successRun req = case execCmd req of
-          Just ("node", ["--version"]) -> pure (okResult "v20.19.0\n")
-          Just ("npm", "pack" : _) -> do
-            case prCwd req of
-              Just workDir -> writeFile (workDir </> "pkg-1.0.0.tgz") "packed"
-              Nothing -> pure ()
-            pure (okResult "")
-          Just ("npm", "--cache" : _) -> pure (okResult "")
-          Just ("tar", _) -> do
-            case prMode req of
-              ExecCmd _ (_ : outPath : _) -> writeFile outPath "npm-tarball"
-              _ -> pure ()
-            pure (okResult "")
-          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    let successRun req = do
+          atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
+          case execCmd req of
+            Just ("node", ["--version"]) -> pure (okResult "v20.19.0\n")
+            Just ("npm", "pack" : _) -> do
+              case prCwd req of
+                Just workDir -> writeFile (workDir </> "pkg-1.0.0.tgz") "packed"
+                Nothing -> pure ()
+              pure (okResult "")
+            Just ("npm", "--cache" : _) -> pure (okResult "")
+            Just ("tar", args) -> do
+              for_ (tarArchivePath args) writeFakeXz
+              pure (okResult "")
+            _ -> pure (failResult ("unexpected: " <> show (prMode req)))
         failRun req = case execCmd req of
           Just ("node", ["--version"]) -> pure (failResult "node missing")
           _ -> pure (failResult "should not run")
@@ -1229,6 +1375,25 @@ testNpmMkCommandRunner =
     assertEq "out path" (outDir </> "left-pad-1.0.0-npm-cache.tar.xz") path
     exists <- doesFileExist path
     assertTrue "tarball written" exists
+    -- Non-Cargo pack asserts uniform XZ_OPT=-T0 -9e.
+    reqs <- reverse <$> readIORef reqsRef
+    let tarReqs =
+          [ r
+          | r <- reqs,
+            case prMode r of
+              ExecCmd "tar" _ -> True
+              _ -> False
+          ]
+    case tarReqs of
+      [] -> fail "npm pack did not invoke tar"
+      (tarReq : _) -> case prEnv tarReq of
+        Just env ->
+          case lookup "XZ_OPT" env of
+            Just v -> do
+              assertTrue "npm XZ_OPT -T0" ("-T0" `isInfixOf` v)
+              assertTrue "npm XZ_OPT -9e" ("-9e" `isInfixOf` v)
+            Nothing -> fail "npm tar missing XZ_OPT"
+        Nothing -> fail "npm tar missing env"
     err <-
       assertLeft "npm mk host fail"
         =<< buildNpmDepsTarball
@@ -1253,10 +1418,8 @@ testBunMkCommandRunner =
             TIO.writeFile (dest </> "bun.lock") "{}"
             pure (okResult "")
           Just ("bun", "install" : _) -> pure (okResult "")
-          Just ("tar", _) -> do
-            case prMode req of
-              ExecCmd _ (_ : outPath : _) -> writeFile outPath "bun-tarball"
-              _ -> pure ()
+          Just ("tar", args) -> do
+            for_ (tarArchivePath args) writeFakeXz
             pure (okResult "")
           _ -> pure (failResult ("unexpected: " <> show (prMode req)))
         failRun req = case execCmd req of
@@ -1312,10 +1475,8 @@ testVendorMkCommandRunner =
           Just ("go", ["version"]) ->
             pure (okResult "go version go1.22.5 linux/amd64\n")
           Just ("go", "mod" : _) -> pure (okResult "")
-          Just ("tar", _) -> do
-            case prMode req of
-              ExecCmd _ (_ : outPath : _) -> writeFile outPath "vendor-tarball"
-              _ -> pure ()
+          Just ("tar", args) -> do
+            for_ (tarArchivePath args) writeFakeXz
             pure (okResult "")
           _ -> pure (failResult ("unexpected: " <> show (prMode req)))
         failRun req = case execCmd req of

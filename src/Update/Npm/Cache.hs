@@ -35,7 +35,6 @@ import Network.HTTP.Client
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion, comparePV, parseEbuildVersion)
 import System.Directory (createDirectoryIfMissing, listDirectory)
-import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import Update.Engines (parseEnginesMinimum)
@@ -44,6 +43,7 @@ import Update.Go.Version
     parseGoVersionToken,
   )
 import Update.Http (HttpLbs, httpLbsEither)
+import Update.Pack.XzTar (packTarXz)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -220,21 +220,8 @@ npmInstallCache run tgz cacheDir = do
       else Left ("npm --cache install failed: " <> T.pack (prStderr res))
 
 tarXzNpmCache :: CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
-tarXzNpmCache run workDir entry outPath = do
-  baseEnv <- getEnvironment
-  let env' = ("XZ_OPT", "-T0 -9") : filter (\(k, _) -> k /= "XZ_OPT") baseEnv
-  res <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "tar" ["-acf", outPath, entry],
-          prCwd = Just workDir,
-          prEnv = Just env',
-          prStdin = ""
-        }
-  pure $
-    if prExitCode res == ExitSuccess
-      then Right ()
-      else Left ("tar xz npm-cache failed: " <> T.pack (prStderr res))
+tarXzNpmCache run workDir entry =
+  packTarXz run "tar xz npm-cache failed" (Just workDir) Nothing [entry]
 
 parseEnginesNode :: Value -> Parser Text
 parseEnginesNode =

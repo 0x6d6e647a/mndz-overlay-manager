@@ -31,6 +31,7 @@ import Update.DiskSpace
     checkPostCloneForClass,
   )
 import Update.Go.Vendor (githubCloneUrl, versionTag)
+import Update.Pack.XzTar (packTarXz)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -448,21 +449,10 @@ materializeFff run root stageDir = do
                       pure (Right ())
 
 packDepsTarball :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
-packDepsTarball run stageDir outPath = do
-  env0 <- getEnvironment
-  let env = ("XZ_OPT", "-T0 -9") : filter ((/= "XZ_OPT") . fst) env0
-  res <-
+packDepsTarball run stageDir =
+  packTarXz
     run
-      ProcessRequest
-        { prMode =
-            ExecCmd
-              "tar"
-              ["-C", stageDir, "-acf", outPath, ".qlot", "fff"],
-          prCwd = Nothing,
-          prEnv = Just env,
-          prStdin = ""
-        }
-  pure $
-    if prExitCode res == ExitSuccess
-      then Right ()
-      else Left ("tar pack failed: " <> T.pack (prStderr res))
+    "tar pack failed"
+    Nothing
+    (Just stageDir)
+    [".qlot", "fff"]

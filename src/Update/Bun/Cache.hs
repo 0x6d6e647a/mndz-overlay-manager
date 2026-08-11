@@ -32,7 +32,6 @@ import System.Directory
     doesFileExist,
     listDirectory,
   )
-import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import Update.DiskSpace
@@ -45,6 +44,7 @@ import Update.Go.Version
   ( compareGoVersions,
     parseGoVersionToken,
   )
+import Update.Pack.XzTar (packTarXz)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -367,18 +367,5 @@ bunInstallCache run cloneDir cacheDir = do
       else Left ("bun install failed: " <> T.pack (prStderr res))
 
 tarXzEntries :: CommandRunner -> FilePath -> [FilePath] -> FilePath -> IO (Either Text ())
-tarXzEntries run workDir entries outPath = do
-  baseEnv <- getEnvironment
-  let env' = ("XZ_OPT", "-T0 -9") : filter (\(k, _) -> k /= "XZ_OPT") baseEnv
-  res <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "tar" (["-acf", outPath] ++ entries),
-          prCwd = Just workDir,
-          prEnv = Just env',
-          prStdin = ""
-        }
-  pure $
-    if prExitCode res == ExitSuccess
-      then Right ()
-      else Left ("tar xz bun deps failed: " <> T.pack (prStderr res))
+tarXzEntries run workDir =
+  packTarXz run "tar xz bun deps failed" (Just workDir) Nothing

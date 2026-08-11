@@ -31,6 +31,7 @@ import Update.Go.Version
     parseGoModGoDirective,
     parseGoVersionOutput,
   )
+import Update.Pack.XzTar (packTarXz)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -250,17 +251,5 @@ goModDownload run goDir = do
       else Left (enrichGoModDownloadError (T.pack (prStderr res)))
 
 tarXzGoMod :: CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
-tarXzGoMod run goDir entryName outPath = do
-  env0 <- getEnvironment
-  res <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "tar" ["-acf", outPath, entryName],
-          prCwd = Just goDir,
-          prEnv = Just (("XZ_OPT", "-T0 -9") : filter ((/= "XZ_OPT") . fst) env0),
-          prStdin = ""
-        }
-  pure $
-    if prExitCode res == ExitSuccess
-      then Right ()
-      else Left ("tar failed: " <> T.pack (prStderr res))
+tarXzGoMod run goDir entryName =
+  packTarXz run "tar failed" (Just goDir) Nothing [entryName]

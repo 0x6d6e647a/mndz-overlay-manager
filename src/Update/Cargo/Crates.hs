@@ -17,7 +17,6 @@ module Update.Cargo.Crates
   )
 where
 
-import Control.Monad (when)
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -27,12 +26,9 @@ import System.Directory
     doesDirectoryExist,
     doesFileExist,
     listDirectory,
-    removeFile,
-    renameFile,
   )
-import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath ((</>))
 import Update.Cargo.Lock
   ( RegistryPackage (..),
     crateDirName,
@@ -50,6 +46,7 @@ import Update.DiskSpace
     checkPostCloneForClass,
   )
 import Update.Go.Vendor (githubCloneUrl, versionTag)
+import Update.Pack.XzTar (packTarXzAtomic)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -435,40 +432,13 @@ extractCrate run cratePath destDir = do
           )
 
 createArchiveAtomic :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
-createArchiveAtomic run stageDir outPath = do
-  createDirectoryIfMissing True (takeDirectory outPath)
-  let tmpPath = outPath <> ".tmp"
-  -- Drop any leftover partial temp from a previous attempt.
-  tmpExists <- doesFileExist tmpPath
-  when tmpExists (removeFile tmpPath)
-  env0 <- getEnvironment
-  let env' = ("XZ_OPT", "-T0 -9e") : filter ((/= "XZ_OPT") . fst) env0
-  res <-
+createArchiveAtomic run stageDir =
+  packTarXzAtomic
     run
-      ProcessRequest
-        { prMode = ExecCmd "tar" ["-C", stageDir, "-acf", tmpPath, "cargo_home"],
-          prCwd = Nothing,
-          prEnv = Just env',
-          prStdin = ""
-        }
-  if prExitCode res /= ExitSuccess
-    then do
-      tryRemove tmpPath
-      pure $
-        Left
-          ( "cargo crates pack failed: tar archive: "
-              <> T.strip (T.pack (prStderr res))
-          )
-    else do
-      -- Replace any existing final path atomically via rename.
-      finalExists <- doesFileExist outPath
-      when finalExists (removeFile outPath)
-      renameFile tmpPath outPath
-      pure (Right ())
-  where
-    tryRemove p = do
-      e <- doesFileExist p
-      when e (removeFile p)
+    "cargo crates pack failed"
+    Nothing
+    (Just stageDir)
+    ["cargo_home"]
 
 gitCloneTag :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text ())
 gitCloneTag run url tag dest = do
