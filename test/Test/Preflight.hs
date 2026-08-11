@@ -206,6 +206,8 @@ import Update.Preflight
     assetsPreflightFromPlan,
     assetsRequiredTools,
     bunRequiredTools,
+    cargoFetcherAdvisories,
+    cargoFetcherAria2Advisory,
     cargoFetcherTools,
     cargoRequiredTools,
     checkToolsOnPath,
@@ -265,6 +267,11 @@ tests =
       testCase "Check Tools Multiple Missing" testCheckToolsMultipleMissing,
       testCase "Validate Assets Path" testValidateAssetsPath,
       testCase "Preflight Update Tools" testPreflightUpdateTools,
+      testCase "Bare aria2 does not satisfy cargo fetcher hard check" testBareAria2NotEnough,
+      testCase "Cargo fetcher soft advisory full-path wget only" testCargoFetcherAdvisoryFullPath,
+      testCase "Cargo fetcher soft advisory aria2c present none" testCargoFetcherAdvisoryAria2cPresent,
+      testCase "Cargo fetcher soft advisory reuse-only none" testCargoFetcherAdvisoryReuseOnly,
+      testCase "Cargo fetcher advisories merge into run warnings list" testCargoFetcherAdvisoryMergeWarnings,
       testCase "Strip Surrounding Quotes" testStripSurroundingQuotes,
       testCase "Assets preflight bare binary needs-work skips go" testAssetsPfBinaryOnly,
       testCase "Assets preflight reuse-only Go skips go" testAssetsPfReuseOnlyGo,
@@ -297,7 +304,11 @@ testRequiredToolListConstants = do
   assertEq "npm tools" ["npm"] npmRequiredTools
   assertEq "bun tools" ["bun"] bunRequiredTools
   assertEq "cargo tools" ["pycargoebuild"] cargoRequiredTools
-  assertEq "cargo fetchers" ["wget", "aria2c", "aria2"] cargoFetcherTools
+  assertEq "cargo fetchers" ["wget", "aria2c"] cargoFetcherTools
+  assertEq
+    "cargo aria2 advisory text"
+    "pycargoebuild is using wget; install aria2 for faster crate fetches"
+    cargoFetcherAria2Advisory
   assertEq "go+assets" ["go", "xz"] goAssetsRequiredTools
 
 testCheckToolsMultipleMissing :: IO ()
@@ -381,12 +392,12 @@ testPreflightUpdateTools = do
     preflightUpdateToolsWith
       ( \name ->
           pure $
-            if name == "aria2"
+            if name == "aria2c"
               then Nothing
               else Just ("/bin/" <> name)
       )
       full
-  assertEq "cargo ok with one fetcher" (Right ()) okFull
+  assertEq "cargo ok with wget only" (Right ()) okFull
   missFetchers <-
     preflightUpdateToolsWith
       ( \name ->
@@ -410,6 +421,121 @@ testPreflightUpdateTools = do
   assertTrue "lists npm" ("npm" `T.isInfixOf` errEco)
   assertTrue "lists bun" ("bun" `T.isInfixOf` errEco)
   assertTrue "lists pycargoebuild" ("pycargoebuild" `T.isInfixOf` errEco)
+
+-- | Bare @aria2@ (no @c@) is not a pycargoebuild fetcher PATH name.
+testBareAria2NotEnough :: IO ()
+testBareAria2NotEnough = do
+  let full =
+        basePreflight
+          { apNeedAssets = True,
+            apNeedCargo = True
+          }
+  -- wget and aria2c missing; only bare "aria2" would be findable if probed.
+  miss <-
+    preflightUpdateToolsWith
+      ( \name ->
+          pure $
+            if name `elem` ["wget", "aria2c"]
+              then Nothing
+              else Just ("/bin/" <> name)
+      )
+      full
+  err <- assertLeft "bare aria2 does not satisfy hard check" miss
+  assertTrue
+    "mentions wget or aria2c"
+    ("wget or aria2c" `T.isInfixOf` err)
+
+cargoFullPathClassify :: [ClassifyPackageResult]
+cargoFullPathClassify =
+  let key = PackageKey "dev-util/mise"
+      pv = parseEbuildVersion "2025.1.0"
+   in [ ClassifyOk
+          key
+          [ ClassifiedPvUnit
+              { cpuKey = key,
+                cpuPN = "mise",
+                cpuPV = pv,
+                cpuEco = Cargo Nothing Nothing,
+                cpuClass = FullCargo,
+                cpuTempBaseline = Just (5 * 1024 * 1024)
+              }
+          ]
+      ]
+
+cargoReuseOnlyClassify :: [ClassifyPackageResult]
+cargoReuseOnlyClassify =
+  let key = PackageKey "dev-util/mise"
+      pv = parseEbuildVersion "2025.1.0"
+   in [ ClassifyOk
+          key
+          [ ClassifiedPvUnit
+              { cpuKey = key,
+                cpuPN = "mise",
+                cpuPV = pv,
+                cpuEco = Cargo Nothing Nothing,
+                cpuClass = ReusePath,
+                cpuTempBaseline = Just (5 * 1024 * 1024)
+              }
+          ]
+      ]
+
+testCargoFetcherAdvisoryFullPath :: IO ()
+testCargoFetcherAdvisoryFullPath = do
+  advisories <-
+    cargoFetcherAdvisories
+      ( \name ->
+          pure $
+            if name == "aria2c"
+              then Nothing
+              else Just ("/bin/" <> name)
+      )
+      cargoFullPathClassify
+  assertEq "one advisory" [cargoFetcherAria2Advisory] advisories
+
+testCargoFetcherAdvisoryAria2cPresent :: IO ()
+testCargoFetcherAdvisoryAria2cPresent = do
+  advisories <-
+    cargoFetcherAdvisories
+      (\name -> pure (Just ("/bin/" <> name)))
+      cargoFullPathClassify
+  assertEq "no advisory when aria2c present" [] advisories
+
+testCargoFetcherAdvisoryReuseOnly :: IO ()
+testCargoFetcherAdvisoryReuseOnly = do
+  advisories <-
+    cargoFetcherAdvisories
+      (\_ -> pure Nothing)
+      cargoReuseOnlyClassify
+  assertEq "no advisory for reuse-only cargo" [] advisories
+
+-- | Spine merges disk-gate warns with cargo advisories on @usrWarnings@;
+-- hard language preflight failure short-circuits before this merge runs.
+testCargoFetcherAdvisoryMergeWarnings :: IO ()
+testCargoFetcherAdvisoryMergeWarnings = do
+  cargoAds <-
+    cargoFetcherAdvisories
+      ( \name ->
+          pure $
+            if name == "aria2c"
+              then Nothing
+              else Just ("/bin/" <> name)
+      )
+      cargoFullPathClassify
+  let diskWarns = ["Portage DISTDIR low free space"]
+      usrWarnings = diskWarns <> cargoAds
+  assertEq
+    "disk + cargo advisory on collected warnings"
+    [ "Portage DISTDIR low free space",
+      cargoFetcherAria2Advisory
+    ]
+    usrWarnings
+  -- Hard fail path: missing fetchers still Left; advisories not consulted.
+  missFetchers <-
+    preflightUpdateToolsWith
+      (missingNamed cargoFetcherTools)
+      (basePreflight {apNeedCargo = True})
+  err <- assertLeft "hard fail before advisory emission" missFetchers
+  assertTrue "hard fail names fetchers" ("wget or aria2c" `T.isInfixOf` err)
 
 testStripSurroundingQuotes :: IO ()
 testStripSurroundingQuotes = do

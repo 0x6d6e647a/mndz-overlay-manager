@@ -9,16 +9,19 @@ module Update.Spine
 where
 
 import CLI.Progress
-  ( ProgressConfig,
+  ( ProgressConfig (..),
     StepHandle (..),
     noopMultiHandle,
     withStepProgress,
   )
+import Colog (logWarning, usingLoggerT)
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
+import Control.Monad (forM_)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Overlay.Types (Ebuild)
+import System.Directory (findExecutable)
 import Update.Apply
   ( ApplyEnv (..),
     applyOverlayFromPlan,
@@ -61,6 +64,7 @@ import Update.Preflight
   ( AssetsPreflight (..),
     assetsPreflightFromPlan,
     buildGitMvUnitPlans,
+    cargoFetcherAdvisories,
     preflightUpdateTools,
     validateAssetsPath,
   )
@@ -181,6 +185,12 @@ runUpdatePhases deps entries allEbuilds selected = do
       case eLang of
         Left err -> pure (Left err)
         Right () -> do
+          -- Soft cargo fetcher tip (full-path + missing aria2c); hard-fail already
+          -- short-circuited above when pycargoebuild/fetchers are missing.
+          cargoAdvisories <-
+            cargoFetcherAdvisories findExecutable classifyResults
+          usingLoggerT (pcLogger pcfg) $
+            forM_ cargoAdvisories logWarning
           -- Disk units from needs-work classified + GitMv
           gitMvUnits <- buildGitMvUnitPlans overlayRoot distDir planResults'
           let units = unitPlansFromClassifyResults classifyResults gitMvUnits
@@ -257,7 +267,7 @@ runUpdatePhases deps entries allEbuilds selected = do
                 Right
                   UpdateSpineResult
                     { usrOutcomes = outcomes,
-                      usrWarnings = warns,
+                      usrWarnings = warns <> cargoAdvisories,
                       usrCacheSummary = mSummary
                     }
 

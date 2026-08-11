@@ -8,6 +8,8 @@ module Update.Preflight
     bunRequiredTools,
     cargoRequiredTools,
     cargoFetcherTools,
+    cargoFetcherAria2Advisory,
+    cargoFetcherAdvisories,
     goAssetsRequiredTools,
     checkToolsOnPath,
     preflightUpdateTools,
@@ -48,6 +50,7 @@ import Update.Git (isGitWorkTree)
 import Update.Types
   ( PackageKey (..),
     ecosystemIsBun,
+    ecosystemIsCargo,
     ecosystemIsGo,
     ecosystemIsNpm,
     splitPackageKey,
@@ -70,13 +73,45 @@ npmRequiredTools = ["npm"]
 bunRequiredTools :: [String]
 bunRequiredTools = ["bun"]
 
--- | Always required when any Cargo DepsAndAssets package is selected (P1).
+-- | Always required when any Cargo DepsAndAssets package needs work (P1,
+-- including reuse-only cargo units).
 cargoRequiredTools :: [String]
 cargoRequiredTools = ["pycargoebuild"]
 
--- | At least one of these must be present for cargo full path (pycargoebuild fetch).
+-- | Hard fetcher PATH names for cargo P1 (any cargo needs work, including
+-- reuse-only). At least one must be present; matches pycargoebuild 0.16
+-- subprocess targets (@wget@ / @aria2c@ only — not bare @aria2@).
 cargoFetcherTools :: [String]
-cargoFetcherTools = ["wget", "aria2c", "aria2"]
+cargoFetcherTools = ["wget", "aria2c"]
+
+-- | Soft advisory when full-path cargo will fetch crates via wget because
+-- @aria2c@ is absent. Exact text shared with tests and @usrWarnings@.
+cargoFetcherAria2Advisory :: Text
+cargoFetcherAria2Advisory =
+  "pycargoebuild is using wget; install aria2 for faster crate fetches"
+
+-- | Soft advisories for cargo fetchers after hard language preflight passed.
+-- Emits when at least one classified unit is full-path cargo and @aria2c@ is
+-- missing on PATH (injectable finder). Empty when reuse-only or @aria2c@ present.
+cargoFetcherAdvisories ::
+  (String -> IO (Maybe FilePath)) ->
+  [ClassifyPackageResult] ->
+  IO [Text]
+cargoFetcherAdvisories findTool classifyResults = do
+  let hasFullPathCargo =
+        or
+          [ ecosystemIsCargo (cpuEco u) && cpuClass u /= ReusePath
+          | ClassifyOk _ us <- classifyResults,
+            u <- us
+          ]
+  if not hasFullPathCargo
+    then pure []
+    else do
+      mAria2c <- findTool "aria2c"
+      pure $
+        case mAria2c of
+          Just _ -> []
+          Nothing -> [cargoFetcherAria2Advisory]
 
 -- | Legacy combined Go + xz tools (full-path Go materialize).
 goAssetsRequiredTools :: [String]
