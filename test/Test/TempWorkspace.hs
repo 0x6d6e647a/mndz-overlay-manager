@@ -4,9 +4,10 @@ module Test.TempWorkspace (tests) where
 
 import Data.List (isInfixOf)
 import Data.Text qualified as T
+import Data.Time.Format (defaultTimeLocale, parseTimeOrError)
+import Data.Time.LocalTime (ZonedTime)
 import System.Directory
-  ( createDirectoryIfMissing,
-    doesDirectoryExist,
+  ( doesDirectoryExist,
     doesFileExist,
   )
 import System.FilePath ((</>))
@@ -22,6 +23,7 @@ import Update.TempWorkspace
     cleanupRunSuccess,
     deleteUnit,
     ensureUnit,
+    formatRunId,
     openRunRootAt,
     retainUnitError,
     runRootPath,
@@ -35,6 +37,7 @@ tests =
     "TempWorkspace"
     [ testCase "unit kind suffixes" testUnitKindSuffix,
       testCase "path construction full and reuse" testPathConstruction,
+      testCase "formatRunId is ISO 8601 basic without colon" testFormatRunId,
       testCase "run id has pid and random hex" testRunIdFormat,
       testCase "openRunRootAt creates brand path" testOpenRunRoot,
       testCase "ensureUnit creates out and work" testEnsureUnit,
@@ -51,10 +54,10 @@ testUnitKindSuffix = do
 
 testPathConstruction :: IO ()
 testPathConstruction = do
-  let run = runRootPath "/tmp" "2026-08-10T15:42:07-07:00-4242.a8f3"
+  let run = runRootPath "/tmp" "20260810T154207-0700-4242.a8f3"
   assertEq
     "run root"
-    "/tmp/mndz/overlay-manager/2026-08-10T15:42:07-07:00-4242.a8f3"
+    "/tmp/mndz/overlay-manager/20260810T154207-0700-4242.a8f3"
     run
   assertEq
     "full unit"
@@ -73,6 +76,21 @@ testPathConstruction = do
     )
     (unitDirPath run "dev-util" "crush" "0.77.0" UnitReuse)
 
+testFormatRunId :: IO ()
+testFormatRunId = do
+  let zt =
+        parseTimeOrError
+          True
+          defaultTimeLocale
+          "%Y-%m-%dT%H:%M:%S%Ez"
+          "2026-08-10T15:42:07-07:00" ::
+          ZonedTime
+      rid = formatRunId zt 4242 "a8f3"
+  assertEq "basic example" "20260810T154207-0700-4242.a8f3" rid
+  assertTrue "no colon (PATH-safe)" (':' `notElem` rid)
+  assertTrue "has T timestamp" ('T' `elem` rid)
+  assertTrue "pid.hex suffix" ("4242.a8f3" `isInfixOf` rid)
+
 testRunIdFormat :: IO ()
 testRunIdFormat =
   withSystemTempDirectory "mndz-tw-id-" $ \tmp -> do
@@ -81,6 +99,7 @@ testRunIdFormat =
     let rid = rrRunId run
     assertTrue "contains pid" (show pid `isInfixOf` rid)
     assertTrue "has T timestamp" ('T' `elem` rid)
+    assertTrue "no colon (PATH-safe)" (':' `notElem` rid)
     -- random segment after last '.'
     let rand = reverse (takeWhile (/= '.') (reverse rid))
     assertEq "random length 4" 4 (length rand)

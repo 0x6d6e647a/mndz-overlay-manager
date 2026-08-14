@@ -75,12 +75,13 @@ unitKindSuffix :: UnitKind -> String
 unitKindSuffix UnitFull = "full"
 unitKindSuffix UnitReuse = "reuse"
 
--- | Pure run-id format: local ISO-8601 with offset, pid, random hex.
+-- | Pure run-id format: ISO 8601 basic local time with numeric offset, pid, random hex.
 --
--- Example: @2026-08-10T15:42:07-07:00-4242.a8f3@
+-- Example: @20260810T154207-0700-4242.a8f3@
+-- The run-id path segment must not contain @:@ (POSIX @PATH@ separator).
 formatRunId :: ZonedTime -> CPid -> String -> String
 formatRunId zt pid rand =
-  formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%Ez" zt
+  formatTime defaultTimeLocale "%Y%m%dT%H%M%S%z" zt
     <> "-"
     <> show pid
     <> "."

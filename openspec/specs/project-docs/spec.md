@@ -248,6 +248,15 @@ When the product performs free-space feasibility checks for `update`, `README.md
 - **WHEN** an operator reads the `update` free-space documentation
 - **THEN** the text indicates that free-space checks apply to packages that need work after planning, not every package in the overlay inventory
 
+### Requirement: README run-id example is PATH-safe
+
+When `README.md` documents the product temporary workspace layout under `$TMPDIR/mndz/overlay-manager/<run-id>/`, it SHALL include at least one example run-id in ISO 8601 **basic** form with numeric offset and no `:` (for example `20260810T154207-0700-4242.a8f3`). It SHALL NOT present the extended colon form (`2026-08-10T15:42:07-07:00-…`) as the on-disk run-id example.
+
+#### Scenario: Operator sees a colon-free run-id example
+
+- **WHEN** an operator reads the temporary workspace layout in `README.md`
+- **THEN** any concrete run-id example is PATH-safe ISO 8601 basic and does not contain `:`
+
 ### Requirement: README documents check cache config and refresh
 
 Operator documentation in `README.md` SHALL document the optional `check-cache-ttl` config key (human duration, default five minutes, zero disables), the default XDG location pattern for check-cache files under `…/mndz/overlay-manager/check-cache/`, and the `--refresh` flag on both `outdated` and `update` for forcing live check or plan work. Examples SHALL use the real key and flag names.

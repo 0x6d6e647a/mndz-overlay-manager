@@ -155,7 +155,7 @@ cabal run mndz-overlay-manager -- update --refresh
 
 Heavy `DepsAndAssets` work (clone, language package download, tarball pack) and reuse downloads write under a **product temporary workspace** on the effective temp root — **`TMPDIR` when set and usable**, otherwise the system default (often `/tmp`, which may be a small tmpfs). Free-space checks still measure that root’s filesystem (not a separate device for the workspace subdirectory). Manager distfile fetches for `ebuild … manifest` write under the effective manager distfiles path (XDG cache by default), not under the temp workspace.
 
-Layout (one run root per `update` process that opens heavy temp work):
+Layout (one run root per `update` process that opens heavy temp work). Run ids are ISO 8601 **basic** local time with numeric offset, pid, and a short hex suffix — for example `20260810T154207-0700-4242.a8f3` (no `:`, so POSIX `PATH` walks stay valid):
 
 ```text
 $TMPDIR/mndz/overlay-manager/<run-id>/
