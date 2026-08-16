@@ -4,7 +4,6 @@ module Update.Go.Vendor
   ( VendorOps (..),
     VendorProgress (..),
     VendorResult (..),
-    productionVendorOps,
     mkVendorOps,
     noopVendorProgress,
     buildVendorTarball,
@@ -37,7 +36,6 @@ import Update.Process
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
-    productionCommandRunner,
   )
 
 -- | Result of a successful vendor tarball build.
@@ -90,9 +88,6 @@ mkVendorOps run =
       voGoModDownload = goModDownload run,
       voTarXz = tarXzGoMod run
     }
-
-productionVendorOps :: VendorOps
-productionVendorOps = mkVendorOps productionCommandRunner
 
 githubCloneUrl :: Text -> Text -> Text
 githubCloneUrl owner repo =
@@ -181,7 +176,7 @@ gateHostGo ops (Just required) = do
         Just False -> Left (goVersionTooOldMessage host required)
         Nothing ->
           Left $
-            "could not compare host Go version "
+            "could not compare materialize image Go version "
               <> host
               <> " with go.mod requirement "
               <> required
@@ -198,12 +193,12 @@ probeHostGoVersion run = do
         }
   pure $
     if prExitCode res /= ExitSuccess
-      then Left ("go version failed: " <> T.pack (prStderr res))
+      then Left ("could not determine materialize image Go version: " <> T.pack (prStderr res))
       else case parseGoVersionOutput (T.pack (prStdout res)) of
         Just v -> Right v
         Nothing ->
           Left $
-            "could not parse host Go version from: "
+            "could not parse materialize image Go version from: "
               <> T.strip (T.pack (prStdout res))
 
 gitCloneTag :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text ())

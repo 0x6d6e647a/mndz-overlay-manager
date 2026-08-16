@@ -14,9 +14,22 @@ This project targets **GHC 9.10.x** and needs a matching **cabal-install**. The 
 |------|------------------|
 | `update` (always) | `git`, `ebuild` (Portage), `egencache` (Portage), `gpg` |
 | `gencache` | `git`, `egencache`, `gpg` |
-| `update` of packages that **need work** and publish vendor/deps/crates assets | additionally `xz`, plus language tools as needed for **full-path** materialize only: `go` (Go vendor), `npm` (npm deps), `bun` (Bun deps), `pycargoebuild` plus `wget` or `aria2c` (Cargo crates—required whenever a cargo package needs work, including reuse-only; package `aria2` providing `aria2c` is recommended for faster full-path crate downloads), and/or **Sbcl/Autolith** materialize tools (`sbcl`, `cargo` for fff vendoring, and Quicklisp at `~/quicklisp/setup.lisp` for `qlot install`). If `pycargoebuild` is installed via `uv`/`pipx` rather than Gentoo `app-portage/pycargoebuild`, ensure it can import system Portage (e.g. `PYTHONPATH=/usr/lib/python3.*/site-packages`). Up-to-date inventory packages and reuse-only Go/npm/Bun work do not require language materialize tools. |
+| `update` of packages that **need work** and use **full-path** DepsAndAssets materialize (new vendor/deps/crates tarballs) | `docker` on `PATH` and a usable product Gentoo materialize image (host CPU architecture). The image provides `go`, `node`/`npm`, `bun`, `sbcl`+Quicklisp/qlot, `cargo`, `pycargoebuild`, `tar`, `xz`, `git`, and fetchers. Host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` / `xz` are **not** required for that path. |
+| `update` that only **reuses** existing GitHub release assets | no Docker and no host language toolchains (download + verify stay on the host) |
 
-`list` and `outdated` only need a readable overlay and a valid config; they do not require Portage or GPG. Help (`--help`) does not load configuration and needs no overlay.
+`list` and `outdated` only need a readable overlay and a valid config; they do not require Portage, GPG, or Docker. Help (`--help`) does not load configuration and needs no overlay.
+
+GPG-signed overlay/assets commits, SSH `git push`, the GitHub token, `ebuild` / `egencache`, and overlay/assets worktrees stay on the **host**. The materialize container does not receive `GITHUB_TOKEN`, `GNUPGHOME`, or `SSH_AUTH_SOCK`.
+
+### Materialize image (full-path `update`)
+
+Build the in-repo Gentoo image once (or whenever engines/`go.mod` outgrow it). The CLI does **not** `docker build` as a side effect of `update`; a missing image is a preflight hard-fail.
+
+```bash
+docker build -t mndz-overlay-manager/materialize:local -f docker/materialize/Dockerfile .
+```
+
+The CLI uses that tag by default. Override with `MNDZ_MATERIALIZE_IMAGE` if you retag or pull a different name. The image must match the **host CPU architecture** (no qemu/foreign-arch materialize).
 
 ## Build and run
 
@@ -47,6 +60,8 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 | `check-cache-ttl` | no | How long successful outdated-check / plan results are reused (human duration, default **5m**). Single unit: `s` / `m` / `h` / `d` (for example `30s`, `5m`, `1h`). **`0` or `0s` disables** the check cache (never read, never write) |
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then `github-token` in the config. Prefer env vars in shared environments; the program never logs the raw token.
+
+Work commands **warn** (and continue) when the loaded config file is not mode `0600` (owner read/write only). Token resolution is unchanged; this is not a hard failure. Help-only paths do not load the file and do not emit the warning.
 
 ### Manager distfiles (private DISTDIR)
 
@@ -129,7 +144,7 @@ cabal run mndz-overlay-manager -- outdated --refresh
 
 ### `update`
 
-Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, regenerate package-scoped Portage `egencache` md5-cache, and create GPG-signed git commits in the overlay (ebuild/Manifest and `metadata/md5-cache/` paths together). For packages under the **DepsAndAssets** technique (Go vendor, npm/Bun deps, Cargo crates, or Sbcl/Autolith deps), it may also materialize cache/vendor/crates/deps tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token and the extra runtime tools above when those packages **need work**: `xz` plus `go` / `npm` / `bun` only for full-path materialize, `pycargoebuild`+fetcher whenever a cargo package needs work, / `sbcl`+`cargo`+Quicklisp as applicable). Reusing an existing assets release does not require `go`/`npm`/`bun`/`sbcl`/`cargo` for those ecosystems; Cargo packages still require `pycargoebuild` and a fetcher in preflight whenever they need work.
+Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, regenerate package-scoped Portage `egencache` md5-cache, and create GPG-signed git commits in the overlay (ebuild/Manifest and `metadata/md5-cache/` paths together). For packages under the **DepsAndAssets** technique (Go vendor, npm/Bun deps, Cargo crates, or Sbcl/Autolith deps), it may also materialize cache/vendor/crates/deps tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token). **Full-path** materialize runs in the Gentoo Docker image (`docker` + image on `PATH`); reuse of an existing assets release stays on the host and does not require Docker or host `go`/`npm`/`bun`/`sbcl`/`pycargoebuild`.
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every inventory package is planned; packages that need work are mutated and others soft-skipped. Explicit targets that do not need work are soft-skipped.
 
@@ -149,7 +164,7 @@ cabal run mndz-overlay-manager -- --no-progress update category/package
 cabal run mndz-overlay-manager -- update --refresh
 ```
 
-`update` runs a **plan phase** first (using the check cache when enabled, same needs-work rules as `outdated` / apply), then conditional assets/token/language-tool checks for packages that need work, then the free-space gate, then concurrent mutate/apply. Spine tools (`git`, `ebuild`, `egencache`, `gpg`) and layout / manager-distfiles probes run before plan. When at least one package that needs work will attempt `DepsAndAssets`, it also checks that `assets-path` is a git work tree and a GitHub token can be resolved. Language tools (`go` / `npm` / `bun`) are required only for full-path materialize after reuse vs full classification. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
+`update` runs a **plan phase** first (using the check cache when enabled, same needs-work rules as `outdated` / apply), then conditional assets/token checks for packages that need work, then reuse vs full classification, then `docker` + materialize-image checks when any unit is full path, then the free-space gate, then concurrent mutate/apply. Spine tools (`git`, `ebuild`, `egencache`, `gpg`) and layout / manager-distfiles probes run before plan. When at least one package that needs work will attempt `DepsAndAssets`, it also checks that `assets-path` is a git work tree and a GitHub token can be resolved. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
 
 #### Free space, `TMPDIR`, and concurrent materialize
 

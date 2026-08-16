@@ -32,7 +32,13 @@ import CLI.Progress
   )
 import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
-import Config.Loader (ConfigError (..), configErrorMessage, loadConfig)
+import Config.Loader
+  ( ConfigError (..),
+    configErrorMessage,
+    configPermissionWarning,
+    loadConfig,
+    loadConfigWithWarn,
+  )
 import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, parseCheckCacheTtl)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
@@ -75,6 +81,7 @@ import System.Exit (exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Posix.Files (setFileMode)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
@@ -283,7 +290,9 @@ tests =
       testCase "Config Load Invalid Toml" testConfigLoadInvalidToml,
       testCase "Parse Check Cache TTL" testParseCheckCacheTtl,
       testCase "Config Check Cache TTL Zero" testConfigCheckCacheTtlZero,
-      testCase "Config Check Cache TTL Invalid" testConfigCheckCacheTtlInvalid
+      testCase "Config Check Cache TTL Invalid" testConfigCheckCacheTtlInvalid,
+      testCase "Config mode 0644 warns" testConfigModeWarns,
+      testCase "Config mode 0600 is silent" testConfigModeSilent
     ]
 
 testConfigLoadSuccess :: IO ()
@@ -430,3 +439,38 @@ testConfigCheckCacheTtlInvalid =
       other -> do
         hPutStrLn stderr $ "expected DecodeError, got " <> show other
         exitFailure
+
+testConfigModeWarns :: IO ()
+testConfigModeWarns =
+  withSystemTempDirectory "om-cfg-mode" $ \tmp -> do
+    let path = tmp </> "overlay-manager.toml"
+    TIO.writeFile path "overlay-path = \"/tmp/ov\"\n"
+    setFileMode path 0o644
+    warns <- newIORef ([] :: [T.Text])
+    cfg <-
+      assertRight "0644 still loads"
+        =<< loadConfigWithWarn (\m -> modifyIORef' warns (m :)) (Just path)
+    assertEq "path loaded" "/tmp/ov" (overlayPath cfg)
+    msgs <- readIORef warns
+    assertTrue "emitted a warning" (not (null msgs))
+    assertTrue "names path" (any (T.pack path `T.isInfixOf`) msgs)
+    assertTrue "names 0600" (any ("0600" `T.isInfixOf`) msgs)
+    direct <- configPermissionWarning path
+    case direct of
+      Nothing -> fail "expected permission warning"
+      Just w -> assertTrue "direct warning names 0600" ("0600" `T.isInfixOf` w)
+
+testConfigModeSilent :: IO ()
+testConfigModeSilent =
+  withSystemTempDirectory "om-cfg-0600" $ \tmp -> do
+    let path = tmp </> "overlay-manager.toml"
+    TIO.writeFile path "overlay-path = \"/tmp/ov\"\n"
+    setFileMode path 0o600
+    warns <- newIORef ([] :: [T.Text])
+    void $
+      assertRight "0600 loads"
+        =<< loadConfigWithWarn (\m -> modifyIORef' warns (m :)) (Just path)
+    msgs <- readIORef warns
+    assertEq "no permission warning" [] msgs
+    none <- configPermissionWarning path
+    assertEq "silent at 0600" Nothing none

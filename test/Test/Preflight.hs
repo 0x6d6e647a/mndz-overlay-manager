@@ -81,6 +81,7 @@ import Update.Apply
     PlannedWork (..),
     applyPackagePhase1Tracked,
     foldExitHardFail,
+    needsWorkCargo,
   )
 import Update.Apply.Errors
   ( ApplyUnitError (..),
@@ -211,10 +212,12 @@ import Update.Preflight
     cargoFetcherTools,
     cargoRequiredTools,
     checkToolsOnPath,
+    dockerRequiredTools,
     goAssetsRequiredTools,
     goRequiredTools,
     npmRequiredTools,
     preflightUpdateToolsWith,
+    preflightUpdateToolsWithImage,
     updateRequiredTools,
     validateAssetsPathWith,
   )
@@ -275,7 +278,11 @@ tests =
       testCase "Strip Surrounding Quotes" testStripSurroundingQuotes,
       testCase "Assets preflight bare binary needs-work skips go" testAssetsPfBinaryOnly,
       testCase "Assets preflight reuse-only Go skips go" testAssetsPfReuseOnlyGo,
-      testCase "Assets preflight cargo needs-work requires cargo tools" testAssetsPfCargo
+      testCase "Assets preflight cargo reuse-only skips docker and pycargo" testAssetsPfCargo,
+      testCase "Full-path missing docker hard-fails" testFullPathMissingDocker,
+      testCase "Reuse-only without docker is ok" testReuseOnlyWithoutDocker,
+      testCase "Reuse-only cargo without pycargoebuild is ok" testReuseCargoWithoutPycargo,
+      testCase "Full-path unusable image hard-fails" testFullPathMissingImage
     ]
 
 testPreflightMissingTools :: IO ()
@@ -299,6 +306,7 @@ testPreflightMissingTools = do
 testRequiredToolListConstants :: IO ()
 testRequiredToolListConstants = do
   assertEq "update tools" ["git", "ebuild", "egencache", "gpg"] updateRequiredTools
+  assertEq "docker tools" ["docker"] dockerRequiredTools
   assertEq "assets tools" ["xz"] assetsRequiredTools
   assertEq "go tools" ["go"] goRequiredTools
   assertEq "npm tools" ["npm"] npmRequiredTools
@@ -343,7 +351,8 @@ basePreflight =
       apNeedGo = False,
       apNeedNpm = False,
       apNeedBun = False,
-      apNeedCargo = False
+      apNeedCargo = False,
+      apNeedDocker = False
     }
 
 testValidateAssetsPath :: IO ()
@@ -386,64 +395,41 @@ testPreflightUpdateTools = do
             apNeedGo = True,
             apNeedNpm = True,
             apNeedBun = True,
-            apNeedCargo = True
+            apNeedCargo = True,
+            apNeedDocker = True
           }
   okFull <-
     preflightUpdateToolsWith
       ( \name ->
           pure $
-            if name == "aria2c"
+            if name `elem` ["aria2c", "go", "npm", "bun", "xz", "pycargoebuild"]
               then Nothing
               else Just ("/bin/" <> name)
       )
       full
-  assertEq "cargo ok with wget only" (Right ()) okFull
-  missFetchers <-
+  assertEq "full-path ok without host language tools" (Right ()) okFull
+  missDocker <-
     preflightUpdateToolsWith
-      ( \name ->
-          pure $
-            if name `elem` cargoFetcherTools
-              then Nothing
-              else Just ("/bin/" <> name)
-      )
+      (missingNamed ["docker"])
       full
-  errFetch <- assertLeft "missing cargo fetchers" missFetchers
-  assertTrue
-    "mentions wget or aria2c"
-    ("wget or aria2c" `T.isInfixOf` errFetch)
-  missEco <-
-    preflightUpdateToolsWith
-      (missingNamed ["xz", "go", "npm", "bun", "pycargoebuild"])
-      full
-  errEco <- assertLeft "missing ecosystem tools" missEco
-  assertTrue "lists xz" ("xz" `T.isInfixOf` errEco)
-  assertTrue "lists go" ("go" `T.isInfixOf` errEco)
-  assertTrue "lists npm" ("npm" `T.isInfixOf` errEco)
-  assertTrue "lists bun" ("bun" `T.isInfixOf` errEco)
-  assertTrue "lists pycargoebuild" ("pycargoebuild" `T.isInfixOf` errEco)
+  errDocker <- assertLeft "missing docker" missDocker
+  assertTrue "lists docker" ("docker" `T.isInfixOf` errDocker)
 
--- | Bare @aria2@ (no @c@) is not a pycargoebuild fetcher PATH name.
+-- | Bare host @aria2@ does not satisfy full-path cargo; docker + image do.
 testBareAria2NotEnough :: IO ()
 testBareAria2NotEnough = do
-  let full =
-        basePreflight
-          { apNeedAssets = True,
-            apNeedCargo = True
-          }
-  -- wget and aria2c missing; only bare "aria2" would be findable if probed.
+  let full = basePreflight {apNeedDocker = True}
   miss <-
     preflightUpdateToolsWith
       ( \name ->
           pure $
-            if name `elem` ["wget", "aria2c"]
+            if name == "docker"
               then Nothing
               else Just ("/bin/" <> name)
       )
       full
-  err <- assertLeft "bare aria2 does not satisfy hard check" miss
-  assertTrue
-    "mentions wget or aria2c"
-    ("wget or aria2c" `T.isInfixOf` err)
+  err <- assertLeft "missing docker; host aria2 is irrelevant" miss
+  assertTrue "lists docker" ("docker" `T.isInfixOf` err)
 
 cargoFullPathClassify :: [ClassifyPackageResult]
 cargoFullPathClassify =
@@ -490,7 +476,7 @@ testCargoFetcherAdvisoryFullPath = do
               else Just ("/bin/" <> name)
       )
       cargoFullPathClassify
-  assertEq "one advisory" [cargoFetcherAria2Advisory] advisories
+  assertEq "no host wget/aria2 advisory" [] advisories
 
 testCargoFetcherAdvisoryAria2cPresent :: IO ()
 testCargoFetcherAdvisoryAria2cPresent = do
@@ -524,18 +510,15 @@ testCargoFetcherAdvisoryMergeWarnings = do
   let diskWarns = ["Portage DISTDIR low free space"]
       usrWarnings = diskWarns <> cargoAds
   assertEq
-    "disk + cargo advisory on collected warnings"
-    [ "Portage DISTDIR low free space",
-      cargoFetcherAria2Advisory
-    ]
+    "disk warns only; cargo host advisory suppressed"
+    ["Portage DISTDIR low free space"]
     usrWarnings
-  -- Hard fail path: missing fetchers still Left; advisories not consulted.
-  missFetchers <-
+  -- Missing host fetchers no longer hard-fail (image provides them).
+  okFetchers <-
     preflightUpdateToolsWith
       (missingNamed cargoFetcherTools)
       (basePreflight {apNeedCargo = True})
-  err <- assertLeft "hard fail before advisory emission" missFetchers
-  assertTrue "hard fail names fetchers" ("wget or aria2c" `T.isInfixOf` err)
+  assertEq "reuse-style cargo tools not required" (Right ()) okFetchers
 
 testStripSurroundingQuotes :: IO ()
 testStripSurroundingQuotes = do
@@ -567,6 +550,7 @@ testAssetsPfBinaryOnly = do
   assertEq "no assets" False (apNeedAssets pf)
   assertEq "no go" False (apNeedGo pf)
   assertEq "no cargo" False (apNeedCargo pf)
+  assertEq "no docker" False (apNeedDocker pf)
 
 testAssetsPfReuseOnlyGo :: IO ()
 testAssetsPfReuseOnlyGo = do
@@ -599,6 +583,7 @@ testAssetsPfReuseOnlyGo = do
       pf = assetsPreflightFromPlan plans classify
   assertEq "assets needed" True (apNeedAssets pf)
   assertEq "reuse-only no go" False (apNeedGo pf)
+  assertEq "reuse-only no docker" False (apNeedDocker pf)
 
 testAssetsPfCargo :: IO ()
 testAssetsPfCargo = do
@@ -630,5 +615,60 @@ testAssetsPfCargo = do
         ]
       pf = assetsPreflightFromPlan plans classify
   assertEq "assets" True (apNeedAssets pf)
-  assertEq "cargo P1 even reuse" True (apNeedCargo pf)
+  assertEq "plan still needs cargo work" True (any needsWorkCargo plans)
+  assertEq "reuse-only cargo no host pycargo" False (apNeedCargo pf)
+  assertEq "reuse-only no docker" False (apNeedDocker pf)
   assertEq "no go" False (apNeedGo pf)
+
+testFullPathMissingDocker :: IO ()
+testFullPathMissingDocker = do
+  miss <-
+    preflightUpdateToolsWith
+      (missingNamed ["docker"])
+      (basePreflight {apNeedDocker = True})
+  err <- assertLeft "full-path needs docker" miss
+  assertTrue "names docker" ("docker" `T.isInfixOf` err)
+
+testReuseOnlyWithoutDocker :: IO ()
+testReuseOnlyWithoutDocker = do
+  ok <-
+    preflightUpdateToolsWith
+      (missingNamed ["docker", "go", "npm", "bun", "xz"])
+      basePreflight
+  assertEq "reuse-only without docker" (Right ()) ok
+
+testReuseCargoWithoutPycargo :: IO ()
+testReuseCargoWithoutPycargo = do
+  let pf = assetsPreflightFromPlan cargoReusePlans cargoReuseOnlyClassify
+  assertEq "reuse cargo no docker" False (apNeedDocker pf)
+  ok <-
+    preflightUpdateToolsWith
+      (missingNamed ["docker", "pycargoebuild", "wget", "aria2c"])
+      pf
+  assertEq "reuse cargo without host pycargo" (Right ()) ok
+  where
+    cargoReusePlans =
+      let key = PackageKey "dev-util/mise"
+          pv = parseEbuildVersion "2025.1.0"
+       in [ PlanNeedsWork
+              key
+              PlannedDeps
+                { pdEco = Cargo Nothing Nothing,
+                  pdSource = GitHub "o" "r" "v",
+                  pdPlan = emptyDepsPlan,
+                  pdLocalPVs = [],
+                  pdContentFix = [pv]
+                }
+          ]
+
+testFullPathMissingImage :: IO ()
+testFullPathMissingImage = do
+  let inspect _ = pure (Left "materialize image is not usable: missing")
+  miss <-
+    preflightUpdateToolsWithImage
+      allPresent
+      inspect
+      "mndz-overlay-manager/materialize:local"
+      (basePreflight {apNeedDocker = True})
+  err <- assertLeft "unusable image" miss
+  assertTrue "names image" ("materialize image" `T.isInfixOf` err)

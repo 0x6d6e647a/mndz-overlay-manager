@@ -6,7 +6,7 @@ Npm registry-only deps cache tarball build, `engines.node` probing, nodejs BDEPE
 
 ### Requirement: Registry-only npm cache tarball
 
-For `DepsAndAssets Npm` full-path materialization of PV, the program SHALL, in the unit directories under the product temporary workspace defined by `temp-workspace` without requiring a git clone of the package source: (1) run `npm pack` for the configured npm package at that version (specifier `{npmPackage}@{pv}`) into the unit work area; (2) populate an `npm-cache/` directory under the unit work area via `npm --cache <npm-cache-path> install` of the produced tarball; (3) create `{pn}-{pv}-deps.tar.xz` under the unit `out/` (or equivalent staged output path for publish) whose top-level entry is `npm-cache/`, using xz compression with environment `XZ_OPT=-T0 -9e` (multi-threaded extreme) when invoking tar, or equivalent extreme multi-thread xz settings; (4) after writing the final deps tarball path, verify that the file is an xz-compressed stream and hard-fail if it is plain tar or otherwise not xz. The program SHALL implement this in-process/Haskell orchestration and SHALL NOT invoke overlay Python helper scripts. Unit temporary trees SHALL follow the `temp-workspace` lifecycle.
+For `DepsAndAssets Npm` full-path materialization of PV, the program SHALL, in the unit directories under the product temporary workspace defined by `temp-workspace` without requiring a git clone of the package source: (1) run `npm pack` for the configured npm package at that version (specifier `{npmPackage}@{pv}`) into the unit work area; (2) populate an `npm-cache/` directory under the unit work area via `npm --cache <npm-cache-path> install` of the produced tarball using an empty userconfig (not the operator `~/.npmrc`); (3) create `{pn}-{pv}-deps.tar.xz` under the unit `out/` whose top-level entry is `npm-cache/`, omitting `npm-cache/_logs/` and `npm-cache/_update-notifier*` members, packing with the hermetic tar/xz rules specified by `hermetic-asset-materialize`; (4) after writing the final deps tarball path, verify that the file is an xz-compressed stream and hard-fail if it is plain tar or otherwise not xz. Full-path npm pack/install/tar SHALL run in the materialize container. The program SHALL implement this in-process/Haskell orchestration and SHALL NOT invoke overlay Python helper scripts. Unit temporary trees SHALL follow the `temp-workspace` lifecycle.
 
 #### Scenario: Tarball layout for openspec
 
@@ -21,12 +21,17 @@ For `DepsAndAssets Npm` full-path materialization of PV, the program SHALL, in t
 #### Scenario: Npm deps pack uses extreme multi-thread xz
 
 - **WHEN** the manager packs an npm deps tarball
-- **THEN** the pack process uses `XZ_OPT` containing `-T0` and `-9e` (or equivalent extreme multi-thread settings)
+- **THEN** the pack process uses `XZ_OPT` containing `-T1` and `-9e` (single-thread extreme; hermetic-asset-materialize)
 
 #### Scenario: Npm deps pack rejects non-xz body
 
 - **WHEN** the final `{pn}-{pv}-deps.tar.xz` path is not an xz-compressed stream after pack
 - **THEN** materialize hard-fails before assets publish treats the file as successful
+
+#### Scenario: Packed cache omits logs
+
+- **WHEN** npm cache construction packs the deps tarball
+- **THEN** the archive has no `npm-cache/_logs/` members
 
 ### Requirement: Npm source and technique pairing
 
@@ -79,11 +84,11 @@ Replacement SHALL consume the full prior Portage atom tail for that package (ver
 
 ### Requirement: Host Node gate on full path
 
-After determining the node requirement for a PV on the full materialize path, the program SHALL compare the host `node` (or equivalent) version to that requirement. If the host is strictly older, the program SHALL hard-fail that PV before `npm pack`/cache population and SHALL NOT publish assets or mutate the overlay for that attempt. The reuse path SHALL NOT apply this host gate.
+After determining the node requirement for a PV on the full materialize path, the program SHALL compare the materialize-image `node` version to that requirement. If the image is strictly older, the program SHALL hard-fail that PV before `npm pack`/cache population and SHALL NOT publish assets or mutate the overlay for that attempt. The reuse path SHALL NOT apply this gate. The program SHALL NOT require a host `node` binary for this gate.
 
 #### Scenario: Host too old
 
-- **WHEN** engines require `20.19.0` and the host Node is older
+- **WHEN** engines require `20.19.0` and the materialize image Node is older
 - **THEN** full-path materialize hard-fails without publishing assets
 
 ### Requirement: openspec enabled end-to-end

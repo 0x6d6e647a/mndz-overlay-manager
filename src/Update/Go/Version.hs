@@ -106,16 +106,16 @@ hostMeetsGoRequirement host required =
     Just _ -> Just True
     Nothing -> Nothing
 
--- | Operator-facing hard-fail message when host Go is too old.
+-- | Operator-facing hard-fail message when the materialize-image Go is too old.
 goVersionTooOldMessage :: Text -> Text -> Text
 goVersionTooOldMessage host required =
-  "host Go "
+  "materialize image Go "
     <> host
     <> " is older than go.mod requirement go "
     <> required
-    <> "; install/upgrade dev-lang/go to at least "
+    <> "; rebuild the materialize image with a newer go (at least "
     <> required
-    <> " (keyword unmask or wait for the Gentoo tree if needed). "
+    <> "). "
     <> "This tool does not set GOTOOLCHAIN=auto or download Go toolchains."
 
 -- | Heuristic: go stderr looks like a toolchain / language version problem.
@@ -138,6 +138,6 @@ enrichGoModDownloadError err
   | looksLikeToolchainError err =
       "go mod download failed: "
         <> err
-        <> " (host Go may be older than go.mod; upgrade dev-lang/go — "
+        <> " (materialize image Go may be older than go.mod; rebuild the image — "
         <> "this tool does not set GOTOOLCHAIN=auto)"
   | otherwise = "go mod download failed: " <> err

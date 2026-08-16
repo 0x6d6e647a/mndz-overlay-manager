@@ -2,6 +2,7 @@
 
 module Update.Preflight
   ( updateRequiredTools,
+    dockerRequiredTools,
     assetsRequiredTools,
     goRequiredTools,
     npmRequiredTools,
@@ -14,6 +15,7 @@ module Update.Preflight
     checkToolsOnPath,
     preflightUpdateTools,
     preflightUpdateToolsWith,
+    preflightUpdateToolsWithImage,
     validateAssetsPath,
     validateAssetsPathWith,
     AssetsPreflight (..),
@@ -32,7 +34,6 @@ import Update.Apply.Plan
     ClassifyPackageResult (..),
     PackagePlanResult (..),
     PlannedWork (..),
-    needsWorkCargo,
     needsWorkDepsAssets,
   )
 import Update.DiskSpace
@@ -47,6 +48,11 @@ import Update.DiskSpace
     readManifestMaybe,
   )
 import Update.Git (isGitWorkTree)
+import Update.Process (productionCommandRunner)
+import Update.Process.Docker
+  ( inspectMaterializeImage,
+    resolveMaterializeImage,
+  )
 import Update.Types
   ( PackageKey (..),
     ecosystemIsBun,
@@ -60,7 +66,11 @@ import Update.Types
 updateRequiredTools :: [String]
 updateRequiredTools = ["git", "ebuild", "egencache", "gpg"]
 
--- | Tools always required when any DepsAndAssets assets work is in scope.
+-- | Required on PATH when any classified unit is full-path materialize.
+dockerRequiredTools :: [String]
+dockerRequiredTools = ["docker"]
+
+-- | Historical host-pack tool list (image provides xz; kept for tests).
 assetsRequiredTools :: [String]
 assetsRequiredTools = ["xz"]
 
@@ -90,55 +100,42 @@ cargoFetcherAria2Advisory :: Text
 cargoFetcherAria2Advisory =
   "pycargoebuild is using wget; install aria2 for faster crate fetches"
 
--- | Soft advisories for cargo fetchers after hard language preflight passed.
--- Emits when at least one classified unit is full-path cargo and @aria2c@ is
--- missing on PATH (injectable finder). Empty when reuse-only or @aria2c@ present.
+-- | Host wget\/aria2 advisories are not emitted: full-path cargo fetchers
+-- live in the materialize image.
 cargoFetcherAdvisories ::
   (String -> IO (Maybe FilePath)) ->
   [ClassifyPackageResult] ->
   IO [Text]
-cargoFetcherAdvisories findTool classifyResults = do
-  let hasFullPathCargo =
-        or
-          [ ecosystemIsCargo (cpuEco u) && cpuClass u /= ReusePath
-          | ClassifyOk _ us <- classifyResults,
-            u <- us
-          ]
-  if not hasFullPathCargo
-    then pure []
-    else do
-      mAria2c <- findTool "aria2c"
-      pure $
-        case mAria2c of
-          Just _ -> []
-          Nothing -> [cargoFetcherAria2Advisory]
+cargoFetcherAdvisories _findTool _classifyResults = pure []
 
 -- | Legacy combined Go + xz tools (full-path Go materialize).
 goAssetsRequiredTools :: [String]
 goAssetsRequiredTools = goRequiredTools <> assetsRequiredTools
 
--- | Which language tools and assets extras to require.
+-- | Which assets extras and docker to require after plan + classify.
 data AssetsPreflight = AssetsPreflight
   { apNeedAssets :: Bool,
     apNeedGo :: Bool,
     apNeedNpm :: Bool,
     apNeedBun :: Bool,
-    apNeedCargo :: Bool
+    apNeedCargo :: Bool,
+    -- | Any classified unit is full path (image provides language tools).
+    apNeedDocker :: Bool
   }
   deriving (Eq, Show)
 
--- | Derive tool/assets preflight from plan + classify results (A2).
+-- | Derive tool/assets preflight from plan + classify results.
 --
--- Language tools only for full-path ecosystems among classified units;
--- cargo tools when any cargo package needs work (P1, including reuse-only);
--- assets/token/xz when any DepsAndAssets package needs work.
+-- Docker is required when any classified unit is full path. Host language
+-- tools, xz, pycargoebuild, and fetchers are not required for that path.
+-- @apNeedCargo@ is true only for full-path cargo (reuse-only does not need
+-- host pycargoebuild).
 assetsPreflightFromPlan ::
   [PackagePlanResult] ->
   [ClassifyPackageResult] ->
   AssetsPreflight
 assetsPreflightFromPlan planResults classifyResults =
   let needAssets = any needsWorkDepsAssets planResults
-      needCargo = any needsWorkCargo planResults
       fullUnits =
         [ u
         | ClassifyOk _ us <- classifyResults,
@@ -148,12 +145,14 @@ assetsPreflightFromPlan planResults classifyResults =
       needGo = any (ecosystemIsGo . cpuEco) fullUnits
       needNpm = any (ecosystemIsNpm . cpuEco) fullUnits
       needBun = any (ecosystemIsBun . cpuEco) fullUnits
+      needCargo = any (ecosystemIsCargo . cpuEco) fullUnits
    in AssetsPreflight
         { apNeedAssets = needAssets,
           apNeedGo = needGo,
           apNeedNpm = needNpm,
           apNeedBun = needBun,
-          apNeedCargo = needCargo
+          apNeedCargo = needCargo,
+          apNeedDocker = not (null fullUnits)
         }
 
 -- | Check that each tool name is findable on PATH.
@@ -163,41 +162,49 @@ checkToolsOnPath findTool tools = do
   results <- mapM (\t -> (t,) <$> findTool t) tools
   pure [name | (name, path) <- results, isNothing path]
 
--- | Preflight with per-ecosystem tool requirements (production PATH lookup).
+-- | Preflight with production PATH lookup and image inspect.
 preflightUpdateTools :: AssetsPreflight -> IO (Either Text ())
-preflightUpdateTools = preflightUpdateToolsWith findExecutable
+preflightUpdateTools ap = do
+  image <- resolveMaterializeImage
+  preflightUpdateToolsWithImage
+    findExecutable
+    (inspectMaterializeImage productionCommandRunner)
+    image
+    ap
 
 -- | Preflight with an injectable executable finder (for Unit tests).
+-- Image inspect is treated as success when docker is present (tests that
+-- need a failing image use 'preflightUpdateToolsWithImage').
 preflightUpdateToolsWith ::
   (String -> IO (Maybe FilePath)) ->
   AssetsPreflight ->
   IO (Either Text ())
-preflightUpdateToolsWith findTool ap = do
-  let baseTools =
+preflightUpdateToolsWith findTool =
+  preflightUpdateToolsWithImage findTool (\_ -> pure (Right ())) defaultImageForTests
+  where
+    defaultImageForTests = "mndz-overlay-manager/materialize:local"
+
+-- | Preflight with injectable docker finder and image inspect.
+preflightUpdateToolsWithImage ::
+  (String -> IO (Maybe FilePath)) ->
+  (String -> IO (Either Text ())) ->
+  String ->
+  AssetsPreflight ->
+  IO (Either Text ())
+preflightUpdateToolsWithImage findTool inspectImage image ap = do
+  let tools =
         updateRequiredTools
-          <> [t | apNeedAssets ap, t <- assetsRequiredTools]
-          <> [t | apNeedGo ap, t <- goRequiredTools]
-          <> [t | apNeedNpm ap, t <- npmRequiredTools]
-          <> [t | apNeedBun ap, t <- bunRequiredTools]
-          <> [t | apNeedCargo ap, t <- cargoRequiredTools]
-  missingBase <- checkToolsOnPath findTool baseTools
-  missingFetchers <-
-    if apNeedCargo ap
-      then do
-        foundAny <- checkToolsOnPath findTool cargoFetcherTools
-        -- missing all fetchers → report the group
-        pure
-          [ "wget or aria2c"
-          | length foundAny == length cargoFetcherTools
-          ]
-      else pure []
-  let missing = missingBase <> missingFetchers
-  pure $ case missing of
-    [] -> Right ()
-    ms ->
-      Left $
-        "update requires the following tools on PATH: "
-          <> T.intercalate ", " (map T.pack ms)
+          <> [t | apNeedDocker ap, t <- dockerRequiredTools]
+  missing <- checkToolsOnPath findTool tools
+  case missing of
+    ms@(_ : _) ->
+      pure $
+        Left $
+          "update requires the following tools on PATH: "
+            <> T.intercalate ", " (map T.pack ms)
+    []
+      | apNeedDocker ap -> inspectImage image
+    [] -> pure (Right ())
 
 -- | Validate assets worktree path when assets publish is required.
 validateAssetsPath :: Maybe FilePath -> IO (Either Text FilePath)

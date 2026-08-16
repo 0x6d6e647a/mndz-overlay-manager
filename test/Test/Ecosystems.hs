@@ -13,9 +13,15 @@ import Data.List (isInfixOf)
 import Data.Maybe (mapMaybe)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Directory
+  ( createDirectoryIfMissing,
+    createFileLink,
+    doesFileExist,
+    getSymbolicLinkTarget,
+    pathIsSymbolicLink,
+  )
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (isAbsolute, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Support
@@ -37,6 +43,7 @@ import Update.Bun.Cache
     hostMeetsBunRequirement,
     mkBunCacheOps,
     parseEnginesBunFromPackageJson,
+    rewriteBunCacheSymlinks,
   )
 import Update.Cargo.Crates
   ( CargoOps (..),
@@ -70,9 +77,12 @@ import Update.Npm.Cache
     hostMeetsNodeRequirement,
     mkNpmCacheOps,
     nodeVersionTooOldMessage,
+    prepareNpmCacheForPack,
   )
 import Update.Pack.XzTar
-  ( isXzMagic,
+  ( hermeticTarArgs,
+    isXzMagic,
+    packTarXz,
     packTarXzAtomic,
     verifyXzFile,
     xzMagicPrefix,
@@ -84,12 +94,19 @@ import Update.Process
     ProcessResult (..),
     productionCommandRunner,
   )
+import Update.Process.Docker
+  ( MaterializeDockerCfg (..),
+    defaultMaterializeImage,
+    materializeBuilderHome,
+    wrapMaterializeRequest,
+  )
 import Update.Runtime.Ceilings (gentooRepoPath, mkPortageqRunner)
 import Update.Sbcl.Deps
   ( SbclDepsOps (..),
     SbclDepsProgress (..),
     buildSbclDepsTarball,
     parseSbclVersionFloor,
+    sanitizeQlotConfs,
   )
 import Update.Types (PackageKey (..))
 
@@ -121,13 +138,15 @@ unitTests =
         "sbcl pure"
         [ testCase "parseSbclVersionFloor" testParseSbclVersionFloor,
           testCase "buildSbclDepsTarball success + progress" testSbclBuilderSuccess,
-          testCase "buildSbclDepsTarball clone failure" testSbclBuilderCloneFail
+          testCase "buildSbclDepsTarball clone failure" testSbclBuilderCloneFail,
+          testCase "sanitizeQlotConfs rewrites operator home" testSanitizeQlotConfs
         ],
       testGroup
         "npm builder"
         [ testCase "buildNpmDepsTarball success + progress" testNpmBuilderSuccess,
           testCase "buildNpmDepsTarball host too old" testNpmBuilderHostTooOld,
-          testCase "buildNpmDepsTarball pack failure" testNpmBuilderPackFail
+          testCase "buildNpmDepsTarball pack failure" testNpmBuilderPackFail,
+          testCase "npm pack omits _logs and _update-notifier" testNpmPackOmitsLogs
         ],
       testGroup
         "bun builder"
@@ -136,7 +155,9 @@ unitTests =
           testCase "buildBunDepsTarball InstallTree empty tree fails" testBunBuilderInstallTreeEmpty,
           testCase "buildBunDepsTarball host too old" testBunBuilderHostTooOld,
           testCase "buildBunDepsTarball missing lock" testBunBuilderMissingLock,
-          testCase "buildBunDepsTarball install failure" testBunBuilderInstallFail
+          testCase "buildBunDepsTarball install failure" testBunBuilderInstallFail,
+          testCase "BunCache rewrite unscoped and scoped alias symlinks" testBunCacheRewriteSymlinks,
+          testCase "BunCache leftover absolute symlink hard-fails" testBunCacheAbsoluteLeftover
         ],
       testGroup
         "cargo builder"
@@ -152,7 +173,8 @@ unitTests =
       testGroup
         "xz pack helpers"
         [ testCase "verifyXzFile rejects plain tar, accepts xz magic" testVerifyXzFile,
-          testCase "packTarXzAtomic temp path is not bare .tmp" testPackTarXzAtomicTempSuffix
+          testCase "packTarXzAtomic temp path is not bare .tmp" testPackTarXzAtomicTempSuffix,
+          testCase "packTarXz hermetic owners and XZ_OPT -T1 -9e" testPackTarXzHermetic
         ],
       testGroup
         "production CommandRunner adapters"
@@ -160,7 +182,8 @@ unitTests =
           testCase "bun mk path success + failure" testBunMkCommandRunner,
           testCase "vendor mk path success + failure" testVendorMkCommandRunner,
           testCase "cargo mk path success + failure" testCargoMkCommandRunner,
-          testCase "ebuild/egencache/portageq mk runners" testSimpleRunnersMk
+          testCase "ebuild/egencache/portageq mk runners" testSimpleRunnersMk,
+          testCase "docker wrap uses bind-mount HOME and strips secrets" testDockerWrapRequest
         ]
     ]
 
@@ -1245,7 +1268,7 @@ testPackCratesTarballXzArgv =
         case lookup "XZ_OPT" env of
           Nothing -> fail "XZ_OPT missing"
           Just v -> do
-            assertTrue "XZ_OPT has -T0" ("-T0" `isInfixOf` v)
+            assertTrue "XZ_OPT has -T1" ("-T1" `isInfixOf` v)
             assertTrue "XZ_OPT has -9e" ("-9e" `isInfixOf` v)
             assertEq "XZ_OPT exact preset" xzOptValue v
 
@@ -1298,6 +1321,183 @@ testPackTarXzAtomicTempSuffix =
     exists <- doesFileExist outPath
     assertTrue "final path exists" exists
 
+testPackTarXzHermetic :: IO ()
+testPackTarXzHermetic =
+  withSystemTempDirectory "mndz-xz-hermetic-" $ \tmp -> do
+    let src = tmp </> "src"
+        outPath = tmp </> "out.tar.xz"
+    createDirectoryIfMissing True src
+    TIO.writeFile (src </> "hello.txt") "hi\n"
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    let run req = do
+          atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
+          productionCommandRunner req
+    assertRight "hermetic pack"
+      =<< packTarXz run "hermetic pack" (Just src) Nothing ["hello.txt"] outPath
+    assertRight "xz magic" =<< verifyXzFile outPath
+    reqs <- readIORef reqsRef
+    let tarArgs =
+          concat
+            [ a
+            | r <- reqs,
+              ExecCmd "tar" a <- [prMode r]
+            ]
+        tarEnvs = [env | r <- reqs, Just env <- [prEnv r]]
+    assertTrue "hermetic flags present" (all (`elem` tarArgs) hermeticTarArgs)
+    case tarEnvs of
+      [] -> fail "expected XZ_OPT env"
+      (env : _) ->
+        case lookup "XZ_OPT" env of
+          Nothing -> fail "XZ_OPT missing"
+          Just v -> do
+            assertTrue "XZ_OPT has -T1" ("-T1" `isInfixOf` v)
+            assertTrue "XZ_OPT has -9e" ("-9e" `isInfixOf` v)
+            assertEq "XZ_OPT exact" xzOptValue v
+    listed <-
+      productionCommandRunner
+        ProcessRequest
+          { prMode = ExecCmd "tar" ["--numeric-owner", "-tvf", outPath],
+            prCwd = Nothing,
+            prEnv = Nothing,
+            prStdin = ""
+          }
+    assertEq "tar -t exit" ExitSuccess (prExitCode listed)
+    assertTrue "members are 0/0" ("0/0" `isInfixOf` prStdout listed)
+
+testNpmPackOmitsLogs :: IO ()
+testNpmPackOmitsLogs =
+  withSystemTempDirectory "mndz-npm-omit-" $ \tmp -> do
+    let cache = tmp </> "npm-cache"
+        logs = cache </> "_logs"
+        outPath = tmp </> "deps.tar.xz"
+    createDirectoryIfMissing True logs
+    TIO.writeFile (logs </> "debug.log") "home=/home/operator\n"
+    TIO.writeFile (cache </> "_update-notifier-last-checked") "x"
+    TIO.writeFile (cache </> "index-v5") "ok\n"
+    prepareNpmCacheForPack cache
+    assertRight "pack after scrub"
+      =<< packTarXz productionCommandRunner "npm omit" (Just tmp) Nothing ["npm-cache"] outPath
+    listed <-
+      productionCommandRunner
+        ProcessRequest
+          { prMode = ExecCmd "tar" ["-tf", outPath],
+            prCwd = Nothing,
+            prEnv = Nothing,
+            prStdin = ""
+          }
+    assertEq "tar -t exit" ExitSuccess (prExitCode listed)
+    let members = prStdout listed
+    assertTrue "keeps cache index" ("index-v5" `isInfixOf` members)
+    assertTrue "omits _logs" (not ("_logs" `isInfixOf` members))
+    assertTrue
+      "omits _update-notifier"
+      (not ("_update-notifier" `isInfixOf` members))
+
+testBunCacheRewriteSymlinks :: IO ()
+testBunCacheRewriteSymlinks =
+  withSystemTempDirectory "mndz-bun-rewrite-" $ \tmp -> do
+    let cache = tmp </> "bun-cache"
+        unscopedDest = cache </> "gifwrap@0.10.1@@@1"
+        unscopedLinkDir = cache </> "gifwrap"
+        unscopedLink = unscopedLinkDir </> "0.10.1@@@1"
+        scopedDest = cache </> "@scope" </> "name@1.0.0@@@1"
+        scopedLinkDir = cache </> "@scope" </> "name"
+        scopedLink = scopedLinkDir </> "1.0.0@@@1"
+    createDirectoryIfMissing True unscopedDest
+    createDirectoryIfMissing True unscopedLinkDir
+    createDirectoryIfMissing True scopedDest
+    createDirectoryIfMissing True scopedLinkDir
+    TIO.writeFile (unscopedDest </> "pkg.json") "{}"
+    TIO.writeFile (scopedDest </> "pkg.json") "{}"
+    createFileLink unscopedDest unscopedLink
+    createFileLink scopedDest scopedLink
+    assertRight "rewrite" =<< rewriteBunCacheSymlinks cache
+    unscopedT <- getSymbolicLinkTarget unscopedLink
+    scopedT <- getSymbolicLinkTarget scopedLink
+    assertTrue "unscoped relative" (not (isAbsolute unscopedT))
+    assertTrue "scoped relative" (not (isAbsolute scopedT))
+    assertTrue "unscoped points at @ form" ("gifwrap@0.10.1@@@1" `isInfixOf` unscopedT)
+    assertTrue "scoped points at @ form" ("name@1.0.0@@@1" `isInfixOf` scopedT)
+    assertTrue "unscoped still a link" =<< pathIsSymbolicLink unscopedLink
+    assertTrue "scoped still a link" =<< pathIsSymbolicLink scopedLink
+
+testBunCacheAbsoluteLeftover :: IO ()
+testBunCacheAbsoluteLeftover =
+  withSystemTempDirectory "mndz-bun-abs-" $ \tmp -> do
+    let cache = tmp </> "bun-cache"
+        link = cache </> "orphan"
+    createDirectoryIfMissing True cache
+    createFileLink "/no/such/bun-cache/missing@1@@@1" link
+    err <- assertLeft "absolute leftover" =<< rewriteBunCacheSymlinks cache
+    assertTrue "mentions bun-cache" ("bun-cache" `T.isInfixOf` err)
+
+testSanitizeQlotConfs :: IO ()
+testSanitizeQlotConfs =
+  withSystemTempDirectory "mndz-qlot-sanitize-" $ \tmp -> do
+    let qlot = tmp </> ".qlot"
+        conf = qlot </> "qlot.conf"
+        srcReg = qlot </> "source-registry.conf"
+        operatorHome = "/home/operator"
+    createDirectoryIfMissing True qlot
+    TIO.writeFile conf (T.pack operatorHome <> "/quicklisp/setup.lisp\n")
+    TIO.writeFile srcReg (":directory \"" <> T.pack operatorHome <> "/quicklisp/local-projects/\"\n")
+    assertRight "sanitize" =<< sanitizeQlotConfs tmp operatorHome
+    confBody <- TIO.readFile conf
+    srcBody <- TIO.readFile srcReg
+    assertTrue "qlot.conf no operator home" (not (T.pack operatorHome `T.isInfixOf` confBody))
+    assertTrue "source-registry no operator home" (not (T.pack operatorHome `T.isInfixOf` srcBody))
+    assertTrue "rewritten to builder home" ("/home/builder" `T.isInfixOf` confBody)
+
+testDockerWrapRequest :: IO ()
+testDockerWrapRequest = do
+  let cfg =
+        MaterializeDockerCfg
+          { mdcImage = defaultMaterializeImage,
+            mdcUser = "1000:1000",
+            mdcBindPath = "/tmp/mndz/overlay-manager/run1"
+          }
+      req =
+        ProcessRequest
+          { prMode = ExecCmd "go" ["version"],
+            prCwd = Just "/tmp/mndz/overlay-manager/run1/work",
+            prEnv =
+              Just
+                [ ("HOME", "/home/operator"),
+                  ("GITHUB_TOKEN", "secret"),
+                  ("GNUPGHOME", "/home/operator/.gnupg"),
+                  ("SSH_AUTH_SOCK", "/tmp/ssh.sock"),
+                  ("GOMODCACHE", "/tmp/mndz/overlay-manager/run1/work/go-mod"),
+                  ("XZ_OPT", "-T1 -9e")
+                ],
+            prStdin = ""
+          }
+      wrapped = wrapMaterializeRequest cfg req
+  case prMode wrapped of
+    ExecCmd cmd args -> do
+      assertEq "docker binary" "docker" cmd
+      assertTrue "run --rm" (["run", "--rm"] `isInfixOf` args)
+      assertTrue "--user host uid" (["--user", "1000:1000"] `isInfixOf` args)
+      assertTrue
+        "HOME=/home/builder"
+        (any (("HOME=" <> materializeBuilderHome) `isInfixOf`) args)
+      assertTrue
+        "bind-mount same path"
+        ( any
+            (isInfixOf "type=bind,src=/tmp/mndz/overlay-manager/run1,dst=/tmp/mndz/overlay-manager/run1")
+            args
+        )
+      assertTrue "workdir" (["--workdir", "/tmp/mndz/overlay-manager/run1/work"] `isInfixOf` args)
+      assertTrue "inner go version" (["go", "version"] `isInfixOf` args)
+      assertTrue "image tag" (defaultMaterializeImage `elem` args)
+      assertTrue "no GITHUB_TOKEN" (not (any ("GITHUB_TOKEN" `isInfixOf`) args))
+      assertTrue "no GNUPGHOME" (not (any ("GNUPGHOME" `isInfixOf`) args))
+      assertTrue "no SSH_AUTH_SOCK" (not (any ("SSH_AUTH_SOCK" `isInfixOf`) args))
+      assertTrue "keeps GOMODCACHE" (any ("GOMODCACHE=" `isInfixOf`) args)
+      assertTrue "keeps XZ_OPT" (any ("XZ_OPT=" `isInfixOf`) args)
+    ShellCmd _ -> fail "expected ExecCmd docker"
+  assertEq "cwd consumed by --workdir" Nothing (prCwd wrapped)
+  assertEq "env not inherited on host docker" Nothing (prEnv wrapped)
+
 ------------------------------------------------------------------------
 -- Production mk*Ops / runners via scripted CommandRunner
 ------------------------------------------------------------------------
@@ -1348,12 +1548,14 @@ testNpmMkCommandRunner =
           atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
           case execCmd req of
             Just ("node", ["--version"]) -> pure (okResult "v20.19.0\n")
-            Just ("npm", "pack" : _) -> do
-              case prCwd req of
-                Just workDir -> writeFile (workDir </> "pkg-1.0.0.tgz") "packed"
-                Nothing -> pure ()
-              pure (okResult "")
-            Just ("npm", "--cache" : _) -> pure (okResult "")
+            Just ("npm", args)
+              | "pack" `elem` args -> do
+                  case prCwd req of
+                    Just workDir -> writeFile (workDir </> "pkg-1.0.0.tgz") "packed"
+                    Nothing -> pure ()
+                  pure (okResult "")
+              | "--cache" `elem` args -> pure (okResult "")
+              | otherwise -> pure (failResult ("unexpected npm: " <> show args))
             Just ("tar", args) -> do
               for_ (tarArchivePath args) writeFakeXz
               pure (okResult "")
@@ -1375,7 +1577,7 @@ testNpmMkCommandRunner =
     assertEq "out path" (outDir </> "left-pad-1.0.0-npm-cache.tar.xz") path
     exists <- doesFileExist path
     assertTrue "tarball written" exists
-    -- Non-Cargo pack asserts uniform XZ_OPT=-T0 -9e.
+    -- Non-Cargo pack asserts uniform XZ_OPT=-T1 -9e.
     reqs <- reverse <$> readIORef reqsRef
     let tarReqs =
           [ r
@@ -1390,7 +1592,7 @@ testNpmMkCommandRunner =
         Just env ->
           case lookup "XZ_OPT" env of
             Just v -> do
-              assertTrue "npm XZ_OPT -T0" ("-T0" `isInfixOf` v)
+              assertTrue "npm XZ_OPT -T1" ("-T1" `isInfixOf` v)
               assertTrue "npm XZ_OPT -9e" ("-9e" `isInfixOf` v)
             Nothing -> fail "npm tar missing XZ_OPT"
         Nothing -> fail "npm tar missing env"
@@ -1405,7 +1607,7 @@ testNpmMkCommandRunner =
           outDir
           outDir
           "x.tar.xz"
-    assertTrue "host node error" ("could not determine host Node version" `T.isInfixOf` err)
+    assertTrue "image node error" ("could not determine materialize image Node version" `T.isInfixOf` err)
 
 testBunMkCommandRunner :: IO ()
 testBunMkCommandRunner =

@@ -334,7 +334,7 @@ cargoChecksumJson packageChecksum =
   "{\"package\":\"" <> packageChecksum <> "\",\"files\":{}}"
 
 -- | Stage distdir registry crates under @cargo_home/gentoo/@, write checksum JSON,
--- and create @{pn}-{pv}-crates.tar.xz@ via system @tar@ with @XZ_OPT=-T0 -9e@.
+-- and create @{pn}-{pv}-crates.tar.xz@ via system @tar@ with @XZ_OPT=-T1 -9e@.
 -- Writes atomically (temp path then rename). Errors use a pack-specific prefix.
 packCratesTarball ::
   CommandRunner ->

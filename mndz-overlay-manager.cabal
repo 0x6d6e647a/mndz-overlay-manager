@@ -54,7 +54,7 @@ build-type:         Simple
 extra-doc-files:    CHANGELOG.md
 
 -- Extra source files to be distributed with the package, such as examples, or a tutorial module.
--- extra-source-files:
+extra-source-files:  docker/materialize/Dockerfile
 
 common warnings
     ghc-options:
@@ -116,6 +116,7 @@ library
       , Update.Pack.XzTar
       , Update.Preflight
       , Update.Process
+      , Update.Process.Docker
       , Update.Resolve
       , Update.Runtime.Ceilings
       , Update.Sbcl.Deps

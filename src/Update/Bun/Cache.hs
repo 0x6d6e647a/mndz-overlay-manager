@@ -14,26 +14,45 @@ module Update.Bun.Cache
     hostBunVersion,
     hostMeetsBunRequirement,
     bunVersionTooOldMessage,
+    rewriteBunCacheSymlinks,
   )
 where
 
-import Control.Monad (forM)
+import Control.Exception (IOException, try)
+import Control.Monad (foldM, forM)
 import Data.Aeson (Value, eitherDecode, withObject, (.:?))
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.ByteString.Lazy qualified as BL
 import Data.Char (isDigit)
-import Data.List (sort)
+import Data.Either (fromRight)
+import Data.List (isPrefixOf, sort)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import System.Directory
   ( createDirectoryIfMissing,
+    createFileLink,
     doesDirectoryExist,
     doesFileExist,
+    doesPathExist,
+    getSymbolicLinkTarget,
     listDirectory,
+    makeAbsolute,
+    pathIsSymbolicLink,
+    removeFile,
   )
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath
+  ( addTrailingPathSeparator,
+    equalFilePath,
+    isAbsolute,
+    joinPath,
+    normalise,
+    splitDirectories,
+    takeDirectory,
+    takeFileName,
+    (</>),
+  )
 import Update.DiskSpace
   ( MaterializeClass (FullNpmBun),
     checkPostCloneForClass,
@@ -113,11 +132,14 @@ hostBunVersion run = do
         }
   pure $
     if prExitCode res /= ExitSuccess
-      then Left ("could not determine host Bun version: " <> T.pack (prStderr res))
+      then Left ("could not determine materialize image Bun version: " <> T.pack (prStderr res))
       else case parseBunVersionOutput (T.pack (prStdout res)) of
         Just v -> Right v
         Nothing ->
-          Left ("could not parse host Bun version from: " <> T.strip (T.pack (prStdout res)))
+          Left
+            ( "could not parse materialize image Bun version from: "
+                <> T.strip (T.pack (prStdout res))
+            )
 
 parseBunVersionOutput :: Text -> Maybe Text
 parseBunVersionOutput out =
@@ -141,11 +163,11 @@ hostMeetsBunRequirement host required =
 
 bunVersionTooOldMessage :: Text -> Text -> Text
 bunVersionTooOldMessage host required =
-  "host Bun "
+  "materialize image Bun "
     <> host
     <> " is older than Bun requirement "
     <> required
-    <> "; install/upgrade dev-lang/bun-bin to at least "
+    <> "; rebuild the materialize image with Bun at least "
     <> required
 
 -- | Bun minimum from @package.json@: parseable @engines.bun@ wins; else
@@ -221,7 +243,7 @@ buildBunDepsTarball ops progress mode owner repo prefix pv bunReq workDir outDir
         Nothing ->
           pure $
             Left
-              ( "could not compare host Bun "
+              ( "could not compare materialize image Bun "
                   <> host
                   <> " to engines.bun "
                   <> bunReq
@@ -282,8 +304,12 @@ packAfterInstall ::
   FilePath ->
   FilePath ->
   IO (Either Text (FilePath, [FilePath]))
-packAfterInstall _ BunCache tmp _cloneDir _cacheDir =
-  pure (Right (tmp, ["bun-cache"]))
+packAfterInstall _ BunCache tmp _cloneDir cacheDir = do
+  rewritten <- rewriteBunCacheSymlinks cacheDir
+  pure $ case rewritten of
+    Left err -> Left err
+    Right () -> Right (tmp, ["bun-cache"])
+-- InstallTree uses the shared hermetic tar only (no bun-cache alias rewrite).
 packAfterInstall _ InstallTree _tmp cloneDir _cacheDir = do
   entries <- collectInstallTreeEntries cloneDir
   pure $
@@ -318,6 +344,182 @@ collectInstallTreeEntries root = sort <$> findNodeModules root ""
             then findNodeModules base childRel
             else pure []
       pure (nmRel ++ concat children)
+
+-- | Rewrite absolute @bun-cache/@ alias symlinks to posix-relative in-tree
+-- targets. Hard-fails if any absolute link remains or a rewritten target is
+-- missing from the tree.
+rewriteBunCacheSymlinks :: FilePath -> IO (Either Text ())
+rewriteBunCacheSymlinks cacheRoot = do
+  exists <- doesDirectoryExist cacheRoot
+  if not exists
+    then
+      pure $
+        Left
+          ( "bun-cache directory missing at "
+              <> T.pack cacheRoot
+          )
+    else do
+      absRoot <- makeAbsolute cacheRoot
+      rewritten <- rewriteWalk absRoot absRoot
+      case rewritten of
+        Left err -> pure (Left err)
+        Right () -> verifyNoAbsolute absRoot absRoot
+
+rewriteWalk :: FilePath -> FilePath -> IO (Either Text ())
+rewriteWalk root dir = do
+  names <- listDirectory dir
+  foldM
+    ( \acc name ->
+        case acc of
+          Left err -> pure (Left err)
+          Right () -> do
+            let p = dir </> name
+            isLink <- pathIsSymbolicLink p
+            if isLink
+              then rewriteOne root p
+              else do
+                isDir <- doesDirectoryExist p
+                if isDir then rewriteWalk root p else pure (Right ())
+    )
+    (Right ())
+    names
+
+rewriteOne :: FilePath -> FilePath -> IO (Either Text ())
+rewriteOne root linkPath = do
+  target <- getSymbolicLinkTarget linkPath
+  if not (isAbsolute target)
+    then pure (Right ())
+    else do
+      mDest <- resolveInTree root target
+      case mDest of
+        Nothing ->
+          pure $
+            Left
+              ( "bun-cache symlink "
+                  <> T.pack linkPath
+                  <> " points at "
+                  <> T.pack target
+                  <> " which is not in the bun-cache tree"
+              )
+        Just dest -> do
+          present <- pathPresent dest
+          if not present
+            then
+              pure $
+                Left
+                  ( "bun-cache rewritten target missing: "
+                      <> T.pack dest
+                      <> " (from "
+                      <> T.pack linkPath
+                      <> ")"
+                  )
+            else do
+              let rel = relativeUnder (takeDirectory linkPath) dest
+              if isAbsolute rel || null rel
+                then
+                  pure $
+                    Left
+                      ( "bun-cache could not compute a relative target for "
+                          <> T.pack linkPath
+                      )
+                else do
+                  removeFile linkPath
+                  createFileLink rel linkPath
+                  pure (Right ())
+
+resolveInTree :: FilePath -> FilePath -> IO (Maybe FilePath)
+resolveInTree root target = do
+  let under = if pathIsUnder root target then Just (normalise target) else Nothing
+  case under of
+    Just dest -> do
+      ok <- pathPresent dest
+      if ok then pure (Just dest) else trySuffix
+    Nothing -> trySuffix
+  where
+    trySuffix = do
+      let rel = dropBunCachePrefix target
+          dest = normalise (root </> rel)
+      ok <- pathPresent dest
+      if ok && pathIsUnder root dest
+        then pure (Just dest)
+        else pure Nothing
+
+dropBunCachePrefix :: FilePath -> FilePath
+dropBunCachePrefix target =
+  case break (== "bun-cache") (splitDirectories target) of
+    (_, "bun-cache" : rest@(_ : _)) -> joinPath rest
+    _ -> takeFileName target
+
+pathIsUnder :: FilePath -> FilePath -> Bool
+pathIsUnder root path =
+  let nRoot = addTrailingPathSeparator (normalise root)
+      nPath = normalise path
+   in nRoot `isPrefixOf` nPath || equalFilePath root path
+
+-- | Relative path from @fromDir@ to @dest@ using path components.
+-- 'makeRelative' is not safe here: @gifwrap@ is a string prefix of
+-- @gifwrap@0.10.1@@@1@ without a trailing separator.
+relativeUnder :: FilePath -> FilePath -> FilePath
+relativeUnder fromDir dest =
+  let fromParts = splitDirectories (normalise fromDir)
+      destParts = splitDirectories (normalise dest)
+      common = length (takeWhile id (zipWith equalFilePath fromParts destParts))
+      ups = replicate (length fromParts - common) ".."
+      downs = drop common destParts
+   in case ups ++ downs of
+        [] -> "."
+        parts -> joinPath parts
+
+pathPresent :: FilePath -> IO Bool
+pathPresent p = do
+  exists <- doesPathExist p
+  if exists
+    then pure True
+    else do
+      eLink <- try (pathIsSymbolicLink p) :: IO (Either IOException Bool)
+      pure (fromRight False eLink)
+
+verifyNoAbsolute :: FilePath -> FilePath -> IO (Either Text ())
+verifyNoAbsolute root dir = do
+  names <- listDirectory dir
+  foldM
+    ( \acc name ->
+        case acc of
+          Left err -> pure (Left err)
+          Right () -> do
+            let p = dir </> name
+            isLink <- pathIsSymbolicLink p
+            if isLink
+              then do
+                target <- getSymbolicLinkTarget p
+                if isAbsolute target
+                  then
+                    pure $
+                      Left
+                        ( "bun-cache symlink still absolute after rewrite: "
+                            <> T.pack p
+                            <> " -> "
+                            <> T.pack target
+                        )
+                  else do
+                    let dest = normalise (takeDirectory p </> target)
+                    present <- pathPresent dest
+                    if not present
+                      then
+                        pure $
+                          Left
+                            ( "bun-cache relative symlink target missing: "
+                                <> T.pack p
+                                <> " -> "
+                                <> T.pack target
+                            )
+                      else pure (Right ())
+              else do
+                isDir <- doesDirectoryExist p
+                if isDir then verifyNoAbsolute root p else pure (Right ())
+    )
+    (Right ())
+    names
 
 gitCloneTag :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text ())
 gitCloneTag run url tag dest = do

@@ -197,7 +197,8 @@ runUpdate rt refresh pkgArgs = do
                 apNeedGo = False,
                 apNeedNpm = False,
                 apNeedBun = False,
-                apNeedCargo = False
+                apNeedCargo = False,
+                apNeedDocker = False
               }
       preflightOk <- liftIO $ runSpineToolSteps (rtProgress rt) spinePf
       case preflightOk of

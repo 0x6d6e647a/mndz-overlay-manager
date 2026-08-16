@@ -9,19 +9,16 @@ module Update.Spine
 where
 
 import CLI.Progress
-  ( ProgressConfig (..),
+  ( ProgressConfig,
     StepHandle (..),
     noopMultiHandle,
     withStepProgress,
   )
-import Colog (logWarning, usingLoggerT)
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
-import Control.Monad (forM_)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Overlay.Types (Ebuild)
-import System.Directory (findExecutable)
 import Update.Apply
   ( ApplyEnv (..),
     applyOverlayFromPlan,
@@ -37,8 +34,8 @@ import Update.Apply.Plan
     unitPlansFromClassifyResults,
   )
 import Update.Assets.Release (ReleaseOps (..))
-import Update.Bun.Cache (productionBunCacheOps)
-import Update.Cargo.Crates (productionCargoOps)
+import Update.Bun.Cache (mkBunCacheOps)
+import Update.Cargo.Crates (mkCargoOps)
 import Update.Check
   ( PackageEntry (..),
     groupByPackage,
@@ -57,24 +54,24 @@ import Update.DiskSpace
   )
 import Update.Distfiles (lookupPortageDistDir)
 import Update.Git (GitOps)
-import Update.Go.Vendor (productionVendorOps)
+import Update.Go.Vendor (mkVendorOps)
 import Update.Md5Cache (productionEgencacheRunner)
-import Update.Npm.Cache (productionNpmCacheOps)
+import Update.Npm.Cache (mkNpmCacheOps)
 import Update.Preflight
   ( AssetsPreflight (..),
     assetsPreflightFromPlan,
     buildGitMvUnitPlans,
-    cargoFetcherAdvisories,
     preflightUpdateTools,
     validateAssetsPath,
   )
-import Update.Sbcl.Deps (productionSbclDepsOps)
+import Update.Process.Docker (productionMaterializeRunner)
+import Update.Sbcl.Deps (mkSbclDepsOps)
 import Update.SshAgent
   ( SshAgentOps,
     ensureSshAgent,
     teardownSshSession,
   )
-import Update.TempWorkspace (openRunRoot)
+import Update.TempWorkspace (RunRoot (..), openRunRoot)
 import Update.Types
   ( ApplyOutcome (..),
     Fetcher,
@@ -146,7 +143,8 @@ runUpdatePhases deps entries allEbuilds selected = do
                 apNeedGo = False,
                 apNeedNpm = False,
                 apNeedBun = False,
-                apNeedCargo = False
+                apNeedCargo = False,
+                apNeedDocker = False
               }
         case toolsAssets of
           Left err -> pure (Left err)
@@ -185,12 +183,6 @@ runUpdatePhases deps entries allEbuilds selected = do
       case eLang of
         Left err -> pure (Left err)
         Right () -> do
-          -- Soft cargo fetcher tip (full-path + missing aria2c); hard-fail already
-          -- short-circuited above when pycargoebuild/fetchers are missing.
-          cargoAdvisories <-
-            cargoFetcherAdvisories findExecutable classifyResults
-          usingLoggerT (pcLogger pcfg) $
-            forM_ cargoAdvisories logWarning
           -- Disk units from needs-work classified + GitMv
           gitMvUnits <- buildGitMvUnitPlans overlayRoot distDir planResults'
           let units = unitPlansFromClassifyResults classifyResults gitMvUnits
@@ -213,17 +205,18 @@ runUpdatePhases deps entries allEbuilds selected = do
                     assetsLock <- newMVar ()
                     overlayLock <- newMVar ()
                     tempRun <- openRunRoot
+                    matRunner <- productionMaterializeRunner (rrPath tempRun)
                     let env =
                           ApplyEnv
                             { aeFetcher = usdFetcher deps,
                               aeGitOps = usdGitOps deps,
                               aeEbuildRunner = productionEbuildRunner distDir,
                               aeEgencacheRunner = productionEgencacheRunner,
-                              aeVendorOps = productionVendorOps,
-                              aeNpmCacheOps = productionNpmCacheOps,
-                              aeBunCacheOps = productionBunCacheOps,
-                              aeCargoOps = productionCargoOps,
-                              aeSbclDepsOps = productionSbclDepsOps,
+                              aeVendorOps = mkVendorOps matRunner,
+                              aeNpmCacheOps = mkNpmCacheOps matRunner,
+                              aeBunCacheOps = mkBunCacheOps matRunner,
+                              aeCargoOps = mkCargoOps matRunner,
+                              aeSbclDepsOps = mkSbclDepsOps matRunner,
                               aeReleaseOps = releaseOps,
                               aeFetchModelsDev = fetchModelsDevApiJson,
                               aeAssetsRoot = mAssetsRoot,
@@ -267,7 +260,7 @@ runUpdatePhases deps entries allEbuilds selected = do
                 Right
                   UpdateSpineResult
                     { usrOutcomes = outcomes,
-                      usrWarnings = warns <> cargoAdvisories,
+                      usrWarnings = warns,
                       usrCacheSummary = mSummary
                     }
 

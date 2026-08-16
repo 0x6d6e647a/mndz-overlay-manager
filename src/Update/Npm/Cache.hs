@@ -13,15 +13,18 @@ module Update.Npm.Cache
     hostNodeVersion,
     hostMeetsNodeRequirement,
     nodeVersionTooOldMessage,
+    prepareNpmCacheForPack,
+    npmUserconfigName,
   )
 where
 
+import Control.Monad (when)
 import Data.Aeson (Value (..), eitherDecode, withObject, (.:), (.:?))
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson.Types (Parser, parseMaybe)
 import Data.Char (isDigit)
-import Data.List (sortBy)
+import Data.List (isPrefixOf, sortBy)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client
@@ -34,7 +37,12 @@ import Network.HTTP.Client
   )
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion, comparePV, parseEbuildVersion)
-import System.Directory (createDirectoryIfMissing, listDirectory)
+import System.Directory
+  ( createDirectoryIfMissing,
+    doesDirectoryExist,
+    listDirectory,
+    removePathForcibly,
+  )
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import Update.Engines (parseEnginesMinimum)
@@ -94,11 +102,14 @@ hostNodeVersion run = do
         }
   pure $
     if prExitCode res /= ExitSuccess
-      then Left ("could not determine host Node version: " <> T.pack (prStderr res))
+      then Left ("could not determine materialize image Node version: " <> T.pack (prStderr res))
       else case parseNodeVersionOutput (T.pack (prStdout res)) of
         Just v -> Right v
         Nothing ->
-          Left ("could not parse host Node version from: " <> T.strip (T.pack (prStdout res)))
+          Left
+            ( "could not parse materialize image Node version from: "
+                <> T.strip (T.pack (prStdout res))
+            )
 
 parseNodeVersionOutput :: Text -> Maybe Text
 parseNodeVersionOutput out =
@@ -122,11 +133,11 @@ hostMeetsNodeRequirement host required =
 
 nodeVersionTooOldMessage :: Text -> Text -> Text
 nodeVersionTooOldMessage host required =
-  "host Node "
+  "materialize image Node "
     <> host
     <> " is older than engines.node requirement "
     <> required
-    <> "; install/upgrade net-libs/nodejs to at least "
+    <> "; rebuild the materialize image with Node at least "
     <> required
 
 -- | Registry-only: npm pack → npm --cache install → tar npm-cache/.
@@ -153,7 +164,7 @@ buildNpmDepsTarball ops progress npmPkg pv nodeReq workDir outDir tarballName = 
         Nothing ->
           pure $
             Left
-              ( "could not compare host Node "
+              ( "could not compare materialize image Node "
                   <> host
                   <> " to engines.node "
                   <> nodeReq
@@ -184,13 +195,45 @@ buildNpmDepsTarball ops progress npmPkg pv nodeReq workDir outDir tarballName = 
                       ncpOnCompressDone progress
                       pure (Right outPath)
 
+-- | Empty npm userconfig basename under the unit @work/@ (not the operator @~\/.npmrc@).
+npmUserconfigName :: FilePath
+npmUserconfigName = "npm-userconfig"
+
+writeEmptyUserconfig :: FilePath -> IO FilePath
+writeEmptyUserconfig workDir = do
+  let path = workDir </> npmUserconfigName
+  writeFile path ""
+  pure path
+
+-- | Drop npm debug logs and update-notifier state before packing.
+prepareNpmCacheForPack :: FilePath -> IO ()
+prepareNpmCacheForPack cacheDir = do
+  exists <- doesDirectoryExist cacheDir
+  if not exists
+    then pure ()
+    else do
+      removePathForcibly (cacheDir </> "_logs")
+      names <- listDirectory cacheDir
+      mapM_
+        ( \n ->
+            when
+              ("_update-notifier" `isPrefixOf` n)
+              (removePathForcibly (cacheDir </> n))
+        )
+        names
+
 npmPack :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text FilePath)
 npmPack run npmPkg pv workDir = do
+  createDirectoryIfMissing True workDir
+  uc <- writeEmptyUserconfig workDir
   let spec = T.unpack npmPkg <> "@" <> T.unpack pv
   res <-
     run
       ProcessRequest
-        { prMode = ExecCmd "npm" ["pack", spec, "--pack-destination", workDir],
+        { prMode =
+            ExecCmd
+              "npm"
+              ["pack", spec, "--pack-destination", workDir, "--userconfig", uc],
           prCwd = Just workDir,
           prEnv = Nothing,
           prStdin = ""
@@ -206,11 +249,16 @@ npmPack run npmPkg pv workDir = do
 
 npmInstallCache :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
 npmInstallCache run tgz cacheDir = do
+  let workDir = takeDirectory tgz
+  uc <- writeEmptyUserconfig workDir
   res <-
     run
       ProcessRequest
-        { prMode = ExecCmd "npm" ["--cache", cacheDir, "install", tgz],
-          prCwd = Just (takeDirectory tgz),
+        { prMode =
+            ExecCmd
+              "npm"
+              ["--userconfig", uc, "--cache", cacheDir, "install", tgz],
+          prCwd = Just workDir,
           prEnv = Nothing,
           prStdin = ""
         }
@@ -220,8 +268,9 @@ npmInstallCache run tgz cacheDir = do
       else Left ("npm --cache install failed: " <> T.pack (prStderr res))
 
 tarXzNpmCache :: CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
-tarXzNpmCache run workDir entry =
-  packTarXz run "tar xz npm-cache failed" (Just workDir) Nothing [entry]
+tarXzNpmCache run workDir entry outPath = do
+  prepareNpmCacheForPack (workDir </> entry)
+  packTarXz run "tar xz npm-cache failed" (Just workDir) Nothing [entry] outPath
 
 parseEnginesNode :: Value -> Parser Text
 parseEnginesNode =

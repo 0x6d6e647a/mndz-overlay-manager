@@ -449,8 +449,8 @@ testGoVersionParse = do
     "toolchain stderr detected"
     (looksLikeToolchainError "go: go.mod requires go >= 1.26.5 (running go 1.26.4; GOTOOLCHAIN=local)")
   assertTrue
-    "enrich mentions upgrade"
-    ("dev-lang/go" `T.isInfixOf` enrichGoModDownloadError "toolchain not available")
+    "enrich mentions rebuild image"
+    ("rebuild the image" `T.isInfixOf` enrichGoModDownloadError "toolchain not available")
 
 testGoBdependEdit :: IO ()
 testGoBdependEdit = do

@@ -2,12 +2,14 @@
 
 -- | Shared DepsAndAssets @tar@ + xz pack helpers.
 --
--- Sets @XZ_OPT=-T0 -9e@, forces xz compression with @-J@ (so a temporary
--- basename cannot disable @tar -a@ auto-compress), and verifies the final
--- file begins with the xz stream magic header.
+-- Sets @XZ_OPT=-T1 -9e@ (single-thread extreme, bit-stable across core
+-- counts), forces xz compression with @-J@ (so a temporary basename cannot
+-- disable @tar -a@ auto-compress), records numeric root owners and a clamped
+-- epoch mtime, and verifies the final file begins with the xz stream magic.
 module Update.Pack.XzTar
   ( xzOptValue,
     withXzOpt,
+    hermeticTarArgs,
     xzMagicPrefix,
     isXzMagic,
     verifyXzFile,
@@ -37,9 +39,24 @@ import Update.Process
     ProcessResult (..),
   )
 
--- | Uniform extreme multi-thread xz settings for DepsAndAssets packs.
+-- | Uniform extreme single-thread xz settings for DepsAndAssets packs.
 xzOptValue :: String
-xzOptValue = "-T0 -9e"
+xzOptValue = "-T1 -9e"
+
+-- | GNU tar flags that strip builder identity from ustar\/PAX headers.
+--
+-- Owners are numeric @0\/0@, names are sorted, mtimes are clamped to the
+-- Unix epoch, and PAX atime\/ctime extended headers are dropped.
+hermeticTarArgs :: [String]
+hermeticTarArgs =
+  [ "--owner=0",
+    "--group=0",
+    "--numeric-owner",
+    "--sort=name",
+    "--mtime=@0",
+    "--clamp-mtime",
+    "--pax-option=delete=atime,delete=ctime"
+  ]
 
 -- | Install @XZ_OPT@ into an environment list (replacing any prior value).
 withXzOpt :: [(String, String)] -> [(String, String)]
@@ -77,8 +94,9 @@ verifyXzFile path = do
                   <> T.pack path
               )
 
--- | Pack @entries@ to @finalPath@ with forced xz (@-cJf@) and @XZ_OPT=-T0 -9e@,
--- then verify xz magic. Non-atomic: writes @finalPath@ directly.
+-- | Pack @entries@ to @finalPath@ with forced xz (@-cJf@), hermetic tar
+-- flags, and @XZ_OPT=-T1 -9e@, then verify xz magic. Non-atomic: writes
+-- @finalPath@ directly.
 --
 -- @cwd@ is the process working directory; @changeDir@ is an optional @tar -C@
 -- directory (applied before create). @errPrefix@ prefixes failure messages.
@@ -143,7 +161,7 @@ runTarXz run errPrefix cwd changeDir entries archivePath = do
         Nothing -> []
         Just d -> ["-C", d]
       -- Force xz with -J so auto-compress suffix cannot skip compression.
-      tarArgs = cArgs ++ ["-cJf", archivePath] ++ entries
+      tarArgs = hermeticTarArgs ++ cArgs ++ ["-cJf", archivePath] ++ entries
   res <-
     run
       ProcessRequest
