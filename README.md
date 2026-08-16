@@ -61,7 +61,7 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then `github-token` in the config. Prefer env vars in shared environments; the program never logs the raw token.
 
-Work commands **warn** (and continue) when the loaded config file is not mode `0600` (owner read/write only). Token resolution is unchanged; this is not a hard failure. Help-only paths do not load the file and do not emit the warning.
+Work commands **hard-fail** (error-level log, exit `1`) when the config file is not exactly mode `0600` (owner read/write only), or when its mode cannot be read. Run `chmod 600` on that file (XDG default or `--config` path) before the next work command. Token resolution is unchanged. Help-only paths do not load the file and do not emit this error.
 
 ### Manager distfiles (private DISTDIR)
 

@@ -35,9 +35,7 @@ import Colog qualified as C
 import Config.Loader
   ( ConfigError (..),
     configErrorMessage,
-    configPermissionWarning,
     loadConfig,
-    loadConfigWithWarn,
   )
 import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, parseCheckCacheTtl)
 import Control.Concurrent (threadDelay)
@@ -81,7 +79,7 @@ import System.Exit (exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Posix.Files (setFileMode)
+import System.Posix.Files (createSymbolicLink, setFileMode)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
@@ -291,12 +289,18 @@ tests =
       testCase "Parse Check Cache TTL" testParseCheckCacheTtl,
       testCase "Config Check Cache TTL Zero" testConfigCheckCacheTtlZero,
       testCase "Config Check Cache TTL Invalid" testConfigCheckCacheTtlInvalid,
-      testCase "Config mode 0644 warns" testConfigModeWarns,
-      testCase "Config mode 0600 is silent" testConfigModeSilent
+      testCase "Config mode 0644 hard-fails" testConfigModeWrong,
+      testCase "Config mode 0600 loads" testConfigModeOk,
+      testCase "Config unreadable mode hard-fails" testConfigModeUnreadable
     ]
+
+-- | Git does not persist @0600@ on tracked fixtures; temp files follow umask.
+chmodConfig600 :: FilePath -> IO ()
+chmodConfig600 path = setFileMode path 0o600
 
 testConfigLoadSuccess :: IO ()
 testConfigLoadSuccess = do
+  chmodConfig600 "test/fixtures/valid-config.toml"
   cfg <- assertRight "valid config" =<< loadConfig (Just "test/fixtures/valid-config.toml")
   assertEq "path key" "test/fixtures/populated-overlay" (overlayPath cfg)
   assertEq "assets optional absent" Nothing (assetsPath cfg)
@@ -306,6 +310,7 @@ testConfigLoadSuccess = do
 
 testConfigOptionalKeys :: IO ()
 testConfigOptionalKeys = do
+  chmodConfig600 "test/fixtures/full-config.toml"
   cfg <- assertRight "full config" =<< loadConfig (Just "test/fixtures/full-config.toml")
   assertEq "path" "/tmp/overlay" (overlayPath cfg)
   assertEq "assets" (Just "/tmp/assets") (assetsPath cfg)
@@ -325,6 +330,7 @@ testConfigLoadMissing = do
 
 testConfigLoadMissingKey :: IO ()
 testConfigLoadMissingKey = do
+  chmodConfig600 "test/fixtures/missing-key-config.toml"
   err <- assertLeft "missing key" =<< loadConfig (Just "test/fixtures/missing-key-config.toml")
   case err of
     DecodeError msg ->
@@ -335,6 +341,7 @@ testConfigLoadMissingKey = do
 
 testConfigLegacyKeysRejected :: IO ()
 testConfigLegacyKeysRejected = do
+  chmodConfig600 "test/fixtures/legacy-key-config.toml"
   err <- assertLeft "legacy keys" =<< loadConfig (Just "test/fixtures/legacy-key-config.toml")
   case err of
     DecodeError msg ->
@@ -359,6 +366,14 @@ testConfigErrorMessages = do
     "decode message"
     "failed to decode config: bad keys"
     (configErrorMessage (DecodeError "bad keys"))
+  assertEq
+    "wrong mode message"
+    "config file /tmp/c.toml is mode 0644; expected mode 0600"
+    (configErrorMessage (ConfigModeError "/tmp/c.toml" (Just 0o644)))
+  assertEq
+    "unreadable mode message"
+    "config file /tmp/c.toml: cannot read permission bits; expected mode 0600"
+    (configErrorMessage (ConfigModeError "/tmp/c.toml" Nothing))
 
 -- | Hit 'defaultConfigPath' via 'loadConfig Nothing' under controlled XDG.
 testConfigDefaultPathViaXdg :: IO ()
@@ -376,6 +391,7 @@ testConfigDefaultPathViaXdg =
     -- Success arm: place a valid config at the XDG default path.
     createDirectoryIfMissing True (tmp </> "mndz")
     TIO.writeFile expected "overlay-path = \"/tmp/from-xdg\"\n"
+    chmodConfig600 expected
     withEnvVar "XDG_CONFIG_HOME" (Just tmp) $ do
       cfg <- assertRight "default present" =<< loadConfig Nothing
       assertEq "loaded via xdg" "/tmp/from-xdg" (overlayPath cfg)
@@ -385,6 +401,7 @@ testConfigLoadInvalidToml =
   withSystemTempDirectory "om-config-bad" $ \tmp -> do
     let path = tmp </> "bad.toml"
     TIO.writeFile path "this is not = valid toml [[[\n"
+    chmodConfig600 path
     err <- assertLeft "invalid toml" =<< loadConfig (Just path)
     case err of
       DecodeError msg ->
@@ -424,6 +441,7 @@ testConfigCheckCacheTtlZero =
   withSystemTempDirectory "om-cache-ttl0" $ \tmp -> do
     let path = tmp </> "c.toml"
     TIO.writeFile path "overlay-path = \"/tmp/ov\"\ncheck-cache-ttl = \"0s\"\n"
+    chmodConfig600 path
     cfg <- assertRight "zero ttl" =<< loadConfig (Just path)
     assertEq "disabled" CacheDisabled (checkCacheTtl cfg)
 
@@ -432,6 +450,7 @@ testConfigCheckCacheTtlInvalid =
   withSystemTempDirectory "om-cache-ttl-bad" $ \tmp -> do
     let path = tmp </> "c.toml"
     TIO.writeFile path "overlay-path = \"/tmp/ov\"\ncheck-cache-ttl = \"1h30m\"\n"
+    chmodConfig600 path
     err <- assertLeft "invalid ttl" =<< loadConfig (Just path)
     case err of
       DecodeError msg ->
@@ -440,37 +459,58 @@ testConfigCheckCacheTtlInvalid =
         hPutStrLn stderr $ "expected DecodeError, got " <> show other
         exitFailure
 
-testConfigModeWarns :: IO ()
-testConfigModeWarns =
+testConfigModeWrong :: IO ()
+testConfigModeWrong =
   withSystemTempDirectory "om-cfg-mode" $ \tmp -> do
     let path = tmp </> "overlay-manager.toml"
     TIO.writeFile path "overlay-path = \"/tmp/ov\"\n"
     setFileMode path 0o644
-    warns <- newIORef ([] :: [T.Text])
-    cfg <-
-      assertRight "0644 still loads"
-        =<< loadConfigWithWarn (\m -> modifyIORef' warns (m :)) (Just path)
-    assertEq "path loaded" "/tmp/ov" (overlayPath cfg)
-    msgs <- readIORef warns
-    assertTrue "emitted a warning" (not (null msgs))
-    assertTrue "names path" (any (T.pack path `T.isInfixOf`) msgs)
-    assertTrue "names 0600" (any ("0600" `T.isInfixOf`) msgs)
-    direct <- configPermissionWarning path
-    case direct of
-      Nothing -> fail "expected permission warning"
-      Just w -> assertTrue "direct warning names 0600" ("0600" `T.isInfixOf` w)
+    err <- assertLeft "0644 hard-fails" =<< loadConfig (Just path)
+    case err of
+      ConfigModeError p (Just mode) -> do
+        assertEq "mode error path" path p
+        assertEq "observed mode" 0o644 mode
+        assertTrue "names 0600" ("0600" `T.isInfixOf` T.pack (configErrorMessage err))
+      other -> do
+        hPutStrLn stderr $ "expected ConfigModeError with observed mode, got " <> show other
+        exitFailure
 
-testConfigModeSilent :: IO ()
-testConfigModeSilent =
+testConfigModeOk :: IO ()
+testConfigModeOk =
   withSystemTempDirectory "om-cfg-0600" $ \tmp -> do
     let path = tmp </> "overlay-manager.toml"
     TIO.writeFile path "overlay-path = \"/tmp/ov\"\n"
     setFileMode path 0o600
-    warns <- newIORef ([] :: [T.Text])
-    void $
-      assertRight "0600 loads"
-        =<< loadConfigWithWarn (\m -> modifyIORef' warns (m :)) (Just path)
-    msgs <- readIORef warns
-    assertEq "no permission warning" [] msgs
-    none <- configPermissionWarning path
-    assertEq "silent at 0600" Nothing none
+    cfg <- assertRight "0600 loads" =<< loadConfig (Just path)
+    assertEq "path loaded" "/tmp/ov" (overlayPath cfg)
+
+-- | Parent mode @000@ makes @stat@ fail with a non-ENOENT error. Restore the
+-- directory so temp cleanup can run. A privileged process that can still
+-- @stat@ falls back to a symlink loop (also a non-ENOENT @stat@ failure).
+testConfigModeUnreadable :: IO ()
+testConfigModeUnreadable =
+  withSystemTempDirectory "om-cfg-nostat" $ \tmp -> do
+    let dir = tmp </> "hidden"
+        path = dir </> "overlay-manager.toml"
+    createDirectoryIfMissing True dir
+    TIO.writeFile path "overlay-path = \"/tmp/ov\"\n"
+    chmodConfig600 path
+    denied <-
+      bracket_
+        (setFileMode dir 0o000)
+        (setFileMode dir 0o700)
+        (loadConfig (Just path))
+    err <- case denied of
+      Left e -> pure e
+      Right _ -> do
+        let a = tmp </> "loop-a"
+            b = tmp </> "loop-b"
+        createSymbolicLink b a
+        createSymbolicLink a b
+        assertLeft "unreadable mode (stat loop)" =<< loadConfig (Just a)
+    case err of
+      ConfigModeError _ _ ->
+        assertTrue "names 0600" ("0600" `T.isInfixOf` T.pack (configErrorMessage err))
+      other -> do
+        hPutStrLn stderr $ "expected ConfigModeError for unreadable mode, got " <> show other
+        exitFailure

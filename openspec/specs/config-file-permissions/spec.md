@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Work commands that load the overlay-manager TOML warn when the file is not mode `0600`, so a world-readable config is visible without changing token resolution or making permissions a hard failure.
+Work commands that load the overlay-manager TOML hard-fail when the file is not exactly mode `0600` or its mode cannot be read, so a world-readable config cannot be used. Token resolution is unchanged.
 
 ## Requirements
 
