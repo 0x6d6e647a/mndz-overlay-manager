@@ -81,6 +81,8 @@ data PanelController = PanelController
 -- | Handle for multi-progress package rows.
 data MultiHandle = MultiHandle
   { mhStart :: PackageKey -> IO (),
+    -- | Waiting (not in-flight, not skip, not hard-fail). Reason names the provider.
+    mhWait :: PackageKey -> Text -> IO (),
     -- | Set current step/phase name without advancing the step counter.
     mhStatus :: PackageKey -> Text -> IO (),
     -- | Set or revise the per-package step total (keeps done, clamped to total).
@@ -102,6 +104,7 @@ noopMultiHandle :: MultiHandle
 noopMultiHandle =
   MultiHandle
     { mhStart = \_ -> pure (),
+      mhWait = \_ _ -> pure (),
       mhStatus = \_ _ -> pure (),
       mhSteps = \_ _ -> pure (),
       mhStep = \_ _ -> pure (),
@@ -206,6 +209,8 @@ data ActiveJob = ActiveJob
 
 data JobRow
   = JobActive ActiveJob
+  | -- | Withheld on an overlay wait-edge provider (reason names the provider).
+    JobWaiting Text
   | JobSkipped Text
   | JobFailed Text
   deriving (Eq, Show)
@@ -287,6 +292,11 @@ multiHandle stateRef =
                     )
                     (msJobs s)
               },
+            ()
+          ),
+      mhWait = \key reason ->
+        atomicModifyIORef' stateRef $ \s ->
+          ( s {msJobs = Map.insert key (JobWaiting reason) (msJobs s)},
             ()
           ),
       mhStatus = \key phase ->
@@ -412,6 +422,7 @@ renderMulti color MultiState {..} =
             JobSkipped _ -> True
             JobFailed _ -> True
             JobActive _ -> False
+            JobWaiting _ -> False
         ]
     done = msSucceeded + retainedTerminal
     progress =
@@ -457,6 +468,14 @@ renderJob color tick key = \case
                     else pkg <> "  " <> name
              in maybeColor color ColorBrightWhite $
                   spinner label tick SpinnerDots
+  JobWaiting reason ->
+    let line =
+          "… "
+            <> T.unpack (packageKeyText key)
+            <> if T.null reason
+              then ""
+              else "  " <> T.unpack reason
+     in maybeColor color ColorBrightCyan (text line)
   JobSkipped reason ->
     let line =
           "⚠ "

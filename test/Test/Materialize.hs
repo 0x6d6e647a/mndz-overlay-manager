@@ -336,6 +336,7 @@ recordingMulti events =
   let logEv e = atomicModifyIORef' events (\es -> (e : es, ()))
    in MultiHandle
         { mhStart = \_ -> pure (),
+          mhWait = \_ _ -> pure (),
           mhStatus = \_ name -> logEv ("status:" <> name),
           mhSteps = \_ n -> logEv ("steps:" <> T.pack (show n)),
           mhStep = \_ name -> logEv ("step:" <> name),

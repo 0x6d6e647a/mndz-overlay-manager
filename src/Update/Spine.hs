@@ -21,16 +21,19 @@ import Data.Text (Text)
 import Overlay.Types (Ebuild)
 import Update.Apply
   ( ApplyEnv (..),
+    EbuildRunner,
     applyOverlayFromPlan,
     fetchModelsDevApiJson,
-    productionEbuildRunner,
   )
 import Update.Apply.Plan
   ( ClassifyPackageResult (..),
     PackagePlanResult (..),
+    PlanEnv (..),
     classifyNeedsWorkPackages,
     needsWorkDepsAssets,
+    planPackage,
     planPackages,
+    planResultKey,
     unitPlansFromClassifyResults,
   )
 import Update.Assets.Release (ReleaseOps (..))
@@ -45,7 +48,7 @@ import Update.CheckCache
     cacheSummaryLine,
     flushCheckCache,
   )
-import Update.Deps.Plan (DepsPlanOps, toGoPlanOps)
+import Update.Deps.Plan (DepsPlanOps, invalidateBunCeilingsCache, toGoPlanOps)
 import Update.DiskSpace
   ( DiskGateOk (..),
     DiskSpaceProbe,
@@ -55,13 +58,19 @@ import Update.DiskSpace
 import Update.Distfiles (lookupPortageDistDir)
 import Update.Git (GitOps)
 import Update.Go.Vendor (mkVendorOps)
-import Update.Md5Cache (productionEgencacheRunner)
+import Update.Hardcoded (lookupPolicy)
+import Update.Md5Cache (EgencacheRunner)
 import Update.Npm.Cache (mkNpmCacheOps)
+import Update.OverlayWaves
+  ( AdmitSets (..),
+    OverlayPlanKind (..),
+    classifyAdmit,
+    overlayCeilingProviderForKey,
+  )
 import Update.Preflight
   ( AssetsPreflight (..),
     assetsPreflightFromPlan,
     buildGitMvUnitPlans,
-    preflightUpdateTools,
     validateAssetsPath,
   )
 import Update.Process.Docker (productionMaterializeRunner)
@@ -76,6 +85,8 @@ import Update.Types
   ( ApplyOutcome (..),
     Fetcher,
     PackageKey (..),
+    PackagePolicy (..),
+    techniqueNeedsAssets,
   )
 
 -- | Injectable dependencies for the update spine (tests override probes/ops).
@@ -94,7 +105,10 @@ data UpdateSpineDeps = UpdateSpineDeps
     usdAssetsPathCfg :: Maybe FilePath,
     usdDistDir :: FilePath,
     usdOverlayRoot :: FilePath,
-    usdSshOps :: SshAgentOps
+    usdSshOps :: SshAgentOps,
+    usdEbuildRunner :: EbuildRunner,
+    usdEgencacheRunner :: EgencacheRunner,
+    usdPreflightTools :: AssetsPreflight -> IO (Either Text ())
   }
 
 data UpdateSpineResult = UpdateSpineResult
@@ -131,13 +145,29 @@ runUpdatePhases deps entries allEbuilds selected = do
       jobs
       selected
       byPkg
-  let needDeps = any needsWorkDepsAssets planResults
-  -- Conditional assets/token/xz before classify (token needed for probe)
+  let kinds = [(planResultKey r, planKind r) | r <- planResults]
+      admit = classifyAdmit overlayCeilingProviderForKey kinds
+      admittedKeys = asReady admit
+      withheldKeys = map fst (asWithheld admit)
+      admittedPlans =
+        [r | r <- planResults, planResultKey r `elem` admittedKeys]
+      needDepsAdmitted = any needsWorkDepsAssets admittedPlans
+      withheldNeedsAssets =
+        any
+          ( \k ->
+              case lookupPolicy k of
+                Just pol -> techniqueNeedsAssets (policyTechnique pol)
+                Nothing -> False
+          )
+          withheldKeys
+      needDeps = needDepsAdmitted || withheldNeedsAssets
+  -- Conditional assets/token before classify (token needed for probe)
   eTokenAssets <-
     if needDeps
       then do
         toolsAssets <-
-          preflightUpdateTools
+          usdPreflightTools
+            deps
             AssetsPreflight
               { apNeedAssets = True,
                 apNeedGo = False,
@@ -164,27 +194,27 @@ runUpdatePhases deps entries allEbuilds selected = do
     Left err -> pure (Left err)
     Right mAssetsRoot -> do
       let releaseOps = usdReleaseOps deps
-      -- CLASSIFY
+      -- CLASSIFY admitted packages only (withheld re-enter after provider commit)
       classifyResults <-
         classifyNeedsWorkPackages
           releaseOps
           (usdAssetsOwner deps)
           (usdAssetsRepo deps)
           overlayRoot
-          planResults
+          admittedPlans
       let planResults' = mergeClassifyHardFails planResults classifyResults
-          languagePf = assetsPreflightFromPlan planResults' classifyResults
-          -- Language/cargo tools only (assets already checked when needDeps).
+          admittedAfter =
+            [r | r <- planResults', planResultKey r `elem` admittedKeys]
+          languagePf = assetsPreflightFromPlan admittedAfter classifyResults
           langOnly =
             languagePf
               { apNeedAssets = False
               }
-      eLang <- preflightUpdateTools langOnly
+      eLang <- usdPreflightTools deps langOnly
       case eLang of
         Left err -> pure (Left err)
         Right () -> do
-          -- Disk units from needs-work classified + GitMv
-          gitMvUnits <- buildGitMvUnitPlans overlayRoot distDir planResults'
+          gitMvUnits <- buildGitMvUnitPlans overlayRoot distDir admittedAfter
           let units = unitPlansFromClassifyResults classifyResults gitMvUnits
           diskGate <-
             withStepProgress pcfg 1 $ \step -> do
@@ -201,7 +231,62 @@ runUpdatePhases deps entries allEbuilds selected = do
           case diskGate of
             Left err -> pure (Left err)
             Right (DiskGateOk warns) -> do
-              let runMutate = do
+              let prepare _provider consumers mh = do
+                    invalidateBunCeilingsCache (usdDepsPlanOps deps)
+                    let consumerEntries =
+                          [e | e <- selected, peKey e `elem` consumers]
+                        planEnv =
+                          PlanEnv
+                            { peFetcher = usdFetcher deps,
+                              peDepsPlanOps = usdDepsPlanOps deps,
+                              peCheckCache = cache,
+                              peJobs = jobs,
+                              peMulti = mh,
+                              peSelectedKeys = map peKey selected
+                            }
+                    -- Keep waiting presentation; do not mhStart (that is apply).
+                    planned <- mapM (planPackage planEnv byPkg) consumerEntries
+                    let needWork = [r | r@PlanNeedsWork {} <- planned]
+                    classifyR <-
+                      classifyNeedsWorkPackages
+                        releaseOps
+                        (usdAssetsOwner deps)
+                        (usdAssetsRepo deps)
+                        overlayRoot
+                        needWork
+                    let planned' = mergeClassifyHardFails planned classifyR
+                        rePf =
+                          (assetsPreflightFromPlan planned' classifyR)
+                            { apNeedAssets = False
+                            }
+                    eReLang <- usdPreflightTools deps rePf
+                    case eReLang of
+                      Left err ->
+                        pure (failNeedsWork err planned')
+                      Right () -> do
+                        gitMvU <-
+                          buildGitMvUnitPlans overlayRoot distDir planned'
+                        let newUnits =
+                              unitPlansFromClassifyResults classifyR gitMvU
+                        if null newUnits
+                          then pure planned'
+                          else do
+                            tempRoot <- resolveTempRoot
+                            mPortage <- lookupPortageDistDir
+                            disk <-
+                              runDiskSpaceGate
+                                (usdDiskProbe deps)
+                                jobs
+                                tempRoot
+                                distDir
+                                mPortage
+                                newUnits
+                            case disk of
+                              Left err ->
+                                pure (failNeedsWork err planned')
+                              Right (DiskGateOk _) ->
+                                pure planned'
+                  runMutate = do
                     assetsLock <- newMVar ()
                     overlayLock <- newMVar ()
                     tempRun <- openRunRoot
@@ -210,8 +295,8 @@ runUpdatePhases deps entries allEbuilds selected = do
                           ApplyEnv
                             { aeFetcher = usdFetcher deps,
                               aeGitOps = usdGitOps deps,
-                              aeEbuildRunner = productionEbuildRunner distDir,
-                              aeEgencacheRunner = productionEgencacheRunner,
+                              aeEbuildRunner = usdEbuildRunner deps,
+                              aeEgencacheRunner = usdEgencacheRunner deps,
                               aeVendorOps = mkVendorOps matRunner,
                               aeNpmCacheOps = mkNpmCacheOps matRunner,
                               aeBunCacheOps = mkBunCacheOps matRunner,
@@ -232,7 +317,13 @@ runUpdatePhases deps entries allEbuilds selected = do
                               aeTempRun = tempRun,
                               aeCheckCache = cache
                             }
-                    applyOverlayFromPlan pcfg env overlayRoot entries planResults'
+                    applyOverlayFromPlan
+                      pcfg
+                      env
+                      overlayRoot
+                      entries
+                      planResults'
+                      prepare
               outcomes <-
                 if needDeps
                   then
@@ -287,3 +378,17 @@ mergeClassifyHardFails plans classify =
       PlanSoftSkip k _ -> k
       PlanHardFail k _ -> k
       PlanNeedsWork k _ -> k
+
+planKind :: PackagePlanResult -> OverlayPlanKind
+planKind = \case
+  PlanSoftSkip {} -> OverlayPlanSkip
+  PlanHardFail {} -> OverlayPlanFail
+  PlanNeedsWork {} -> OverlayPlanWork
+
+failNeedsWork :: Text -> [PackagePlanResult] -> [PackagePlanResult]
+failNeedsWork err =
+  map
+    ( \case
+        PlanNeedsWork k _ -> PlanHardFail k err
+        other -> other
+    )

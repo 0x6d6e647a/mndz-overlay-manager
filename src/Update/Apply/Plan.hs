@@ -74,7 +74,8 @@ import Update.CheckCache
     storeDeps,
   )
 import Update.Deps.Plan
-  ( DepsPlanOps,
+  ( DepsPlanOps (..),
+    planDepsPackageWithCeilings,
     planDepsPackageWithProgress,
   )
 import Update.DiskSpace
@@ -93,6 +94,18 @@ import Update.Go.Lanes
   )
 import Update.Go.Plan (PlanProgress (..), localNonLivePVs)
 import Update.Hardcoded (lookupPolicy)
+import Update.OverlayWaves
+  ( computeOverlayProviderFingerprint,
+    fetchOverlayProviderLatest,
+    hypotheticalCeilings,
+    overlayCeilingProvider,
+    overlayFailClosedMessage,
+    overlayRefuseMessage,
+    planDeltaHolds,
+  )
+import Update.Runtime.Ceilings
+  ( discoverBunBinMetas,
+  )
 import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
@@ -165,7 +178,9 @@ data PlanEnv = PlanEnv
     peDepsPlanOps :: DepsPlanOps,
     peCheckCache :: CheckCacheHandle,
     peJobs :: Int,
-    peMulti :: MultiHandle
+    peMulti :: MultiHandle,
+    -- | Full @update@ selection (for unselected-provider plan-delta).
+    peSelectedKeys :: [PackageKey]
   }
 
 -- | Concurrent plan over selected packages with multi-progress.
@@ -186,7 +201,8 @@ planPackages pcfg fetch depsOps cache jobs selected byPkg =
               peDepsPlanOps = depsOps,
               peCheckCache = cache,
               peJobs = jobs,
-              peMulti = mh
+              peMulti = mh,
+              peSelectedKeys = map peKey selected
             }
      in mapConcurrentlyN jobs (planPackageTracked env byPkg) selected
 
@@ -262,8 +278,25 @@ planDeps env entry locals src eco = do
       depsOps = peDepsPlanOps env
       progress = planProgress mh key eco
       localPVs = localNonLivePVs locals
+      tech = DepsAndAssets eco
   fp <- computeFingerprint src locals
-  mCached <- lookupDeps cache key fp
+  mProvFp <-
+    case dpoOverlayRoot depsOps of
+      Just overlayRoot -> computeOverlayProviderFingerprint overlayRoot tech
+      Nothing -> pure Nothing
+  let requireProv = overlayCeilingProvider tech
+      lookupProv =
+        case requireProv of
+          Nothing -> Nothing
+          Just _
+            | Just pfp <- mProvFp -> Just pfp
+            | otherwise ->
+                -- Required but unreadable: force a miss.
+                Nothing
+  mCached <-
+    case (requireProv, mProvFp) of
+      (Just _, Nothing) -> pure Nothing
+      _ -> lookupDeps cache key fp lookupProv
   planResult <- case mCached of
     Just plan -> do
       recordHit cache
@@ -279,22 +312,94 @@ planDeps env entry locals src eco = do
           ("runtime-lane plan failed: " <> planErrorMessage err)
     Right plan -> do
       case mCached of
-        Nothing -> storeDeps cache key fp plan
+        Nothing -> storeDeps cache key fp mProvFp plan
         Just _ -> pure ()
       contentFix <- contentFixPVs depsOps eco src locals plan
-      if not (planNeedsWork localPVs contentFix plan)
-        then pure $ PlanSoftSkip key "already matches runtime-lane plan"
-        else
-          pure $
-            PlanNeedsWork
-              key
-              PlannedDeps
-                { pdEco = eco,
-                  pdSource = src,
-                  pdPlan = plan,
-                  pdLocalPVs = localPVs,
-                  pdContentFix = contentFix
-                }
+      let onDiskNeed = planNeedsWork localPVs contentFix plan
+      refuse <- refuseUnselectedProvider env key eco src localPVs locals plan onDiskNeed
+      case refuse of
+        Just failMsg -> pure $ PlanHardFail key failMsg
+        Nothing ->
+          if not onDiskNeed
+            then pure $ PlanSoftSkip key "already matches runtime-lane plan"
+            else
+              pure $
+                PlanNeedsWork
+                  key
+                  PlannedDeps
+                    { pdEco = eco,
+                      pdSource = src,
+                      pdPlan = plan,
+                      pdLocalPVs = localPVs,
+                      pdContentFix = contentFix
+                    }
+
+-- | When the overlay ceiling provider is not in this selection, refuse on
+-- plan-delta or fail-closed if its GitMv latest cannot be fetched.
+refuseUnselectedProvider ::
+  PlanEnv ->
+  PackageKey ->
+  EcosystemSpec ->
+  UpdateSource ->
+  [EbuildVersion] ->
+  [Ebuild] ->
+  RuntimeLanePlan ->
+  Bool ->
+  IO (Maybe Text)
+refuseUnselectedProvider env key eco src localPVs locals onDiskPlan onDiskNeed =
+  case overlayCeilingProvider (DepsAndAssets eco) of
+    Nothing -> pure Nothing
+    Just provider
+      | provider `elem` peSelectedKeys env ->
+          pure Nothing
+      | otherwise ->
+          case dpoOverlayRoot (peDepsPlanOps env) of
+            Nothing ->
+              pure $ Just (overlayFailClosedMessage provider)
+            Just overlayRoot -> do
+              eRemote <-
+                fetchOverlayProviderLatest
+                  (peFetcher env)
+                  (peCheckCache env)
+                  overlayRoot
+                  provider
+              case eRemote of
+                Left _ ->
+                  pure $ Just (overlayFailClosedMessage provider)
+                Right remote -> do
+                  eMetas <- discoverBunBinMetas overlayRoot
+                  case eMetas of
+                    Left _ ->
+                      pure $ Just (overlayFailClosedMessage provider)
+                    Right metas -> do
+                      let hypoCeil = hypotheticalCeilings metas remote
+                      hypoResult <-
+                        planDepsPackageWithCeilings
+                          (peDepsPlanOps env)
+                          (planProgress (peMulti env) key eco)
+                          eco
+                          src
+                          localPVs
+                          hypoCeil
+                      case hypoResult of
+                        Left _ ->
+                          pure $ Just (overlayFailClosedMessage provider)
+                        Right hypoPlan -> do
+                          hypoFix <-
+                            contentFixPVs
+                              (peDepsPlanOps env)
+                              eco
+                              src
+                              locals
+                              hypoPlan
+                          let hypoNeed = planNeedsWork localPVs hypoFix hypoPlan
+                          if planDeltaHolds
+                            (glpUniquePVs onDiskPlan)
+                            onDiskNeed
+                            (glpUniquePVs hypoPlan)
+                            hypoNeed
+                            then pure $ Just (overlayRefuseMessage provider)
+                            else pure Nothing
 
 planProgress :: MultiHandle -> PackageKey -> EcosystemSpec -> PlanProgress
 planProgress mh key eco =

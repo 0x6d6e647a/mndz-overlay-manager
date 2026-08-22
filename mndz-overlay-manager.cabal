@@ -113,6 +113,7 @@ library
       , Update.Md5Cache
       , Update.Npm
       , Update.Npm.Cache
+      , Update.OverlayWaves
       , Update.Pack.XzTar
       , Update.Preflight
       , Update.Process
@@ -236,6 +237,7 @@ test-suite mndz-overlay-manager-test
         Test.Materialize
         Test.Md5Cache
         Test.Overlay
+        Test.OverlayWaves
         Test.Policy
         Test.Preflight
         Test.Progress
@@ -244,6 +246,7 @@ test-suite mndz-overlay-manager-test
         Test.Support
         Test.Targets
         Test.TempWorkspace
+        Test.Waves
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:

@@ -152,6 +152,10 @@ import Update.Npm.Cache
   ( NpmCacheProgress (..),
     buildNpmDepsTarball,
   )
+import Update.OverlayWaves
+  ( computeOverlayProviderFingerprint,
+    overlayCeilingProvider,
+  )
 import Update.Sbcl.Deps
   ( SbclDepsProgress (..),
     buildSbclDepsTarball,
@@ -170,6 +174,7 @@ import Update.Types
     PackageKey (..),
     SuccessLine (..),
     UpdateSource (..),
+    UpdateTechnique (..),
     splitPackageKey,
   )
 
@@ -190,7 +195,12 @@ applyDepsAndAssets env overlayRoot entry src eco = do
   let progress = depsApplyPlanProgress mh key eco planDoneRef
   localPVs <- listLocalNonLivePVs pkgDir pn
   fp <- computeFingerprintFromDir src pkgDir pn
-  mCached <- lookupDeps cache key fp
+  mProvFp <- computeOverlayProviderFingerprint overlayRoot (DepsAndAssets eco)
+  mCached <-
+    case (overlayCeilingProvider (DepsAndAssets eco), mProvFp) of
+      (Just _, Nothing) -> pure Nothing
+      (Just _, Just pfp) -> lookupDeps cache key fp (Just pfp)
+      (Nothing, _) -> lookupDeps cache key fp Nothing
   planResult <- case mCached of
     Just plan -> do
       recordHit cache
@@ -215,7 +225,7 @@ applyDepsAndAssets env overlayRoot entry src eco = do
     Right plan -> do
       -- Persist successful live plans; cache hits leave the existing entry.
       case mCached of
-        Nothing -> storeDeps cache key fp plan
+        Nothing -> storeDeps cache key fp mProvFp plan
         Just _ -> pure ()
       contentFix <- contentFixNeededEnv env eco src pkgDir pn key plan
       if not (planNeedsWork localPVs contentFix plan)
@@ -277,7 +287,9 @@ applyDepsAndAssetsFromPlan
                 planDone
             when (any isApplySuccess outcomes) $ do
               fp' <- computeFingerprintFromDir src pkgDir pn
-              storeDeps (aeCheckCache env) key fp' plan
+              mProvFp' <-
+                computeOverlayProviderFingerprint overlayRoot (DepsAndAssets eco)
+              storeDeps (aeCheckCache env) key fp' mProvFp' plan
             pure outcomes
     where
       isApplySuccess ApplySuccess {} = True

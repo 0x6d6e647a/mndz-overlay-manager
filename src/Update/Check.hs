@@ -42,6 +42,7 @@ import Update.CheckCache
   )
 import Update.Deps.Plan
   ( DepsPlanOps (..),
+    planDepsPackageWithCeilings,
     planDepsPackageWithProgress,
   )
 import Update.EbuildEdit
@@ -72,7 +73,17 @@ import Update.Go.Vendor (versionTag)
 import Update.Hardcoded (lookupPolicy)
 import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
+import Update.OverlayWaves
+  ( blockedOnLabel,
+    computeOverlayProviderFingerprint,
+    fetchOverlayProviderLatest,
+    hypotheticalCeilings,
+    overlayCeilingProvider,
+    overlayFailClosedMessage,
+    planDeltaHolds,
+  )
 import Update.Resolve (resolveSource)
+import Update.Runtime.Ceilings (discoverBunBinMetas)
 import Update.Sbcl.Deps (parseSbclVersionFloor)
 import Update.Types
   ( EcosystemSpec (..),
@@ -168,7 +179,7 @@ checkOne mh fetch depsOps cache byPkg entry = do
   let locals = Map.findWithDefault [] key byPkg
   report <- case lookupPolicy key of
     Just (PackagePolicy src (DepsAndAssets eco)) ->
-      checkPackageDeps mh depsOps cache entry locals src eco
+      checkPackageDeps mh fetch depsOps cache entry locals src eco
     _ -> do
       mhStatus mh key "fetching"
       checkPackage fetch cache entry locals
@@ -239,6 +250,7 @@ checkPackage fetch cache entry locals = do
 -- | Runtime-lane outdated check for DepsAndAssets packages.
 checkPackageDeps ::
   MultiHandle ->
+  Fetcher ->
   DepsPlanOps ->
   CheckCacheHandle ->
   PackageEntry ->
@@ -246,16 +258,25 @@ checkPackageDeps ::
   UpdateSource ->
   EcosystemSpec ->
   IO UpdateReport
-checkPackageDeps mh depsOps cache entry locals src eco = do
+checkPackageDeps mh fetch depsOps cache entry locals src eco = do
   let key = peKey entry
       progress = depsPlanProgress mh key eco
       localPVs = localNonLivePVs locals
+      tech = DepsAndAssets eco
   fp <- computeFingerprint src locals
-  mCached <- lookupDeps cache key fp
+  mProvFp <-
+    case dpoOverlayRoot depsOps of
+      Just overlayRoot -> computeOverlayProviderFingerprint overlayRoot tech
+      Nothing -> pure Nothing
+  mCached <-
+    case (overlayCeilingProvider tech, mProvFp) of
+      (Just _, Nothing) -> pure Nothing
+      (Just _, Just pfp) -> lookupDeps cache key fp (Just pfp)
+      (Nothing, _) -> lookupDeps cache key fp Nothing
   case mCached of
     Just plan -> do
       recordHit cache
-      reportFromDepsPlan depsOps eco src entry locals localPVs plan
+      reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan
     Nothing -> do
       recordFetch cache
       planResult <-
@@ -268,11 +289,14 @@ checkPackageDeps mh depsOps cache entry locals src eco = do
                 reportStatus = FetchError (planErrorMessage err)
               }
         Right plan -> do
-          storeDeps cache key fp plan
-          reportFromDepsPlan depsOps eco src entry locals localPVs plan
+          storeDeps cache key fp mProvFp plan
+          reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan
 
 reportFromDepsPlan ::
+  MultiHandle ->
+  Fetcher ->
   DepsPlanOps ->
+  CheckCacheHandle ->
   EcosystemSpec ->
   UpdateSource ->
   PackageEntry ->
@@ -280,38 +304,171 @@ reportFromDepsPlan ::
   [EbuildVersion] ->
   RuntimeLanePlan ->
   IO UpdateReport
-reportFromDepsPlan depsOps eco src entry locals localPVs plan = do
+reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan = do
   let key = peKey entry
   contentFix <- contentFixPVs depsOps eco src locals plan
-  let missing = missingTargets localPVs plan
+  let onDiskNeed = planNeedsWork localPVs contentFix plan
+      missing = missingTargets localPVs plan
       needsWork = missing <> contentFix
       gaps =
-        if planNeedsWork localPVs contentFix plan
+        if onDiskNeed
           then buildGapLines localPVs needsWork plan
           else []
       contentFixSet = contentFix
       isContentOnly toPV =
         any (samePV toPV) contentFixSet
           && not (any (samePV toPV) missing)
-  pure $
-    UpdateReport
-      { reportKey = key,
-        reportStatus =
-          if null gaps
-            then case localPVs of
-              (v : _) -> Ok v
-              [] -> Ok (peLocal entry)
-            else
-              Outdated
-                [ OutdatedLine
-                    { olFrom = glFrom g,
-                      olTo = glTo g,
-                      olLabel = Just (glLabel g),
-                      olAssetsReusable = isContentOnly (glTo g)
-                    }
-                | g <- gaps
-                ]
-      }
+      baseReport =
+        UpdateReport
+          { reportKey = key,
+            reportStatus =
+              if null gaps
+                then case localPVs of
+                  (v : _) -> Ok v
+                  [] -> Ok (peLocal entry)
+                else
+                  Outdated
+                    [ OutdatedLine
+                        { olFrom = glFrom g,
+                          olTo = glTo g,
+                          olLabel = Just (glLabel g),
+                          olAssetsReusable = isContentOnly (glTo g)
+                        }
+                    | g <- gaps
+                    ]
+          }
+  applyOverlayBlockIndication
+    mh
+    fetch
+    depsOps
+    cache
+    eco
+    src
+    entry
+    locals
+    localPVs
+    plan
+    onDiskNeed
+    baseReport
+
+-- | Overlay wait-edge consumers: plan-delta blocked-on, fail-closed on fetch.
+applyOverlayBlockIndication ::
+  MultiHandle ->
+  Fetcher ->
+  DepsPlanOps ->
+  CheckCacheHandle ->
+  EcosystemSpec ->
+  UpdateSource ->
+  PackageEntry ->
+  [Ebuild] ->
+  [EbuildVersion] ->
+  RuntimeLanePlan ->
+  Bool ->
+  UpdateReport ->
+  IO UpdateReport
+applyOverlayBlockIndication mh fetch depsOps cache eco src entry locals localPVs onDiskPlan onDiskNeed base =
+  case overlayCeilingProvider (DepsAndAssets eco) of
+    Nothing -> pure base
+    Just provider ->
+      case dpoOverlayRoot depsOps of
+        Nothing ->
+          pure
+            base
+              { reportStatus = FetchError (overlayFailClosedMessage provider)
+              }
+        Just overlayRoot -> do
+          eRemote <-
+            fetchOverlayProviderLatest fetch cache overlayRoot provider
+          case eRemote of
+            Left _ ->
+              pure
+                base
+                  { reportStatus = FetchError (overlayFailClosedMessage provider)
+                  }
+            Right remote -> do
+              eMetas <- discoverBunBinMetas overlayRoot
+              case eMetas of
+                Left _ ->
+                  pure
+                    base
+                      { reportStatus = FetchError (overlayFailClosedMessage provider)
+                      }
+                Right metas -> do
+                  let hypoCeil = hypotheticalCeilings metas remote
+                  hypoResult <-
+                    planDepsPackageWithCeilings
+                      depsOps
+                      (depsPlanProgress mh (peKey entry) eco)
+                      eco
+                      src
+                      localPVs
+                      hypoCeil
+                  case hypoResult of
+                    Left _ ->
+                      pure
+                        base
+                          { reportStatus = FetchError (overlayFailClosedMessage provider)
+                          }
+                    Right hypoPlan -> do
+                      hypoFix <- contentFixPVs depsOps eco src locals hypoPlan
+                      let hypoNeed = planNeedsWork localPVs hypoFix hypoPlan
+                      if not
+                        ( planDeltaHolds
+                            (glpUniquePVs onDiskPlan)
+                            onDiskNeed
+                            (glpUniquePVs hypoPlan)
+                            hypoNeed
+                        )
+                        then pure base
+                        else
+                          pure $
+                            annotateBlockedOn provider hypoPlan localPVs base
+
+annotateBlockedOn ::
+  PackageKey ->
+  RuntimeLanePlan ->
+  [EbuildVersion] ->
+  UpdateReport ->
+  UpdateReport
+annotateBlockedOn provider hypoPlan localPVs base =
+  let note = blockedOnLabel provider
+   in case reportStatus base of
+        Outdated lines_ ->
+          base
+            { reportStatus =
+                Outdated
+                  [ ol
+                      { olLabel =
+                          Just $
+                            maybe note (\lab -> lab <> " " <> note) (olLabel ol)
+                      }
+                  | ol <- lines_
+                  ]
+            }
+        Ok local ->
+          let target =
+                case glpUniquePVs hypoPlan of
+                  (pv : rest) -> foldl' newerPv pv rest
+                  [] -> local
+           in base
+                { reportStatus =
+                    Outdated
+                      [ OutdatedLine
+                          { olFrom = case localPVs of
+                              (v : _) -> v
+                              [] -> local,
+                            olTo = target,
+                            olLabel = Just note,
+                            olAssetsReusable = False
+                          }
+                      ]
+                }
+        other -> base {reportStatus = other}
+  where
+    newerPv a b =
+      case comparePV a b of
+        Just LT -> b
+        _ -> a
 
 depsPlanProgress :: MultiHandle -> PackageKey -> EcosystemSpec -> PlanProgress
 depsPlanProgress mh key eco =

@@ -26,6 +26,8 @@ module Update.Runtime.Ceilings
     ceilingFor,
     allCeilingLanes,
     discoverRuntimeCeilingsInDir,
+    discoverRuntimeMetasInDir,
+    discoverBunBinMetas,
     discoverGoCeilingsWith,
     discoverNodejsCeilingsWith,
     discoverBunBinCeilings,
@@ -326,23 +328,19 @@ maxPV (x : xs) = Just (foldl' maxOne x xs)
         Just LT -> b
         _ -> a
 
--- | Scan a package directory of @*.ebuild@ files for ceilings.
-discoverRuntimeCeilingsInDir ::
-  Text ->
+-- | Scan a package directory of @*.ebuild@ files for parsed non-live metadata.
+discoverRuntimeMetasInDir ::
   FilePath ->
   -- | Optional filename prefix filter (e.g. @"go-"@); Nothing = all ebuilds.
   Maybe Text ->
-  IO (Either Text RuntimeCeilings)
-discoverRuntimeCeilingsInDir atom pkgDir mPrefix = do
+  IO (Either Text [RuntimeEbuildMeta])
+discoverRuntimeMetasInDir pkgDir mPrefix = do
   exists <- doesDirectoryExist pkgDir
   if not exists
     then
       pure $
         Left
-          ( atom
-              <> " directory not found: "
-              <> T.pack pkgDir
-          )
+          ("directory not found: " <> T.pack pkgDir)
     else do
       names <- listDirectory pkgDir
       let ebuildNames =
@@ -354,12 +352,35 @@ discoverRuntimeCeilingsInDir atom pkgDir mPrefix = do
                 Just p -> p `T.isPrefixOf` T.pack n
             ]
       metas <- mapM (readMeta pkgDir) ebuildNames
-      pure $ Right (computeCeilings atom (catMaybes metas))
+      pure $ Right (catMaybes metas)
   where
     readMeta dir name = do
       let path = dir </> name
       content <- TIO.readFile path
       pure (parseRuntimeEbuildMeta path content)
+
+-- | Overlay bun-bin non-live ebuild metadata.
+discoverBunBinMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])
+discoverBunBinMetas overlayRoot =
+  discoverRuntimeMetasInDir (bunBinPackageDir overlayRoot) (Just "bun-bin-")
+
+-- | Scan a package directory of @*.ebuild@ files for ceilings.
+discoverRuntimeCeilingsInDir ::
+  Text ->
+  FilePath ->
+  -- | Optional filename prefix filter (e.g. @"go-"@); Nothing = all ebuilds.
+  Maybe Text ->
+  IO (Either Text RuntimeCeilings)
+discoverRuntimeCeilingsInDir atom pkgDir mPrefix = do
+  result <- discoverRuntimeMetasInDir pkgDir mPrefix
+  pure $ case result of
+    Left err ->
+      Left
+        ( atom
+            <> " "
+            <> err
+        )
+    Right metas -> Right (computeCeilings atom metas)
 
 -- | Discover Go ceilings with injectable portageq; scans @dev-lang/go@.
 discoverGoCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)

@@ -22,7 +22,8 @@ import Test.Assert (assertEq, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
 import Update.CheckCache
-  ( CacheStats (..),
+  ( CacheFingerprint (..),
+    CacheStats (..),
     CheckCacheHandle,
     cacheStats,
     checkCacheFileName,
@@ -30,12 +31,15 @@ import Update.CheckCache
     defaultCheckCacheDirFromEnv,
     flushCheckCache,
     friendlyOverlayName,
+    lookupDeps,
     lookupLatest,
     openCheckCacheAt,
     overlayPathHash12,
+    storeDeps,
     storeLatest,
     updateSourceId,
   )
+import Update.Go.Lanes (RuntimeLanePlan (..))
 import Update.Types
   ( PackageKey (..),
     UpdateSource (..),
@@ -55,7 +59,10 @@ tests =
       testCase "Fingerprint miss" testFingerprintMiss,
       testCase "Disabled never writes" testDisabledNoWrite,
       testCase "Atomic replace" testAtomicReplace,
-      testCase "Corrupt is empty" testCorruptEmpty
+      testCase "Corrupt is empty" testCorruptEmpty,
+      testCase "Bun-bin tree change misses ralph deps" testOverlayProviderMiss,
+      testCase "GitMv latest ignores overlay provider field" testLatestNoProviderField,
+      testCase "Missing overlay-provider field is a miss" testMissingOverlayProviderMiss
     ]
 
 testXdgDir :: IO ()
@@ -236,3 +243,95 @@ testCorruptEmpty =
     assertTrue "warn present" (maybe False (not . T.null) warn)
     st <- cacheStats h
     assertEq "no packages loaded as hits" 0 (csHits st)
+
+emptyDepsPlan :: RuntimeLanePlan
+emptyDepsPlan =
+  RuntimeLanePlan
+    { glpLanes = [],
+      glpEbuilds = [],
+      glpUniquePVs = [],
+      glpRuntimeAtom = "dev-lang/bun-bin"
+    }
+
+setupBunBin :: FilePath -> IO FilePath
+setupBunBin overlay = do
+  let pkgDir = overlay </> "dev-lang" </> "bun-bin"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile
+    (pkgDir </> "bun-bin-1.1.0.ebuild")
+    "EAPI=8\nKEYWORDS=\"~amd64\"\n"
+  TIO.writeFile (pkgDir </> "Manifest") "DIST bun-bin-1.1.0.tar.xz 1\n"
+  pure pkgDir
+
+testOverlayProviderMiss :: IO ()
+testOverlayProviderMiss =
+  withSystemTempDirectory "om-cc-prov" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        cacheDir = tmp </> "check-cache"
+        src = GitHub "subsy" "ralph-tui" "v"
+        bunSrc = GitHub "oven-sh" "bun" "bun-v"
+        key = PackageKey "dev-util/ralph-tui"
+    ralphDir <- do
+      let d = overlay </> "dev-util" </> "ralph-tui"
+      createDirectoryIfMissing True d
+      TIO.writeFile (d </> "ralph-tui-1.0.0.ebuild") "EAPI=8\n"
+      pure d
+    bunDir <- setupBunBin overlay
+    now <- getCurrentTime
+    (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
+    consumerFp <- computeFingerprintFromDir src ralphDir "ralph-tui"
+    bunFp0 <- computeFingerprintFromDir bunSrc bunDir "bun-bin"
+    storeDeps h key consumerFp (Just bunFp0) emptyDepsPlan
+    flushCheckCache h
+    hit <- lookupDeps h key consumerFp (Just bunFp0)
+    assertTrue "hit with matching provider fp" (hit == Just emptyDepsPlan)
+    TIO.writeFile
+      (bunDir </> "bun-bin-1.1.0.ebuild")
+      "EAPI=8\nKEYWORDS=\"~amd64\"\n# bumped\n"
+    bunFp1 <- computeFingerprintFromDir bunSrc bunDir "bun-bin"
+    assertTrue "bun fingerprint changed" (bunFp0 /= bunFp1)
+    (h2, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
+    miss <- lookupDeps h2 key consumerFp (Just bunFp1)
+    assertEq "bun-bin tree change is a miss" Nothing miss
+
+testLatestNoProviderField :: IO ()
+testLatestNoProviderField =
+  withSystemTempDirectory "om-cc-gitmv" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        cacheDir = tmp </> "check-cache"
+        src = GitHub "o" "r" "v"
+        key = PackageKey "dev-lang/foo"
+        remote = parseEbuildVersion "1.2.3"
+    pkgDir <- setupPkg overlay
+    now <- getCurrentTime
+    (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
+    fp <- computeFingerprintFromDir src pkgDir "foo"
+    storeLatest h key fp remote
+    hit <- lookupLatest h key fp
+    assertEq "latest still hits without overlay provider" (Just remote) hit
+
+testMissingOverlayProviderMiss :: IO ()
+testMissingOverlayProviderMiss =
+  withSystemTempDirectory "om-cc-missing-prov" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        cacheDir = tmp </> "check-cache"
+        src = GitHub "subsy" "ralph-tui" "v"
+        key = PackageKey "dev-util/ralph-tui"
+        dummyProv =
+          CacheFingerprint
+            { cfLocalPvs = ["1.1.0"],
+              cfSourceId = "github:oven-sh/bun",
+              cfContentHash = "abc"
+            }
+    ralphDir <- do
+      let d = overlay </> "dev-util" </> "ralph-tui"
+      createDirectoryIfMissing True d
+      TIO.writeFile (d </> "ralph-tui-1.0.0.ebuild") "EAPI=8\n"
+      pure d
+    now <- getCurrentTime
+    (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
+    consumerFp <- computeFingerprintFromDir src ralphDir "ralph-tui"
+    -- Old-schema deps entry: no overlay-provider field.
+    storeDeps h key consumerFp Nothing emptyDepsPlan
+    miss <- lookupDeps h key consumerFp (Just dummyProv)
+    assertEq "missing overlay-provider field is a miss" Nothing miss

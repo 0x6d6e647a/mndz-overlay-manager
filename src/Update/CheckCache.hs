@@ -62,7 +62,7 @@ import Data.Aeson
     (.:?),
     (.=),
   )
-import Data.Aeson.Types (Parser, parseEither)
+import Data.Aeson.Types (Pair, Parser, parseEither)
 import Data.ByteArray.Encoding (Base (Base16), convertToBase)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
@@ -297,6 +297,9 @@ data CachePayload
 data CacheEntry = CacheEntry
   { ceCheckedAt :: UTCTime,
     ceFingerprint :: CacheFingerprint,
+    -- | Overlay ceiling-provider fingerprint for DepsAndAssets Bun entries.
+    -- Missing on a deps entry that requires it is a miss at lookup.
+    ceOverlayProviderFp :: Maybe CacheFingerprint,
     cePayload :: CachePayload
   }
   deriving (Eq, Show)
@@ -312,19 +315,27 @@ instance ToJSON CacheEntry where
   toJSON e =
     case cePayload e of
       LatestPayload remote ->
-        object
+        object $
           [ "checked_at" .= iso8601Show (ceCheckedAt e),
             "fingerprint" .= ceFingerprint e,
             "kind" .= ("latest" :: Text),
             "remote_pv" .= remote
           ]
+            <> overlayProviderFields e
       DepsPayload plan ->
-        object
+        object $
           [ "checked_at" .= iso8601Show (ceCheckedAt e),
             "fingerprint" .= ceFingerprint e,
             "kind" .= ("deps" :: Text),
             "plan" .= planToJSON plan
           ]
+            <> overlayProviderFields e
+
+overlayProviderFields :: CacheEntry -> [Pair]
+overlayProviderFields e =
+  case ceOverlayProviderFp e of
+    Nothing -> []
+    Just fp -> ["overlay_provider_fingerprint" .= fp]
 
 instance FromJSON CacheEntry where
   parseJSON = withObject "CacheEntry" $ \o -> do
@@ -334,6 +345,7 @@ instance FromJSON CacheEntry where
         Just t -> pure t
         Nothing -> fail $ "invalid checked_at: " <> checkedAtTxt
     fp <- o .: "fingerprint"
+    mProv <- o .:? "overlay_provider_fingerprint"
     kind <- o .: "kind" :: Parser Text
     payload <- case kind of
       "latest" -> LatestPayload <$> o .: "remote_pv"
@@ -347,6 +359,7 @@ instance FromJSON CacheEntry where
       CacheEntry
         { ceCheckedAt = checkedAt,
           ceFingerprint = fp,
+          ceOverlayProviderFp = mProv,
           cePayload = payload
         }
 
@@ -639,8 +652,11 @@ lookupDeps ::
   CheckCacheHandle ->
   PackageKey ->
   CacheFingerprint ->
+  -- | Expected overlay-provider fingerprint. @Just@ requires a matching
+  -- stored field (missing field is a miss). @Nothing@ does not require it.
+  Maybe CacheFingerprint ->
   IO (Maybe RuntimeLanePlan)
-lookupDeps h key fp = do
+lookupDeps h key fp mWantProv = do
   if not (cchEnabled h) || cchRefresh h
     then pure Nothing
     else do
@@ -649,9 +665,17 @@ lookupDeps h key fp = do
       pure $ case Map.lookup (packageKeyText key) (hsPackages st) of
         Just e
           | entryValid (cchTtl h) False now fp e,
+            overlayProviderMatches mWantProv (ceOverlayProviderFp e),
             DepsPayload plan <- cePayload e ->
               Just plan
         _ -> Nothing
+
+-- | When a provider fingerprint is required, the stored field must be present
+-- and equal. GitMv / gentoo-runtime deps entries do not require the field.
+overlayProviderMatches :: Maybe CacheFingerprint -> Maybe CacheFingerprint -> Bool
+overlayProviderMatches Nothing _ = True
+overlayProviderMatches (Just want) (Just have) = want == have
+overlayProviderMatches (Just _) Nothing = False
 
 bumpHit :: CheckCacheHandle -> IO ()
 bumpHit h =
@@ -678,24 +702,26 @@ storeLatest ::
   EbuildVersion ->
   IO ()
 storeLatest h key fp remote =
-  storeEntry h key fp (LatestPayload (renderPV remote))
+  storeEntry h key fp Nothing (LatestPayload (renderPV remote))
 
 storeDeps ::
   CheckCacheHandle ->
   PackageKey ->
   CacheFingerprint ->
+  Maybe CacheFingerprint ->
   RuntimeLanePlan ->
   IO ()
-storeDeps h key fp plan =
-  storeEntry h key fp (DepsPayload plan)
+storeDeps h key fp mProv plan =
+  storeEntry h key fp mProv (DepsPayload plan)
 
 storeEntry ::
   CheckCacheHandle ->
   PackageKey ->
   CacheFingerprint ->
+  Maybe CacheFingerprint ->
   CachePayload ->
   IO ()
-storeEntry h key fp payload
+storeEntry h key fp mProv payload
   | not (cchEnabled h) = pure ()
   | otherwise = do
       now <- cchClock h
@@ -704,6 +730,7 @@ storeEntry h key fp payload
             CacheEntry
               { ceCheckedAt = now,
                 ceFingerprint = fp,
+                ceOverlayProviderFp = mProv,
                 cePayload = payload
               }
       modifyMVar_ (cchState h) $ \st ->

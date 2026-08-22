@@ -4,6 +4,8 @@ module Update.Deps.Plan
   ( DepsPlanOps (..),
     productionDepsPlanOps,
     planDepsPackageWithProgress,
+    planDepsPackageWithCeilings,
+    invalidateBunCeilingsCache,
     toGoPlanOps,
   )
 where
@@ -145,9 +147,32 @@ planDepsPackageWithProgress ops progress eco src locals =
   case eco of
     Go mSub -> planGo ops progress src mSub locals
     NpmEco -> planNpm ops progress src locals
-    Bun -> planBun ops progress src locals
+    Bun -> planBun ops progress src locals Nothing
     Cargo mLock mPkg -> planCargo ops progress src mLock mPkg locals
     Sbcl -> planSbcl ops progress src locals
+
+-- | Plan against caller-supplied ceilings (hypothetical overlay bun-bin).
+-- Does not read or write the process-lifetime bun ceiling cache.
+planDepsPackageWithCeilings ::
+  DepsPlanOps ->
+  PlanProgress ->
+  EcosystemSpec ->
+  UpdateSource ->
+  [EbuildVersion] ->
+  RuntimeCeilings ->
+  IO (Either PlanError RuntimeLanePlan)
+planDepsPackageWithCeilings ops progress eco src locals ceilings =
+  case eco of
+    Bun -> planBun ops progress src locals (Just ceilings)
+    Go mSub -> planGo ops progress src mSub locals
+    NpmEco -> planNpm ops progress src locals
+    Cargo mLock mPkg -> planCargo ops progress src mLock mPkg locals
+    Sbcl -> planSbcl ops progress src locals
+
+-- | Drop the in-process bun-bin ceiling snapshot so the next plan rediscovers.
+invalidateBunCeilingsCache :: DepsPlanOps -> IO ()
+invalidateBunCeilingsCache ops =
+  modifyMVar_ (dpoBunCeilingsCache ops) (\_ -> pure Nothing)
 
 ------------------------------------------------------------------------
 -- Go
@@ -224,41 +249,61 @@ planBun ::
   PlanProgress ->
   UpdateSource ->
   [EbuildVersion] ->
+  -- | Override ceilings (hypothetical plan-delta). @Nothing@ discovers from overlay.
+  Maybe RuntimeCeilings ->
   IO (Either PlanError RuntimeLanePlan)
-planBun ops progress src locals =
+planBun ops progress src locals mCeilings =
   case src of
     GitHub owner repo prefix ->
-      case dpoOverlayRoot ops of
-        Nothing ->
-          pure
-            ( Left
-                ( PlanFailed
-                    "overlay path required for bun-bin runtime ceilings"
-                )
-            )
-        Just overlayRoot ->
+      case mCeilings of
+        Just ceilings ->
           planWith
             ops
             progress
             src
             locals
-            ( discoverCeilingsCached
-                (dpoBunCeilingsCache ops)
-                (discoverBunBinCeilings overlayRoot)
-            )
-            ( \pv -> do
-                eres <-
-                  dpoFetchBunEngines
-                    ops
-                    owner
-                    repo
-                    prefix
-                    (renderPVNoRev pv)
-                pure $ case eres of
-                  Left err -> Left (PlanProbeFailed err)
-                  Right ver -> Right (Just ver)
-            )
+            (pure (Right ceilings))
+            (bunProbe ops owner repo prefix)
+        Nothing ->
+          case dpoOverlayRoot ops of
+            Nothing ->
+              pure
+                ( Left
+                    ( PlanFailed
+                        "overlay path required for bun-bin runtime ceilings"
+                    )
+                )
+            Just overlayRoot ->
+              planWith
+                ops
+                progress
+                src
+                locals
+                ( discoverCeilingsCached
+                    (dpoBunCeilingsCache ops)
+                    (discoverBunBinCeilings overlayRoot)
+                )
+                (bunProbe ops owner repo prefix)
     _ -> pure (Left (PlanFailed "DepsAndAssets Bun requires a GitHub update source"))
+
+bunProbe ::
+  DepsPlanOps ->
+  Text ->
+  Text ->
+  Text ->
+  EbuildVersion ->
+  IO (Either PlanError (Maybe Text))
+bunProbe ops owner repo prefix pv = do
+  eres <-
+    dpoFetchBunEngines
+      ops
+      owner
+      repo
+      prefix
+      (renderPVNoRev pv)
+  pure $ case eres of
+    Left err -> Left (PlanProbeFailed err)
+    Right ver -> Right (Just ver)
 
 ------------------------------------------------------------------------
 -- Cargo

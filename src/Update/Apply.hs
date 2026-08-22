@@ -7,6 +7,7 @@
 module Update.Apply
   ( applyOverlay,
     applyOverlayFromPlan,
+    WavePrepare,
     foldExitHardFail,
     EbuildRunner,
     productionEbuildRunner,
@@ -28,7 +29,15 @@ import CLI.Progress
     ProgressConfig,
     withMultiProgress,
   )
-import Control.Monad (unless)
+import Control.Concurrent (newQSem, signalQSem, waitQSem)
+import Control.Concurrent.Async (mapConcurrently_)
+import Control.Concurrent.Chan (newChan, readChan, writeChan)
+import Control.Exception (bracket_)
+import Control.Monad (replicateM_, unless, when)
+import Data.Foldable (for_)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -48,6 +57,13 @@ import Update.Apply.Plan
 import Update.Check (PackageEntry (..))
 import Update.Git (GitOps (..))
 import Update.Hardcoded (lookupPolicy)
+import Update.OverlayWaves
+  ( AdmitSets (..),
+    OverlayPlanKind (..),
+    classifyAdmit,
+    overlayCeilingProviderForKey,
+    overlayProviderCascadeMessage,
+  )
 import Update.TempWorkspace (cleanupRunSuccess)
 import Update.Types
   ( ApplyOutcome (..),
@@ -55,6 +71,7 @@ import Update.Types
     PackagePolicy (..),
     UpdateTechnique (..),
     outcomeIsHardFail,
+    packageKeyText,
   )
 
 foldExitHardFail :: [ApplyOutcome] -> Bool
@@ -95,16 +112,31 @@ applyOverlay pcfg env overlayRoot entries mFilter = do
         cleanupRunSuccess (aeTempRun env)
       pure outcomes
 
--- | Mutate phase consuming plan results: skip plan hard-fails / soft-skips;
--- only re-enter needs-work packages with carried plan data.
+-- | After a provider signed commit (or apply skip), re-plan withheld consumers.
+type WavePrepare =
+  PackageKey ->
+  [PackageKey] ->
+  MultiHandle ->
+  IO [PackagePlanResult]
+
+planKindOf :: PackagePlanResult -> OverlayPlanKind
+planKindOf = \case
+  PlanSoftSkip {} -> OverlayPlanSkip
+  PlanHardFail {} -> OverlayPlanFail
+  PlanNeedsWork {} -> OverlayPlanWork
+
+-- | Mutate phase consuming plan results. Overlay wait-edge consumers are
+-- withheld until their in-run provider reaches a non-hard-fail terminal
+-- overlay outcome; they are not mutated on the start-of-run plan.
 applyOverlayFromPlan ::
   ProgressConfig ->
   ApplyEnv ->
   FilePath ->
   [PackageEntry] ->
   [PackagePlanResult] ->
+  WavePrepare ->
   IO [ApplyOutcome]
-applyOverlayFromPlan pcfg env overlayRoot entries planResults = do
+applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare = do
   isGit <- goIsWorkTree (aeGitOps env) overlayRoot
   if not isGit
     then
@@ -116,28 +148,133 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults = do
             False
         ]
     else do
-      let carried = mapMaybe planResultToOutcome planResults
-          needs =
+      let kinds = [(planResultKey r, planKindOf r) | r <- planResults]
+          admit = classifyAdmit overlayCeilingProviderForKey kinds
+          withheldSet = Map.fromList (asWithheld admit)
+          terminalKeys = asTerminal admit
+          carried =
+            mapMaybe
+              ( \r ->
+                  if planResultKey r `elem` terminalKeys
+                    then planResultToOutcome r
+                    else Nothing
+              )
+              planResults
+          byEntry = Map.fromList [(peKey e, e) | e <- entries]
+          planByKey = Map.fromList [(planResultKey r, r) | r <- planResults]
+          admittedWork =
             [ (e, work)
-            | PlanNeedsWork key work <- planResults,
-              e <- entries,
-              peKey e == key
+            | k <- asReady admit,
+              Just (PlanNeedsWork _ work) <- [Map.lookup k planByKey],
+              Just e <- [Map.lookup k byEntry]
             ]
-      -- Soft-skips for packages not in planResults should not occur;
-      -- plan covers the full selected set.
+          withheldPairs = asWithheld admit
+          panelTotal = length admittedWork + length withheldPairs
       nested <-
-        if null needs
+        if panelTotal <= 0
           then pure []
-          else withMultiProgress pcfg "Updating packages" (length needs) $ \mh ->
+          else withMultiProgress pcfg "Updating packages" panelTotal $ \mh -> do
+            for_ withheldPairs $ \(consumer, provider) ->
+              mhWait mh consumer ("waiting on " <> packageKeyText provider)
             let env' = env {aeMulti = mh}
-             in mapConcurrentlyN
-                  (aeJobs env')
-                  (uncurry (applyNeedsWorkTracked env' overlayRoot))
-                  needs
-      let outcomes = carried <> concat nested
+            runAdmitPool
+              env'
+              overlayRoot
+              admittedWork
+              withheldSet
+              byEntry
+              prepare
+      let outcomes = carried <> nested
       unless (any outcomeIsHardFail outcomes) $
         cleanupRunSuccess (aeTempRun env)
       pure outcomes
+
+runAdmitPool ::
+  ApplyEnv ->
+  FilePath ->
+  [(PackageEntry, PlannedWork)] ->
+  Map PackageKey PackageKey ->
+  Map PackageKey PackageEntry ->
+  WavePrepare ->
+  IO [ApplyOutcome]
+runAdmitPool env overlayRoot initialWork withheld0 byEntry prepare = do
+  let jobs = max 1 (aeJobs env)
+      mh = aeMulti env
+      panelCount = length initialWork + Map.size withheld0
+  if panelCount == 0
+    then pure []
+    else do
+      sem <- newQSem jobs
+      chan <- newChan
+      remaining <- newIORef panelCount
+      outcomesRef <- newIORef ([] :: [ApplyOutcome])
+      withheldRef <- newIORef withheld0
+      for_ initialWork $ \item -> writeChan chan (Just item)
+      let finishOne = do
+            n <- atomicModifyIORef' remaining (\x -> let x' = x - 1 in (x', x'))
+            when (n == 0) $
+              replicateM_ jobs (writeChan chan Nothing)
+          recordOutcomes os =
+            atomicModifyIORef' outcomesRef (\acc -> (acc <> os, ()))
+          cascade provider consumers = do
+            let msg = overlayProviderCascadeMessage provider
+            for_ consumers $ \c -> do
+              mhFail mh c msg
+              recordOutcomes [ApplyHardFail c msg False False]
+              finishOne
+          admitResults provider consumers results = do
+            let byPlan = Map.fromList [(planResultKey r, r) | r <- results]
+            for_ consumers $ \c ->
+              case Map.lookup c byPlan of
+                Just (PlanNeedsWork _ work)
+                  | Just e <- Map.lookup c byEntry ->
+                      writeChan chan (Just (e, work))
+                Just (PlanSoftSkip _ reason) -> do
+                  mhSkip mh c (shortApplyReason reason)
+                  recordOutcomes [ApplySoftSkip c reason]
+                  finishOne
+                Just (PlanHardFail _ msg) -> do
+                  mhFail mh c (shortApplyReason msg)
+                  recordOutcomes [ApplyHardFail c msg False False]
+                  finishOne
+                _ -> cascade provider [c]
+          handleDone key outs = do
+            recordOutcomes outs
+            waiting <-
+              Map.keys . Map.filter (== key) <$> readIORef withheldRef
+            if null waiting
+              then finishOne
+              else do
+                atomicModifyIORef'
+                  withheldRef
+                  (\m -> (foldl' (flip Map.delete) m waiting, ()))
+                finishOne
+                if any outcomeIsHardFail outs
+                  then cascade key waiting
+                  else do
+                    results <- prepare key waiting mh
+                    admitResults key waiting results
+          worker = do
+            item <- readChan chan
+            case item of
+              Nothing -> pure ()
+              Just (entry, work) -> do
+                outs <-
+                  bracket_
+                    (waitQSem sem)
+                    (signalQSem sem)
+                    (applyNeedsWorkTracked env overlayRoot entry work)
+                handleDone (peKey entry) outs
+                worker
+      mapConcurrently_ (const worker) [1 .. jobs]
+      readIORef outcomesRef
+
+shortApplyReason :: Text -> Text
+shortApplyReason t =
+  let oneLine = T.unwords (T.words t)
+   in if T.length oneLine > 60
+        then T.take 57 oneLine <> "..."
+        else oneLine
 
 applyNeedsWorkTracked ::
   ApplyEnv ->

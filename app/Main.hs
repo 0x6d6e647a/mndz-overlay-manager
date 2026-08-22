@@ -36,7 +36,7 @@ import Overlay.Types (Ebuild, ebuildAtom, ebuildCategory, ebuildPackage)
 import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (EbuildVersion (..), prettyVersion)
 import System.Exit (ExitCode (..), exitWith)
-import Update.Apply (foldExitHardFail)
+import Update.Apply (foldExitHardFail, productionEbuildRunner)
 import Update.Assets.Release (ReleaseOps (..), productionReleaseOps)
 import Update.Auth (resolveGitHubToken)
 import Update.Check
@@ -263,7 +263,10 @@ runUpdate rt refresh pkgArgs = do
                           usdAssetsPathCfg = assetsPath cfg,
                           usdDistDir = distDir,
                           usdOverlayRoot = overlayPath,
-                          usdSshOps = productionSshAgentOps
+                          usdSshOps = productionSshAgentOps,
+                          usdEbuildRunner = productionEbuildRunner distDir,
+                          usdEgencacheRunner = productionEgencacheRunner,
+                          usdPreflightTools = preflightUpdateTools
                         }
                  in runUpdatePhases deps entries ebuilds selected
             )

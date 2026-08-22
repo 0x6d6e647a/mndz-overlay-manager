@@ -283,7 +283,8 @@ unitTests =
       testCase "Step Progress Draw Throw No Hang" testStepProgressDrawThrowNoHang,
       testCase "Step Progress Body Throw No Hang" testStepProgressBodyThrowNoHang,
       testCase "Step Progress Panel Fail Success" testStepProgressPanelFailSuccess,
-      testCase "Pause Clear Throw Lock Not Stuck" testPauseClearThrowLockNotStuck
+      testCase "Pause Clear Throw Lock Not Stuck" testPauseClearThrowLockNotStuck,
+      testCase "Waiting is not hard-fail chrome" testWaitingNotHardFail
     ]
 
 -- | Soft-skip handle drives ApplyEnv / PlanOps apply path.
@@ -404,6 +405,43 @@ testMultiProgressSkipVsFail = do
   assertTrue "skip styling yellow when color on" (yellow `T.isInfixOf` frameOn)
   assertTrue "fail styling red when color on" (red `T.isInfixOf` frameOn)
 
+-- | Waiting rows name the provider, are not hard-fail, and do not count as done.
+testWaitingNotHardFail :: IO ()
+testWaitingNotHardFail = do
+  stateRef <-
+    newIORef
+      MultiState
+        { msLabel = "Updating packages",
+          msTotal = 2,
+          msSucceeded = 0,
+          msJobs = Map.empty,
+          msTick = 0
+        }
+  let mh = multiHandle stateRef
+      bun = mkPackageKey "dev-lang" "bun-bin"
+      ralph = mkPackageKey "dev-util" "ralph-tui"
+  mhStart mh bun
+  mhWait mh ralph "waiting on dev-lang/bun-bin"
+  s0 <- readIORef stateRef
+  case Map.lookup ralph (msJobs s0) of
+    Just (JobWaiting reason) ->
+      assertEq "waiting names provider" "waiting on dev-lang/bun-bin" reason
+    other -> do
+      hPutStrLn stderr ("expected JobWaiting, got: " <> show other)
+      exitFailure
+  let frame = T.pack (renderMulti ColorOff s0)
+  assertTrue "waiting in frame" ("waiting on dev-lang/bun-bin" `T.isInfixOf` frame)
+  assertTrue "ralph key in frame" ("dev-util/ralph-tui" `T.isInfixOf` frame)
+  assertTrue "not fail glyph for waiting" (not ("✗" `T.isInfixOf` frame))
+  assertTrue "panel not complete while waiting" ("0/2" `T.isInfixOf` frame)
+  mhStart mh ralph
+  s1 <- readIORef stateRef
+  case Map.lookup ralph (msJobs s1) of
+    Just (JobActive _) -> pure ()
+    other -> do
+      hPutStrLn stderr ("expected in-flight after admit, got: " <> show other)
+      exitFailure
+
 -- | Soft-skip-only package outcomes call mhSkip, not mhFail.
 
 -- | Soft-skip-only package outcomes call mhSkip, not mhFail.
@@ -425,6 +463,7 @@ testApplyProgressSoftSkipHandle = do
         mh =
           MultiHandle
             { mhStart = \_ -> logTerm "start",
+              mhWait = \_ _ -> pure (),
               mhStatus = \_ _ -> pure (),
               mhSteps = \_ _ -> pure (),
               mhStep = \_ _ -> pure (),

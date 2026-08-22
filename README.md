@@ -93,7 +93,7 @@ Default location (XDG cache):
 - `$XDG_CACHE_HOME/mndz/overlay-manager/check-cache/` when `XDG_CACHE_HOME` is set and non-empty
 - otherwise `~/.cache/mndz/overlay-manager/check-cache/`
 
-One JSON file per overlay is named `<friendly>-<hash12>.json` (sanitized overlay directory basename plus a short hash of the absolute overlay path). Entries are invalidated when the package’s local non-live versions, update source, or ebuild/Manifest content change. Use `--refresh` on either command to ignore existing entries for reads and force live network work (fresh entries are still written when caching is enabled).
+One JSON file per overlay is named `<friendly>-<hash12>.json` (sanitized overlay directory basename plus a short hash of the absolute overlay path). Entries are invalidated when the package’s local non-live versions, update source, or ebuild/Manifest content change. DepsAndAssets Bun plans also fingerprint overlay `dev-lang/bun-bin` (a missing field is a miss). Use `--refresh` on either command to ignore existing entries for reads and force live network work (fresh entries are still written when caching is enabled).
 
 ## Commands
 
@@ -124,6 +124,8 @@ cabal run mndz-overlay-manager -- --overlay-path /path/to/overlay list
 ### `outdated`
 
 Compare discovered packages to their configured update sources and report packages that have a newer upstream version (or a runtime-lane gap for DepsAndAssets packages). Outdated lines go to standard output; warnings (unmapped packages, fetch failures, local ahead of remote) go to the log on stderr. Soft failures do not by themselves force a non-zero exit; spine failures (missing config, invalid overlay, empty inventory, unknown/ambiguous package targets) do.
+
+Bun packages whose runtime ceiling comes from overlay `dev-lang/bun-bin` are **blocked on** that provider when a newer bun-bin would change the planned PVs: the consumer still prints a line that names `dev-lang/bun-bin` rather than appearing fully current under the on-disk ceiling. When bun-bin itself is in the check set, it still prints its own unlabeled `LOCAL -> REMOTE` line. If bun-bin’s upstream latest cannot be fetched, the consumer check fail-closes (error naming bun-bin) instead of omitting the package as current.
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name (same form as `update` / `gencache`). With no arguments, every discovered package is checked. With one or more targets, only the selected packages are checked.
 
@@ -165,6 +167,8 @@ cabal run mndz-overlay-manager -- update --refresh
 ```
 
 `update` runs a **plan phase** first (using the check cache when enabled, same needs-work rules as `outdated` / apply), then conditional assets/token checks for packages that need work, then reuse vs full classification, then `docker` + materialize-image checks when any unit is full path, then the free-space gate, then concurrent mutate/apply. Spine tools (`git`, `ebuild`, `egencache`, `gpg`) and layout / manager-distfiles probes run before plan. When at least one package that needs work will attempt `DepsAndAssets`, it also checks that `assets-path` is a git work tree and a GitHub token can be resolved. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
+
+Untargeted `update` applies overlay runtime providers (today `dev-lang/bun-bin`) **before** their Bun consumers in the same run: after bun-bin’s signed overlay commit, those consumers are re-planned against the new overlay ceilings so a ralph PV that needed the new Bun can land in one command. Independent packages (mise, beads, …) may overlap bun-bin under `--jobs`; a withheld consumer does not occupy a job slot while waiting. `update ralph-tui` while bun-bin is stale **does not** pull bun-bin into the selection: if a newer bun-bin would change ralph’s plan (or bun-bin’s latest cannot be fetched), ralph hard-fails naming `dev-lang/bun-bin` with recovery `update bun-bin` or untargeted `update`.
 
 #### Free space, `TMPDIR`, and concurrent materialize
 

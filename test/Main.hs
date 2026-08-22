@@ -16,6 +16,7 @@ import Test.Lanes qualified as Lanes
 import Test.Materialize qualified as Materialize
 import Test.Md5Cache qualified as Md5Cache
 import Test.Overlay qualified as Overlay
+import Test.OverlayWaves qualified as OverlayWaves
 import Test.Policy qualified as Policy
 import Test.Preflight qualified as Preflight
 import Test.Progress qualified as Progress
@@ -24,6 +25,7 @@ import Test.Ssh qualified as Ssh
 import Test.Targets qualified as Targets
 import Test.Tasty (defaultMain, testGroup)
 import Test.TempWorkspace qualified as TempWorkspace
+import Test.Waves qualified as Waves
 
 -- Test taxonomy (Unit vs Integration) — design D3 / CONTRIBUTING.
 --
@@ -47,6 +49,7 @@ main =
       [ testGroup
           "Unit"
           [ Overlay.tests,
+            OverlayWaves.tests,
             Config.tests,
             CheckCache.tests,
             Distfiles.tests,
@@ -78,6 +81,7 @@ main =
             Materialize.integrationTests,
             Md5Cache.integrationTests,
             Ecosystems.integrationTests,
-            CheckPlan.integrationTests
+            CheckPlan.integrationTests,
+            Waves.integrationTests
           ]
       ]

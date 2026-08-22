@@ -13,6 +13,11 @@ where
 import Data.Text (Text)
 import Data.Text qualified as T
 import Update.Md5Cache (PackageCacheIssue (..), packageCacheGateError)
+import Update.OverlayWaves
+  ( overlayFailClosedMessage,
+    overlayProviderCascadeMessage,
+    overlayRefuseMessage,
+  )
 import Update.Types
   ( ApplyOutcome (..),
     PackageKey,
@@ -34,6 +39,12 @@ data ApplyUnitError
   | -- | Donor/template ebuild path missing when a unit must read it.
     -- Args: package key, planned PV (rendered), path that does not exist.
     ApplyMissingDonorTemplate PackageKey Text FilePath
+  | -- | Unselected overlay ceiling provider with plan-delta.
+    ApplyOverlayRefuse PackageKey
+  | -- | Overlay ceiling provider latest could not be fetched.
+    ApplyOverlayFailClosed PackageKey
+  | -- | Withheld consumer fails because the overlay provider hard-failed.
+    ApplyOverlayProviderCascade PackageKey
   deriving (Eq, Show)
 
 applyUnitErrorMessage :: ApplyUnitError -> Text
@@ -55,6 +66,9 @@ applyUnitErrorMessage = \case
       <> pv
       <> " at "
       <> T.pack path
+  ApplyOverlayRefuse provider -> overlayRefuseMessage provider
+  ApplyOverlayFailClosed provider -> overlayFailClosedMessage provider
+  ApplyOverlayProviderCascade provider -> overlayProviderCascadeMessage provider
 
 -- | Build 'ApplyHardFail' with stable operator wording for a known unit error.
 -- Remaining args are half-applied (overlay mutated) and assets-published flags.

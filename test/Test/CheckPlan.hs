@@ -7,7 +7,8 @@ module Test.CheckPlan (unitTests, integrationTests) where
 import CLI.Jobs (newWorkBudget)
 import CLI.Progress (noopMultiHandle)
 import Config.Types (CheckCacheTtl (..))
-import Control.Concurrent.MVar (newMVar)
+import Control.Concurrent.MVar (modifyMVar_, newMVar)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (newManager)
@@ -21,11 +22,17 @@ import Test.Assert (assertEq, assertRight, assertTrue)
 import Test.Support (dualArchGoCeilings)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase)
+import Update.Apply
+  ( PackagePlanResult (..),
+    PlanEnv (..),
+    planPackage,
+  )
 import Update.Check
   ( PackageEntry (..),
     checkOverlayWithDepsPlan,
     checkPackage,
     checkPackageDeps,
+    groupByPackage,
   )
 import Update.CheckCache (CheckCacheHandle, openCheckCache)
 import Update.Deps.Plan
@@ -82,6 +89,13 @@ unitTests =
           testCase "list versions failure" testPlanListVersionsFailed,
           testCase "zero planned PVs" testPlanZeroPlannedPVs,
           testCase "npm probe failure" testPlanNpmProbeFailed
+        ],
+      testGroup
+        "overlay plan-delta refuse"
+        [ testCase "refuse when bun-bin unselected and plan-delta" testRefusePlanDelta,
+          testCase "no-delta still plans on-disk" testNoPlanDeltaAllowsOnDisk,
+          testCase "provider fetch fail-closed" testRefuseFailClosed,
+          testCase "ralph refuses, mise still plans" testRefuseRalphStillPlansMise
         ]
     ]
 
@@ -96,7 +110,10 @@ integrationTests =
       testCase "contentFix Npm content-only reusable" testContentFixNpmReusable,
       testCase "contentFix Bun content-only reusable" testContentFixBunReusable,
       testCase "contentFix Cargo content-only reusable" testContentFixCargoReusable,
-      testCase "checkPackageDeps Sbcl outdated floor" testCheckPackageDepsSbclOutdated
+      testCase "checkPackageDeps Sbcl outdated floor" testCheckPackageDepsSbclOutdated,
+      testCase "outdated ralph blocked on bun-bin" testOutdatedBlockedOn,
+      testCase "outdated fail-closed when bun-bin latest missing" testOutdatedFailClosed,
+      testCase "outdated bun-bin still has its own line" testOutdatedBunBinOwnLine
     ]
 
 ------------------------------------------------------------------------
@@ -186,6 +203,9 @@ unusedCargo ::
   Maybe FilePath ->
   IO (Either T.Text T.Text)
 unusedCargo _ _ _ _ _ = pure (Left "cargo toml unused")
+
+unusedFetch :: UpdateSource -> IO (Either T.Text EbuildVersion)
+unusedFetch _ = pure (Left "provider latest unused")
 
 listFixed :: [T.Text] -> UpdateSource -> IO (Either T.Text [EbuildVersion])
 listFixed vers _ = pure (Right (map parseEbuildVersion vers))
@@ -284,7 +304,7 @@ testCheckPackageDepsGoOutdated = do
       src = GitHub "gastownhall" "beads" "v"
   cache <- disabledCache
   report <-
-    checkPackageDeps noopMultiHandle ops cache e locals src (Go Nothing)
+    checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src (Go Nothing)
   assertTrue "outdated gaps" (isOutdated (reportStatus report))
   assertEq "key" (PackageKey "dev-util/beads") (reportKey report)
 
@@ -315,7 +335,7 @@ testCheckPackageDepsSbclOutdated = do
       src = GitHub "luciusmagn" "autolith" "v"
   cache <- disabledCache
   report <-
-    checkPackageDeps noopMultiHandle ops cache e locals src Sbcl
+    checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src Sbcl
   case reportStatus report of
     Outdated lines_ -> do
       assertTrue "has gaps" (not (null lines_))
@@ -342,7 +362,7 @@ testCheckPackageDepsPlanFail = do
       src = Npm "@fission-ai/openspec"
   cache <- disabledCache
   report <-
-    checkPackageDeps noopMultiHandle ops cache e locals src NpmEco
+    checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src NpmEco
   case reportStatus report of
     FetchError msg ->
       assertTrue
@@ -785,14 +805,14 @@ testContentFixGoReusable =
         src = GitHub "charmbracelet" "crush" "v"
     cache <- disabledCache
     report <-
-      checkPackageDeps noopMultiHandle ops cache e locals src (Go Nothing)
+      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src (Go Nothing)
     assertContentOnlyReusable "go content-fix" (reportStatus report)
     -- Complete Manifest + good BDEPEND → Ok
     TIO.writeFile
       (pkgDir </> "Manifest")
       "DIST crush-0.84.0-vendor.tar.xz 1 BLAKE2B aa SHA512 abcdef0123456789\n"
     reportOk <-
-      checkPackageDeps noopMultiHandle ops cache e locals src (Go Nothing)
+      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src (Go Nothing)
     assertOkStatus "go content ok" (reportStatus reportOk)
 
 -- | Npm: wrong nodejs BDEPEND on present PV → content-only reusable.
@@ -834,7 +854,7 @@ testContentFixNpmReusable =
         src = Npm "@fission-ai/openspec"
     cache <- disabledCache
     report <-
-      checkPackageDeps noopMultiHandle ops cache e locals src NpmEco
+      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src NpmEco
     assertContentOnlyReusable "npm content-fix" (reportStatus report)
     TIO.writeFile
       ebuildPath
@@ -844,7 +864,7 @@ testContentFixNpmReusable =
           body
       )
     reportOk <-
-      checkPackageDeps noopMultiHandle ops cache e locals src NpmEco
+      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src NpmEco
     assertOkStatus "npm content ok" (reportStatus reportOk)
 
 -- | Bun: missing Manifest deps DIST on present PV → content-only reusable.
@@ -865,6 +885,7 @@ testContentFixBunReusable =
     createDirectoryIfMissing True pkgDir
     TIO.writeFile ebuildPath body
     TIO.writeFile (pkgDir </> "Manifest") "DIST ralph-tui-1.5.0.tar.gz 1 SHA512 x\n"
+    _ <- seedBunBin tmp "1.2.0"
     ops <-
       mkDepsPlanOps
         (listFixed ["1.5.0"])
@@ -883,14 +904,18 @@ testContentFixBunReusable =
         locals = [Ebuild "dev-util" pn ver ebuildPath]
         src = GitHub "subsy" "ralph-tui" "v"
     cache <- disabledCache
+    let fetchBunLatest src0 = case src0 of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          _ -> unusedFetch src0
     report <-
-      checkPackageDeps noopMultiHandle ops cache e locals src Bun
+      checkPackageDeps noopMultiHandle fetchBunLatest ops cache e locals src Bun
     assertContentOnlyReusable "bun content-fix" (reportStatus report)
     TIO.writeFile
       (pkgDir </> "Manifest")
       "DIST ralph-tui-1.5.0-deps.tar.xz 1 SHA512 deadbeef\n"
     reportOk <-
-      checkPackageDeps noopMultiHandle ops cache e locals src Bun
+      checkPackageDeps noopMultiHandle fetchBunLatest ops cache e locals src Bun
     assertOkStatus "bun content ok" (reportStatus reportOk)
 
 -- | Cargo: wrong RUST_MIN_VER on present PV → content-only reusable.
@@ -943,6 +968,7 @@ testContentFixCargoReusable =
     report <-
       checkPackageDeps
         noopMultiHandle
+        unusedFetch
         ops
         cache
         e
@@ -954,6 +980,7 @@ testContentFixCargoReusable =
     reportOk <-
       checkPackageDeps
         noopMultiHandle
+        unusedFetch
         ops
         cache
         e
@@ -961,3 +988,370 @@ testContentFixCargoReusable =
         src
         (Cargo Nothing Nothing)
     assertOkStatus "cargo content ok" (reportStatus reportOk)
+
+------------------------------------------------------------------------
+-- Overlay wait-edge plan-delta / outdated blocked-on
+------------------------------------------------------------------------
+
+seedBunBin :: FilePath -> T.Text -> IO FilePath
+seedBunBin overlay ver = do
+  let pkgDir = overlay </> "dev-lang" </> "bun-bin"
+      name = "bun-bin-" <> T.unpack ver <> ".ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile
+    (pkgDir </> name)
+    "EAPI=8\nKEYWORDS=\"~amd64 ~arm64\"\n"
+  TIO.writeFile (pkgDir </> "Manifest") "DIST bun 1\n"
+  pure (pkgDir </> name)
+
+seedRalph :: FilePath -> T.Text -> IO FilePath
+seedRalph overlay ver = do
+  let pkgDir = overlay </> "dev-util" </> "ralph-tui"
+      name = "ralph-tui-" <> T.unpack ver <> ".ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile (pkgDir </> name) "EAPI=8\nKEYWORDS=\"~amd64\"\n"
+  TIO.writeFile (pkgDir </> "Manifest") "DIST ralph 1\n"
+  pure (pkgDir </> name)
+
+liveBunOps ::
+  FilePath ->
+  (UpdateSource -> IO (Either T.Text [EbuildVersion])) ->
+  (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
+  IO DepsPlanOps
+liveBunOps overlay listVers fetchBun = do
+  ops <-
+    mkDepsPlanOps
+      listVers
+      unusedGoMod
+      unusedNpm
+      fetchBun
+      unusedCargo
+      (Just overlay)
+  modifyMVar_ (dpoBunCeilingsCache ops) (\_ -> pure Nothing)
+  pure ops
+
+bunEnginesForDelta ::
+  T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)
+bunEnginesForDelta _o _r _p pv =
+  pure $
+    Right $
+      case pv of
+        "1.0.0" -> "1.1.0"
+        "1.5.0" -> "1.2.0"
+        _ -> "1.0.0"
+
+ralphEbuild :: FilePath -> T.Text -> Ebuild
+ralphEbuild path ver =
+  Ebuild "dev-util" "ralph-tui" ver path
+
+mkRalphPlanEnv ::
+  (UpdateSource -> IO (Either T.Text EbuildVersion)) ->
+  DepsPlanOps ->
+  CheckCacheHandle ->
+  [PackageKey] ->
+  PlanEnv
+mkRalphPlanEnv fetch ops cache selected =
+  PlanEnv
+    { peFetcher = fetch,
+      peDepsPlanOps = ops,
+      peCheckCache = cache,
+      peJobs = 1,
+      peMulti = noopMultiHandle,
+      peSelectedKeys = selected
+    }
+
+testRefusePlanDelta :: IO ()
+testRefusePlanDelta =
+  withSystemTempDirectory "om-refuse-delta" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["1.5.0", "1.0.0"])
+        bunEnginesForDelta
+    cache <- disabledCache
+    let fetch src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          _ -> pure (Left "unexpected source")
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+        e =
+          PackageEntry
+            { peKey = ralphKey,
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "1.0.0"]
+        byPkg = groupByPackage (locals <> [Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath])
+        env = mkRalphPlanEnv fetch ops cache [ralphKey]
+    result <- planPackage env byPkg e
+    case result of
+      PlanHardFail k msg -> do
+        assertEq "ralph key" ralphKey k
+        assertTrue "names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` msg)
+        assertTrue "mentions update" ("update" `T.isInfixOf` msg)
+      other -> assertFailure $ "expected refuse hard-fail, got " <> show other
+
+testNoPlanDeltaAllowsOnDisk :: IO ()
+testNoPlanDeltaAllowsOnDisk =
+  withSystemTempDirectory "om-no-delta" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["1.0.0"])
+        bunEnginesForDelta
+    cache <- disabledCache
+    let fetch src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          _ -> pure (Left "unexpected source")
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+        e =
+          PackageEntry
+            { peKey = ralphKey,
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "1.0.0"]
+        byPkg = groupByPackage locals
+        env = mkRalphPlanEnv fetch ops cache [ralphKey]
+    result <- planPackage env byPkg e
+    case result of
+      PlanHardFail _ msg ->
+        assertFailure $ "did not expect refuse: " <> T.unpack msg
+      PlanSoftSkip k _ -> assertEq "ralph skip or apply on-disk" ralphKey k
+      PlanNeedsWork k _ -> assertEq "ralph needs work on-disk" ralphKey k
+
+testRefuseFailClosed :: IO ()
+testRefuseFailClosed =
+  withSystemTempDirectory "om-fail-closed" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["1.5.0", "1.0.0"])
+        bunEnginesForDelta
+    cache <- disabledCache
+    let fetch _ = pure (Left "network down")
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+        e =
+          PackageEntry
+            { peKey = ralphKey,
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "1.0.0"]
+        env = mkRalphPlanEnv fetch ops cache [ralphKey]
+    result <- planPackage env (groupByPackage locals) e
+    case result of
+      PlanHardFail k msg -> do
+        assertEq "ralph key" ralphKey k
+        assertTrue "names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` msg)
+        assertTrue
+          "indicates upstream check failed"
+          ("upstream" `T.isInfixOf` msg || "could not check" `T.isInfixOf` msg)
+      other -> assertFailure $ "expected fail-closed, got " <> show other
+
+testRefuseRalphStillPlansMise :: IO ()
+testRefuseRalphStillPlansMise =
+  withSystemTempDirectory "om-ralph-mise" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    ops <-
+      liveBunOps
+        overlay
+        ( \src -> case src of
+            GitHub "subsy" "ralph-tui" _ ->
+              listFixed ["1.5.0", "1.0.0"] src
+            GitHub "jdx" "mise" _ ->
+              listFixed ["2025.1.0"] src
+            _ -> listFixed ["1.0.0"] src
+        )
+        bunEnginesForDelta
+    cache <- disabledCache
+    let fetch src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          _ -> pure (Left "unexpected")
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+        miseKey = mkPackageKey "dev-util" "mise"
+        ralphE =
+          PackageEntry
+            { peKey = ralphKey,
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        miseE = entry "dev-util" "mise" "2024.1.0"
+        envBoth = mkRalphPlanEnv fetch ops cache [ralphKey, miseKey]
+        ralphLocals = [ralphEbuild ralphPath "1.0.0"]
+        miseLocals =
+          [ Ebuild
+              "dev-util"
+              "mise"
+              "2024.1.0"
+              (pePath miseE)
+          ]
+    ralphR <- planPackage envBoth (groupByPackage ralphLocals) ralphE
+    miseR <-
+      planPackage
+        envBoth
+        (groupByPackage miseLocals)
+        miseE
+    case ralphR of
+      PlanHardFail k _ -> assertEq "ralph refused" ralphKey k
+      other -> assertFailure $ "expected ralph refuse, got " <> show other
+    case miseR of
+      PlanHardFail _ msg ->
+        assertTrue
+          "mise is not overlay-refuse"
+          (not ("dev-lang/bun-bin" `T.isInfixOf` msg))
+      _ -> pure ()
+
+testOutdatedBlockedOn :: IO ()
+testOutdatedBlockedOn =
+  withSystemTempDirectory "om-outdated-block" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["1.5.0", "1.0.0"])
+        bunEnginesForDelta
+    cache <- disabledCache
+    let fetchBun src0 = case src0 of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          _ -> pure (Left "unexpected")
+        e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "ralph-tui",
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "1.0.0"]
+        src = GitHub "subsy" "ralph-tui" "v"
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        fetchBun
+        ops
+        cache
+        e
+        locals
+        src
+        Bun
+    case reportStatus report of
+      Outdated lines_ -> do
+        let blob = T.unwords (map (fromMaybe "" . olLabel) lines_)
+        assertTrue "blocked indication" ("blocked on" `T.isInfixOf` blob)
+        assertTrue "names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` blob)
+      other ->
+        assertFailure $
+          "expected outdated blocked-on, got " <> show other
+
+testOutdatedFailClosed :: IO ()
+testOutdatedFailClosed =
+  withSystemTempDirectory "om-outdated-fc" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["1.5.0", "1.0.0"])
+        bunEnginesForDelta
+    cache <- disabledCache
+    let fetch _ = pure (Left "network down")
+        e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "ralph-tui",
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "1.0.0"]
+        src = GitHub "subsy" "ralph-tui" "v"
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        fetch
+        ops
+        cache
+        e
+        locals
+        src
+        Bun
+    case reportStatus report of
+      FetchError msg -> do
+        assertTrue "names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` msg)
+      Ok _ ->
+        assertFailure "fail-closed must not omit consumer as current"
+      other ->
+        assertFailure $ "expected FetchError, got " <> show other
+
+testOutdatedBunBinOwnLine :: IO ()
+testOutdatedBunBinOwnLine =
+  withSystemTempDirectory "om-outdated-both" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["1.5.0", "1.0.0"])
+        bunEnginesForDelta
+    cache <- disabledCache
+    let fetch src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          _ -> pure (Left "unexpected")
+        ebuilds =
+          [ Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath,
+            ralphEbuild ralphPath "1.0.0"
+          ]
+    reports <-
+      checkOverlayWithDepsPlan 2 noopMultiHandle fetch ops cache ebuilds
+    let bunRep =
+          [ r
+          | r <- reports,
+            reportKey r == mkPackageKey "dev-lang" "bun-bin"
+          ]
+        ralphRep =
+          [ r
+          | r <- reports,
+            reportKey r == mkPackageKey "dev-util" "ralph-tui"
+          ]
+    case bunRep of
+      [r] ->
+        case reportStatus r of
+          Outdated lines_ ->
+            assertTrue
+              "bun-bin unlabeled latest line"
+              (any (isNothing . olLabel) lines_)
+          other ->
+            assertFailure $ "expected bun-bin outdated, got " <> show other
+      _ -> assertFailure "expected bun-bin report"
+    case ralphRep of
+      [r] ->
+        case reportStatus r of
+          Outdated lines_ ->
+            assertTrue
+              "ralph blocked-on"
+              (any (maybe False ("blocked on" `T.isInfixOf`) . olLabel) lines_)
+          other ->
+            assertFailure $ "expected ralph blocked-on, got " <> show other
+      _ -> assertFailure "expected ralph report"

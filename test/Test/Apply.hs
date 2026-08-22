@@ -1179,6 +1179,7 @@ testFullPathApplyProgressSequence =
         mh =
           MultiHandle
             { mhStart = \_ -> pure (),
+              mhWait = \_ _ -> pure (),
               mhStatus = \_ name -> logEv ("status:" <> name),
               mhSteps = \_ n -> logEv ("steps:" <> T.pack (show n)),
               mhStep = \_ name -> logEv ("step:" <> name),
@@ -1348,6 +1349,7 @@ testReusePathApplyProgressSequence =
         mh =
           MultiHandle
             { mhStart = \_ -> pure (),
+              mhWait = \_ _ -> pure (),
               mhStatus = \_ name -> logEv ("status:" <> name),
               mhSteps = \_ n -> logEv ("steps:" <> T.pack (show n)),
               mhStep = \_ name -> logEv ("step:" <> name),
