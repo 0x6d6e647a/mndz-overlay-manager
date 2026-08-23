@@ -26,13 +26,13 @@ After spine tools (`git`, `ebuild`, `egencache`, `gpg`) and existing layout and 
 
 After the plan phase:
 
-1. When at least one package that needs work **and is admissible** (not withheld on an overlay wait-edge provider that still needs work) will attempt `DepsAndAssets` apply, hard-require a resolvable GitHub token and configured `assets-path` git work tree, and prepare SSH when assets work requires it.
+1. When at least one package that needs work **and is admissible** (not withheld on an overlay wait-edge provider that still needs work) will attempt `DepsAndAssets` apply, hard-require a resolvable GitHub token and configured `assets-path` git work tree, and prepare SSH when assets work requires it. When overlay wait-edge consumers are withheld but may need assets after re-plan, the program MAY require token and `assets-path` at this time as already implemented for withheld Bun packages.
 2. Classify reuse vs full for assets units that need heavy work among **admitted** packages (as defined by `disk-space-preflight`).
-3. When at least one planned unit that needs work and is admitted is classified **full path**, require `docker` on `PATH` and a usable product materialize image as specified by `hermetic-asset-materialize`. The program SHALL NOT require host `go`, `npm`, `bun`, `pycargoebuild`, fetchers, or `xz` on `PATH` solely because a unit is full path (those tools live in the image).
-4. Run the disk-space feasibility gate on heavy units from admitted packages that need work only.
-5. Run the mutate/apply phase for **admitted** packages (soft-skips and successes as applicable). Packages withheld per `overlay-apply-waves` SHALL NOT be mutated on the initial plan. Packages already hard-failed in plan or classification SHALL NOT be re-planned or re-mutated; their hard-fail outcomes SHALL count toward the final exit status aggregation. The program SHALL still enter mutate/apply after a successful spine even when no package needs work (soft-skip presentation), and SHALL NOT use a special-case early exit solely because the needs-work set is empty.
+3. When at least one planned unit that needs work and is admitted is classified **full path**, require `docker` on `PATH`. The program SHALL NOT require host `go`, `npm`, `bun`, `pycargoebuild`, fetchers, or `xz` on `PATH` solely because a unit is full path (those tools live in the image). Ensure of the materialize image SHALL follow `ensure-materialize-image`: GitMv and reuse MAY enter mutate without waiting on ensure; full-path language materialize SHALL wait on successful ensure and SHALL NOT occupy a package job while waiting.
+4. Run the disk-space feasibility gate on heavy units from admitted packages that need work only, and the image-build free-space check when ensure will `docker build`, as specified by `disk-space-preflight` and `ensure-materialize-image`.
+5. Run the mutate/apply phase for **admitted** packages (soft-skips and successes as applicable). Packages withheld per `overlay-apply-waves` SHALL NOT be mutated on the initial plan. Full-path admitted packages SHALL NOT start container materialize until ensure has succeeded. Packages already hard-failed in plan or classification SHALL NOT be re-planned or re-mutated; their hard-fail outcomes SHALL count toward the final exit status aggregation. The program SHALL still enter mutate/apply after a successful spine even when no package needs work (soft-skip presentation), and SHALL NOT use a special-case early exit solely because the needs-work set is empty.
 
-When an overlay wait-edge provider later succeeds with a signed overlay commit, the program SHALL re-plan withheld consumers as specified by `overlay-apply-waves`, then repeat classify, conditional token/assets/docker preflight, and the disk-space gate for **new** needs-work units from those consumers before admitting them. A conditional-preflight or disk-gate failure at that re-entry SHALL hard-fail the affected consumers and SHALL NOT roll back already-committed overlay units.
+When an overlay wait-edge provider later succeeds with a signed overlay commit, the program SHALL re-plan withheld consumers as specified by `overlay-apply-waves`, then repeat classify, conditional token/assets/docker-on-PATH, **image ensure**, and the disk-space gate for **new** needs-work units from those consumers before admitting them to language materialize. A conditional-preflight, ensure, or disk-gate failure at that re-entry SHALL hard-fail the affected consumers and SHALL NOT roll back already-committed overlay units.
 
 #### Scenario: Plan runs before disk gate
 
@@ -60,20 +60,26 @@ When an overlay wait-edge provider later succeeds with a signed overlay commit, 
 - **THEN** ralph-tui hard-fails
 - **AND** the bun-bin overlay commit remains
 
+#### Scenario: GitMv starts while image is ensured
+
+- **WHEN** bun-bin and a full-path Go package both need work and the materialize image is missing
+- **THEN** bun-bin may mutate while ensure runs
+- **AND** the Go package does not start container materialize until ensure succeeds
+
 ### Requirement: Update preflight requires git ebuild and gpg
 
 The `update` command SHALL verify that `git`, `ebuild`, `egencache`, and `gpg` are available on `PATH` before package mutation (spine tools). Spine tools SHALL be checked before the plan phase.
 
-When at least one selected package **that needs work** will attempt a `DepsAndAssets` apply (including same-PV content/revision fixes), `update` SHALL additionally verify that `assets-path` is configured and names a git work tree, and that a GitHub token can be resolved. When any such package will use the **full** materialize path, `docker` SHALL be on `PATH` and a usable product materialize image SHALL be available, as specified by `hermetic-asset-materialize`. Missing conditional hard requirements SHALL log an error and exit with status `1` before package mutation. When no package that needs work will attempt `DepsAndAssets`, the program SHALL NOT fail preflight solely because `docker`, assets path, or token are missing. Packages that only need the reuse path SHALL NOT require `docker` or host language tools (`go`/`npm`/`bun`/`pycargoebuild`) solely for that reuse work.
+When at least one selected package **that needs work** will attempt a `DepsAndAssets` apply (including same-PV content/revision fixes), `update` SHALL additionally verify that `assets-path` is configured and names a git work tree, and that a GitHub token can be resolved. When any such package will use the **full** materialize path, `docker` SHALL be on `PATH` and a usable product materialize image SHALL be available as specified by `hermetic-asset-materialize` and `ensure-materialize-image` (ensure for the default tag; inspect-only for `MNDZ_MATERIALIZE_IMAGE`). Missing conditional hard requirements SHALL log an error and fail with status `1` before those units’ mutation (spine-wide before mutate has started; per-consumer at overlay wait-edge re-entry). When no package that needs work will attempt `DepsAndAssets`, the program SHALL NOT fail preflight solely because `docker`, assets path, or token are missing. Packages that only need the reuse path SHALL NOT require `docker` or host language tools (`go`/`npm`/`bun`/`pycargoebuild`) solely for that reuse work.
 
 The program SHALL NOT require host `xz`, `go`, `npm`, `bun`, `pycargoebuild`, or cargo fetchers on `PATH` solely because a DepsAndAssets unit is full path. Host cargo wget/aria2 advisories SHALL NOT fire solely because those binaries are absent from the host `PATH` when full-path cargo runs in the image.
 
-Conditional assets and Docker requirements that depend on needs-work or full vs reuse SHALL be evaluated **after** the plan phase (and after reuse/full classification for Docker), not solely from technique presence in the full selected inventory.
+Conditional assets and Docker requirements that depend on needs-work or full vs reuse SHALL be evaluated **after** the plan phase (and after reuse/full classification for Docker), not solely from technique presence in the full selected inventory. Docker image **ensure** SHALL NOT block GitMv or reuse mutate.
 
 #### Scenario: Go tools required only when Go technique selected
 
 - **WHEN** the user runs `update dev-util/crush` and crush will attempt full-path `DepsAndAssets` Go work
-- **THEN** preflight requires `docker` on `PATH` and a usable materialize image and does not fail solely because host `go` is missing
+- **THEN** preflight requires `docker` on `PATH` and a usable materialize image (ensured if the default tag is used) and does not fail solely because host `go` is missing
 
 #### Scenario: npm required for openspec full path
 

@@ -48,11 +48,6 @@ import Update.DiskSpace
     readManifestMaybe,
   )
 import Update.Git (isGitWorkTree)
-import Update.Process (productionCommandRunner)
-import Update.Process.Docker
-  ( inspectMaterializeImage,
-    resolveMaterializeImage,
-  )
 import Update.Types
   ( PackageKey (..),
     ecosystemIsBun,
@@ -162,15 +157,10 @@ checkToolsOnPath findTool tools = do
   results <- mapM (\t -> (t,) <$> findTool t) tools
   pure [name | (name, path) <- results, isNothing path]
 
--- | Preflight with production PATH lookup and image inspect.
+-- | Preflight with production PATH lookup. Image usability is
+-- 'Update.Materialize.ensureMaterializeImage', not inspect-only.
 preflightUpdateTools :: AssetsPreflight -> IO (Either Text ())
-preflightUpdateTools ap = do
-  image <- resolveMaterializeImage
-  preflightUpdateToolsWithImage
-    findExecutable
-    (inspectMaterializeImage productionCommandRunner)
-    image
-    ap
+preflightUpdateTools = preflightUpdateToolsWith findExecutable
 
 -- | Preflight with an injectable executable finder (for Unit tests).
 -- Image inspect is treated as success when docker is present (tests that

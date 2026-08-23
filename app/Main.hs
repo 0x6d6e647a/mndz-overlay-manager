@@ -24,6 +24,7 @@ import CLI.Progress
 import Colog (LogAction, Message, WithLog, logError, logInfo, logWarning, usingLoggerT)
 import Config.Loader (configErrorMessage, loadConfig)
 import Config.Types (OverlayConfig (..))
+import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -35,6 +36,7 @@ import Overlay.Discovery (collectEbuilds, discoveryErrorMessage)
 import Overlay.Types (Ebuild, ebuildAtom, ebuildCategory, ebuildPackage)
 import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (EbuildVersion (..), prettyVersion)
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import Update.Apply (foldExitHardFail, productionEbuildRunner)
 import Update.Assets.Release (ReleaseOps (..), productionReleaseOps)
@@ -63,6 +65,14 @@ import Update.GpgAgent
     productionGpgAgentOps,
     teardownGpgHandle,
   )
+import Update.Materialize
+  ( EnsureConfig (..),
+    defaultMaterializeSidecarDir,
+    ensureMaterializeImage,
+    hostRecipeArch,
+    productionEnsureNow,
+    prunePreviousMaterializeImage,
+  )
 import Update.Md5Cache
   ( checkLayoutCacheFormats,
     gencachePackages,
@@ -73,6 +83,8 @@ import Update.Preflight
   ( AssetsPreflight (..),
     preflightUpdateTools,
   )
+import Update.Process (productionCommandRunner)
+import Update.Process.Docker (materializeImageEnvVar)
 import Update.Spine
   ( UpdateSpineDeps (..),
     UpdateSpineResult (..),
@@ -246,8 +258,26 @@ runUpdate rt refresh pkgArgs = do
           bracket
             (newGpgHandle gpgOps)
             teardownGpgHandle
-            ( \gpg ->
-                let deps =
+            ( \gpg -> do
+                sidecarDir <- defaultMaterializeSidecarDir
+                arch <- hostRecipeArch
+                mOvr <- lookupEnv materializeImageEnvVar
+                prev <- newMVar Nothing
+                let ovr = case mOvr of
+                      Just s | not (null s) -> Just s
+                      _ -> Nothing
+                    ensureCfg =
+                      EnsureConfig
+                        { ecRun = productionCommandRunner,
+                          ecProbe = productionDiskSpaceProbe,
+                          ecOverlayRoot = overlayPath,
+                          ecSidecarDir = sidecarDir,
+                          ecNow = productionEnsureNow,
+                          ecArch = arch,
+                          ecOverrideTag = ovr,
+                          ecPrevImageId = prev
+                        }
+                    deps =
                       UpdateSpineDeps
                         { usdJobs = rtJobs rt,
                           usdProgress = pcfg,
@@ -266,9 +296,12 @@ runUpdate rt refresh pkgArgs = do
                           usdSshOps = productionSshAgentOps,
                           usdEbuildRunner = productionEbuildRunner distDir,
                           usdEgencacheRunner = productionEgencacheRunner,
-                          usdPreflightTools = preflightUpdateTools
+                          usdPreflightTools = preflightUpdateTools,
+                          usdEnsureImage = ensureMaterializeImage ensureCfg,
+                          usdPruneMaterialize =
+                            prunePreviousMaterializeImage ensureCfg
                         }
-                 in runUpdatePhases deps entries ebuilds selected
+                runUpdatePhases deps entries ebuilds selected
             )
       case spineResult of
         Left err -> dieError (T.unpack err)

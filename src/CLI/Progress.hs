@@ -306,6 +306,7 @@ multiHandle stateRef =
                   Map.adjust
                     ( \case
                         JobActive aj -> JobActive aj {ajName = phase}
+                        JobWaiting _ -> JobWaiting phase
                         other -> other
                     )
                     key

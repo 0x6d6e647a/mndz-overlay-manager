@@ -211,6 +211,10 @@ import Update.GpgAgent
     teardownGpgHandle,
   )
 import Update.Hardcoded (lookupHardcoded, lookupPolicy)
+import Update.Materialize
+  ( ensuringMaterializeImageStatus,
+    waitingOnMaterializeImage,
+  )
 import Update.Md5Cache
   ( EgencacheRequest (..),
     GencacheAction (..),
@@ -284,7 +288,8 @@ unitTests =
       testCase "Step Progress Body Throw No Hang" testStepProgressBodyThrowNoHang,
       testCase "Step Progress Panel Fail Success" testStepProgressPanelFailSuccess,
       testCase "Pause Clear Throw Lock Not Stuck" testPauseClearThrowLockNotStuck,
-      testCase "Waiting is not hard-fail chrome" testWaitingNotHardFail
+      testCase "Waiting is not hard-fail chrome" testWaitingNotHardFail,
+      testCase "Full-path waiting on ensure is not hard-fail" testWaitingOnEnsureNotHardFail
     ]
 
 -- | Soft-skip handle drives ApplyEnv / PlanOps apply path.
@@ -442,7 +447,40 @@ testWaitingNotHardFail = do
       hPutStrLn stderr ("expected in-flight after admit, got: " <> show other)
       exitFailure
 
--- | Soft-skip-only package outcomes call mhSkip, not mhFail.
+-- | Full-path waiting on materialize image uses waiting chrome, not hard-fail.
+testWaitingOnEnsureNotHardFail :: IO ()
+testWaitingOnEnsureNotHardFail = do
+  stateRef <-
+    newIORef
+      MultiState
+        { msLabel = "Updating packages",
+          msTotal = 2,
+          msSucceeded = 0,
+          msJobs = Map.empty,
+          msTick = 0
+        }
+  let mh = multiHandle stateRef
+      bun = mkPackageKey "dev-lang" "bun-bin"
+      crush = mkPackageKey "dev-util" "crush"
+  mhStart mh bun
+  mhWait mh crush waitingOnMaterializeImage
+  mhStatus mh crush ensuringMaterializeImageStatus
+  s0 <- readIORef stateRef
+  case Map.lookup crush (msJobs s0) of
+    Just (JobWaiting reason) ->
+      assertEq
+        "waiting status updated"
+        ensuringMaterializeImageStatus
+        reason
+    other -> do
+      hPutStrLn stderr ("expected JobWaiting, got: " <> show other)
+      exitFailure
+  let frame = T.pack (renderMulti ColorOff s0)
+  assertTrue
+    "ensuring in frame"
+    (ensuringMaterializeImageStatus `T.isInfixOf` frame)
+  assertTrue "not fail glyph" (not ("✗" `T.isInfixOf` frame))
+  assertTrue "panel not complete" ("0/2" `T.isInfixOf` frame)
 
 -- | Soft-skip-only package outcomes call mhSkip, not mhFail.
 testApplyProgressSoftSkipHandle :: IO ()

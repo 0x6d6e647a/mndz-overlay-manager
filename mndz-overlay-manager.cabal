@@ -53,9 +53,6 @@ build-type:         Simple
 -- Extra doc files to be distributed with the package, such as a CHANGELOG or a README.
 extra-doc-files:    CHANGELOG.md
 
--- Extra source files to be distributed with the package, such as examples, or a tutorial module.
-extra-source-files:  docker/materialize/Dockerfile
-
 common warnings
     ghc-options:
         -Wall
@@ -110,6 +107,7 @@ library
       , Update.GpgAgent
       , Update.Hardcoded
       , Update.Http
+      , Update.Materialize
       , Update.Md5Cache
       , Update.Npm
       , Update.Npm.Cache
@@ -138,6 +136,10 @@ library
       , Update.Apply.Plan
       , Update.Cargo.Lock
       , Update.DiskSpace.StatVfs
+      , Update.Materialize.Ensure
+      , Update.Materialize.Floors
+      , Update.Materialize.Recipe
+      , Update.Materialize.Sidecar
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -229,6 +231,7 @@ test-suite mndz-overlay-manager-test
         Test.DiskSpace
         Test.Distfiles
         Test.EbuildEdit
+        Test.Ensure
         Test.Ecosystems
         Test.Git
         Test.Gpg

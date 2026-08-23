@@ -23,13 +23,14 @@ GPG-signed overlay/assets commits, SSH `git push`, the GitHub token, `ebuild` / 
 
 ### Materialize image (full-path `update`)
 
-Build the in-repo Gentoo image once (or whenever engines/`go.mod` outgrow it). The CLI does **not** `docker build` as a side effect of `update`; a missing image is a preflight hard-fail.
+When `update` has classified **full-path** DepsAndAssets work, it **ensures** the default Gentoo materialize image (`mndz-overlay-manager/materialize:local`): it reuses the current image when recorded floors still satisfy this prepare, otherwise it generates a Dockerfile and `docker build`s it. GitMv and reuse-path work may proceed while that ensure runs. There is no in-repo Dockerfile to `docker build`; a manual image build is **not** a prerequisite of `update`.
 
-```bash
-docker build -t mndz-overlay-manager/materialize:local -f docker/materialize/Dockerfile .
-```
+Bun inside the image comes from overlay `dev-lang/bun-bin::mndz` (overlay bind-mounted read-only at build). Image metadata lives under the XDG cache:
 
-The CLI uses that tag by default. Override with `MNDZ_MATERIALIZE_IMAGE` if you retag or pull a different name. The image must match the **host CPU architecture** (no qemu/foreign-arch materialize).
+- `$XDG_CACHE_HOME/mndz/overlay-manager/materialize/` when `XDG_CACHE_HOME` is set and non-empty (`image.json` plus the last generated `Dockerfile`)
+- otherwise `~/.cache/mndz/overlay-manager/materialize/`
+
+Override with `MNDZ_MATERIALIZE_IMAGE` to an **existing** tag: the CLI inspects/satisfies that tag only and does not `docker build` or `docker rmi` it. The image must match the **host CPU architecture** (no qemu/foreign-arch materialize).
 
 ## Build and run
 

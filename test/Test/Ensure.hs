@@ -1,0 +1,541 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
+
+-- | Unit coverage for materialize-image floors, sidecar, recipe, and ensure IO.
+module Test.Ensure (unitTests) where
+
+import Control.Concurrent.MVar (modifyMVar_, newMVar)
+import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as LBS
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.Text qualified as T
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
+import Data.Time (UTCTime (..), fromGregorian)
+import Overlay.Version (parseEbuildVersion)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Exit (ExitCode (..))
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
+import Test.Assert (assertEq, assertTrue)
+import Test.Tasty (TestTree, testGroup)
+import Test.Tasty.HUnit (assertFailure, testCase)
+import Update.Apply
+  ( ClassifiedPvUnit (..),
+    ClassifyPackageResult (..),
+    PackagePlanResult (..),
+    PlannedWork (..),
+  )
+import Update.DiskSpace
+  ( DiskSpaceProbe (..),
+    MaterializeClass (..),
+  )
+import Update.Go.Lanes
+  ( LaneTarget (..),
+    RuntimeLanePlan (..),
+    pattern LaneAmd64Plain,
+  )
+import Update.Materialize
+  ( EnsureConfig (..),
+    EnsureOutcome (..),
+    ImageSidecar (..),
+    NeededFloors (..),
+    RecipeArch (..),
+    addToolchainNeedBytes,
+    decodeImageSidecar,
+    defaultMaterializeSidecarDirFromEnv,
+    emptyFloors,
+    encodeImageSidecar,
+    ensureMaterializeImage,
+    firstImageNeedBytes,
+    floorsSatisfy,
+    imageDiskInsufficientMessage,
+    imageSidecarSchemaVersion,
+    materializeGeneratorId,
+    neededFloorsFromClassified,
+    overrideUnusableMessage,
+    prunePreviousMaterializeImage,
+    renderMaterializeDockerfile,
+    sidecarImageJsonPath,
+    unionFloors,
+  )
+import Update.Process
+  ( ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+  )
+import Update.Process.Docker
+  ( defaultMaterializeImage,
+    inspectMaterializeImage,
+    materializeImageEnvVar,
+    missingImageMessage,
+  )
+import Update.Types
+  ( EcosystemSpec (..),
+    UpdateSource (..),
+    mkPackageKey,
+  )
+
+unitTests :: TestTree
+unitTests =
+  testGroup
+    "Ensure"
+    [ testCase "union/satisfy Go floors" testUnionSatisfy,
+      testCase "Bun-only first image omits SBCL" testBunOnlyOmitsSbcl,
+      testCase "render contains ::mndz and no official tarball URLs" testRenderMndzNoOfficial,
+      testCase "missing sidecar field is a miss" testMissingSidecarField,
+      testCase "skip docker build when satisfies" testSkipWhenSatisfies,
+      testCase "override missing hard-fails without build" testOverrideMissingNoBuild,
+      testCase "fake build records union satisfies" testFakeBuildRecordsUnion,
+      testCase "image disk gate skipped when satisfies" testDiskGateSkippedWhenSatisfies,
+      testCase "first build fails early on tiny disk" testFirstBuildDiskFail,
+      testCase "prune rmi unused previous id then image prune -f" testPruneRmiThenPruneF,
+      testCase "inspect missing image uses ensure copy not Dockerfile recipe" testInspectMissingMessage,
+      testCase "default sidecar path under HOME" testDefaultSidecarPath
+    ]
+
+------------------------------------------------------------------------
+-- Pure floors / recipe / sidecar
+------------------------------------------------------------------------
+
+testUnionSatisfy :: IO ()
+testUnionSatisfy = do
+  let recorded = emptyFloors {nfGo = Just "1.26.5"}
+      needed = emptyFloors {nfGo = Just "1.26.4"}
+      bunOnly = emptyFloors {nfBun = Just "1.3.0"}
+  assertTrue "1.26.5 satisfies 1.26.4" (floorsSatisfy recorded needed)
+  assertTrue "1.26.4 does not satisfy 1.26.5" (not (floorsSatisfy needed recorded))
+  assertTrue "missing Go does not satisfy" (not (floorsSatisfy emptyFloors needed))
+  let unioned = unionFloors recorded bunOnly
+  assertEq "union keeps Go" (Just "1.26.5") (nfGo unioned)
+  assertEq "union adds Bun" (Just "1.3.0") (nfBun unioned)
+  assertEq "union does not invent SBCL" Nothing (nfSbcl unioned)
+
+testBunOnlyOmitsSbcl :: IO ()
+testBunOnlyOmitsSbcl = do
+  let key = mkPackageKey "dev-util" "ralph-tui"
+      classify =
+        [ ClassifyOk
+            key
+            [ ClassifiedPvUnit
+                { cpuKey = key,
+                  cpuPN = "ralph-tui",
+                  cpuPV = parseEbuildVersion "1.0.0",
+                  cpuEco = Bun,
+                  cpuClass = FullNpmBun,
+                  cpuTempBaseline = Nothing
+                }
+            ]
+        ]
+      plan =
+        [ PlanNeedsWork
+            key
+            PlannedDeps
+              { pdEco = Bun,
+                pdSource = GitHub "subsy" "ralph-tui" "v",
+                pdPlan = bunPlan "1.2.0",
+                pdLocalPVs = [],
+                pdContentFix = [parseEbuildVersion "1.0.0"]
+              }
+        ]
+      needed = neededFloorsFromClassified classify plan (Just "1.2.0")
+  assertEq "bun floor" (Just "1.2.0") (nfBun needed)
+  assertEq "no SBCL on first bun-only" Nothing (nfSbcl needed)
+  assertEq "no Go on bun-only" Nothing (nfGo needed)
+  let df = renderMaterializeDockerfile needed (RecipeArch "amd64") "/overlay"
+  assertTrue "recipe has bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` df)
+  assertTrue "recipe omits sbcl emerge" (not ("dev-lisp/sbcl" `T.isInfixOf` df))
+
+testRenderMndzNoOfficial :: IO ()
+testRenderMndzNoOfficial = do
+  let floors =
+        emptyFloors
+          { nfGo = Just "1.26.5",
+            nfBun = Just "1.2.21"
+          }
+      df = renderMaterializeDockerfile floors (RecipeArch "amd64") "/home/op/overlay"
+  assertTrue "::mndz" ("::mndz" `T.isInfixOf` df)
+  assertTrue "accept_keywords bun-bin" ("dev-lang/bun-bin::mndz ~amd64" `T.isInfixOf` df)
+  assertTrue "go via portage" ("dev-lang/go" `T.isInfixOf` df)
+  assertTrue "no go.dev" (not ("go.dev" `T.isInfixOf` df))
+  assertTrue "no nodejs.org" (not ("nodejs.org" `T.isInfixOf` df))
+  assertTrue
+    "no bun github zip"
+    (not ("github.com/oven-sh/bun" `T.isInfixOf` df))
+  assertTrue "overlay bind ro" (",ro" `T.isInfixOf` df)
+  assertTrue "DISTDIR cache" ("/var/cache/distfiles" `T.isInfixOf` df)
+  assertTrue "PKGDIR cache" ("/var/cache/binpkgs" `T.isInfixOf` df)
+
+testMissingSidecarField :: IO ()
+testMissingSidecarField = do
+  let missingId =
+        "{\"version\":1,\"tag\":\"t\",\"satisfies\":{},\
+        \\"generator\":\"g\",\"built_at\":\"2026-01-01T00:00:00Z\"}"
+      bad = decodeImageSidecar (encodeUtf8 missingId)
+  assertTrue "missing id is a miss" (case bad of Left _ -> True; Right _ -> False)
+  let now = epoch
+      full =
+        ImageSidecar
+          { isVersion = imageSidecarSchemaVersion,
+            isId = "sha256:abc",
+            isTag = T.pack defaultMaterializeImage,
+            isSatisfies = emptyFloors {nfGo = Just "1.26.5"},
+            isGenerator = materializeGeneratorId,
+            isBuiltAt = now
+          }
+  case decodeImageSidecar (LBS.toStrict (encodeImageSidecar full)) of
+    Left err -> assertFailure ("roundtrip failed: " <> err)
+    Right got -> do
+      assertEq "id" (isId full) (isId got)
+      assertEq "go floor" (nfGo (isSatisfies full)) (nfGo (isSatisfies got))
+
+epoch :: UTCTime
+epoch = UTCTime (fromGregorian 2026 1 1) 0
+
+bunPlan :: T.Text -> RuntimeLanePlan
+bunPlan req =
+  RuntimeLanePlan
+    { glpLanes =
+        [ LaneTarget
+            { ltLane = LaneAmd64Plain,
+              ltCeiling = Just (parseEbuildVersion "1.3.0"),
+              ltPackagePV = Just (parseEbuildVersion "1.0.0"),
+              ltGoReq = Just req
+            }
+        ],
+      glpEbuilds = [],
+      glpUniquePVs = [parseEbuildVersion "1.0.0"],
+      glpRuntimeAtom = "dev-lang/bun-bin"
+    }
+
+testDefaultSidecarPath :: IO ()
+testDefaultSidecarPath = do
+  let dir = defaultMaterializeSidecarDirFromEnv Nothing "/home/op"
+  assertEq
+    "HOME fallback"
+    "/home/op/.cache/mndz/overlay-manager/materialize"
+    dir
+  let xdg = defaultMaterializeSidecarDirFromEnv (Just "/xdg") "/home/op"
+  assertEq
+    "XDG"
+    "/xdg/mndz/overlay-manager/materialize"
+    xdg
+
+------------------------------------------------------------------------
+-- Ensure IO with fake docker
+------------------------------------------------------------------------
+
+plentyDisk :: DiskSpaceProbe
+plentyDisk =
+  DiskSpaceProbe
+    { dspFreeBytes = \_ -> pure (Right (100 * 1024 * 1024 * 1024)),
+      dspDeviceId = \_ -> pure (Right 1)
+    }
+
+tinyDisk :: DiskSpaceProbe
+tinyDisk =
+  DiskSpaceProbe
+    { dspFreeBytes = \_ -> pure (Right (1024 * 1024)),
+      dspDeviceId = \_ -> pure (Right 1)
+    }
+
+data FakeDocker = FakeDocker
+  { fdInspectOk :: Bool,
+    fdInspectId :: String,
+    fdBuildShouldRun :: IORef [[String]]
+  }
+
+mkLogRef :: IO (IORef [[String]])
+mkLogRef = newIORef []
+
+fakeRunner :: FakeDocker -> ProcessRequest -> IO ProcessResult
+fakeRunner fake req = case prMode req of
+  ExecCmd "docker" ("image" : "inspect" : rest) ->
+    if fdInspectOk fake
+      then
+        pure
+          ProcessResult
+            { prExitCode = ExitSuccess,
+              prStdout = fdInspectId fake <> "\n",
+              prStderr = ""
+            }
+      else
+        pure
+          ProcessResult
+            { prExitCode = ExitFailure 1,
+              prStdout = "",
+              prStderr = "Error: No such image: " <> last rest
+            }
+  ExecCmd "docker" ("build" : args) -> do
+    atomicModifyIORef' (fdBuildShouldRun fake) (\xs -> (args : xs, ()))
+    pure
+      ProcessResult
+        { prExitCode = ExitSuccess,
+          prStdout = "",
+          prStderr = ""
+        }
+  ExecCmd "docker" ("info" : _) ->
+    pure
+      ProcessResult
+        { prExitCode = ExitSuccess,
+          prStdout = "/var/lib/docker\n",
+          prStderr = ""
+        }
+  ExecCmd "docker" ("rmi" : args) -> do
+    atomicModifyIORef' (fdBuildShouldRun fake) (\xs -> (("rmi" : args) : xs, ()))
+    pure
+      ProcessResult
+        { prExitCode = ExitSuccess,
+          prStdout = "",
+          prStderr = ""
+        }
+  ExecCmd "docker" ("image" : "prune" : args) -> do
+    atomicModifyIORef'
+      (fdBuildShouldRun fake)
+      (\xs -> (("image" : "prune" : args) : xs, ()))
+    pure
+      ProcessResult
+        { prExitCode = ExitSuccess,
+          prStdout = "",
+          prStderr = ""
+        }
+  _ ->
+    pure
+      ProcessResult
+        { prExitCode = ExitFailure 127,
+          prStdout = "",
+          prStderr = "unexpected"
+        }
+
+mkCfg ::
+  FilePath ->
+  FilePath ->
+  FakeDocker ->
+  DiskSpaceProbe ->
+  Maybe String ->
+  IO EnsureConfig
+mkCfg overlay sidecar fake probe mOverride = do
+  prev <- newMVar Nothing
+  pure
+    EnsureConfig
+      { ecRun = fakeRunner fake,
+        ecProbe = probe,
+        ecOverlayRoot = overlay,
+        ecSidecarDir = sidecar,
+        ecNow = pure epoch,
+        ecArch = RecipeArch "amd64",
+        ecOverrideTag = mOverride,
+        ecPrevImageId = prev
+      }
+
+neededGo :: NeededFloors
+neededGo = emptyFloors {nfGo = Just "1.26.4"}
+
+writeSidecarGo :: FilePath -> String -> T.Text -> IO ()
+writeSidecarGo dir iid goVer = do
+  createDirectoryIfMissing True dir
+  let side =
+        ImageSidecar
+          { isVersion = imageSidecarSchemaVersion,
+            isId = T.pack iid,
+            isTag = T.pack defaultMaterializeImage,
+            isSatisfies = emptyFloors {nfGo = Just goVer},
+            isGenerator = materializeGeneratorId,
+            isBuiltAt = epoch
+          }
+  BS.writeFile (sidecarImageJsonPath dir) (LBS.toStrict (encodeImageSidecar side))
+
+testSkipWhenSatisfies :: IO ()
+testSkipWhenSatisfies =
+  withSystemTempDirectory "om-ensure-skip" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:already"
+    createDirectoryIfMissing True overlay
+    writeSidecarGo sidecar iid "1.26.5"
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = True,
+              fdInspectId = iid,
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    assertEq "skipped" (Right EnsureSkipped) got
+    calls <- readIORef builds
+    assertEq "no docker build" [] calls
+
+testOverrideMissingNoBuild :: IO ()
+testOverrideMissingNoBuild =
+  withSystemTempDirectory "om-ensure-override" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        tag = "example/materialize:ci"
+    createDirectoryIfMissing True overlay
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = False,
+              fdInspectId = "",
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfg overlay sidecar fake plentyDisk (Just tag)
+    got <- ensureMaterializeImage cfg neededGo
+    case got of
+      Left msg -> do
+        assertTrue "names override" (T.pack tag `T.isInfixOf` msg)
+        assertTrue
+          "mentions env"
+          (T.pack materializeImageEnvVar `T.isInfixOf` msg)
+        assertTrue
+          "does not tell operator to docker build default"
+          (not ("docker/materialize/Dockerfile" `T.isInfixOf` msg))
+      Right o -> assertFailure ("expected fail, got " <> show o)
+    calls <- readIORef builds
+    assertEq "no docker build of override" [] calls
+    -- Message helper stays aligned with spec copy.
+    assertTrue
+      "helper names tag"
+      (T.pack tag `T.isInfixOf` overrideUnusableMessage tag)
+
+testFakeBuildRecordsUnion :: IO ()
+testFakeBuildRecordsUnion =
+  withSystemTempDirectory "om-ensure-build" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        oldId = "sha256:old"
+    createDirectoryIfMissing True overlay
+    writeSidecarGo sidecar oldId "1.26.5"
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = True,
+              fdInspectId = oldId,
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    let needed = emptyFloors {nfBun = Just "1.3.0"}
+    got <- ensureMaterializeImage cfg needed
+    assertEq "built" (Right EnsureBuilt) got
+    calls <- readIORef builds
+    assertTrue "docker build ran" (any ("-t" `elem`) calls)
+    bs <- BS.readFile (sidecarImageJsonPath sidecar)
+    case decodeImageSidecar bs of
+      Left err -> assertFailure err
+      Right side -> do
+        assertEq "keeps prior Go" (Just "1.26.5") (nfGo (isSatisfies side))
+        assertEq "adds Bun" (Just "1.3.0") (nfBun (isSatisfies side))
+        assertEq "no SBCL paid for" Nothing (nfSbcl (isSatisfies side))
+    dfExists <- doesFileExist (sidecar </> "Dockerfile")
+    assertTrue "wrote Dockerfile" dfExists
+    df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
+    assertTrue "recipe ::mndz" ("::mndz" `T.isInfixOf` df)
+    assertTrue "recipe still has go" ("dev-lang/go" `T.isInfixOf` df)
+
+testDiskGateSkippedWhenSatisfies :: IO ()
+testDiskGateSkippedWhenSatisfies =
+  withSystemTempDirectory "om-ensure-disk" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:ok"
+    createDirectoryIfMissing True overlay
+    writeSidecarGo sidecar iid "1.26.5"
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = True,
+              fdInspectId = iid,
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfg overlay sidecar fake tinyDisk Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    assertEq "tiny disk still skip when satisfies" (Right EnsureSkipped) got
+    calls <- readIORef builds
+    assertEq "no build" [] calls
+    let msg =
+          imageDiskInsufficientMessage
+            "/var/lib/docker"
+            (1024 * 1024)
+            firstImageNeedBytes
+    assertTrue "disk message names path" ("/var/lib/docker" `T.isInfixOf` msg)
+    assertTrue "disk message mentions free" ("free:" `T.isInfixOf` msg)
+    assertTrue "disk message mentions need" ("need:" `T.isInfixOf` msg)
+    assertTrue "add-toolchain bound is below first image" (addToolchainNeedBytes < firstImageNeedBytes)
+
+testFirstBuildDiskFail :: IO ()
+testFirstBuildDiskFail =
+  withSystemTempDirectory "om-ensure-disk-fail" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+    createDirectoryIfMissing True overlay
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = False,
+              fdInspectId = "",
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfg overlay sidecar fake tinyDisk Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    case got of
+      Left msg -> do
+        assertTrue "names docker path" ("/var/lib/docker" `T.isInfixOf` msg)
+        assertTrue "mentions free" ("free:" `T.isInfixOf` msg)
+        assertTrue "mentions need" ("need:" `T.isInfixOf` msg)
+      Right o -> assertFailure ("expected disk fail, got " <> show o)
+    calls <- readIORef builds
+    assertEq "no docker build after disk fail" [] calls
+
+testPruneRmiThenPruneF :: IO ()
+testPruneRmiThenPruneF =
+  withSystemTempDirectory "om-ensure-prune" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        oldId = "sha256:old"
+        newId = "sha256:new"
+    createDirectoryIfMissing True overlay
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = True,
+              fdInspectId = newId,
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    modifyMVar_ (ecPrevImageId cfg) (\_ -> pure (Just oldId))
+    prunePreviousMaterializeImage cfg
+    calls <- readIORef builds
+    assertTrue "rmi previous id" (["rmi", oldId] `elem` calls)
+    assertTrue "image prune -f" (["image", "prune", "-f"] `elem` calls)
+    assertTrue "not prune -a" (not (any ("-a" `elem`) calls))
+    assertTrue
+      "not builder prune"
+      (not (any ("builder" `elem`) calls))
+
+testInspectMissingMessage :: IO ()
+testInspectMissingMessage = do
+  let tag = "mndz-overlay-manager/materialize:local"
+      fake req = case prMode req of
+        ExecCmd "docker" ("image" : "inspect" : _) ->
+          pure
+            ProcessResult
+              { prExitCode = ExitFailure 1,
+                prStdout = "",
+                prStderr = "No such image"
+              }
+        _ ->
+          pure
+            ProcessResult
+              { prExitCode = ExitFailure 127,
+                prStdout = "",
+                prStderr = "unexpected"
+              }
+  got <- inspectMaterializeImage fake tag
+  case got of
+    Left msg -> do
+      assertEq "inspect uses missingImageMessage" (missingImageMessage tag) msg
+      assertTrue
+        "no in-repo Dockerfile recipe"
+        (not ("docker/materialize/Dockerfile" `T.isInfixOf` msg))
+      assertTrue "mentions ensure" ("ensures the default tag" `T.isInfixOf` msg)
+    Right () -> assertFailure "expected inspect miss"

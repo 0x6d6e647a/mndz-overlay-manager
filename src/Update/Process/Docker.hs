@@ -171,8 +171,8 @@ missingImageMessage :: String -> Text
 missingImageMessage image =
   "materialize image is not usable: "
     <> T.pack image
-    <> " (build it with: docker build -t "
+    <> " (update ensures the default tag "
     <> T.pack defaultMaterializeImage
-    <> " -f docker/materialize/Dockerfile . ; override the tag with "
+    <> " when full-path work needs it; set "
     <> T.pack materializeImageEnvVar
-    <> "; see README)"
+    <> " only to an existing inspect-only override; see README)"

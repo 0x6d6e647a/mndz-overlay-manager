@@ -8,6 +8,7 @@ module Update.Apply
   ( applyOverlay,
     applyOverlayFromPlan,
     WavePrepare,
+    ImageEnsure,
     foldExitHardFail,
     EbuildRunner,
     productionEbuildRunner,
@@ -30,7 +31,7 @@ import CLI.Progress
     withMultiProgress,
   )
 import Control.Concurrent (newQSem, signalQSem, waitQSem)
-import Control.Concurrent.Async (mapConcurrently_)
+import Control.Concurrent.Async (mapConcurrently_, wait, withAsync)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Exception (bracket_)
 import Control.Monad (replicateM_, unless, when)
@@ -57,6 +58,7 @@ import Update.Apply.Plan
 import Update.Check (PackageEntry (..))
 import Update.Git (GitOps (..))
 import Update.Hardcoded (lookupPolicy)
+import Update.Materialize (waitingOnMaterializeImage)
 import Update.OverlayWaves
   ( AdmitSets (..),
     OverlayPlanKind (..),
@@ -119,6 +121,9 @@ type WavePrepare =
   MultiHandle ->
   IO [PackagePlanResult]
 
+-- | t0 image ensure: runs outside the package job limiter.
+type ImageEnsure = MultiHandle -> IO (Either Text ())
+
 planKindOf :: PackagePlanResult -> OverlayPlanKind
 planKindOf = \case
   PlanSoftSkip {} -> OverlayPlanSkip
@@ -135,8 +140,11 @@ applyOverlayFromPlan ::
   [PackageEntry] ->
   [PackagePlanResult] ->
   WavePrepare ->
+  -- | Admitted full-path keys that wait on image ensure (not a job slot).
+  [PackageKey] ->
+  ImageEnsure ->
   IO [ApplyOutcome]
-applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare = do
+applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare fullPathKeys imageEnsure = do
   isGit <- goIsWorkTree (aeGitOps env) overlayRoot
   if not isGit
     then
@@ -170,17 +178,23 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare = do
             ]
           withheldPairs = asWithheld admit
           panelTotal = length admittedWork + length withheldPairs
+          (readyWork, ensureWork) =
+            partitionEnsure fullPathKeys admittedWork
       nested <-
         if panelTotal <= 0
           then pure []
           else withMultiProgress pcfg "Updating packages" panelTotal $ \mh -> do
             for_ withheldPairs $ \(consumer, provider) ->
               mhWait mh consumer ("waiting on " <> packageKeyText provider)
+            for_ ensureWork $ \(e, _) ->
+              mhWait mh (peKey e) waitingOnMaterializeImage
             let env' = env {aeMulti = mh}
             runAdmitPool
               env'
               overlayRoot
-              admittedWork
+              readyWork
+              ensureWork
+              imageEnsure
               withheldSet
               byEntry
               prepare
@@ -189,18 +203,32 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare = do
         cleanupRunSuccess (aeTempRun env)
       pure outcomes
 
+partitionEnsure ::
+  [PackageKey] ->
+  [(PackageEntry, PlannedWork)] ->
+  ( [(PackageEntry, PlannedWork)],
+    [(PackageEntry, PlannedWork)]
+  )
+partitionEnsure fullKeys items =
+  let isFull e = peKey e `elem` fullKeys
+   in ( [it | it@(e, _) <- items, not (isFull e)],
+        [it | it@(e, _) <- items, isFull e]
+      )
+
 runAdmitPool ::
   ApplyEnv ->
   FilePath ->
   [(PackageEntry, PlannedWork)] ->
+  [(PackageEntry, PlannedWork)] ->
+  ImageEnsure ->
   Map PackageKey PackageKey ->
   Map PackageKey PackageEntry ->
   WavePrepare ->
   IO [ApplyOutcome]
-runAdmitPool env overlayRoot initialWork withheld0 byEntry prepare = do
+runAdmitPool env overlayRoot readyWork ensureWork imageEnsure withheld0 byEntry prepare = do
   let jobs = max 1 (aeJobs env)
       mh = aeMulti env
-      panelCount = length initialWork + Map.size withheld0
+      panelCount = length readyWork + length ensureWork + Map.size withheld0
   if panelCount == 0
     then pure []
     else do
@@ -209,7 +237,7 @@ runAdmitPool env overlayRoot initialWork withheld0 byEntry prepare = do
       remaining <- newIORef panelCount
       outcomesRef <- newIORef ([] :: [ApplyOutcome])
       withheldRef <- newIORef withheld0
-      for_ initialWork $ \item -> writeChan chan (Just item)
+      for_ readyWork $ \item -> writeChan chan (Just item)
       let finishOne = do
             n <- atomicModifyIORef' remaining (\x -> let x' = x - 1 in (x', x'))
             when (n == 0) $
@@ -266,7 +294,23 @@ runAdmitPool env overlayRoot initialWork withheld0 byEntry prepare = do
                     (applyNeedsWorkTracked env overlayRoot entry work)
                 handleDone (peKey entry) outs
                 worker
-      mapConcurrently_ (const worker) [1 .. jobs]
+          runEnsure =
+            if null ensureWork
+              then pure ()
+              else do
+                result <- imageEnsure mh
+                case result of
+                  Left err ->
+                    for_ ensureWork $ \(e, _) -> do
+                      let k = peKey e
+                      mhFail mh k (shortApplyReason err)
+                      recordOutcomes [ApplyHardFail k err False False]
+                      finishOne
+                  Right () ->
+                    for_ ensureWork $ \item -> writeChan chan (Just item)
+      withAsync runEnsure $ \ea -> do
+        mapConcurrently_ (const worker) [1 .. jobs]
+        wait ea
       readIORef outcomesRef
 
 shortApplyReason :: Text -> Text

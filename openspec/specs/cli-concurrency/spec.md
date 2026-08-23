@@ -26,7 +26,7 @@ When `--jobs` is omitted, the program SHALL use a default concurrency equal to t
 
 ### Requirement: Job pool applies to package checks and apply phase one
 
-The jobs limit SHALL bound concurrent per-package work for `outdated` checks and for `update` phase-1 apply of **admitted** packages. The limit SHALL NOT require every selected package to be admitted at the start of mutate; overlay wait-edge consumers withheld as specified by `overlay-apply-waves` SHALL NOT count as in-flight phase-1 jobs while waiting. The limit SHALL NOT force preflight steps or signed commits to run concurrently; those phases remain sequential.
+The jobs limit SHALL bound concurrent per-package work for `outdated` checks and for `update` phase-1 apply of **admitted** packages. The limit SHALL NOT require every selected package to be admitted at the start of mutate; overlay wait-edge consumers withheld as specified by `overlay-apply-waves` SHALL NOT count as in-flight phase-1 jobs while waiting. Packages waiting on materialize image ensure as specified by `ensure-materialize-image` SHALL NOT count as in-flight phase-1 jobs while waiting. Image ensure itself SHALL NOT occupy a package job slot. The limit SHALL NOT force preflight steps, image ensure, or signed commits to run concurrently as package jobs; overlay commits remain sequential.
 
 #### Scenario: Commits remain sequential
 
@@ -43,6 +43,12 @@ The jobs limit SHALL bound concurrent per-package work for `outdated` checks and
 - **WHEN** `--jobs 1`, bun-bin needs work, and ralph-tui is withheld on bun-bin
 - **THEN** bun-bin may run phase-1 while ralph-tui is waiting
 - **AND** ralph-tui is not occupying the single job slot solely by waiting
+
+#### Scenario: Ensure does not take a job slot
+
+- **WHEN** `--jobs 1`, bun-bin needs work, and a full-path package waits on image ensure
+- **THEN** bun-bin may run phase-1 while ensure runs
+- **AND** neither ensure nor the waiting full-path package occupies the single job slot solely by waiting
 
 ### Requirement: Work budget for nested Go planning work
 

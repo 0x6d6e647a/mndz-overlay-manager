@@ -10,6 +10,7 @@ import Test.DiskSpace qualified as DiskSpace
 import Test.Distfiles qualified as Distfiles
 import Test.EbuildEdit qualified as EbuildEdit
 import Test.Ecosystems qualified as Ecosystems
+import Test.Ensure qualified as Ensure
 import Test.Git qualified as Git
 import Test.Gpg qualified as Gpg
 import Test.Lanes qualified as Lanes
@@ -68,6 +69,7 @@ main =
             Progress.unitTests,
             Apply.unitTests,
             Materialize.unitTests,
+            Ensure.unitTests,
             Md5Cache.unitTests,
             Ecosystems.unitTests,
             CheckPlan.unitTests,

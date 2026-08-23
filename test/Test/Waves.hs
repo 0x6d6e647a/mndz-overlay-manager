@@ -12,6 +12,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (race)
 import Control.Concurrent.MVar (modifyMVar_, newMVar)
 import Data.ByteString qualified as BS
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -40,6 +41,7 @@ import Update.CheckCache (openCheckCache)
 import Update.Deps.Plan (DepsPlanOps (..))
 import Update.DiskSpace (DiskSpaceProbe (..))
 import Update.Git (GitOps (..))
+import Update.Materialize (EnsureOutcome (..), NeededFloors)
 import Update.Preflight (AssetsPreflight (..))
 import Update.Spine
   ( UpdateSpineDeps (..),
@@ -74,7 +76,19 @@ integrationTests =
         testReplanDockerFailKeepsCommit,
       testCase
         "same-run bun-bin commit then ralph higher PV"
-        testSameRunBunThenRalph
+        testSameRunBunThenRalph,
+      testCase
+        "GitMv-only never calls image ensure"
+        testGitMvOnlyNeverEnsure,
+      testCase
+        "reuse-only never calls image ensure"
+        testReuseOnlyNeverEnsure,
+      testCase
+        "re-entry ensure after bun-bin; failed ensure keeps commit"
+        testFailedReEnsureKeepsCommit,
+      testCase
+        "second ensure after bun-bin commit"
+        testSecondEnsureAfterBunBin
     ]
 
 ------------------------------------------------------------------------
@@ -309,7 +323,9 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
         usdSshOps = sshOk,
         usdEbuildRunner = fakeEbuildRun,
         usdEgencacheRunner = mockEgencacheWriteMatching,
-        usdPreflightTools = preflight
+        usdPreflightTools = preflight,
+        usdEnsureImage = \_ -> pure (Right EnsureSkipped),
+        usdPruneMaterialize = pure ()
       }
 
 outcomeKey :: ApplyOutcome -> PackageKey
@@ -484,3 +500,134 @@ testSameRunBunThenRalph =
           doesFileExist
             (overlay </> "dev-util" </> "ralph-tui" </> "ralph-tui-1.5.0.ebuild")
         assertTrue "ralph 1.5.0 ebuild written" exists
+
+countingEnsure ::
+  IORef Int ->
+  NeededFloors ->
+  IO (Either T.Text EnsureOutcome)
+countingEnsure ref _ = do
+  atomicModifyIORef' ref (\n -> (n + 1, ()))
+  pure (Right EnsureSkipped)
+
+failingEnsure :: NeededFloors -> IO (Either T.Text EnsureOutcome)
+failingEnsure _ = pure (Left "ensure failed for test")
+
+testGitMvOnlyNeverEnsure :: IO ()
+testGitMvOnlyNeverEnsure =
+  withSystemTempDirectory "om-wave-gitmv-only" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath]
+        entries = groupNewest ebuilds
+    nEnsure <- newIORef (0 :: Int)
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    let deps = deps0 {usdEnsureImage = countingEnsure nEnsure}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res -> do
+        let bunKey = mkPackageKey "dev-lang" "bun-bin"
+        assertTrue
+          "bun-bin outcome"
+          ( any
+              ( \case
+                  ApplySuccess k _ _ -> k == bunKey
+                  ApplyHardFail k _ _ _ -> k == bunKey
+                  _ -> False
+              )
+              (usrOutcomes res)
+          )
+        n <- readIORef nEnsure
+        assertEq "GitMv-only never ensures" 0 n
+
+testReuseOnlyNeverEnsure :: IO ()
+testReuseOnlyNeverEnsure =
+  withSystemTempDirectory "om-wave-reuse-only" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    -- bun-bin already at fetched latest; ralph reuses release assets.
+    bunPath <- seedBunBin overlay "1.2.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds =
+          [ Ebuild "dev-lang" "bun-bin" "1.2.0" bunPath,
+            Ebuild "dev-util" "ralph-tui" "1.0.0" ralphPath
+          ]
+        entries = groupNewest ebuilds
+    nEnsure <- newIORef (0 :: Int)
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseRalphReuse 2 preflightOk
+    let deps = deps0 {usdEnsureImage = countingEnsure nEnsure}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right _ -> do
+        n <- readIORef nEnsure
+        assertEq "reuse-only never ensures" 0 n
+
+testFailedReEnsureKeepsCommit :: IO ()
+testFailedReEnsureKeepsCommit =
+  withSystemTempDirectory "om-wave-ensure-fail" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let (entries, ebuilds) = mkEntries bunPath ralphPath
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    let deps = deps0 {usdEnsureImage = failingEnsure}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res -> do
+        let bunKey = mkPackageKey "dev-lang" "bun-bin"
+            ralphKey = mkPackageKey "dev-util" "ralph-tui"
+            outs = usrOutcomes res
+        assertTrue
+          "bun-bin success kept"
+          (any (\case ApplySuccess k _ _ -> k == bunKey; _ -> False) outs)
+        case [m | ApplyHardFail k m _ _ <- outs, k == ralphKey] of
+          (msg : _) ->
+            assertTrue "ralph ensure fail" ("ensure failed" `T.isInfixOf` msg)
+          [] -> assertFailure "expected ralph hard-fail at re-ensure"
+        exists <-
+          doesFileExist
+            (overlay </> "dev-lang" </> "bun-bin" </> "bun-bin-1.2.0.ebuild")
+        assertTrue "bun-bin commit/rename remains" exists
+
+testSecondEnsureAfterBunBin :: IO ()
+testSecondEnsureAfterBunBin =
+  withSystemTempDirectory "om-wave-second-ensure" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let (entries, ebuilds) = mkEntries bunPath ralphPath
+    nEnsure <- newIORef (0 :: Int)
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    let deps = deps0 {usdEnsureImage = countingEnsure nEnsure}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res -> do
+        let bunKey = mkPackageKey "dev-lang" "bun-bin"
+            outs = usrOutcomes res
+        assertTrue
+          "bun-bin success"
+          (any (\case ApplySuccess k _ _ -> k == bunKey; _ -> False) outs)
+        n <- readIORef nEnsure
+        assertTrue "re-entry ensure ran" (n >= 1)
