@@ -138,6 +138,7 @@ library
       , Update.DiskSpace.StatVfs
       , Update.Materialize.Ensure
       , Update.Materialize.Floors
+      , Update.Materialize.ImageLayout
       , Update.Materialize.Recipe
       , Update.Materialize.Resolve
       , Update.Materialize.Sidecar

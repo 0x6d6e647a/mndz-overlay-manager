@@ -37,29 +37,42 @@ import Update.Go.Lanes
     pattern LaneAmd64Plain,
   )
 import Update.Materialize
-  ( EnsureConfig (..),
+  ( DockerInfoFacts (..),
+    EnsureConfig (..),
     EnsureOutcome (..),
     ImageSidecar (..),
+    ImageStoreLayout (..),
     NeededFloors (..),
     RecipeArch (..),
     ResolvedInstall (..),
     ResolvedToolchain (..),
     ToolchainKind (..),
+    addToolchainCacheNeedBytes,
+    addToolchainLayerNeedBytes,
     addToolchainNeedBytes,
+    containerdDumpNeeded,
+    containerdRootUnresolvedMessage,
     decodeImageSidecar,
     defaultMaterializeSidecarDirFromEnv,
     emptyFloors,
     encodeImageSidecar,
     ensureFailedMessage,
     ensureMaterializeImage,
+    firstImageCacheNeedBytes,
+    firstImageLayerNeedBytes,
     firstImageNeedBytes,
     floorsSatisfy,
     imageDiskInsufficientMessage,
     imageSidecarSchemaVersion,
+    imageStoreLayout,
+    imageStoreUnresolvedMessage,
+    isBundledContainerdAddress,
     lookupRecipeArch,
     materializeGeneratorId,
     neededFloorsFromClassified,
     overrideUnusableMessage,
+    parseContainerdDump,
+    parseDockerInfoJson,
     prunePreviousMaterializeImage,
     renderMaterializeDockerfile,
     resolveToolchain,
@@ -108,8 +121,18 @@ unitTests =
       testCase "override on unmapped uname skips generate" testOverrideUnmappedNoBuild,
       testCase "override missing hard-fails without build" testOverrideMissingNoBuild,
       testCase "fake build records union satisfies" testFakeBuildRecordsUnion,
+      testCase "parse docker info overlay2 and snapshotter sockets" testParseDockerInfoFixtures,
+      testCase "parse containerd dump root and root_path" testParseContainerdDump,
+      testCase "pure image store layout classic bundled system" testImageStoreLayout,
+      testCase "role bounds combined vs split" testRoleBounds,
       testCase "image disk gate skipped when satisfies" testDiskGateSkippedWhenSatisfies,
       testCase "first build fails early on tiny disk" testFirstBuildDiskFail,
+      testCase "split store fails on cache filesystem" testSplitCacheShort,
+      testCase "split store fails on layer filesystem" testSplitLayersShort,
+      testCase "split store ample overlay tiny still builds" testSplitAmpleOverlayTiny,
+      testCase "system snapshotter dump miss fails closed" testSnapshotterDumpMiss,
+      testCase "system snapshotter missing root fails closed" testSnapshotterRootMissing,
+      testCase "bundled snapshotter does not dump containerd" testBundledSnapshotterNoDump,
       testCase "resolve miss does not invoke docker build" testResolveMissNoBuild,
       testCase "prune rmi unused previous id then image prune -f" testPruneRmiThenPruneF,
       testCase "inspect missing image uses ensure copy not Dockerfile recipe" testInspectMissingMessage,
@@ -534,70 +557,111 @@ tinyDisk =
 data FakeDocker = FakeDocker
   { fdInspectOk :: Bool,
     fdInspectId :: String,
-    fdBuildShouldRun :: IORef [[String]]
+    fdBuildShouldRun :: IORef [[String]],
+    fdDockerInfoJson :: String,
+    fdContainerdDump :: Maybe String,
+    fdContainerdCalls :: IORef [[String]]
   }
 
 mkLogRef :: IO (IORef [[String]])
 mkLogRef = newIORef []
 
+classicInfoJson :: String
+classicInfoJson =
+  dockerInfoJson "/var/lib/docker" False "/run/containerd/containerd.sock"
+
+dockerInfoJson :: FilePath -> Bool -> FilePath -> String
+dockerInfoJson root snapshotter addr =
+  concat
+    [ "{\"DockerRootDir\":",
+      show root,
+      ",\"DriverStatus\":",
+      if snapshotter
+        then "[[\"driver-type\",\"io.containerd.snapshotter.v1\"]]"
+        else "[[\"Backing Filesystem\",\"extfs\"]]",
+      ",\"Containerd\":{\"Address\":",
+      show addr,
+      "}}"
+    ]
+
+containerdDumpText :: FilePath -> Maybe FilePath -> String
+containerdDumpText root mRootPath =
+  unlines
+    [ "version = 2",
+      "root = '" <> root <> "'",
+      "",
+      "[plugins.'io.containerd.snapshotter.v1.overlayfs']",
+      "  root_path = "
+        <> case mRootPath of
+          Nothing -> "''"
+          Just p -> "'" <> p <> "'"
+    ]
+
+mkFakeDocker :: Bool -> String -> IORef [[String]] -> IO FakeDocker
+mkFakeDocker ok iid builds = do
+  dumps <- mkLogRef
+  pure
+    FakeDocker
+      { fdInspectOk = ok,
+        fdInspectId = iid,
+        fdBuildShouldRun = builds,
+        fdDockerInfoJson = classicInfoJson,
+        fdContainerdDump = Nothing,
+        fdContainerdCalls = dumps
+      }
+
+okResult :: String -> ProcessResult
+okResult out =
+  ProcessResult
+    { prExitCode = ExitSuccess,
+      prStdout = out,
+      prStderr = ""
+    }
+
+failResult :: Int -> String -> ProcessResult
+failResult n err =
+  ProcessResult
+    { prExitCode = ExitFailure n,
+      prStdout = "",
+      prStderr = err
+    }
+
 fakeRunner :: FakeDocker -> ProcessRequest -> IO ProcessResult
 fakeRunner fake req = case prMode req of
-  ExecCmd "docker" ("image" : "inspect" : rest) ->
+  ExecCmd "docker" ("image" : "inspect" : rest) -> do
+    builds <- readIORef (fdBuildShouldRun fake)
+    let built = any ("-t" `elem`) builds
     if fdInspectOk fake
-      then
-        pure
-          ProcessResult
-            { prExitCode = ExitSuccess,
-              prStdout = fdInspectId fake <> "\n",
-              prStderr = ""
-            }
+      then pure (okResult (fdInspectId fake <> "\n"))
       else
-        pure
-          ProcessResult
-            { prExitCode = ExitFailure 1,
-              prStdout = "",
-              prStderr = "Error: No such image: " <> last rest
-            }
+        if built
+          then pure (okResult "sha256:built\n")
+          else
+            pure (failResult 1 ("Error: No such image: " <> last rest))
   ExecCmd "docker" ("build" : args) -> do
     atomicModifyIORef' (fdBuildShouldRun fake) (\xs -> (args : xs, ()))
-    pure
-      ProcessResult
-        { prExitCode = ExitSuccess,
-          prStdout = "",
-          prStderr = ""
-        }
+    pure (okResult "")
+  ExecCmd "docker" ["info", "--format", "{{json .}}"] ->
+    pure (okResult (fdDockerInfoJson fake <> "\n"))
   ExecCmd "docker" ("info" : _) ->
-    pure
-      ProcessResult
-        { prExitCode = ExitSuccess,
-          prStdout = "/var/lib/docker\n",
-          prStderr = ""
-        }
+    pure (failResult 1 "expected docker info --format '{{json .}}'")
   ExecCmd "docker" ("rmi" : args) -> do
     atomicModifyIORef' (fdBuildShouldRun fake) (\xs -> (("rmi" : args) : xs, ()))
-    pure
-      ProcessResult
-        { prExitCode = ExitSuccess,
-          prStdout = "",
-          prStderr = ""
-        }
+    pure (okResult "")
   ExecCmd "docker" ("image" : "prune" : args) -> do
     atomicModifyIORef'
       (fdBuildShouldRun fake)
       (\xs -> (("image" : "prune" : args) : xs, ()))
-    pure
-      ProcessResult
-        { prExitCode = ExitSuccess,
-          prStdout = "",
-          prStderr = ""
-        }
+    pure (okResult "")
+  ExecCmd "containerd" args -> do
+    atomicModifyIORef' (fdContainerdCalls fake) (\xs -> (args : xs, ()))
+    case (args, fdContainerdDump fake) of
+      (["config", "dump"], Just txt) -> pure (okResult txt)
+      (["config", "dump"], Nothing) ->
+        pure (failResult 127 "containerd: command not found")
+      _ -> pure (failResult 127 "unexpected containerd")
   _ ->
-    pure
-      ProcessResult
-        { prExitCode = ExitFailure 127,
-          prStdout = "",
-          prStderr = "unexpected"
-        }
+    pure (failResult 127 "unexpected")
 
 mkCfg ::
   FilePath ->
@@ -679,12 +743,7 @@ testSkipWhenSatisfies =
     createDirectoryIfMissing True overlay
     writeSidecarGo sidecar iid "1.26.5"
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = True,
-              fdInspectId = iid,
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker True iid builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
     got <- ensureMaterializeImage cfg neededGo
     assertEq "skipped" (Right EnsureSkipped) got
@@ -701,12 +760,7 @@ testGeneratorMismatchRebuilds =
     seedGoAmd64 (tmp </> "gentoo")
     writeSidecarGoGen sidecar iid "1.26.5" "mndz-overlay-manager-materialize-1"
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = True,
-              fdInspectId = iid,
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker True iid builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
     got <- ensureMaterializeImage cfg neededGo
     assertEq "rebuilt" (Right EnsureBuilt) got
@@ -726,12 +780,7 @@ testUnmappedDefaultNoBuild =
         uname = "sparc64"
     createDirectoryIfMissing True overlay
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = False,
-              fdInspectId = "",
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker False "" builds
     cfg <- mkCfgUname overlay sidecar fake plentyDisk Nothing uname
     got <- ensureMaterializeImage cfg neededGo
     case got of
@@ -755,12 +804,7 @@ testOverrideUnmappedNoBuild =
         tag = "example/materialize:ci"
     createDirectoryIfMissing True overlay
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = True,
-              fdInspectId = "sha256:override",
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker True "sha256:override" builds
     cfg <- mkCfgUname overlay sidecar fake plentyDisk (Just tag) "sparc64"
     got <- ensureMaterializeImage cfg neededGo
     assertEq "inspect-only skip" (Right EnsureSkipped) got
@@ -775,12 +819,7 @@ testOverrideMissingNoBuild =
         tag = "example/materialize:ci"
     createDirectoryIfMissing True overlay
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = False,
-              fdInspectId = "",
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker False "" builds
     cfg <- mkCfg overlay sidecar fake plentyDisk (Just tag)
     got <- ensureMaterializeImage cfg neededGo
     case got of
@@ -811,12 +850,7 @@ testFakeBuildRecordsUnion =
     seedBunOverlay overlay "1.3.0" "~amd64"
     writeSidecarGo sidecar oldId "1.26.5"
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = True,
-              fdInspectId = oldId,
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker True oldId builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
     let needed = emptyFloors {nfBun = Just "1.3.0"}
     got <- ensureMaterializeImage cfg needed
@@ -845,12 +879,7 @@ testDiskGateSkippedWhenSatisfies =
     createDirectoryIfMissing True overlay
     writeSidecarGo sidecar iid "1.26.5"
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = True,
-              fdInspectId = iid,
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker True iid builds
     cfg <- mkCfg overlay sidecar fake tinyDisk Nothing
     got <- ensureMaterializeImage cfg neededGo
     assertEq "tiny disk still skip when satisfies" (Right EnsureSkipped) got
@@ -874,12 +903,7 @@ testFirstBuildDiskFail =
     createDirectoryIfMissing True overlay
     seedGoAmd64 (tmp </> "gentoo")
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = False,
-              fdInspectId = "",
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker False "" builds
     cfg <- mkCfg overlay sidecar fake tinyDisk Nothing
     got <- ensureMaterializeImage cfg neededGo
     case got of
@@ -887,6 +911,9 @@ testFirstBuildDiskFail =
         assertTrue "names docker path" ("/var/lib/docker" `T.isInfixOf` msg)
         assertTrue "mentions free" ("free:" `T.isInfixOf` msg)
         assertTrue "mentions need" ("need:" `T.isInfixOf` msg)
+        assertTrue
+          "combined does not invent roles"
+          (not ("image layers" `T.isInfixOf` msg))
       Right o -> assertFailure ("expected disk fail, got " <> show o)
     calls <- readIORef builds
     assertEq "no docker build after disk fail" [] calls
@@ -904,12 +931,7 @@ testResolveMissNoBuild =
       "2.6.6"
       "~amd64"
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = False,
-              fdInspectId = "",
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker False "" builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
     got <- ensureMaterializeImage cfg (emptyFloors {nfSbcl = Just "2.7.0"})
     case got of
@@ -930,12 +952,7 @@ testPruneRmiThenPruneF =
         newId = "sha256:new"
     createDirectoryIfMissing True overlay
     builds <- mkLogRef
-    let fake =
-          FakeDocker
-            { fdInspectOk = True,
-              fdInspectId = newId,
-              fdBuildShouldRun = builds
-            }
+    fake <- mkFakeDocker True newId builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
     modifyMVar_ (ecPrevImageId cfg) (\_ -> pure (Just oldId))
     prunePreviousMaterializeImage cfg
@@ -974,3 +991,375 @@ testInspectMissingMessage = do
         (not ("docker/materialize/Dockerfile" `T.isInfixOf` msg))
       assertTrue "mentions ensure" ("ensures the default tag" `T.isInfixOf` msg)
     Right () -> assertFailure "expected inspect miss"
+
+------------------------------------------------------------------------
+-- Image-store layout parse (pure)
+------------------------------------------------------------------------
+
+giB :: Integer
+giB = 1024 * 1024 * 1024
+
+testParseDockerInfoFixtures :: IO ()
+testParseDockerInfoFixtures = do
+  overlay2 <-
+    case parseDockerInfoJson (T.pack classicInfoJson) of
+      Left err -> assertFailure ("overlay2 JSON: " <> T.unpack err)
+      Right facts -> pure facts
+  assertEq "overlay2 root" "/var/lib/docker" (difDockerRootDir overlay2)
+  assertEq "overlay2 not snapshotter" False (difUsesSnapshotter overlay2)
+  assertEq
+    "overlay2 dump not needed"
+    False
+    (containerdDumpNeeded overlay2)
+  assertEq
+    "system socket is not bundled"
+    False
+    (isBundledContainerdAddress "/run/containerd/containerd.sock")
+
+  let systemJson =
+        dockerInfoJson
+          "/var/lib/docker"
+          True
+          "/run/containerd/containerd.sock"
+  systemFacts <-
+    case parseDockerInfoJson (T.pack systemJson) of
+      Left err -> assertFailure ("system JSON: " <> T.unpack err)
+      Right facts -> pure facts
+  assertEq "system snapshotter" True (difUsesSnapshotter systemFacts)
+  assertEq
+    "system dump needed"
+    True
+    (containerdDumpNeeded systemFacts)
+  assertEq
+    "system address"
+    (Just "/run/containerd/containerd.sock")
+    (difContainerdAddress systemFacts)
+
+  let bundledJson =
+        dockerInfoJson
+          "/var/lib/docker"
+          True
+          "/run/docker/containerd/containerd.sock"
+  bundledFacts <-
+    case parseDockerInfoJson (T.pack bundledJson) of
+      Left err -> assertFailure ("bundled JSON: " <> T.unpack err)
+      Right facts -> pure facts
+  assertEq "bundled snapshotter" True (difUsesSnapshotter bundledFacts)
+  assertTrue
+    "bundled address"
+    (isBundledContainerdAddress "/run/docker/containerd/containerd.sock")
+  assertEq
+    "bundled dump not needed"
+    False
+    (containerdDumpNeeded bundledFacts)
+
+  case parseDockerInfoJson "{\"DriverStatus\":[]}" of
+    Left msg ->
+      assertEq
+        "missing DockerRootDir"
+        (imageStoreUnresolvedMessage "docker info did not report DockerRootDir")
+        msg
+    Right facts ->
+      assertFailure ("expected missing root, got " <> show facts)
+
+testParseContainerdDump :: IO ()
+testParseContainerdDump = do
+  case parseContainerdDump (T.pack (containerdDumpText "/var/lib/containerd" Nothing)) of
+    Left err -> assertFailure ("dump root: " <> T.unpack err)
+    Right path -> assertEq "top-level root" "/var/lib/containerd" path
+  case parseContainerdDump
+    (T.pack (containerdDumpText "/var/lib/containerd" (Just "/custom/snap"))) of
+    Left err -> assertFailure ("dump root_path: " <> T.unpack err)
+    Right path -> assertEq "non-empty root_path wins" "/custom/snap" path
+  case parseContainerdDump "version = 2\n" of
+    Left msg ->
+      assertEq "dump miss" containerdRootUnresolvedMessage msg
+    Right path -> assertFailure ("expected dump miss, got " <> path)
+  case parseContainerdDump "root = ''\n" of
+    Left msg ->
+      assertEq "empty root" containerdRootUnresolvedMessage msg
+    Right path -> assertFailure ("expected empty root fail, got " <> path)
+
+testImageStoreLayout :: IO ()
+testImageStoreLayout = do
+  overlay2 <-
+    case parseDockerInfoJson (T.pack classicInfoJson) of
+      Left err -> assertFailure (T.unpack err)
+      Right facts -> pure facts
+  case imageStoreLayout overlay2 Nothing of
+    Left err -> assertFailure ("classic layout: " <> T.unpack err)
+    Right layout -> do
+      assertEq "classic layers" ["/var/lib/docker"] (islLayerPaths layout)
+      assertEq "classic cache" ["/var/lib/docker"] (islCachePaths layout)
+
+  bundled <-
+    case parseDockerInfoJson
+      ( T.pack
+          ( dockerInfoJson
+              "/var/lib/docker"
+              True
+              "/run/docker/containerd/containerd.sock"
+          )
+      ) of
+      Left err -> assertFailure (T.unpack err)
+      Right facts -> pure facts
+  case imageStoreLayout bundled Nothing of
+    Left err -> assertFailure ("bundled layout: " <> T.unpack err)
+    Right layout -> do
+      assertEq "bundled layers" ["/var/lib/docker"] (islLayerPaths layout)
+      assertEq "bundled cache" ["/var/lib/docker"] (islCachePaths layout)
+
+  systemFacts <-
+    case parseDockerInfoJson
+      ( T.pack
+          ( dockerInfoJson
+              "/var/lib/docker"
+              True
+              "/run/containerd/containerd.sock"
+          )
+      ) of
+      Left err -> assertFailure (T.unpack err)
+      Right facts -> pure facts
+  case imageStoreLayout systemFacts Nothing of
+    Left msg ->
+      assertTrue
+        "system without root is discovery"
+        ("could not resolve the image store" `T.isInfixOf` msg)
+    Right layout ->
+      assertFailure ("expected discovery miss, got " <> show layout)
+  case imageStoreLayout systemFacts (Just "/var/lib/containerd") of
+    Left err -> assertFailure ("system layout: " <> T.unpack err)
+    Right layout -> do
+      assertEq
+        "system layers"
+        ["/var/lib/containerd"]
+        (islLayerPaths layout)
+      assertEq "system cache" ["/var/lib/docker"] (islCachePaths layout)
+
+testRoleBounds :: IO ()
+testRoleBounds = do
+  assertEq "first combined" (20 * giB) firstImageNeedBytes
+  assertEq "add combined" (8 * giB) addToolchainNeedBytes
+  assertEq "first layers" (16 * giB) firstImageLayerNeedBytes
+  assertEq "first cache" (6 * giB) firstImageCacheNeedBytes
+  assertEq "add layers" (6 * giB) addToolchainLayerNeedBytes
+  assertEq "add cache" (2 * giB) addToolchainCacheNeedBytes
+  assertTrue
+    "split first does not sum past combined"
+    ( firstImageLayerNeedBytes + firstImageCacheNeedBytes
+        > firstImageNeedBytes
+    )
+
+------------------------------------------------------------------------
+-- Split / discovery ensure IO
+------------------------------------------------------------------------
+
+splitProbe ::
+  FilePath ->
+  FilePath ->
+  Integer ->
+  Integer ->
+  DiskSpaceProbe
+splitProbe cachePath layerPath cacheFree layerFree =
+  DiskSpaceProbe
+    { dspFreeBytes = \p ->
+        pure $
+          Right $
+            if p == cachePath
+              then cacheFree
+              else
+                if p == layerPath
+                  then layerFree
+                  else 1024 * 1024,
+      dspDeviceId = \p ->
+        pure $
+          Right $
+            if p == cachePath
+              then 10
+              else
+                if p == layerPath
+                  then 20
+                  else 1
+    }
+
+systemSnapshotterFake ::
+  FilePath ->
+  Maybe FilePath ->
+  IORef [[String]] ->
+  IO FakeDocker
+systemSnapshotterFake dockerRoot mLayerRoot builds = do
+  fake <- mkFakeDocker False "" builds
+  pure
+    fake
+      { fdDockerInfoJson =
+          dockerInfoJson dockerRoot True "/run/containerd/containerd.sock",
+        fdContainerdDump =
+          fmap (`containerdDumpText` Nothing) mLayerRoot
+      }
+
+assertNoBuild :: IORef [[String]] -> IO ()
+assertNoBuild builds = do
+  calls <- readIORef builds
+  assertEq "no docker build" [] calls
+
+testSplitCacheShort :: IO ()
+testSplitCacheShort =
+  withSystemTempDirectory "om-ensure-split-cache" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        dockerRoot = tmp </> "docker"
+        layerRoot = tmp </> "containerd"
+    createDirectoryIfMissing True overlay
+    createDirectoryIfMissing True dockerRoot
+    createDirectoryIfMissing True layerRoot
+    seedGoAmd64 (tmp </> "gentoo")
+    builds <- mkLogRef
+    fake <- systemSnapshotterFake dockerRoot (Just layerRoot) builds
+    let probe = splitProbe dockerRoot layerRoot giB (50 * giB)
+    cfg <- mkCfg overlay sidecar fake probe Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    case got of
+      Left msg -> do
+        assertTrue "names cache path" (T.pack dockerRoot `T.isInfixOf` msg)
+        assertTrue "names layer path" (T.pack layerRoot `T.isInfixOf` msg)
+        assertTrue "names cache role" ("build cache" `T.isInfixOf` msg)
+        assertTrue "names layer role" ("image layers" `T.isInfixOf` msg)
+        assertTrue "mentions free" ("free:" `T.isInfixOf` msg)
+        assertTrue "mentions need" ("need:" `T.isInfixOf` msg)
+      Right o -> assertFailure ("expected cache-short fail, got " <> show o)
+    assertNoBuild builds
+
+testSplitLayersShort :: IO ()
+testSplitLayersShort =
+  withSystemTempDirectory "om-ensure-split-layers" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        dockerRoot = tmp </> "docker"
+        layerRoot = tmp </> "containerd"
+    createDirectoryIfMissing True overlay
+    createDirectoryIfMissing True dockerRoot
+    createDirectoryIfMissing True layerRoot
+    seedGoAmd64 (tmp </> "gentoo")
+    builds <- mkLogRef
+    fake <- systemSnapshotterFake dockerRoot (Just layerRoot) builds
+    let probe = splitProbe dockerRoot layerRoot (50 * giB) giB
+    cfg <- mkCfg overlay sidecar fake probe Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    case got of
+      Left msg -> do
+        assertTrue "names cache path" (T.pack dockerRoot `T.isInfixOf` msg)
+        assertTrue "names layer path" (T.pack layerRoot `T.isInfixOf` msg)
+        assertTrue "names cache role" ("build cache" `T.isInfixOf` msg)
+        assertTrue "names layer role" ("image layers" `T.isInfixOf` msg)
+      Right o -> assertFailure ("expected layers-short fail, got " <> show o)
+    assertNoBuild builds
+
+testSplitAmpleOverlayTiny :: IO ()
+testSplitAmpleOverlayTiny =
+  withSystemTempDirectory "om-ensure-split-ok" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        dockerRoot = tmp </> "docker"
+        layerRoot = tmp </> "containerd"
+    createDirectoryIfMissing True overlay
+    createDirectoryIfMissing True dockerRoot
+    createDirectoryIfMissing True layerRoot
+    seedGoAmd64 (tmp </> "gentoo")
+    builds <- mkLogRef
+    fake <- systemSnapshotterFake dockerRoot (Just layerRoot) builds
+    let probe = splitProbe dockerRoot layerRoot (100 * giB) (100 * giB)
+    cfg <- mkCfg overlay sidecar fake probe Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    assertEq "built despite tiny overlay" (Right EnsureBuilt) got
+    calls <- readIORef builds
+    assertTrue "docker build ran" (any ("-t" `elem`) calls)
+
+testSnapshotterDumpMiss :: IO ()
+testSnapshotterDumpMiss =
+  withSystemTempDirectory "om-ensure-dump-miss" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        dockerRoot = tmp </> "docker"
+    createDirectoryIfMissing True overlay
+    createDirectoryIfMissing True dockerRoot
+    seedGoAmd64 (tmp </> "gentoo")
+    builds <- mkLogRef
+    fake <- systemSnapshotterFake dockerRoot Nothing builds
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    case got of
+      Left msg -> do
+        assertTrue
+          "unresolved store"
+          ("could not resolve the image store" `T.isInfixOf` msg)
+        assertTrue
+          "dump hint"
+          ("containerd config dump must yield a root" `T.isInfixOf` msg)
+        assertTrue "not a free-space line" (not ("free:" `T.isInfixOf` msg))
+        assertEq
+          "helper matches"
+          containerdRootUnresolvedMessage
+          (sndPrefix msg)
+      Right o -> assertFailure ("expected discovery fail, got " <> show o)
+    assertNoBuild builds
+    dumps <- readIORef (fdContainerdCalls fake)
+    assertTrue "invoked dump" (["config", "dump"] `elem` dumps)
+    assertTrue
+      "no --config"
+      (not (any ("--config" `elem`) dumps))
+  where
+    sndPrefix msg =
+      let pfx = ensureFailedMessage ""
+          stripped =
+            if pfx `T.isPrefixOf` msg
+              then T.drop (T.length pfx) msg
+              else msg
+       in stripped
+
+testSnapshotterRootMissing :: IO ()
+testSnapshotterRootMissing =
+  withSystemTempDirectory "om-ensure-root-miss" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        dockerRoot = tmp </> "docker"
+        missingRoot = tmp </> "no-such-containerd"
+    createDirectoryIfMissing True overlay
+    createDirectoryIfMissing True dockerRoot
+    seedGoAmd64 (tmp </> "gentoo")
+    builds <- mkLogRef
+    fake <- systemSnapshotterFake dockerRoot (Just missingRoot) builds
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    case got of
+      Left msg -> do
+        assertTrue
+          "unresolved store"
+          ("could not resolve the image store" `T.isInfixOf` msg)
+        assertTrue "not a free-space line" (not ("free:" `T.isInfixOf` msg))
+      Right o -> assertFailure ("expected discovery fail, got " <> show o)
+    assertNoBuild builds
+
+testBundledSnapshotterNoDump :: IO ()
+testBundledSnapshotterNoDump =
+  withSystemTempDirectory "om-ensure-bundled" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+    createDirectoryIfMissing True overlay
+    seedGoAmd64 (tmp </> "gentoo")
+    builds <- mkLogRef
+    fake0 <- mkFakeDocker False "" builds
+    let fake =
+          fake0
+            { fdDockerInfoJson =
+                dockerInfoJson
+                  "/var/lib/docker"
+                  True
+                  "/run/docker/containerd/containerd.sock"
+            }
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    assertEq "bundled still builds" (Right EnsureBuilt) got
+    calls <- readIORef builds
+    assertTrue "docker build ran" (any ("-t" `elem`) calls)
+    dumps <- readIORef (fdContainerdCalls fake)
+    assertEq "bundled does not dump" [] dumps

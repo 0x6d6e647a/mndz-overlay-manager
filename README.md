@@ -23,7 +23,7 @@ GPG-signed overlay/assets commits, SSH `git push`, the GitHub token, `ebuild` / 
 
 ### Materialize image (full-path `update`)
 
-When `update` has classified **full-path** DepsAndAssets work, it **ensures** the default Gentoo materialize image (`mndz-overlay-manager/materialize:local`): it reuses the current image when recorded floors still satisfy this prepare, otherwise it generates a Dockerfile from an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture and `docker build`s it. A host architecture with no such official flavor hard-fails ensure; host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` are not used instead. GitMv and reuse-path work may proceed while that ensure runs. There is no in-repo Dockerfile to `docker build`; a manual image build is **not** a prerequisite of `update`.
+When `update` has classified **full-path** DepsAndAssets work, it **ensures** the default Gentoo materialize image (`mndz-overlay-manager/materialize:local`): it reuses the current image when recorded floors still satisfy this prepare, otherwise it generates a Dockerfile from an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture and `docker build`s it (after a free-space check on probed Docker/containerd storage). A host architecture with no such official flavor hard-fails ensure; host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` are not used instead. GitMv and reuse-path work may proceed while that ensure runs. There is no in-repo Dockerfile to `docker build`; a manual image build is **not** a prerequisite of `update`.
 
 The generated image installs language toolchains via Portage: it prefers a Gentoo `-bin` package when one can meet the floor, accepts testing KEYWORDS per atom (`~arch`, `::gentoo` or `::mndz`) when the floor is not stable-visible, does not set whole-image `ACCEPT_KEYWORDS` to `~arch`, and reuses locally built binpkgs across image rebuilds.
 
@@ -198,6 +198,8 @@ After planning which packages **need work**, and after classifying each heavy un
 If free space is insufficient for the planned needs-work units, `update` **hard-fails early** with the path, free vs need, and remediation hints (free space, set `TMPDIR` to roomier disk storage such as `$HOME/local/tmp`, or lower `--jobs`). That is intended to prevent mid-materialize `no space left on device` when the planned concurrent work already cannot fit.
 
 Live **system Portage DISTDIR** (when it differs from the manager path) is **warn-only** if free space there looks tight; it does not hard-fail the command by itself.
+
+When `update` will `docker build` the materialize image, it also checks free space on the **Docker data-root** (BuildKit cache) and, when Docker stores image layers in **containerd** on a distinct filesystem, that containerd data-root. Those directories are discovered from live Docker/containerd configuration rather than a hardcoded `/var/lib/docker`. Insufficient space names the probed path(s), the role (**image layers** versus **build cache**), and free versus need. The overlay tree bind-mounted into the build is not part of that image-storage check.
 
 ```bash
 # Prefer a disk-backed temp root when /tmp is a small tmpfs
