@@ -25,6 +25,8 @@ GPG-signed overlay/assets commits, SSH `git push`, the GitHub token, `ebuild` / 
 
 When `update` has classified **full-path** DepsAndAssets work, it **ensures** the default Gentoo materialize image (`mndz-overlay-manager/materialize:local`): it reuses the current image when recorded floors still satisfy this prepare, otherwise it generates a Dockerfile from an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture and `docker build`s it. A host architecture with no such official flavor hard-fails ensure; host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` are not used instead. GitMv and reuse-path work may proceed while that ensure runs. There is no in-repo Dockerfile to `docker build`; a manual image build is **not** a prerequisite of `update`.
 
+The generated image installs language toolchains via Portage: it prefers a Gentoo `-bin` package when one can meet the floor, accepts testing KEYWORDS per atom (`~arch`, `::gentoo` or `::mndz`) when the floor is not stable-visible, does not set whole-image `ACCEPT_KEYWORDS` to `~arch`, and reuses locally built binpkgs across image rebuilds.
+
 Bun inside the image comes from overlay `dev-lang/bun-bin::mndz` (overlay bind-mounted read-only at build). Image metadata lives under the XDG cache:
 
 - `$XDG_CACHE_HOME/mndz/overlay-manager/materialize/` when `XDG_CACHE_HOME` is set and non-empty (`image.json` plus the last generated `Dockerfile`)

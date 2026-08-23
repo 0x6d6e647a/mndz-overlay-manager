@@ -11,11 +11,12 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isNothing)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
+import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime (..), fromGregorian)
-import Overlay.Version (parseEbuildVersion)
+import Overlay.Version (EbuildVersion, parseEbuildVersion)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertTrue)
 import Test.Tasty (TestTree, testGroup)
@@ -41,6 +42,9 @@ import Update.Materialize
     ImageSidecar (..),
     NeededFloors (..),
     RecipeArch (..),
+    ResolvedInstall (..),
+    ResolvedToolchain (..),
+    ToolchainKind (..),
     addToolchainNeedBytes,
     decodeImageSidecar,
     defaultMaterializeSidecarDirFromEnv,
@@ -58,6 +62,7 @@ import Update.Materialize
     overrideUnusableMessage,
     prunePreviousMaterializeImage,
     renderMaterializeDockerfile,
+    resolveToolchain,
     sidecarImageJsonPath,
     unionFloors,
     unmappedArchMessage,
@@ -73,6 +78,7 @@ import Update.Process.Docker
     materializeImageEnvVar,
     missingImageMessage,
   )
+import Update.Runtime.Ceilings (RuntimeEbuildMeta (..))
 import Update.Types
   ( EcosystemSpec (..),
     UpdateSource (..),
@@ -85,10 +91,16 @@ unitTests =
     "Ensure"
     [ testCase "union/satisfy Go floors" testUnionSatisfy,
       testCase "Bun-only first image omits SBCL" testBunOnlyOmitsSbcl,
+      testCase "rust-bin preferred over plain rust" testResolvePrefersRustBin,
+      testCase "sbcl without -bin picks source and ~amd64 accept" testResolveSbclNoBinTilde,
+      testCase "missing ebuilds at floor is a resolve miss" testResolveMissingFloorMiss,
+      testCase "floor 0 is unversioned; ~arch only without plain ebuild" testResolveFloorZero,
+      testCase "full-path 1.24 + reuse 1.26 → Go floor 1.24" testFullPathFloorIgnoresReuseSibling,
       testCase "render contains ::mndz and no official tarball URLs" testRenderMndzNoOfficial,
       testCase "uname map splits KEYWORDS from OpenRC Hub tag" testLookupRecipeArch,
       testCase "x86_64 recipe uses amd64-openrc FROM and ~amd64 keywords" testAmd64OpenrcRecipe,
       testCase "ppc64le recipe uses ppc64le-openrc FROM and ~ppc64 keywords" testPpc64leOpenrcRecipe,
+      testCase "SBCL testing floor is one emerge plus ::gentoo ~amd64" testRenderSbclTestingFloor,
       testCase "missing sidecar field is a miss" testMissingSidecarField,
       testCase "skip docker build when satisfies" testSkipWhenSatisfies,
       testCase "generator mismatch rebuilds despite floors" testGeneratorMismatchRebuilds,
@@ -98,6 +110,7 @@ unitTests =
       testCase "fake build records union satisfies" testFakeBuildRecordsUnion,
       testCase "image disk gate skipped when satisfies" testDiskGateSkippedWhenSatisfies,
       testCase "first build fails early on tiny disk" testFirstBuildDiskFail,
+      testCase "resolve miss does not invoke docker build" testResolveMissNoBuild,
       testCase "prune rmi unused previous id then image prune -f" testPruneRmiThenPruneF,
       testCase "inspect missing image uses ensure copy not Dockerfile recipe" testInspectMissingMessage,
       testCase "default sidecar path under HOME" testDefaultSidecarPath
@@ -151,20 +164,151 @@ testBunOnlyOmitsSbcl = do
   assertEq "bun floor" (Just "1.2.0") (nfBun needed)
   assertEq "no SBCL on first bun-only" Nothing (nfSbcl needed)
   assertEq "no Go on bun-only" Nothing (nfGo needed)
-  df <- renderMapped "x86_64" needed "/overlay"
+  df <- renderMapped "x86_64" [bunInstall "1.2.0" "amd64"] "/overlay"
   assertTrue "recipe has bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` df)
   assertTrue "recipe omits sbcl emerge" (not ("dev-lisp/sbcl" `T.isInfixOf` df))
 
+testResolvePrefersRustBin :: IO ()
+testResolvePrefersRustBin = do
+  let binMetas = [meta "1.88.0" ["~amd64"]]
+      srcMetas = [meta "1.88.0" ["amd64"]]
+  rt <-
+    assertResolved "rust-bin" $
+      resolveToolchain
+        "amd64"
+        "1.88.0"
+        "dev-lang/rust-bin"
+        binMetas
+        "dev-lang/rust"
+        srcMetas
+        "gentoo"
+  assertEq "atom" "dev-lang/rust-bin" (rtAtom rt)
+  assertEq "emerge" ">=dev-lang/rust-bin-1.88.0" (rtEmergeSpec rt)
+  assertEq
+    "accept"
+    (Just ">=dev-lang/rust-bin-1.88.0::gentoo ~amd64")
+    (rtAcceptLine rt)
+
+testResolveSbclNoBinTilde :: IO ()
+testResolveSbclNoBinTilde = do
+  rt <-
+    assertResolved "sbcl" $
+      resolveToolchain
+        "amd64"
+        "2.6.6"
+        "dev-lisp/sbcl-bin"
+        []
+        "dev-lisp/sbcl"
+        [meta "2.6.6" ["~amd64"]]
+        "gentoo"
+  assertEq "atom" "dev-lisp/sbcl" (rtAtom rt)
+  assertEq "emerge" ">=dev-lisp/sbcl-2.6.6" (rtEmergeSpec rt)
+  assertEq
+    "accept"
+    (Just ">=dev-lisp/sbcl-2.6.6::gentoo ~amd64")
+    (rtAcceptLine rt)
+
+testResolveMissingFloorMiss :: IO ()
+testResolveMissingFloorMiss = do
+  case resolveToolchain
+    "amd64"
+    "2.7.0"
+    "dev-lisp/sbcl-bin"
+    []
+    "dev-lisp/sbcl"
+    [meta "2.6.6" ["~amd64"]]
+    "gentoo" of
+    Left msg ->
+      assertTrue "names floor" ("2.7.0" `T.isInfixOf` msg)
+    Right rt ->
+      assertFailure ("expected miss, got " <> show rt)
+
+testResolveFloorZero :: IO ()
+testResolveFloorZero = do
+  plain <-
+    assertResolved "floor0-plain" $
+      resolveToolchain
+        "amd64"
+        "0"
+        "dev-lang/go-bin"
+        []
+        "dev-lang/go"
+        [meta "1.26.5" ["amd64"]]
+        "gentoo"
+  assertEq "unversioned emerge" "dev-lang/go" (rtEmergeSpec plain)
+  assertEq "no accept when plain exists" Nothing (rtAcceptLine plain)
+  tilde <-
+    assertResolved "floor0-tilde" $
+      resolveToolchain
+        "amd64"
+        "0"
+        "dev-lang/go-bin"
+        []
+        "dev-lang/go"
+        [meta "1.26.5" ["~amd64"]]
+        "gentoo"
+  assertEq "unversioned emerge tilde" "dev-lang/go" (rtEmergeSpec tilde)
+  assertEq
+    "accept without version"
+    (Just "dev-lang/go::gentoo ~amd64")
+    (rtAcceptLine tilde)
+
+testFullPathFloorIgnoresReuseSibling :: IO ()
+testFullPathFloorIgnoresReuseSibling = do
+  let key = mkPackageKey "app-misc" "dolt"
+      pvFull = parseEbuildVersion "1.0.0"
+      pvReuse = parseEbuildVersion "1.1.0"
+      classify =
+        [ ClassifyOk
+            key
+            [ ClassifiedPvUnit
+                { cpuKey = key,
+                  cpuPN = "dolt",
+                  cpuPV = pvFull,
+                  cpuEco = Go Nothing,
+                  cpuClass = FullGo,
+                  cpuTempBaseline = Nothing
+                },
+              ClassifiedPvUnit
+                { cpuKey = key,
+                  cpuPN = "dolt",
+                  cpuPV = pvReuse,
+                  cpuEco = Go Nothing,
+                  cpuClass = ReusePath,
+                  cpuTempBaseline = Nothing
+                }
+            ]
+        ]
+      plan =
+        [ PlanNeedsWork
+            key
+            PlannedDeps
+              { pdEco = Go Nothing,
+                pdSource = GitHub "dolthub" "dolt" "v",
+                pdPlan =
+                  goPlan
+                    [ (pvFull, "1.24.0"),
+                      (pvReuse, "1.26.5")
+                    ],
+                pdLocalPVs = [pvFull, pvReuse],
+                pdContentFix = []
+              }
+        ]
+      needed = neededFloorsFromClassified classify plan Nothing
+  assertEq "Go floor from full-path PV only" (Just "1.24.0") (nfGo needed)
+  assertEq "no unused toolchains" Nothing (nfSbcl needed)
+
 testRenderMndzNoOfficial :: IO ()
 testRenderMndzNoOfficial = do
-  let floors =
-        emptyFloors
-          { nfGo = Just "1.26.5",
-            nfBun = Just "1.2.21"
-          }
-  df <- renderMapped "x86_64" floors "/home/op/overlay"
+  df <-
+    renderMapped
+      "x86_64"
+      [goInstall "1.26.5", bunInstall "1.2.21" "amd64"]
+      "/home/op/overlay"
   assertTrue "::mndz" ("::mndz" `T.isInfixOf` df)
-  assertTrue "accept_keywords bun-bin" ("dev-lang/bun-bin::mndz ~amd64" `T.isInfixOf` df)
+  assertTrue
+    "accept_keywords bun-bin"
+    (">=dev-lang/bun-bin-1.2.21::mndz ~amd64" `T.isInfixOf` df)
   assertTrue "go via portage" ("dev-lang/go" `T.isInfixOf` df)
   assertTrue "no go.dev" (not ("go.dev" `T.isInfixOf` df))
   assertTrue "no nodejs.org" (not ("nodejs.org" `T.isInfixOf` df))
@@ -174,6 +318,16 @@ testRenderMndzNoOfficial = do
   assertTrue "overlay bind ro" (",ro" `T.isInfixOf` df)
   assertTrue "DISTDIR cache" ("/var/cache/distfiles" `T.isInfixOf` df)
   assertTrue "PKGDIR cache" ("/var/cache/binpkgs" `T.isInfixOf` df)
+  assertTrue "buildpkg FEATURES" ("buildpkg" `T.isInfixOf` df)
+  assertTrue "usepkg" ("--usepkg" `T.isInfixOf` df)
+  assertTrue
+    "stable distfiles cache id"
+    ("id=mndz-materialize-distfiles" `T.isInfixOf` df)
+  assertTrue
+    "stable binpkgs cache id"
+    ("id=mndz-materialize-binpkgs" `T.isInfixOf` df)
+  assertTrue "no sbcl-bin ||" (not ("sbcl-bin" `T.isInfixOf` df))
+  assertTrue "no shell fallback" (not ("|| emerge" `T.isInfixOf` df))
 
 testLookupRecipeArch :: IO ()
 testLookupRecipeArch = do
@@ -204,7 +358,7 @@ testLookupRecipeArch = do
 
 testAmd64OpenrcRecipe :: IO ()
 testAmd64OpenrcRecipe = do
-  df <- renderMapped "x86_64" bunFloors "/overlay"
+  df <- renderMapped "x86_64" [bunInstall "1.2.21" "amd64"] "/overlay"
   assertTrue
     "OpenRC FROM"
     ("FROM gentoo/stage3:amd64-openrc" `T.isInfixOf` df)
@@ -213,26 +367,79 @@ testAmd64OpenrcRecipe = do
     (not ("FROM gentoo/stage3:amd64\n" `T.isInfixOf` df))
   assertTrue
     "bun-bin KEYWORDS"
-    ("dev-lang/bun-bin::mndz ~amd64" `T.isInfixOf` df)
+    (">=dev-lang/bun-bin-1.2.21::mndz ~amd64" `T.isInfixOf` df)
 
 testPpc64leOpenrcRecipe :: IO ()
 testPpc64leOpenrcRecipe = do
-  df <- renderMapped "ppc64le" bunFloors "/overlay"
+  df <- renderMapped "ppc64le" [bunInstall "1.2.21" "ppc64"] "/overlay"
   assertTrue
     "OpenRC FROM"
     ("FROM gentoo/stage3:ppc64le-openrc" `T.isInfixOf` df)
   assertTrue
     "bun-bin KEYWORDS ppc64"
-    ("dev-lang/bun-bin::mndz ~ppc64" `T.isInfixOf` df)
+    (">=dev-lang/bun-bin-1.2.21::mndz ~ppc64" `T.isInfixOf` df)
 
-bunFloors :: NeededFloors
-bunFloors = emptyFloors {nfBun = Just "1.2.21"}
+testRenderSbclTestingFloor :: IO ()
+testRenderSbclTestingFloor = do
+  rt <-
+    assertResolved "sbcl-render" $
+      resolveToolchain
+        "amd64"
+        "2.6.6"
+        "dev-lisp/sbcl-bin"
+        []
+        "dev-lisp/sbcl"
+        [meta "2.6.6" ["~amd64"]]
+        "gentoo"
+  df <- renderMapped "x86_64" [ResolvedInstall TkSbcl rt] "/overlay"
+  assertEq
+    "one versioned sbcl emerge"
+    1
+    (T.count "emerge -n \">=dev-lisp/sbcl-2.6.6\"" df)
+  assertTrue
+    "accept ::gentoo ~amd64"
+    (">=dev-lisp/sbcl-2.6.6::gentoo ~amd64" `T.isInfixOf` df)
+  assertTrue "no sbcl-bin" (not ("sbcl-bin" `T.isInfixOf` df))
+  assertTrue "no shell || fallback" (not ("|| emerge" `T.isInfixOf` df))
+  assertTrue "no source USE" (not ("[source]" `T.isInfixOf` df))
 
-renderMapped :: String -> NeededFloors -> FilePath -> IO T.Text
-renderMapped uname floors overlay =
+renderMapped :: String -> [ResolvedInstall] -> FilePath -> IO T.Text
+renderMapped uname installs overlay =
   case lookupRecipeArch uname of
     Nothing -> assertFailure (uname <> " should map")
-    Just arch -> pure (renderMaterializeDockerfile floors arch overlay)
+    Just arch -> pure (renderMaterializeDockerfile arch overlay installs)
+
+bunInstall :: T.Text -> T.Text -> ResolvedInstall
+bunInstall ver kw =
+  ResolvedInstall
+    TkBun
+    ResolvedToolchain
+      { rtAtom = "dev-lang/bun-bin",
+        rtEmergeSpec = ">=dev-lang/bun-bin-" <> ver <> "::mndz",
+        rtAcceptLine = Just (">=dev-lang/bun-bin-" <> ver <> "::mndz ~" <> kw)
+      }
+
+goInstall :: T.Text -> ResolvedInstall
+goInstall ver =
+  ResolvedInstall
+    TkGo
+    ResolvedToolchain
+      { rtAtom = "dev-lang/go",
+        rtEmergeSpec = ">=dev-lang/go-" <> ver,
+        rtAcceptLine = Nothing
+      }
+
+meta :: T.Text -> [T.Text] -> RuntimeEbuildMeta
+meta ver kws =
+  RuntimeEbuildMeta
+    { remPV = parseEbuildVersion ver,
+      remKeywords = kws
+    }
+
+assertResolved :: String -> Either T.Text ResolvedToolchain -> IO ResolvedToolchain
+assertResolved name = \case
+  Left err -> assertFailure (name <> ": " <> T.unpack err)
+  Right rt -> pure rt
 
 testMissingSidecarField :: IO ()
 testMissingSidecarField = do
@@ -274,6 +481,23 @@ bunPlan req =
       glpEbuilds = [],
       glpUniquePVs = [parseEbuildVersion "1.0.0"],
       glpRuntimeAtom = "dev-lang/bun-bin"
+    }
+
+goPlan :: [(EbuildVersion, T.Text)] -> RuntimeLanePlan
+goPlan rows =
+  RuntimeLanePlan
+    { glpLanes =
+        [ LaneTarget
+            { ltLane = LaneAmd64Plain,
+              ltCeiling = Just (parseEbuildVersion "1.26.5"),
+              ltPackagePV = Just pv,
+              ltGoReq = Just req
+            }
+        | (pv, req) <- rows
+        ],
+      glpEbuilds = [],
+      glpUniquePVs = [pv | (pv, _) <- rows],
+      glpRuntimeAtom = "dev-lang/go"
     }
 
 testDefaultSidecarPath :: IO ()
@@ -404,8 +628,26 @@ mkCfgUname overlay sidecar fake probe mOverride uname = do
         ecNow = pure epoch,
         ecUname = uname,
         ecOverrideTag = mOverride,
-        ecPrevImageId = prev
+        ecPrevImageId = prev,
+        ecGentooRoot = pure (Right (takeDirectory overlay </> "gentoo"))
       }
+
+writeRuntimeEbuild :: FilePath -> T.Text -> T.Text -> T.Text -> IO ()
+writeRuntimeEbuild pkgDir pn ver keywords = do
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile
+    (pkgDir </> (T.unpack pn <> "-" <> T.unpack ver <> ".ebuild"))
+    ("KEYWORDS=\"" <> keywords <> "\"\n")
+
+seedGoAmd64 :: FilePath -> IO ()
+seedGoAmd64 gentoo =
+  writeRuntimeEbuild (gentoo </> "dev-lang" </> "go") "go" "1.26.5" "amd64"
+
+seedBunOverlay :: FilePath -> T.Text -> T.Text -> IO ()
+seedBunOverlay overlay =
+  writeRuntimeEbuild
+    (overlay </> "dev-lang" </> "bun-bin")
+    "bun-bin"
 
 neededGo :: NeededFloors
 neededGo = emptyFloors {nfGo = Just "1.26.4"}
@@ -456,6 +698,7 @@ testGeneratorMismatchRebuilds =
         sidecar = tmp </> "side"
         iid = "sha256:stale-gen"
     createDirectoryIfMissing True overlay
+    seedGoAmd64 (tmp </> "gentoo")
     writeSidecarGoGen sidecar iid "1.26.5" "mndz-overlay-manager-materialize-1"
     builds <- mkLogRef
     let fake =
@@ -564,6 +807,8 @@ testFakeBuildRecordsUnion =
         sidecar = tmp </> "side"
         oldId = "sha256:old"
     createDirectoryIfMissing True overlay
+    seedGoAmd64 (tmp </> "gentoo")
+    seedBunOverlay overlay "1.3.0" "~amd64"
     writeSidecarGo sidecar oldId "1.26.5"
     builds <- mkLogRef
     let fake =
@@ -627,6 +872,7 @@ testFirstBuildDiskFail =
     let overlay = tmp </> "ov"
         sidecar = tmp </> "side"
     createDirectoryIfMissing True overlay
+    seedGoAmd64 (tmp </> "gentoo")
     builds <- mkLogRef
     let fake =
           FakeDocker
@@ -644,6 +890,36 @@ testFirstBuildDiskFail =
       Right o -> assertFailure ("expected disk fail, got " <> show o)
     calls <- readIORef builds
     assertEq "no docker build after disk fail" [] calls
+
+testResolveMissNoBuild :: IO ()
+testResolveMissNoBuild =
+  withSystemTempDirectory "om-ensure-resolve-miss" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        gentoo = tmp </> "gentoo"
+    createDirectoryIfMissing True overlay
+    writeRuntimeEbuild
+      (gentoo </> "dev-lisp" </> "sbcl")
+      "sbcl"
+      "2.6.6"
+      "~amd64"
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = False,
+              fdInspectId = "",
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    got <- ensureMaterializeImage cfg (emptyFloors {nfSbcl = Just "2.7.0"})
+    case got of
+      Left msg ->
+        assertTrue "names floor" ("2.7.0" `T.isInfixOf` msg)
+      Right o -> assertFailure ("expected resolve miss, got " <> show o)
+    calls <- readIORef builds
+    assertEq "no docker build on resolve miss" [] calls
+    dfExists <- doesFileExist (sidecar </> "Dockerfile")
+    assertTrue "did not write recipe" (not dfExists)
 
 testPruneRmiThenPruneF :: IO ()
 testPruneRmiThenPruneF =

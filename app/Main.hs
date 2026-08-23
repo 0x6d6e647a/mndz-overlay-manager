@@ -85,6 +85,7 @@ import Update.Preflight
   )
 import Update.Process (productionCommandRunner)
 import Update.Process.Docker (materializeImageEnvVar)
+import Update.Runtime.Ceilings (gentooRepoPath, productionPortageqRunner)
 import Update.Spine
   ( UpdateSpineDeps (..),
     UpdateSpineResult (..),
@@ -275,7 +276,8 @@ runUpdate rt refresh pkgArgs = do
                           ecNow = productionEnsureNow,
                           ecUname = uname,
                           ecOverrideTag = ovr,
-                          ecPrevImageId = prev
+                          ecPrevImageId = prev,
+                          ecGentooRoot = gentooRepoPath productionPortageqRunner
                         }
                     deps =
                       UpdateSpineDeps

@@ -18,7 +18,7 @@ where
 import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:?), (.=))
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
-import Overlay.Version (comparePV, renderPV)
+import Overlay.Version (EbuildVersion, comparePV, renderPV)
 import Update.Apply.Plan
   ( ClassifiedPvUnit (..),
     ClassifyPackageResult (..),
@@ -130,23 +130,23 @@ neededFloorsFromClassified ::
   Maybe Text ->
   NeededFloors
 neededFloorsFromClassified classifyResults planResults mOverlayBun =
-  let fullKeys = fullPathKeysFromClassify classifyResults
-      plansByKey =
+  let plansByKey =
         [ (planResultKey r, r)
         | r <- planResults
         ]
-      fromPlans =
+      fromUnits =
         foldl'
           unionFloors
           emptyFloors
-          [ floorsForPlan work
-          | k <- fullKeys,
-            Just (PlanNeedsWork _ work) <- [lookup k plansByKey]
+          [ floorsForFullUnit plansByKey u
+          | ClassifyOk _ us <- classifyResults,
+            u <- us,
+            isFull u
           ]
       withBun =
         if any bunFull classifyResults
-          then fromPlans {nfBun = maxFloor (nfBun fromPlans) mOverlayBun}
-          else fromPlans
+          then fromUnits {nfBun = maxFloor (nfBun fromUnits) mOverlayBun}
+          else fromUnits
    in withBun
   where
     bunFull (ClassifyOk _ us) = any (ecosystemIsBun . cpuEco) (filter isFull us)
@@ -167,26 +167,34 @@ isFull u = case cpuClass u of
   FullNpmBun -> True
   FullSbcl -> True
 
-floorsForPlan :: PlannedWork -> NeededFloors
-floorsForPlan = \case
-  PlannedGitMv {} -> emptyFloors
-  PlannedDeps eco _src plan _ _ ->
-    let req = needAtLeast (maxReqFromPlan plan)
-     in case eco of
-          Go _ -> emptyFloors {nfGo = req}
-          NpmEco -> emptyFloors {nfNode = req}
-          Bun -> emptyFloors {nfBun = req}
-          Cargo {} -> emptyFloors {nfRust = req}
-          Sbcl -> emptyFloors {nfSbcl = req}
+-- | This-prepare floor from one classified full-path PV: that PV’s lane req,
+-- not the max over unused / reuse sibling lanes.
+floorsForFullUnit ::
+  [(PackageKey, PackagePlanResult)] ->
+  ClassifiedPvUnit ->
+  NeededFloors
+floorsForFullUnit plansByKey u =
+  case lookup (cpuKey u) plansByKey of
+    Just (PlanNeedsWork _ (PlannedDeps eco _ plan _ _)) ->
+      let req = needAtLeast (reqForPv plan (cpuPV u))
+       in case eco of
+            Go _ -> emptyFloors {nfGo = req}
+            NpmEco -> emptyFloors {nfNode = req}
+            Bun -> emptyFloors {nfBun = req}
+            Cargo {} -> emptyFloors {nfRust = req}
+            Sbcl -> emptyFloors {nfSbcl = req}
+    _ -> emptyFloors
+
+reqForPv :: RuntimeLanePlan -> EbuildVersion -> Maybe Text
+reqForPv plan pv =
+  case [ltGoReq lt | lt <- glpLanes plan, ltPackagePV lt == Just pv] of
+    (r : _) -> r
+    [] -> Nothing
 
 -- | Any-version floor when the probe did not yield a token.
 needAtLeast :: Maybe Text -> Maybe Text
 needAtLeast Nothing = Just "0"
 needAtLeast (Just v) = Just v
-
-maxReqFromPlan :: RuntimeLanePlan -> Maybe Text
-maxReqFromPlan plan =
-  foldl' maxFloor Nothing (map ltGoReq (glpLanes plan))
 
 -- | Highest overlay bun-bin PV as a floor token.
 overlayBunFloorFromMetas :: [RuntimeEbuildMeta] -> Maybe Text

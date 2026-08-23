@@ -280,10 +280,11 @@ Operator documentation in `README.md` SHALL document the optional `check-cache-t
 3. That GPG-signed commits, SSH `git push`, GitHub token, `ebuild` / `egencache`, and overlay/assets worktrees stay on the host.
 4. That `update` **ensures** the default materialize image when full-path work needs it (generate and `docker build` if the current image does not satisfy those floors); that GitMv/reuse may proceed while ensure runs; that Bun in the image comes from overlay `dev-lang/bun-bin::mndz`; that metadata lives under the XDG cache `…/mndz/overlay-manager/materialize/` (`image.json`); that `MNDZ_MATERIALIZE_IMAGE` uses an existing tag and is not built or deleted by the CLI; that a manual `docker build` of an in-repo Dockerfile is **not** a required prerequisite of `update`; that the git tree SHALL NOT ship `docker/materialize/` (recipe or pointer) as operator documentation; that ensure’s generated recipe uses an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture; and that a host architecture with no such official flavor hard-fails ensure (no host language-toolchain fallback).
 5. That work commands warn when the overlay-manager TOML is not mode `0600`, without changing token resolution.
+6. That the generated image installs language toolchains via Portage: prefers a Gentoo `-bin` package when one can meet the floor, accepts testing KEYWORDS per atom (`~arch`, `::gentoo` or `::mndz`) when the floor is not stable-visible, does not set whole-image `ACCEPT_KEYWORDS` to `~arch`, and reuses local binpkgs across image rebuilds.
 
 #### Scenario: Operator finds Docker in the runtime table
 
-- **WHEN** an operator reads `README.md` runtime requirements after this capability ships
+- **WHEN** an operator reads `README.md` runtime requirements
 - **THEN** the documentation lists `docker` for full-path `update` of vendor/deps/crates packages and does not claim host `go`/`npm`/`bun` are required for that path
 
 #### Scenario: Operator finds config mode warning
@@ -308,6 +309,13 @@ Operator documentation in `README.md` SHALL document the optional `check-cache-t
 - **WHEN** an operator reads `README.md` materialize image documentation
 - **THEN** the text states that ensure uses an official Gentoo OpenRC stage3 for the host CPU architecture
 - **AND** that a host architecture without such an image hard-fails (host `go`/`npm`/`bun` are not used instead)
+
+#### Scenario: Operator finds Portage -bin and per-atom testing keywords
+
+- **WHEN** an operator reads `README.md` materialize image documentation
+- **THEN** the text states that toolchains come from Portage `-bin` when available
+- **AND** that testing toolchain versions are accepted per package, not by setting the whole image to `~arch`
+- **AND** that image rebuilds reuse locally built binpkgs
 
 ### Requirement: README documents overlay apply order and blocked-on
 

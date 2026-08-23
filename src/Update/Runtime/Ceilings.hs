@@ -12,7 +12,9 @@ module Update.Runtime.Ceilings
     mkPortageqRunner,
     gentooRepoPath,
     goPackageDir,
+    goBinPackageDir,
     nodejsPackageDir,
+    nodejsBinPackageDir,
     bunBinPackageDir,
     parseKeywordsField,
     normalizeArchToken,
@@ -42,6 +44,7 @@ module Update.Runtime.Ceilings
     rustPackageDir,
     rustBinPackageDir,
     sbclPackageDir,
+    sbclBinPackageDir,
   )
 where
 
@@ -182,8 +185,14 @@ gentooRepoPath run = do
 goPackageDir :: FilePath -> FilePath
 goPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "go"
 
+goBinPackageDir :: FilePath -> FilePath
+goBinPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "go-bin"
+
 nodejsPackageDir :: FilePath -> FilePath
 nodejsPackageDir gentooRoot = gentooRoot </> "net-libs" </> "nodejs"
+
+nodejsBinPackageDir :: FilePath -> FilePath
+nodejsBinPackageDir gentooRoot = gentooRoot </> "net-libs" </> "nodejs-bin"
 
 bunBinPackageDir :: FilePath -> FilePath
 bunBinPackageDir overlayRoot = overlayRoot </> "dev-lang" </> "bun-bin"
@@ -196,6 +205,9 @@ rustBinPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "rust-bin"
 
 sbclPackageDir :: FilePath -> FilePath
 sbclPackageDir gentooRoot = gentooRoot </> "dev-lisp" </> "sbcl"
+
+sbclBinPackageDir :: FilePath -> FilePath
+sbclBinPackageDir gentooRoot = gentooRoot </> "dev-lisp" </> "sbcl-bin"
 
 -- | Parse KEYWORDS=... from ebuild body into token list.
 -- Shell comments after the assignment (@# …@) are stripped so rust-bin lines like

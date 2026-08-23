@@ -139,6 +139,7 @@ library
       , Update.Materialize.Ensure
       , Update.Materialize.Floors
       , Update.Materialize.Recipe
+      , Update.Materialize.Resolve
       , Update.Materialize.Sidecar
 
     -- LANGUAGE extensions used by modules in this package.
