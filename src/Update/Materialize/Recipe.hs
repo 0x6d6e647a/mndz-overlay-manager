@@ -67,7 +67,7 @@ renderMaterializeDockerfile arch overlayPath installs =
   T.unlines $
     header
       <> [runCache baseCmds]
-      <> concatMap (installRuns overlay) ordered
+      <> concatMap (installRuns overlay (raKeywords arch)) ordered
       <> builderHome
   where
     overlay = T.pack overlayPath
@@ -105,26 +105,36 @@ kindRank = \case
   TkGo -> 3
   TkBun -> 4
 
-installRuns :: Text -> ResolvedInstall -> [Text]
-installRuns overlay (ResolvedInstall kind rt) = case kind of
+-- | Gentoo @get_libdir@ for mapped KEYWORDS tokens.
+gentooLibdir :: Text -> Text
+gentooLibdir kw
+  | kw `elem` ["amd64", "arm64", "ppc64", "riscv", "s390"] = "lib64"
+  | otherwise = "lib"
+
+installRuns :: Text -> Text -> ResolvedInstall -> [Text]
+installRuns overlay keywords (ResolvedInstall kind rt) = case kind of
   TkRust ->
     [ runCache (portageCmds rt kind ["emerge -n app-portage/pycargoebuild"]),
       ""
     ]
   TkSbcl ->
-    [ runCache (portageCmds rt kind []),
-      "",
-      "RUN mkdir -p /home/builder \\",
-      " && wget -O /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp \\",
-      " && sbcl --non-interactive --no-userinit --no-sysinit \\",
-      "      --load /tmp/quicklisp.lisp \\",
-      "      --eval '(quicklisp-quickstart:install :path \"/home/builder/quicklisp/\")' \\",
-      "      --eval '(ql:quickload :qlot :silent t)' \\",
-      "      --quit \\",
-      " && rm -f /tmp/quicklisp.lisp \\",
-      " && chmod -R a+rX /home/builder/quicklisp",
-      ""
-    ]
+    let libdir = gentooLibdir keywords
+     in [ runCache (portageCmds rt kind []),
+          "",
+          "ENV SBCL_HOME=/usr/" <> libdir <> "/sbcl",
+          "ENV SBCL_SOURCE_ROOT=/usr/" <> libdir <> "/sbcl/src",
+          "",
+          "RUN mkdir -p /home/builder \\",
+          " && aria2c --dir=/tmp --out=quicklisp.lisp --allow-overwrite=true https://beta.quicklisp.org/quicklisp.lisp \\",
+          " && sbcl --non-interactive --no-userinit --no-sysinit \\",
+          "      --load /tmp/quicklisp.lisp \\",
+          "      --eval '(quicklisp-quickstart:install :path \"/home/builder/quicklisp/\")' \\",
+          "      --eval '(ql:quickload :qlot :silent t)' \\",
+          "      --quit \\",
+          " && rm -f /tmp/quicklisp.lisp \\",
+          " && chmod -R a+rX /home/builder/quicklisp",
+          ""
+        ]
   TkNode ->
     [runCache (portageCmds rt kind []), ""]
   TkGo ->

@@ -1466,6 +1466,8 @@ testDockerWrapRequest = do
                   ("GITHUB_TOKEN", "secret"),
                   ("GNUPGHOME", "/home/operator/.gnupg"),
                   ("SSH_AUTH_SOCK", "/tmp/ssh.sock"),
+                  ("SBCL_HOME", "/usr/lib64/sbcl"),
+                  ("SBCL_SOURCE_ROOT", "/usr/lib64/sbcl/src"),
                   ("GOMODCACHE", "/tmp/mndz/overlay-manager/run1/work/go-mod"),
                   ("XZ_OPT", "-T1 -9e")
                 ],
@@ -1492,6 +1494,8 @@ testDockerWrapRequest = do
       assertTrue "no GITHUB_TOKEN" (not (any ("GITHUB_TOKEN" `isInfixOf`) args))
       assertTrue "no GNUPGHOME" (not (any ("GNUPGHOME" `isInfixOf`) args))
       assertTrue "no SSH_AUTH_SOCK" (not (any ("SSH_AUTH_SOCK" `isInfixOf`) args))
+      assertTrue "no SBCL_HOME" (not (any ("SBCL_HOME" `isInfixOf`) args))
+      assertTrue "no SBCL_SOURCE_ROOT" (not (any ("SBCL_SOURCE_ROOT" `isInfixOf`) args))
       assertTrue "keeps GOMODCACHE" (any ("GOMODCACHE=" `isInfixOf`) args)
       assertTrue "keeps XZ_OPT" (any ("XZ_OPT=" `isInfixOf`) args)
     ShellCmd _ -> fail "expected ExecCmd docker"

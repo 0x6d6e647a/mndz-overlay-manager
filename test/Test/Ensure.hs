@@ -114,6 +114,7 @@ unitTests =
       testCase "x86_64 recipe uses amd64-openrc FROM and ~amd64 keywords" testAmd64OpenrcRecipe,
       testCase "ppc64le recipe uses ppc64le-openrc FROM and ~ppc64 keywords" testPpc64leOpenrcRecipe,
       testCase "SBCL testing floor is one emerge plus ::gentoo ~amd64" testRenderSbclTestingFloor,
+      testCase "i686 SBCL recipe uses /usr/lib/sbcl ENV" testRenderSbclX86Libdir,
       testCase "missing sidecar field is a miss" testMissingSidecarField,
       testCase "skip docker build when satisfies" testSkipWhenSatisfies,
       testCase "generator mismatch rebuilds despite floors" testGeneratorMismatchRebuilds,
@@ -190,6 +191,8 @@ testBunOnlyOmitsSbcl = do
   df <- renderMapped "x86_64" [bunInstall "1.2.0" "amd64"] "/overlay"
   assertTrue "recipe has bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` df)
   assertTrue "recipe omits sbcl emerge" (not ("dev-lisp/sbcl" `T.isInfixOf` df))
+  assertTrue "bun-only omits SBCL_HOME" (not ("SBCL_HOME" `T.isInfixOf` df))
+  assertTrue "base still emerges wget" ("net-misc/wget" `T.isInfixOf` df)
 
 testResolvePrefersRustBin :: IO ()
 testResolvePrefersRustBin = do
@@ -425,6 +428,45 @@ testRenderSbclTestingFloor = do
   assertTrue "no sbcl-bin" (not ("sbcl-bin" `T.isInfixOf` df))
   assertTrue "no shell || fallback" (not ("|| emerge" `T.isInfixOf` df))
   assertTrue "no source USE" (not ("[source]" `T.isInfixOf` df))
+  assertTrue
+    "ENV SBCL_HOME lib64"
+    ("ENV SBCL_HOME=/usr/lib64/sbcl" `T.isInfixOf` df)
+  assertTrue
+    "ENV SBCL_SOURCE_ROOT lib64"
+    ("ENV SBCL_SOURCE_ROOT=/usr/lib64/sbcl/src" `T.isInfixOf` df)
+  let (beforeSbcl, _) = T.breakOn "sbcl --non-interactive" df
+  assertTrue
+    "ENV HOME before sbcl"
+    ("ENV SBCL_HOME=/usr/lib64/sbcl" `T.isInfixOf` beforeSbcl)
+  assertTrue
+    "ENV SOURCE_ROOT before sbcl"
+    ("ENV SBCL_SOURCE_ROOT=/usr/lib64/sbcl/src" `T.isInfixOf` beforeSbcl)
+  assertTrue
+    "aria2c fetches installer"
+    ("aria2c --dir=/tmp --out=quicklisp.lisp --allow-overwrite=true https://beta.quicklisp.org/quicklisp.lisp" `T.isInfixOf` df)
+  assertTrue
+    "installer not fetched with wget"
+    (not ("wget -O /tmp/quicklisp.lisp" `T.isInfixOf` df))
+  assertTrue "base still emerges wget" ("net-misc/wget" `T.isInfixOf` df)
+
+testRenderSbclX86Libdir :: IO ()
+testRenderSbclX86Libdir = do
+  let rt =
+        ResolvedToolchain
+          { rtAtom = "dev-lisp/sbcl",
+            rtEmergeSpec = ">=dev-lisp/sbcl-2.6.6",
+            rtAcceptLine = Just ">=dev-lisp/sbcl-2.6.6::gentoo ~x86"
+          }
+  df <- renderMapped "i686" [ResolvedInstall TkSbcl rt] "/overlay"
+  assertTrue
+    "ENV SBCL_HOME lib"
+    ("ENV SBCL_HOME=/usr/lib/sbcl" `T.isInfixOf` df)
+  assertTrue
+    "ENV SBCL_SOURCE_ROOT lib"
+    ("ENV SBCL_SOURCE_ROOT=/usr/lib/sbcl/src" `T.isInfixOf` df)
+  assertTrue
+    "not lib64 on x86"
+    (not ("/usr/lib64/sbcl" `T.isInfixOf` df))
 
 renderMapped :: String -> [ResolvedInstall] -> FilePath -> IO T.Text
 renderMapped uname installs overlay =

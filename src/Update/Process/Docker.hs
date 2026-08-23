@@ -58,7 +58,14 @@ secretMaterializeEnvKeys =
   ]
 
 forcedEnvKeys :: [String]
-forcedEnvKeys = ["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "PATH"]
+forcedEnvKeys =
+  [ "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "PATH",
+    "SBCL_HOME",
+    "SBCL_SOURCE_ROOT"
+  ]
 
 -- | Bind-mount + identity settings for one @docker run@.
 data MaterializeDockerCfg = MaterializeDockerCfg
