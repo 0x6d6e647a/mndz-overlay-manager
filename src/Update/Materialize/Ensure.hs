@@ -16,7 +16,8 @@ module Update.Materialize.Ensure
     ensureMaterializeImage,
     prunePreviousMaterializeImage,
     defaultMaterializeSidecarDir,
-    hostRecipeArch,
+    hostMachineArch,
+    unmappedArchMessage,
     productionEnsureNow,
   )
 where
@@ -51,7 +52,8 @@ import Update.Materialize.Floors
     unionFloors,
   )
 import Update.Materialize.Recipe
-  ( RecipeArch (..),
+  ( RecipeArch,
+    lookupRecipeArch,
     renderMaterializeDockerfile,
   )
 import Update.Materialize.Sidecar
@@ -105,7 +107,8 @@ data EnsureConfig = EnsureConfig
     ecOverlayRoot :: FilePath,
     ecSidecarDir :: FilePath,
     ecNow :: IO UTCTime,
-    ecArch :: RecipeArch,
+    -- | Host @uname -m@. Mapped when ensure is about to generate/build.
+    ecUname :: String,
     -- | Non-empty @MNDZ_MATERIALIZE_IMAGE@ override, if set.
     ecOverrideTag :: Maybe String,
     -- | Previous default-tag image id remembered for prune-after-mutate.
@@ -124,6 +127,12 @@ ensureFailedMessage :: Text -> Text
 ensureFailedMessage err =
   "failed to ensure materialize image: " <> err
 
+-- | Default-tag generate path when @uname -m@ has no official OpenRC stage3.
+unmappedArchMessage :: String -> Text
+unmappedArchMessage uname =
+  "no official gentoo/stage3 OpenRC flavor for host architecture "
+    <> T.pack uname
+
 imageDiskInsufficientMessage :: FilePath -> Integer -> Integer -> Text
 imageDiskInsufficientMessage path free need =
   "insufficient free space to docker build the materialize image:\n  "
@@ -141,15 +150,8 @@ defaultMaterializeSidecarDir = do
   xdg <- lookupEnv "XDG_CACHE_HOME"
   defaultMaterializeSidecarDirFromEnv xdg <$> getHomeDirectory
 
-hostRecipeArch :: IO RecipeArch
-hostRecipeArch = do
-  sid <- getSystemID
-  pure $ RecipeArch $ case machine sid of
-    "x86_64" -> "amd64"
-    "amd64" -> "amd64"
-    "aarch64" -> "arm64"
-    "arm64" -> "arm64"
-    other -> T.pack other
+hostMachineArch :: IO String
+hostMachineArch = machine <$> getSystemID
 
 readOverlayBunFloor :: FilePath -> IO (Maybe Text)
 readOverlayBunFloor overlayRoot = do
@@ -203,17 +205,22 @@ ensureDefault cfg needed = do
   case (eId, mSide) of
     (Right iid, Just side)
       | T.unpack (isId side) == iid,
-        floorsSatisfy (isSatisfies side) needed ->
+        floorsSatisfy (isSatisfies side) needed,
+        isGenerator side == materializeGeneratorId ->
           pure (Right EnsureSkipped)
-    _ -> do
-      let oldSatisfies = maybe emptyFloors isSatisfies mSide
-          unioned = unionFloors oldSatisfies needed
-          oldId = either (const Nothing) Just eId
-      eDisk <- imageDiskGate cfg (isFirstImage mSide eId)
-      case eDisk of
-        Left err -> pure (Left (ensureFailedMessage err))
-        Right () ->
-          buildAndRecord cfg tag oldId unioned
+    _ ->
+      case lookupRecipeArch (ecUname cfg) of
+        Nothing ->
+          pure (Left (ensureFailedMessage (unmappedArchMessage (ecUname cfg))))
+        Just arch -> do
+          let oldSatisfies = maybe emptyFloors isSatisfies mSide
+              unioned = unionFloors oldSatisfies needed
+              oldId = either (const Nothing) Just eId
+          eDisk <- imageDiskGate cfg (isFirstImage mSide eId)
+          case eDisk of
+            Left err -> pure (Left (ensureFailedMessage err))
+            Right () ->
+              buildAndRecord cfg tag oldId unioned arch
   where
     isFirstImage mSide eId = case (eId, mSide) of
       (Right _, Just _) -> False
@@ -224,14 +231,15 @@ buildAndRecord ::
   String ->
   Maybe String ->
   NeededFloors ->
+  RecipeArch ->
   IO (Either Text EnsureOutcome)
-buildAndRecord cfg tag oldId unioned = do
+buildAndRecord cfg tag oldId unioned arch = do
   let sidecarDir = ecSidecarDir cfg
       dfPath = sidecarDockerfilePath sidecarDir
       ctxDir = sidecarDir </> "context"
       overlay = ecOverlayRoot cfg
       dockerfile =
-        renderMaterializeDockerfile unioned (ecArch cfg) overlay
+        renderMaterializeDockerfile unioned arch overlay
   createDirectoryIfMissing True ctxDir
   TIO.writeFile dfPath dockerfile
   -- Remember previous id before retag.

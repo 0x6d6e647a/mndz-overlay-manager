@@ -69,7 +69,7 @@ import Update.Materialize
   ( EnsureConfig (..),
     defaultMaterializeSidecarDir,
     ensureMaterializeImage,
-    hostRecipeArch,
+    hostMachineArch,
     productionEnsureNow,
     prunePreviousMaterializeImage,
   )
@@ -260,7 +260,7 @@ runUpdate rt refresh pkgArgs = do
             teardownGpgHandle
             ( \gpg -> do
                 sidecarDir <- defaultMaterializeSidecarDir
-                arch <- hostRecipeArch
+                uname <- hostMachineArch
                 mOvr <- lookupEnv materializeImageEnvVar
                 prev <- newMVar Nothing
                 let ovr = case mOvr of
@@ -273,7 +273,7 @@ runUpdate rt refresh pkgArgs = do
                           ecOverlayRoot = overlayPath,
                           ecSidecarDir = sidecarDir,
                           ecNow = productionEnsureNow,
-                          ecArch = arch,
+                          ecUname = uname,
                           ecOverrideTag = ovr,
                           ecPrevImageId = prev
                         }

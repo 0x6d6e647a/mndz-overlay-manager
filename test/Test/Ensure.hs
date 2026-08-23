@@ -8,6 +8,7 @@ import Control.Concurrent.MVar (modifyMVar_, newMVar)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.Maybe (isNothing)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Time (UTCTime (..), fromGregorian)
@@ -45,11 +46,13 @@ import Update.Materialize
     defaultMaterializeSidecarDirFromEnv,
     emptyFloors,
     encodeImageSidecar,
+    ensureFailedMessage,
     ensureMaterializeImage,
     firstImageNeedBytes,
     floorsSatisfy,
     imageDiskInsufficientMessage,
     imageSidecarSchemaVersion,
+    lookupRecipeArch,
     materializeGeneratorId,
     neededFloorsFromClassified,
     overrideUnusableMessage,
@@ -57,6 +60,7 @@ import Update.Materialize
     renderMaterializeDockerfile,
     sidecarImageJsonPath,
     unionFloors,
+    unmappedArchMessage,
   )
 import Update.Process
   ( ProcessMode (..),
@@ -82,8 +86,14 @@ unitTests =
     [ testCase "union/satisfy Go floors" testUnionSatisfy,
       testCase "Bun-only first image omits SBCL" testBunOnlyOmitsSbcl,
       testCase "render contains ::mndz and no official tarball URLs" testRenderMndzNoOfficial,
+      testCase "uname map splits KEYWORDS from OpenRC Hub tag" testLookupRecipeArch,
+      testCase "x86_64 recipe uses amd64-openrc FROM and ~amd64 keywords" testAmd64OpenrcRecipe,
+      testCase "ppc64le recipe uses ppc64le-openrc FROM and ~ppc64 keywords" testPpc64leOpenrcRecipe,
       testCase "missing sidecar field is a miss" testMissingSidecarField,
       testCase "skip docker build when satisfies" testSkipWhenSatisfies,
+      testCase "generator mismatch rebuilds despite floors" testGeneratorMismatchRebuilds,
+      testCase "unmapped uname hard-fails without docker build" testUnmappedDefaultNoBuild,
+      testCase "override on unmapped uname skips generate" testOverrideUnmappedNoBuild,
       testCase "override missing hard-fails without build" testOverrideMissingNoBuild,
       testCase "fake build records union satisfies" testFakeBuildRecordsUnion,
       testCase "image disk gate skipped when satisfies" testDiskGateSkippedWhenSatisfies,
@@ -141,7 +151,7 @@ testBunOnlyOmitsSbcl = do
   assertEq "bun floor" (Just "1.2.0") (nfBun needed)
   assertEq "no SBCL on first bun-only" Nothing (nfSbcl needed)
   assertEq "no Go on bun-only" Nothing (nfGo needed)
-  let df = renderMaterializeDockerfile needed (RecipeArch "amd64") "/overlay"
+  df <- renderMapped "x86_64" needed "/overlay"
   assertTrue "recipe has bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` df)
   assertTrue "recipe omits sbcl emerge" (not ("dev-lisp/sbcl" `T.isInfixOf` df))
 
@@ -152,7 +162,7 @@ testRenderMndzNoOfficial = do
           { nfGo = Just "1.26.5",
             nfBun = Just "1.2.21"
           }
-      df = renderMaterializeDockerfile floors (RecipeArch "amd64") "/home/op/overlay"
+  df <- renderMapped "x86_64" floors "/home/op/overlay"
   assertTrue "::mndz" ("::mndz" `T.isInfixOf` df)
   assertTrue "accept_keywords bun-bin" ("dev-lang/bun-bin::mndz ~amd64" `T.isInfixOf` df)
   assertTrue "go via portage" ("dev-lang/go" `T.isInfixOf` df)
@@ -164,6 +174,65 @@ testRenderMndzNoOfficial = do
   assertTrue "overlay bind ro" (",ro" `T.isInfixOf` df)
   assertTrue "DISTDIR cache" ("/var/cache/distfiles" `T.isInfixOf` df)
   assertTrue "PKGDIR cache" ("/var/cache/binpkgs" `T.isInfixOf` df)
+
+testLookupRecipeArch :: IO ()
+testLookupRecipeArch = do
+  let rows =
+        [ ("x86_64", "amd64", "amd64-openrc"),
+          ("amd64", "amd64", "amd64-openrc"),
+          ("aarch64", "arm64", "arm64-openrc"),
+          ("arm64", "arm64", "arm64-openrc"),
+          ("ppc64le", "ppc64", "ppc64le-openrc"),
+          ("riscv64", "riscv", "rv64_lp64d-openrc"),
+          ("s390x", "s390", "s390x-openrc"),
+          ("i686", "x86", "i686-openrc"),
+          ("i386", "x86", "i686-openrc"),
+          ("armv7l", "arm", "armv7a_hardfp-openrc"),
+          ("armv6l", "arm", "armv6j_hardfp-openrc")
+        ]
+  mapM_ assertMapped rows
+  assertTrue "sparc64 is a miss" (isNothing (lookupRecipeArch "sparc64"))
+  assertTrue "ppc64 BE is a miss" (isNothing (lookupRecipeArch "ppc64"))
+  assertTrue "loongarch64 is a miss" (isNothing (lookupRecipeArch "loongarch64"))
+  where
+    assertMapped (uname, kw, hub) =
+      case lookupRecipeArch uname of
+        Nothing -> assertFailure (uname <> " should map")
+        Just arch -> do
+          assertEq (uname <> " keywords") kw (raKeywords arch)
+          assertEq (uname <> " hub") hub (raHubTag arch)
+
+testAmd64OpenrcRecipe :: IO ()
+testAmd64OpenrcRecipe = do
+  df <- renderMapped "x86_64" bunFloors "/overlay"
+  assertTrue
+    "OpenRC FROM"
+    ("FROM gentoo/stage3:amd64-openrc" `T.isInfixOf` df)
+  assertTrue
+    "not fossil amd64 FROM line"
+    (not ("FROM gentoo/stage3:amd64\n" `T.isInfixOf` df))
+  assertTrue
+    "bun-bin KEYWORDS"
+    ("dev-lang/bun-bin::mndz ~amd64" `T.isInfixOf` df)
+
+testPpc64leOpenrcRecipe :: IO ()
+testPpc64leOpenrcRecipe = do
+  df <- renderMapped "ppc64le" bunFloors "/overlay"
+  assertTrue
+    "OpenRC FROM"
+    ("FROM gentoo/stage3:ppc64le-openrc" `T.isInfixOf` df)
+  assertTrue
+    "bun-bin KEYWORDS ppc64"
+    ("dev-lang/bun-bin::mndz ~ppc64" `T.isInfixOf` df)
+
+bunFloors :: NeededFloors
+bunFloors = emptyFloors {nfBun = Just "1.2.21"}
+
+renderMapped :: String -> NeededFloors -> FilePath -> IO T.Text
+renderMapped uname floors overlay =
+  case lookupRecipeArch uname of
+    Nothing -> assertFailure (uname <> " should map")
+    Just arch -> pure (renderMaterializeDockerfile floors arch overlay)
 
 testMissingSidecarField :: IO ()
 testMissingSidecarField = do
@@ -313,7 +382,18 @@ mkCfg ::
   DiskSpaceProbe ->
   Maybe String ->
   IO EnsureConfig
-mkCfg overlay sidecar fake probe mOverride = do
+mkCfg overlay sidecar fake probe mOverride =
+  mkCfgUname overlay sidecar fake probe mOverride "x86_64"
+
+mkCfgUname ::
+  FilePath ->
+  FilePath ->
+  FakeDocker ->
+  DiskSpaceProbe ->
+  Maybe String ->
+  String ->
+  IO EnsureConfig
+mkCfgUname overlay sidecar fake probe mOverride uname = do
   prev <- newMVar Nothing
   pure
     EnsureConfig
@@ -322,7 +402,7 @@ mkCfg overlay sidecar fake probe mOverride = do
         ecOverlayRoot = overlay,
         ecSidecarDir = sidecar,
         ecNow = pure epoch,
-        ecArch = RecipeArch "amd64",
+        ecUname = uname,
         ecOverrideTag = mOverride,
         ecPrevImageId = prev
       }
@@ -331,7 +411,11 @@ neededGo :: NeededFloors
 neededGo = emptyFloors {nfGo = Just "1.26.4"}
 
 writeSidecarGo :: FilePath -> String -> T.Text -> IO ()
-writeSidecarGo dir iid goVer = do
+writeSidecarGo dir iid goVer =
+  writeSidecarGoGen dir iid goVer materializeGeneratorId
+
+writeSidecarGoGen :: FilePath -> String -> T.Text -> T.Text -> IO ()
+writeSidecarGoGen dir iid goVer gen = do
   createDirectoryIfMissing True dir
   let side =
         ImageSidecar
@@ -339,7 +423,7 @@ writeSidecarGo dir iid goVer = do
             isId = T.pack iid,
             isTag = T.pack defaultMaterializeImage,
             isSatisfies = emptyFloors {nfGo = Just goVer},
-            isGenerator = materializeGeneratorId,
+            isGenerator = gen,
             isBuiltAt = epoch
           }
   BS.writeFile (sidecarImageJsonPath dir) (LBS.toStrict (encodeImageSidecar side))
@@ -362,6 +446,81 @@ testSkipWhenSatisfies =
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
     got <- ensureMaterializeImage cfg neededGo
     assertEq "skipped" (Right EnsureSkipped) got
+    calls <- readIORef builds
+    assertEq "no docker build" [] calls
+
+testGeneratorMismatchRebuilds :: IO ()
+testGeneratorMismatchRebuilds =
+  withSystemTempDirectory "om-ensure-gen" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:stale-gen"
+    createDirectoryIfMissing True overlay
+    writeSidecarGoGen sidecar iid "1.26.5" "mndz-overlay-manager-materialize-1"
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = True,
+              fdInspectId = iid,
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    got <- ensureMaterializeImage cfg neededGo
+    assertEq "rebuilt" (Right EnsureBuilt) got
+    calls <- readIORef builds
+    assertTrue "docker build ran" (any ("-t" `elem`) calls)
+    bs <- BS.readFile (sidecarImageJsonPath sidecar)
+    case decodeImageSidecar bs of
+      Left err -> assertFailure err
+      Right side ->
+        assertEq "records current generator" materializeGeneratorId (isGenerator side)
+
+testUnmappedDefaultNoBuild :: IO ()
+testUnmappedDefaultNoBuild =
+  withSystemTempDirectory "om-ensure-unmapped" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        uname = "sparc64"
+    createDirectoryIfMissing True overlay
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = False,
+              fdInspectId = "",
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfgUname overlay sidecar fake plentyDisk Nothing uname
+    got <- ensureMaterializeImage cfg neededGo
+    case got of
+      Left msg -> do
+        assertTrue "names sparc64" ("sparc64" `T.isInfixOf` msg)
+        assertEq "uses unmapped helper" (ensureFailedMessage (unmappedArchMessage uname)) msg
+        assertTrue
+          "no host-path fallback copy"
+          (not ("host-path" `T.isInfixOf` msg))
+      Right o -> assertFailure ("expected unmapped fail, got " <> show o)
+    calls <- readIORef builds
+    assertEq "no docker build" [] calls
+    dfExists <- doesFileExist (sidecar </> "Dockerfile")
+    assertTrue "did not write a fossil FROM recipe" (not dfExists)
+
+testOverrideUnmappedNoBuild :: IO ()
+testOverrideUnmappedNoBuild =
+  withSystemTempDirectory "om-ensure-ovr-unmapped" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        tag = "example/materialize:ci"
+    createDirectoryIfMissing True overlay
+    builds <- mkLogRef
+    let fake =
+          FakeDocker
+            { fdInspectOk = True,
+              fdInspectId = "sha256:override",
+              fdBuildShouldRun = builds
+            }
+    cfg <- mkCfgUname overlay sidecar fake plentyDisk (Just tag) "sparc64"
+    got <- ensureMaterializeImage cfg neededGo
+    assertEq "inspect-only skip" (Right EnsureSkipped) got
     calls <- readIORef builds
     assertEq "no docker build" [] calls
 

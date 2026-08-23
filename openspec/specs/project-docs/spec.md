@@ -278,7 +278,7 @@ Operator documentation in `README.md` SHALL document the optional `check-cache-t
 1. That `update` of DepsAndAssets packages that need **full-path** materialize requires `docker` on `PATH` and a product Gentoo materialize image (host CPU architecture), and does not require host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` for that path.
 2. That reuse of existing assets releases does not require Docker or those language tools.
 3. That GPG-signed commits, SSH `git push`, GitHub token, `ebuild` / `egencache`, and overlay/assets worktrees stay on the host.
-4. That `update` **ensures** the default materialize image when full-path work needs it (generate and `docker build` if the current image does not satisfy those floors); that GitMv/reuse may proceed while ensure runs; that Bun in the image comes from overlay `dev-lang/bun-bin::mndz`; that metadata lives under the XDG cache `…/mndz/overlay-manager/materialize/` (`image.json`); that `MNDZ_MATERIALIZE_IMAGE` uses an existing tag and is not built or deleted by the CLI; that a manual `docker build` of an in-repo Dockerfile is **not** a required prerequisite of `update`; and that the git tree SHALL NOT ship `docker/materialize/` (recipe or pointer) as operator documentation.
+4. That `update` **ensures** the default materialize image when full-path work needs it (generate and `docker build` if the current image does not satisfy those floors); that GitMv/reuse may proceed while ensure runs; that Bun in the image comes from overlay `dev-lang/bun-bin::mndz`; that metadata lives under the XDG cache `…/mndz/overlay-manager/materialize/` (`image.json`); that `MNDZ_MATERIALIZE_IMAGE` uses an existing tag and is not built or deleted by the CLI; that a manual `docker build` of an in-repo Dockerfile is **not** a required prerequisite of `update`; that the git tree SHALL NOT ship `docker/materialize/` (recipe or pointer) as operator documentation; that ensure’s generated recipe uses an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture; and that a host architecture with no such official flavor hard-fails ensure (no host language-toolchain fallback).
 5. That work commands warn when the overlay-manager TOML is not mode `0600`, without changing token resolution.
 
 #### Scenario: Operator finds Docker in the runtime table
@@ -302,6 +302,12 @@ Operator documentation in `README.md` SHALL document the optional `check-cache-t
 - **WHEN** an operator inspects the repository for a materialize Docker recipe
 - **THEN** there is no `docker/materialize/` directory (Dockerfile or pointer README)
 - **AND** `README.md` is the operator documentation for image ensure
+
+#### Scenario: Operator finds OpenRC stage3 and unsupported-arch hard-fail
+
+- **WHEN** an operator reads `README.md` materialize image documentation
+- **THEN** the text states that ensure uses an official Gentoo OpenRC stage3 for the host CPU architecture
+- **AND** that a host architecture without such an image hard-fails (host `go`/`npm`/`bun` are not used instead)
 
 ### Requirement: README documents overlay apply order and blocked-on
 
