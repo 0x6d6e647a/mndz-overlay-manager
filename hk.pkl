@@ -76,6 +76,9 @@ hooks {
   }
   ["fix"] {
     fix = true
+    // Format the worktree only; do not git add. Pre-commit still restages
+    // already-staged files it formats (default stage = true + stash = "git").
+    stage = false
     steps {
       ["tools-preflight"] = linters["tools-preflight"]
       ["ormolu"] = linters["ormolu"]

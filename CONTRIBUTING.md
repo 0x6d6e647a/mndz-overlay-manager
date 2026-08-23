@@ -101,7 +101,7 @@ With a global install, repos **without** `hk.pkl` are a no-op; this repo has `hk
 hk check
 ```
 
-All steps must pass before you commit (pre-commit runs the same gates, with ormolu allowed to fix).
+All steps must pass before you commit (pre-commit runs the same gates, with ormolu allowed to fix already-staged files and restage them; unstaged hunks are stashed first so they are not pulled into the commit).
 
 ### Building and running the program
 
@@ -145,7 +145,7 @@ Prefer fixing new findings over widening excludes. When you deliberately change 
 
 ```bash
 hk check          # full gate (same as pre-commit, check-oriented)
-hk fix            # preflight + ormolu inplace only
+hk fix            # preflight + ormolu inplace only (does not git add)
 ```
 
 Do not run stan/weeder without a recent successful non-coverage `cabal build all` (HIE must match sources and GHC). Coverage builds use a separate Cabal plan and must not be treated as the HIE source for analyzers.
@@ -154,7 +154,7 @@ Do not run stan/weeder without a recent successful non-coverage `cabal build all
 
 ```bash
 hk check          # full gate (build + coverage + analyzers)
-hk fix            # preflight + ormolu fix only
+hk fix            # preflight + ormolu inplace; does not stage files
 hk run pre-commit # exercise the pre-commit hook without committing
 
 ./scripts/coverage   # instrumented tests + HPC reports only
@@ -200,7 +200,7 @@ Generated coverage output is **gitignored** — do not commit HTML, `.tix`, or s
 ### Edit → verify loop
 
 1. Implement the change (prefer OpenSpec change tasks when one is active).
-2. Format: `hk fix` or `.tools/bin/ormolu --mode inplace …`.
+2. Format: `hk fix` or `.tools/bin/ormolu --mode inplace …` (`hk fix` does not `git add`; stage files yourself when you want them in a commit).
 3. Tests: `./scripts/coverage` (or full `hk check`). For a quick uninstrumented smoke: `cabal test all`.
 4. Fix hlint/stan/weeder findings; do not weaken configs without intent.
 5. Re-run `hk check` until green.
@@ -211,7 +211,7 @@ Generated coverage output is **gitignored** — do not commit HTML, `.tix`, or s
 | Symptom | What to do |
 |---------|------------|
 | `missing project tool: .tools/bin/...` | Run `./scripts/install-dev-tools` |
-| ormolu wants a reformat | `hk fix` or `.tools/bin/ormolu --mode inplace path/to/File.hs` |
+| ormolu wants a reformat | `hk fix` or `.tools/bin/ormolu --mode inplace path/to/File.hs` (`hk fix` does not stage) |
 | tests / build fail | Fix compile/test errors; `cabal test all` or `./scripts/coverage` locally |
 | coverage report missing / script error | Ensure `hpc` is on PATH (ships with GHC); inspect `scripts/coverage` output; confirm `.tix` under `dist-newstyle/.../hpc/vanilla/tix/` |
 | hlint hints | Apply suggestions or adjust code; default hlint must be clean |
