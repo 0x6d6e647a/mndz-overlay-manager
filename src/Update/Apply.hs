@@ -34,14 +34,14 @@ import CLI.Progress
 import Control.Concurrent (newQSem, signalQSem, waitQSem)
 import Control.Concurrent.Async (mapConcurrently_, wait, withAsync)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Exception (bracket_)
 import Control.Monad (replicateM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isJust, mapMaybe)
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Update.Apply.Env
@@ -138,8 +138,8 @@ data MutateEnsure = MutateEnsure
     meImageEnsure :: ImageEnsure,
     -- | GitMv key whose signed commit waits until ensure finishes.
     meDelayCommit :: Maybe PackageKey,
-    -- | GitMv key whose file work must finish before @docker build@.
-    meGateEnsureOnFiles :: Maybe PackageKey,
+    -- | GitMv keys whose overlay file work must finish before @docker build@.
+    meGateEnsureOnFiles :: [PackageKey],
     -- | Run t0 ensure even when no admitted full-path package exists.
     meRunEnsure :: Bool
   }
@@ -254,8 +254,21 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
       mh = aeMulti env
       panelCount = length readyWork + length ensureWork + Map.size withheld0
       delayKey = meDelayCommit mutate
+      gateKeys = meGateEnsureOnFiles mutate
+      isGitMvWork = \case
+        PlannedGitMv {} -> True
+        _ -> False
       delayInReady =
-        maybe False (\k -> any (\(e, _) -> peKey e == k) readyWork) delayKey
+        maybe
+          False
+          (\k -> any (\(e, w) -> peKey e == k && isGitMvWork w) readyWork)
+          delayKey
+      nGates =
+        length
+          [ k
+          | k <- gateKeys,
+            any (\(e, w) -> peKey e == k && isGitMvWork w) readyWork
+          ]
   if panelCount == 0
     then pure []
     else do
@@ -266,8 +279,10 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
       withheldRef <- newIORef withheld0
       filesReady <- newEmptyMVar
       pendingVar <- newEmptyMVar
-      unless delayInReady $
-        putMVar filesReady (Right ())
+      remainingGates <- newIORef nGates
+      when (nGates == 0) $
+        void $
+          tryPutMVar filesReady (Right ())
       for_ readyWork $ \item -> writeChan chan (Just item)
       let finishOne = do
             n <- atomicModifyIORef' remaining (\x -> let x' = x - 1 in (x', x'))
@@ -320,10 +335,15 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
               recordOutcomes [ApplyHardFail k err False False]
               finishOne
           delayedGitMv key work =
-            delayKey == Just key
-              && case work of
-                PlannedGitMv {} -> True
-                _ -> False
+            delayKey == Just key && isGitMvWork work
+          gatedGitMv key work =
+            key `elem` gateKeys && isGitMvWork work && delayKey /= Just key
+          signalFiles result = void $ tryPutMVar filesReady result
+          signalGateDone result = case result of
+            Left err -> signalFiles (Left err)
+            Right () -> do
+              n <- atomicModifyIORef' remainingGates (\x -> let x' = x - 1 in (x', x'))
+              when (n == 0) $ signalFiles (Right ())
           worker = do
             item <- readChan chan
             case item of
@@ -338,13 +358,25 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                     case fileResult of
                       Left outcome -> do
                         presentApplyChrome mh (peKey entry) [outcome]
-                        putMVar filesReady (Left (outcomeMessage outcome))
+                        signalGateDone (Left (outcomeMessage outcome))
                         handleDone (peKey entry) [outcome]
                         worker
                       Right pending -> do
                         putMVar pendingVar pending
-                        putMVar filesReady (Right ())
+                        signalGateDone (Right ())
                         worker
+                | gatedGitMv (peKey entry) work -> do
+                    outs <-
+                      bracket_
+                        (waitQSem sem)
+                        (signalQSem sem)
+                        (applyNeedsWorkTracked env overlayRoot entry work)
+                    signalGateDone $
+                      case [m | ApplyHardFail _ m _ _ <- outs] of
+                        (m : _) -> Left m
+                        [] -> Right ()
+                    handleDone (peKey entry) outs
+                    worker
                 | otherwise -> do
                     outs <-
                       bracket_
@@ -353,7 +385,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                         (applyNeedsWorkTracked env overlayRoot entry work)
                     handleDone (peKey entry) outs
                     worker
-          gated = isJust (meGateEnsureOnFiles mutate)
+          gated = not (null gateKeys)
           runEnsure = do
             filesBefore <-
               if gated

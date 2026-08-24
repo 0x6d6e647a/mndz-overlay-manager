@@ -40,13 +40,14 @@ The program SHALL model a package policy that binds a package key `category/pack
 The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay that this manager automates, each with both a source and a technique. At minimum:
 
 - `dev-lang/bun-bin`, `dev-lang/deno-bin`, and `dev-util/grok-build-bin` SHALL use `GitMvAndManifest`
+- `dev-lisp/qlot` SHALL use `GitMvAndManifest` with GitHub source `fukamachi/qlot` and an empty tag prefix
 - `dev-db/dolt` (go.mod subdir `go`), `dev-util/beads` (root), `dev-util/crush` (root), and `dev-db/badger` (root) SHALL use `DepsAndAssets` with ecosystem `Go` and their existing GitHub sources (`dolthub/dolt`, `gastownhall/beads`, `charmbracelet/crush`, `dgraph-io/badger` with tag prefix `v`)
 - `dev-util/openspec` SHALL use `DepsAndAssets Npm` with its npm source
 - `dev-util/ralph-tui` and `dev-util/opencode` SHALL use `DepsAndAssets Bun` with GitHub sources (`subsy/ralph-tui`, `anomalyco/opencode`, tag prefix `v`)
 - `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets Cargo` with GitHub sources (`jdx` / respective repos / tag prefix `v`); `usage` SHALL use package subdirectory `cli` when required for package metadata
 - `dev-util/autolith` SHALL use `DepsAndAssets Sbcl` with GitHub source `luciusmagn/autolith` and tag prefix `v`
 
-The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone.
+The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone. `dev-lisp/qlot` SHALL NOT be an overlay wait-edge provider for Autolith or other packages.
 
 #### Scenario: Simple binary package is GitMvAndManifest
 
@@ -95,6 +96,12 @@ The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for c
 - **WHEN** policy is resolved for `dev-util/opencode-bin`
 - **THEN** no policy entry is returned (unconfigured)
 
+#### Scenario: qlot is GitMvAndManifest
+
+- **WHEN** policy is resolved for `dev-lisp/qlot`
+- **THEN** the technique is `GitMvAndManifest`
+- **AND** the source is GitHub `fukamachi/qlot` with an empty tag prefix
+
 ### Requirement: Preserve Autolith template body on Sbcl apply
 
 When rewriting a `DepsAndAssets Sbcl` ebuild for assets parameterization, SBCL atom alignment, KEYWORDS, or PV filename update, the program SHALL preserve template-owned body that is not those rewritten fields. This includes private-prefix install logic, wrapper generation, identity stamping, network-install disablement, core build steps, `IUSE`/`RESTRICT` test gating, and any non-assets `SRC_URI` companions or `FILESDIR`/`PATCHES` references present on the donor ebuild. The program SHALL NOT strip those constructs when parameterizing deps assets URLs to `${PV}`.
@@ -127,6 +134,17 @@ Other GitMv packages SHALL keep commit-on-unit-success. The program SHALL NOT de
 
 - **WHEN** the only needs-work package is `dev-lang/bun-bin` and no full-path unit requires ensure
 - **THEN** bun-bin’s signed overlay commit is created after egencache without waiting on docker
+
+### Requirement: Overlay qlot GitMv file work precedes qlot-layer docker
+
+When `update` **will ensure** a materialize image in this run and the recipe will `emerge` `dev-lisp/qlot::mndz`, and overlay qlot is selected and needs `GitMvAndManifest` work, the program SHALL complete qlot rename, `ebuild … manifest`, and package `egencache` **before** that `docker build`. The program SHALL NOT delay qlot’s signed overlay commit until ensure finishes solely because ensure ran (qlot is not an overlay wait-edge provider). Autolith and other packages SHALL NOT be withheld on qlot. Independent GitMv that the image does not emerge may overlap ensure as already specified for bun-bin.
+
+#### Scenario: qlot Manifest before docker; commit not delayed
+
+- **WHEN** untargeted `update` needs GitMv work on `dev-lisp/qlot` and full-path work on Autolith, and the recipe will emerge overlay qlot
+- **THEN** qlot rename, Manifest, and egencache complete before that `docker build`
+- **AND** qlot’s signed overlay commit is not required to wait until ensure finishes
+- **AND** Autolith is not presented as waiting on `dev-lisp/qlot`
 
 ### Requirement: Hypo-planned consumer overlay write asserts provider PV
 

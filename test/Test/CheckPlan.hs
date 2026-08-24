@@ -70,7 +70,8 @@ unitTests =
           testCase "ok" testCheckPackageOk,
           testCase "ahead" testCheckPackageAhead,
           testCase "fetch error" testCheckPackageFetchError,
-          testCase "unconfigured" testCheckPackageUnconfigured
+          testCase "unconfigured" testCheckPackageUnconfigured,
+          testCase "qlot outdated empty tag prefix" testCheckPackageQlotOutdated
         ],
       testGroup
         "checkPackageDeps"
@@ -268,6 +269,21 @@ testCheckPackageFetchError = do
   case reportStatus report of
     FetchError msg -> assertTrue "error text" ("network down" `T.isInfixOf` msg)
     other -> assertFailure $ "expected FetchError, got " <> show other
+
+testCheckPackageQlotOutdated :: IO ()
+testCheckPackageQlotOutdated = do
+  let e = entry "dev-lisp" "qlot" "1.8.4"
+      fetch src = case src of
+        GitHub "fukamachi" "qlot" "" ->
+          pure (Right (parseEbuildVersion "1.8.5"))
+        _ -> pure (Left "unexpected qlot source")
+  cache <- disabledCache
+  report <- checkPackage fetch cache e []
+  case reportStatus report of
+    Outdated [line] -> do
+      assertEq "from" (parseEbuildVersion "1.8.4") (olFrom line)
+      assertEq "to" (parseEbuildVersion "1.8.5") (olTo line)
+    other -> assertFailure $ "expected qlot Outdated, got " <> show other
 
 testCheckPackageUnconfigured :: IO ()
 testCheckPackageUnconfigured = do

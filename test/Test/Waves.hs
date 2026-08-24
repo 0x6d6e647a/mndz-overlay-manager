@@ -17,6 +17,7 @@ import Control.Concurrent.MVar
     putMVar,
     takeMVar,
   )
+import Control.Monad (when)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text qualified as T
@@ -32,7 +33,11 @@ import System.FilePath (takeBaseName, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (callProcess)
 import Test.Assert (assertEq, assertTrue)
-import Test.Support (mockEgencacheWriteMatching, writeMatchingCachesForPackage)
+import Test.Support
+  ( dualArchGoCeilings,
+    mockEgencacheWriteMatching,
+    writeMatchingCachesForPackage,
+  )
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Assets.Hash (digestSHA512, hashBytes)
@@ -53,6 +58,7 @@ import Update.DiskSpace (DiskSpaceProbe (..))
 import Update.Git (GitOps (..))
 import Update.Materialize (EnsureOutcome (..), NeededFloors (..))
 import Update.Preflight (AssetsPreflight (..))
+import Update.Runtime.Ceilings (RuntimeCeilings (..))
 import Update.Spine
   ( UpdateSpineDeps (..),
     UpdateSpineResult (..),
@@ -70,6 +76,11 @@ import Update.Types
     UpdateSource (..),
     mkPackageKey,
   )
+
+waveSbclCeilings :: RuntimeCeilings
+waveSbclCeilings =
+  let base = dualArchGoCeilings (Just "2.6.2") (Just "2.6.6")
+   in base {rcAtom = "dev-lisp/sbcl"}
 
 integrationTests :: TestTree
 integrationTests =
@@ -122,7 +133,16 @@ integrationTests =
         testSafetyAssertMismatch,
       testCase
         "hypo ralph plan is not cached under old bun-bin fingerprint"
-        testHypoPlanNotCachedUnderOldBunBin
+        testHypoPlanNotCachedUnderOldBunBin,
+      testCase
+        "leftover qlot dirt fails Autolith without ensure"
+        testDirtyQlotFailsAutolith,
+      testCase
+        "qlot-only GitMv never calls image ensure"
+        testQlotOnlyNeverEnsure,
+      testCase
+        "ensure waits for qlot Manifest; qlot commit is not delayed"
+        testEnsureWaitsForQlotManifestCommitNotDelayed
     ]
 
 ------------------------------------------------------------------------
@@ -1046,3 +1066,189 @@ testHypoPlanNotCachedUnderOldBunBin =
           hit
         -- Silence unused cacheDir (handle is in-memory + overlay path).
         createDirectoryIfMissing True cacheDir
+
+seedQlot :: FilePath -> T.Text -> IO FilePath
+seedQlot overlay ver = do
+  let pkgDir = overlay </> "dev-lisp" </> "qlot"
+      name = "qlot-" <> T.unpack ver <> ".ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile
+    (pkgDir </> name)
+    "EAPI=8\nKEYWORDS=\"~amd64\"\n"
+  TIO.writeFile (pkgDir </> "Manifest") ("DIST qlot-" <> ver <> ".tar.gz 1\n")
+  writeMatchingCachesForPackage overlay "dev-lisp" "qlot" pkgDir
+  pure (pkgDir </> name)
+
+autolithEbuildBody :: T.Text
+autolithEbuildBody =
+  T.unlines
+    [ "EAPI=8",
+      "KEYWORDS=\"~amd64\"",
+      "BDEPEND=\">=dev-lisp/sbcl-2.6.4\"",
+      "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/autolith-${PV}/autolith-${PV}-deps.tar.xz\""
+    ]
+
+seedAutolith :: FilePath -> IO FilePath
+seedAutolith overlay = do
+  let pkgDir = overlay </> "dev-util" </> "autolith"
+      pn = "autolith" :: T.Text
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile (pkgDir </> "autolith-0.17.2.ebuild") autolithEbuildBody
+  TIO.writeFile
+    (pkgDir </> "Manifest")
+    ("DIST " <> T.pack (depsTarballName pn "0.17.2") <> " 1 SHA512 deadbeef\n")
+  writeMatchingCachesForPackage overlay "dev-util" pn pkgDir
+  pure (pkgDir </> "autolith-0.17.2.ebuild")
+
+liveAutolithOps :: FilePath -> IO DepsPlanOps
+liveAutolithOps overlay = do
+  base <- liveBunOps overlay
+  modifyMVar_ (dpoSbclCeilingsCache base) (\_ -> pure (Just waveSbclCeilings))
+  pure
+    base
+      { dpoFetchSbclVersion = \_ _ _ _ -> pure (Right "2.6.4\n"),
+        dpoListVersions = \src -> case src of
+          GitHub "luciusmagn" "autolith" _ ->
+            pure (Right (map parseEbuildVersion ["0.18.0", "0.17.2"]))
+          _ -> dpoListVersions base src
+      }
+
+fetchAutolithAndQlot :: UpdateSource -> IO (Either T.Text EbuildVersion)
+fetchAutolithAndQlot src = case src of
+  GitHub "luciusmagn" "autolith" _ ->
+    pure (Right (parseEbuildVersion "0.18.0"))
+  GitHub "fukamachi" "qlot" _ ->
+    pure (Right (parseEbuildVersion "1.8.5"))
+  _ -> fetchBunLatest src
+
+testDirtyQlotFailsAutolith :: IO ()
+testDirtyQlotFailsAutolith =
+  withSystemTempDirectory "om-wave-dirty-qlot" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    _qlotPath <- seedQlot overlay "1.8.4"
+    autoPath <- seedAutolith overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    nEnsure <- newIORef (0 :: Int)
+    let ebuilds = [Ebuild "dev-util" "autolith" "0.17.2" autoPath]
+        entries = groupNewest ebuilds
+    ops <- liveAutolithOps overlay
+    deps0 <-
+      baseSpine
+        overlay
+        assets
+        dist
+        (dirtyIfPathContains "qlot")
+        releaseMissing
+        2
+        preflightOk
+    let deps =
+          deps0
+            { usdEnsureImage = countingEnsure nEnsure,
+              usdFetcher = fetchAutolithAndQlot,
+              usdDepsPlanOps = ops
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> do
+        assertTrue "names qlot" ("dev-lisp/qlot" `T.isInfixOf` err)
+        assertTrue "restore/finish" ("restore or finish" `T.isInfixOf` err)
+      Right _ -> assertFailure "expected dirty qlot preflight hard-fail"
+    n <- readIORef nEnsure
+    assertEq "no ensure after dirty qlot" 0 n
+    still <- doesFileExist autoPath
+    assertTrue "autolith not mutated" still
+
+testQlotOnlyNeverEnsure :: IO ()
+testQlotOnlyNeverEnsure =
+  withSystemTempDirectory "om-wave-qlot-only" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    qlotPath <- seedQlot overlay "1.8.4"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    nEnsure <- newIORef (0 :: Int)
+    let ebuilds = [Ebuild "dev-lisp" "qlot" "1.8.4" qlotPath]
+        entries = groupNewest ebuilds
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    let deps =
+          deps0
+            { usdEnsureImage = countingEnsure nEnsure,
+              usdFetcher = fetchAutolithAndQlot
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res -> do
+        let qlotKey = mkPackageKey "dev-lisp" "qlot"
+        assertTrue
+          "qlot outcome"
+          ( any
+              ( \case
+                  ApplySuccess k _ _ -> k == qlotKey
+                  ApplyHardFail k _ _ _ -> k == qlotKey
+                  _ -> False
+              )
+              (usrOutcomes res)
+          )
+        n <- readIORef nEnsure
+        assertEq "qlot-only GitMv never ensures" 0 n
+
+testEnsureWaitsForQlotManifestCommitNotDelayed :: IO ()
+testEnsureWaitsForQlotManifestCommitNotDelayed =
+  withSystemTempDirectory "om-wave-qlot-manifest" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+        qlotMan = overlay </> "dev-lisp" </> "qlot" </> "Manifest"
+    qlotPath <- seedQlot overlay "1.8.4"
+    autoPath <- seedAutolith overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    sawMan <- newIORef False
+    sawCommit <- newIORef False
+    commits <- newIORef ([] :: [T.Text])
+    let gitOps =
+          cleanGit
+            { goAddAndCommit = \_ paths _msg -> do
+                atomicModifyIORef'
+                  commits
+                  (\cs -> (T.unwords (map T.pack paths) : cs, ()))
+                pure (Right ())
+            }
+        delayedQlot pkgDir name = do
+          when ("qlot" `T.isInfixOf` T.pack name) (threadDelay 150_000)
+          fakeEbuildRun pkgDir name
+        gatedEnsure _floors = do
+          man <- TIO.readFile qlotMan
+          writeIORef sawMan ("qlot-1.8.5" `T.isInfixOf` man)
+          cs <- readIORef commits
+          writeIORef sawCommit (any ("qlot" `T.isInfixOf`) cs)
+          pure (Right EnsureSkipped)
+        ebuilds =
+          [ Ebuild "dev-lisp" "qlot" "1.8.4" qlotPath,
+            Ebuild "dev-util" "autolith" "0.17.2" autoPath
+          ]
+        entries = groupNewest ebuilds
+    ops <- liveAutolithOps overlay
+    deps0 <-
+      baseSpine overlay assets dist gitOps releaseMissing 2 preflightOk
+    let deps =
+          deps0
+            { usdEbuildRunner = delayedQlot,
+              usdEnsureImage = gatedEnsure,
+              usdFetcher = fetchAutolithAndQlot,
+              usdDepsPlanOps = ops
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right _ -> do
+        ready <- readIORef sawMan
+        committed <- readIORef sawCommit
+        assertTrue "ensure saw Manifest DIST for new qlot PV" ready
+        assertTrue "qlot commit completed before ensure" committed

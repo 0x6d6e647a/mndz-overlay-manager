@@ -40,7 +40,7 @@ imageSidecarSchemaVersion = 1
 
 -- | Identity of the Dockerfile generator recorded in @image.json@.
 materializeGeneratorId :: Text
-materializeGeneratorId = "mndz-overlay-manager-materialize-4"
+materializeGeneratorId = "mndz-overlay-manager-materialize-5"
 
 -- | Record of the current product materialize image.
 data ImageSidecar = ImageSidecar

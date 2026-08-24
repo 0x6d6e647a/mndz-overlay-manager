@@ -94,6 +94,11 @@ testHardcodedEdges = do
   assertEq "opencode" (Just bunBinPackageKey) (overlayCeilingProviderForKey opencode)
   assertEq "mise" Nothing (overlayCeilingProviderForKey mise)
   assertEq "bun-bin itself" Nothing (overlayCeilingProviderForKey bunBinPackageKey)
+  assertEq "qlot" Nothing (overlayCeilingProviderForKey (mkPackageKey "dev-lisp" "qlot"))
+  assertEq
+    "autolith"
+    Nothing
+    (overlayCeilingProviderForKey (mkPackageKey "dev-util" "autolith"))
 
 testNewBunInherits :: IO ()
 testNewBunInherits = do

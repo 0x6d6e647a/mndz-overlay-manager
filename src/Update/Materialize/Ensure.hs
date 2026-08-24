@@ -26,6 +26,7 @@ module Update.Materialize.Ensure
     imageStoreUnresolvedMessage,
     containerdRootUnresolvedMessage,
     readOverlayBunFloor,
+    readOverlayQlotFloor,
     ensureMaterializeImage,
     prunePreviousMaterializeImage,
     defaultMaterializeSidecarDir,
@@ -118,6 +119,7 @@ import Update.Process.Docker
 import Update.Runtime.Ceilings
   ( RuntimeEbuildMeta,
     discoverBunBinMetas,
+    discoverQlotMetas,
     discoverRuntimeMetasInDir,
     goBinPackageDir,
     goPackageDir,
@@ -226,6 +228,11 @@ readOverlayBunFloor overlayRoot = do
   metas <- loadBunMetas overlayRoot
   pure (overlayBunFloorFromMetas metas)
 
+readOverlayQlotFloor :: FilePath -> IO (Maybe Text)
+readOverlayQlotFloor overlayRoot = do
+  metas <- loadQlotMetas overlayRoot
+  pure (overlayBunFloorFromMetas metas)
+
 -- | Missing package dir (including @-bin@) is an empty meta list, not a fail.
 loadGentooToolchainMetas :: FilePath -> IO GentooToolchainMetas
 loadGentooToolchainMetas gentooRoot =
@@ -242,6 +249,13 @@ loadGentooToolchainMetas gentooRoot =
 loadBunMetas :: FilePath -> IO [RuntimeEbuildMeta]
 loadBunMetas overlayRoot = do
   eMetas <- discoverBunBinMetas overlayRoot
+  pure $ case eMetas of
+    Left _ -> []
+    Right metas -> metas
+
+loadQlotMetas :: FilePath -> IO [RuntimeEbuildMeta]
+loadQlotMetas overlayRoot = do
+  eMetas <- discoverQlotMetas overlayRoot
   pure $ case eMetas of
     Left _ -> []
     Right metas -> metas
@@ -319,7 +333,8 @@ ensureDefault cfg needed = do
             Right gentooRoot -> do
               metas <- loadGentooToolchainMetas gentooRoot
               bunMetas <- loadBunMetas (ecOverlayRoot cfg)
-              case resolveNeededInstalls (raKeywords arch) unioned metas bunMetas of
+              qlotMetas <- loadQlotMetas (ecOverlayRoot cfg)
+              case resolveNeededInstalls (raKeywords arch) unioned metas bunMetas qlotMetas of
                 Left err ->
                   pure (Left (ensureFailedMessage err))
                 Right installs -> do

@@ -16,6 +16,7 @@ module Update.Runtime.Ceilings
     nodejsPackageDir,
     nodejsBinPackageDir,
     bunBinPackageDir,
+    qlotPackageDir,
     parseKeywordsField,
     normalizeArchToken,
     keywordsHasBare,
@@ -30,6 +31,7 @@ module Update.Runtime.Ceilings
     discoverRuntimeCeilingsInDir,
     discoverRuntimeMetasInDir,
     discoverBunBinMetas,
+    discoverQlotMetas,
     discoverGoCeilingsWith,
     discoverNodejsCeilingsWith,
     discoverBunBinCeilings,
@@ -196,6 +198,9 @@ nodejsBinPackageDir gentooRoot = gentooRoot </> "net-libs" </> "nodejs-bin"
 
 bunBinPackageDir :: FilePath -> FilePath
 bunBinPackageDir overlayRoot = overlayRoot </> "dev-lang" </> "bun-bin"
+
+qlotPackageDir :: FilePath -> FilePath
+qlotPackageDir overlayRoot = overlayRoot </> "dev-lisp" </> "qlot"
 
 rustPackageDir :: FilePath -> FilePath
 rustPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "rust"
@@ -375,6 +380,11 @@ discoverRuntimeMetasInDir pkgDir mPrefix = do
 discoverBunBinMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])
 discoverBunBinMetas overlayRoot =
   discoverRuntimeMetasInDir (bunBinPackageDir overlayRoot) (Just "bun-bin-")
+
+-- | Overlay qlot non-live ebuild metadata.
+discoverQlotMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])
+discoverQlotMetas overlayRoot =
+  discoverRuntimeMetasInDir (qlotPackageDir overlayRoot) (Just "qlot-")
 
 -- | Scan a package directory of @*.ebuild@ files for ceilings.
 discoverRuntimeCeilingsInDir ::

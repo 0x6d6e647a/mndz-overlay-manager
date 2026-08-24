@@ -8,6 +8,7 @@
 -- and does not keep a per-package edge map.
 module Update.OverlayWaves
   ( bunBinPackageKey,
+    qlotPackageKey,
     overlayCeilingProvider,
     overlayCeilingProviderForKey,
     OverlayPlanKind (..),
@@ -68,6 +69,10 @@ import Update.Types
 -- | Overlay package that supplies Bun runtime-lane ceilings.
 bunBinPackageKey :: PackageKey
 bunBinPackageKey = PackageKey "dev-lang/bun-bin"
+
+-- | Overlay qlot atom emerged into SBCL materialize images.
+qlotPackageKey :: PackageKey
+qlotPackageKey = PackageKey "dev-lisp/qlot"
 
 -- | Overlay wait-edge provider for a technique, if any.
 overlayCeilingProvider :: UpdateTechnique -> Maybe PackageKey

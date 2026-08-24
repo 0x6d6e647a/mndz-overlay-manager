@@ -383,6 +383,16 @@ testPolicyClassification = do
     other -> do
       hPutStrLn stderr $ "autolith technique: " <> show other
       exitFailure
+  case lookupPolicy (PackageKey "dev-lisp/qlot") of
+    Just
+      ( PackagePolicy
+          (GitHub "fukamachi" "qlot" "")
+          GitMvAndManifest
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "qlot technique: " <> show other
+      exitFailure
   assertEq "unmapped" Nothing (lookupPolicy (PackageKey "dev-lang/haskell"))
   case lookupPolicy (PackageKey "dev-lang/bun-bin") of
     Just (PackagePolicy (GitHub "oven-sh" "bun" "bun-v") GitMvAndManifest) -> pure ()

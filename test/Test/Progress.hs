@@ -294,7 +294,8 @@ unitTests =
       testCase "Pause Clear Throw Lock Not Stuck" testPauseClearThrowLockNotStuck,
       testCase "Waiting is not hard-fail chrome" testWaitingNotHardFail,
       testCase "Full-path waiting on ensure is not hard-fail" testWaitingOnEnsureNotHardFail,
-      testCase "Ralph stays waiting on bun-bin through Manifest and commit" testRalphWaitsThroughManifestAndCommit
+      testCase "Ralph stays waiting on bun-bin through Manifest and commit" testRalphWaitsThroughManifestAndCommit,
+      testCase "qlot Manifest is visible; Autolith is not waiting on qlot" testQlotManifestVisibleAutolithNotWaiting
     ]
 
 -- | Soft-skip handle drives ApplyEnv / PlanOps apply path.
@@ -521,6 +522,42 @@ testRalphWaitsThroughManifestAndCommit = do
   assertTrue "commit status on bun-bin" (committingOverlayStatus `T.isInfixOf` frame)
   assertTrue "not fail glyph" (not ("✗" `T.isInfixOf` frame))
   assertTrue "one panel still 0/2" ("0/2" `T.isInfixOf` frame)
+
+-- | qlot Manifest regen is visible; Autolith waits on the image, not qlot.
+testQlotManifestVisibleAutolithNotWaiting :: IO ()
+testQlotManifestVisibleAutolithNotWaiting = do
+  stateRef <-
+    newIORef
+      MultiState
+        { msLabel = "Updating packages",
+          msTotal = 2,
+          msSucceeded = 0,
+          msJobs = Map.empty,
+          msTick = 0
+        }
+  let mh = multiHandle stateRef
+      qlot = mkPackageKey "dev-lisp" "qlot"
+      autolith = mkPackageKey "dev-util" "autolith"
+  mhStart mh qlot
+  mhWait mh autolith waitingOnMaterializeImage
+  mhStatus mh qlot regeneratingManifestStatus
+  s0 <- readIORef stateRef
+  case Map.lookup autolith (msJobs s0) of
+    Just (JobWaiting reason) ->
+      assertEq
+        "autolith waits on image"
+        waitingOnMaterializeImage
+        reason
+    other -> do
+      hPutStrLn stderr ("expected JobWaiting, got: " <> show other)
+      exitFailure
+  let frame = T.pack (renderMulti ColorOff s0)
+  assertTrue "qlot Manifest status" (regeneratingManifestStatus `T.isInfixOf` frame)
+  assertTrue
+    "autolith not waiting on qlot"
+    (not ("waiting on dev-lisp/qlot" `T.isInfixOf` frame))
+  assertTrue "image wait in frame" (waitingOnMaterializeImage `T.isInfixOf` frame)
+  assertTrue "not fail glyph" (not ("✗" `T.isInfixOf` frame))
 
 -- | Soft-skip-only package outcomes call mhSkip, not mhFail.
 testApplyProgressSoftSkipHandle :: IO ()

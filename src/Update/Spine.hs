@@ -74,6 +74,7 @@ import Update.Materialize
     fullPathKeysFromClassify,
     neededFloorsFromClassified,
     readOverlayBunFloor,
+    readOverlayQlotFloor,
   )
 import Update.Md5Cache (EgencacheRunner)
 import Update.Npm.Cache (mkNpmCacheOps)
@@ -86,6 +87,7 @@ import Update.OverlayWaves
     overlayCeilingProviderForKey,
     overlayDirtyPreflightMessage,
     overlayPackageRelDir,
+    qlotPackageKey,
   )
 import Update.Preflight
   ( AssetsPreflight (..),
@@ -263,16 +265,26 @@ runUpdatePhases deps entries allEbuilds selected = do
             Right (DiskGateOk warns) -> do
               t0EnsureOutcome <- newIORef (Nothing :: Maybe (Either Text ()))
               bunFloor <- bunFloorForEnsure overlayRoot planResults'
+              qlotFloor <- qlotFloorForEnsure overlayRoot planResults'
               let t0Floors =
                     neededFloorsFromClassified
                       classifyResults
                       planResults'
                       bunFloor
+                      qlotFloor
                   bunNeedsGitMv =
                     any
                       ( \case
                           PlanNeedsWork k PlannedGitMv {} ->
                             k == bunBinPackageKey
+                          _ -> False
+                      )
+                      planResults'
+                  qlotNeedsGitMv =
+                    any
+                      ( \case
+                          PlanNeedsWork k PlannedGitMv {} ->
+                            k == qlotPackageKey
                           _ -> False
                       )
                       planResults'
@@ -282,19 +294,28 @@ runUpdatePhases deps entries allEbuilds selected = do
                       then Just bunBinPackageKey
                       else Nothing
                   gateEnsure =
-                    if willEnsure && bunNeedsGitMv && isJust (nfBun t0Floors)
-                      then Just bunBinPackageKey
-                      else Nothing
+                    [ k
+                    | (True, k) <-
+                        [ ( willEnsure && bunNeedsGitMv && isJust (nfBun t0Floors),
+                            bunBinPackageKey
+                          ),
+                          ( willEnsure && qlotNeedsGitMv && isJust (nfSbcl t0Floors),
+                            qlotPackageKey
+                          )
+                        ]
+                    ]
                   recordEnsure outcome = do
                     writeIORef t0EnsureOutcome (Just outcome)
                     pure outcome
                   runEnsure classifyForFloors plansForFloors mh = do
                     bunFl <- bunFloorForEnsure overlayRoot plansForFloors
+                    qlotFl <- qlotFloorForEnsure overlayRoot plansForFloors
                     let floors =
                           neededFloorsFromClassified
                             classifyForFloors
                             plansForFloors
                             bunFl
+                            qlotFl
                     if floorsIsEmpty floors
                       then recordEnsure (Right ())
                       else do
@@ -410,7 +431,7 @@ runUpdatePhases deps entries allEbuilds selected = do
                             { meFullPathKeys = [],
                               meImageEnsure = \_ -> pure (Right ()),
                               meDelayCommit = Nothing,
-                              meGateEnsureOnFiles = Nothing,
+                              meGateEnsureOnFiles = [],
                               meRunEnsure = False
                             }
                     if null t0FullKeys
@@ -475,40 +496,52 @@ runUpdatePhases deps entries allEbuilds selected = do
                                     { meFullPathKeys = t0FullKeys,
                                       meImageEnsure = \_ -> pure (Left err),
                                       meDelayCommit = Nothing,
-                                      meGateEnsureOnFiles = Nothing,
+                                      meGateEnsureOnFiles = [],
                                       meRunEnsure = True
                                     }
-              outcomes <-
-                if needDeps
+              eDirtyQlot <-
+                if isJust (nfSbcl t0Floors)
                   then
-                    bracket
-                      (ensureSshAgent (usdSshOps deps))
-                      ( \case
-                          Left _ -> pure ()
-                          Right sess -> teardownSshSession (usdSshOps deps) sess
-                      )
-                      ( \case
-                          Left err ->
-                            pure
-                              [ ApplyHardFail
-                                  (PackageKey "")
-                                  ("SSH agent setup failed: " <> err)
-                                  False
-                                  False
-                              ]
-                          Right _sess -> runMutate
-                      )
-                  else runMutate
-              usdPruneMaterialize deps
-              flushCheckCache cache
-              mSummary <- cacheSummaryLine cache
-              pure $
-                Right
-                  UpdateSpineResult
-                    { usrOutcomes = outcomes,
-                      usrWarnings = warns,
-                      usrCacheSummary = mSummary
-                    }
+                    runDirtyPreflight
+                      pcfg
+                      (usdGitOps deps)
+                      overlayRoot
+                      [qlotPackageKey]
+                  else pure (Right ())
+              case eDirtyQlot of
+                Left err -> pure (Left err)
+                Right () -> do
+                  outcomes <-
+                    if needDeps
+                      then
+                        bracket
+                          (ensureSshAgent (usdSshOps deps))
+                          ( \case
+                              Left _ -> pure ()
+                              Right sess -> teardownSshSession (usdSshOps deps) sess
+                          )
+                          ( \case
+                              Left err ->
+                                pure
+                                  [ ApplyHardFail
+                                      (PackageKey "")
+                                      ("SSH agent setup failed: " <> err)
+                                      False
+                                      False
+                                  ]
+                              Right _sess -> runMutate
+                          )
+                      else runMutate
+                  usdPruneMaterialize deps
+                  flushCheckCache cache
+                  mSummary <- cacheSummaryLine cache
+                  pure $
+                    Right
+                      UpdateSpineResult
+                        { usrOutcomes = outcomes,
+                          usrWarnings = warns,
+                          usrCacheSummary = mSummary
+                        }
 
 -- | Promote classify hard-fails into plan results so mutate skips them.
 mergeClassifyHardFails ::
@@ -574,10 +607,23 @@ runDirtyPreflight pcfg gitOps overlayRoot keys =
 
 -- | Overlay bun floor for ensure: planned bun-bin remote when selected GitMv.
 bunFloorForEnsure :: FilePath -> [PackagePlanResult] -> IO (Maybe Text)
-bunFloorForEnsure overlayRoot plans =
+bunFloorForEnsure overlayRoot =
+  overlayGitMvFloorForEnsure bunBinPackageKey (readOverlayBunFloor overlayRoot)
+
+-- | Overlay qlot floor for ensure: planned qlot remote when selected GitMv.
+qlotFloorForEnsure :: FilePath -> [PackagePlanResult] -> IO (Maybe Text)
+qlotFloorForEnsure overlayRoot =
+  overlayGitMvFloorForEnsure qlotPackageKey (readOverlayQlotFloor overlayRoot)
+
+overlayGitMvFloorForEnsure ::
+  PackageKey ->
+  IO (Maybe Text) ->
+  [PackagePlanResult] ->
+  IO (Maybe Text)
+overlayGitMvFloorForEnsure key scanOverlay plans =
   case [ renderPV remote
        | PlanNeedsWork k (PlannedGitMv remote) <- plans,
-         k == bunBinPackageKey
+         k == key
        ] of
     (pv : _) -> pure (Just pv)
-    [] -> readOverlayBunFloor overlayRoot
+    [] -> scanOverlay

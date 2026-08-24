@@ -105,7 +105,9 @@ import Update.Sbcl.Deps
   ( SbclDepsOps (..),
     SbclDepsProgress (..),
     buildSbclDepsTarball,
+    materializeHome,
     parseSbclVersionFloor,
+    qlotInstall,
     sanitizeQlotConfs,
   )
 import Update.Types (PackageKey (..))
@@ -139,7 +141,8 @@ unitTests =
         [ testCase "parseSbclVersionFloor" testParseSbclVersionFloor,
           testCase "buildSbclDepsTarball success + progress" testSbclBuilderSuccess,
           testCase "buildSbclDepsTarball clone failure" testSbclBuilderCloneFail,
-          testCase "sanitizeQlotConfs rewrites operator home" testSanitizeQlotConfs
+          testCase "sanitizeQlotConfs rewrites operator home" testSanitizeQlotConfs,
+          testCase "qlotInstall argv is qlot on PATH" testQlotInstallArgv
         ],
       testGroup
         "npm builder"
@@ -339,7 +342,7 @@ fakeSbclSuccessOps _tarballPath =
         createDirectoryIfMissing True (dest </> "native" </> "fff")
         TIO.writeFile (dest </> "native" </> "fff" </> "commit") "abc\n"
         pure (Right ()),
-      sdoQlotInstall = \_ _ _ -> pure (Right ()),
+      sdoQlotInstall = \_ -> pure (Right ()),
       sdoCopyQlot = \_ stage -> do
         createDirectoryIfMissing True (stage </> ".qlot")
         TIO.writeFile (stage </> ".qlot" </> "marker") "ok\n"
@@ -349,8 +352,7 @@ fakeSbclSuccessOps _tarballPath =
         pure (Right ()),
       sdoPackTarball = \_ outPath -> do
         TIO.writeFile outPath "fake-deps-tarball\n"
-        pure (Right ()),
-      sdoQuicklispSetup = pure (Right "/tmp/quicklisp/setup.lisp")
+        pure (Right ())
     }
 
 testSbclBuilderSuccess :: IO ()
@@ -1430,6 +1432,33 @@ testBunCacheAbsoluteLeftover =
     createFileLink "/no/such/bun-cache/missing@1@@@1" link
     err <- assertLeft "absolute leftover" =<< rewriteBunCacheSymlinks cache
     assertTrue "mentions bun-cache" ("bun-cache" `T.isInfixOf` err)
+
+testQlotInstallArgv :: IO ()
+testQlotInstallArgv =
+  withSystemTempDirectory "mndz-qlot-argv-" $ \tmp -> do
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    let run req = do
+          atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
+          pure (okResult "")
+    assertRight "qlot install" =<< qlotInstall run tmp
+    reqs <- reverse <$> readIORef reqsRef
+    case reqs of
+      [req] -> do
+        case prMode req of
+          ExecCmd cmd args -> do
+            assertEq "qlot binary" "qlot" cmd
+            assertEq "install argv" ["install"] args
+            assertTrue "no --load" ("--load" `notElem` args)
+            assertTrue
+              "no quicklisp setup"
+              (not (any ("quicklisp/setup.lisp" `isInfixOf`) args))
+          ShellCmd _ -> fail "expected ExecCmd qlot"
+        assertEq "cwd is clone" (Just tmp) (prCwd req)
+        case prEnv req of
+          Just env ->
+            assertEq "HOME is builder" (Just materializeHome) (lookup "HOME" env)
+          Nothing -> fail "expected HOME in env"
+      other -> fail ("expected one qlot request, got " <> show (length other))
 
 testSanitizeQlotConfs :: IO ()
 testSanitizeQlotConfs =

@@ -118,6 +118,7 @@ unitTests =
       testCase "missing sidecar field is a miss" testMissingSidecarField,
       testCase "skip docker build when satisfies" testSkipWhenSatisfies,
       testCase "generator mismatch rebuilds despite floors" testGeneratorMismatchRebuilds,
+      testCase "newer overlay qlot rebuilds despite language floors" testNewerQlotRebuilds,
       testCase "unmapped uname hard-fails without docker build" testUnmappedDefaultNoBuild,
       testCase "override on unmapped uname skips generate" testOverrideUnmappedNoBuild,
       testCase "override missing hard-fails without build" testOverrideMissingNoBuild,
@@ -156,6 +157,12 @@ testUnionSatisfy = do
   assertEq "union keeps Go" (Just "1.26.5") (nfGo unioned)
   assertEq "union adds Bun" (Just "1.3.0") (nfBun unioned)
   assertEq "union does not invent SBCL" Nothing (nfSbcl unioned)
+  assertEq "union does not invent qlot" Nothing (nfQlot unioned)
+  let recQlot = emptyFloors {nfQlot = Just "1.8.4"}
+      needQlot = emptyFloors {nfQlot = Just "1.8.5"}
+  assertTrue "1.8.5 does not satisfy as recorded 1.8.4" (not (floorsSatisfy recQlot needQlot))
+  assertTrue "missing recorded qlot is a miss" (not (floorsSatisfy emptyFloors needQlot))
+  assertTrue "1.8.5 satisfies 1.8.4" (floorsSatisfy needQlot recQlot)
 
 testBunOnlyOmitsSbcl :: IO ()
 testBunOnlyOmitsSbcl = do
@@ -185,14 +192,16 @@ testBunOnlyOmitsSbcl = do
                 pdHypoProvider = Nothing
               }
         ]
-      needed = neededFloorsFromClassified classify plan (Just "1.2.0")
+      needed = neededFloorsFromClassified classify plan (Just "1.2.0") Nothing
   assertEq "bun floor" (Just "1.2.0") (nfBun needed)
   assertEq "no SBCL on first bun-only" Nothing (nfSbcl needed)
+  assertEq "no qlot on bun-only" Nothing (nfQlot needed)
   assertEq "no Go on bun-only" Nothing (nfGo needed)
   df <- renderMapped "x86_64" [bunInstall "1.2.0" "amd64"] "/overlay"
   assertTrue "recipe has bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` df)
   assertTrue "recipe omits sbcl emerge" (not ("dev-lisp/sbcl" `T.isInfixOf` df))
   assertTrue "bun-only omits SBCL_HOME" (not ("SBCL_HOME" `T.isInfixOf` df))
+  assertTrue "bun-only omits qlot" (not ("dev-lisp/qlot" `T.isInfixOf` df))
   assertTrue "base still emerges wget" ("net-misc/wget" `T.isInfixOf` df)
 
 testResolvePrefersRustBin :: IO ()
@@ -322,9 +331,10 @@ testFullPathFloorIgnoresReuseSibling = do
                 pdHypoProvider = Nothing
               }
         ]
-      needed = neededFloorsFromClassified classify plan Nothing
+      needed = neededFloorsFromClassified classify plan Nothing Nothing
   assertEq "Go floor from full-path PV only" (Just "1.24.0") (nfGo needed)
   assertEq "no unused toolchains" Nothing (nfSbcl needed)
+  assertEq "no qlot without SBCL" Nothing (nfQlot needed)
 
 testRenderMndzNoOfficial :: IO ()
 testRenderMndzNoOfficial = do
@@ -419,7 +429,11 @@ testRenderSbclTestingFloor = do
         "dev-lisp/sbcl"
         [meta "2.6.6" ["~amd64"]]
         "gentoo"
-  df <- renderMapped "x86_64" [ResolvedInstall TkSbcl rt] "/overlay"
+  df <-
+    renderMapped
+      "x86_64"
+      [ResolvedInstall TkSbcl rt, overlayQlotInstall "1.8.4" "amd64"]
+      "/overlay"
   assertEq
     "one versioned sbcl emerge"
     1
@@ -436,20 +450,29 @@ testRenderSbclTestingFloor = do
   assertTrue
     "ENV SBCL_SOURCE_ROOT lib64"
     ("ENV SBCL_SOURCE_ROOT=/usr/lib64/sbcl/src" `T.isInfixOf` df)
-  let (beforeSbcl, _) = T.breakOn "sbcl --non-interactive" df
+  let (beforeQlot, _) = T.breakOn "dev-lisp/qlot" df
   assertTrue
-    "ENV HOME before sbcl"
-    ("ENV SBCL_HOME=/usr/lib64/sbcl" `T.isInfixOf` beforeSbcl)
+    "ENV HOME before qlot"
+    ("ENV SBCL_HOME=/usr/lib64/sbcl" `T.isInfixOf` beforeQlot)
   assertTrue
-    "ENV SOURCE_ROOT before sbcl"
-    ("ENV SBCL_SOURCE_ROOT=/usr/lib64/sbcl/src" `T.isInfixOf` beforeSbcl)
+    "ENV SOURCE_ROOT before qlot"
+    ("ENV SBCL_SOURCE_ROOT=/usr/lib64/sbcl/src" `T.isInfixOf` beforeQlot)
   assertTrue
-    "aria2c fetches installer"
-    ("aria2c --dir=/tmp --out=quicklisp.lisp --allow-overwrite=true https://beta.quicklisp.org/quicklisp.lisp" `T.isInfixOf` df)
+    "qlot emerge spec"
+    (">=dev-lisp/qlot-1.8.4::mndz" `T.isInfixOf` df)
   assertTrue
-    "installer not fetched with wget"
-    (not ("wget -O /tmp/quicklisp.lisp" `T.isInfixOf` df))
+    "qlot accept ::mndz ~amd64"
+    (">=dev-lisp/qlot-1.8.4::mndz ~amd64" `T.isInfixOf` df)
+  assertTrue
+    "no Quicklisp installer fetch"
+    (not ("beta.quicklisp.org" `T.isInfixOf` df))
+  let qlotRuns = filter ("dev-lisp/qlot" `T.isInfixOf`) (T.splitOn "RUN " df)
+  assertTrue "qlot has a RUN" (not (null qlotRuns))
+  assertTrue
+    "overlay bind on qlot RUN"
+    (all ("from=overlay" `T.isInfixOf`) qlotRuns)
   assertTrue "base still emerges wget" ("net-misc/wget" `T.isInfixOf` df)
+  assertTrue "base still emerges aria2" ("net-misc/aria2" `T.isInfixOf` df)
 
 testRenderSbclX86Libdir :: IO ()
 testRenderSbclX86Libdir = do
@@ -459,7 +482,11 @@ testRenderSbclX86Libdir = do
             rtEmergeSpec = ">=dev-lisp/sbcl-2.6.6",
             rtAcceptLine = Just ">=dev-lisp/sbcl-2.6.6::gentoo ~x86"
           }
-  df <- renderMapped "i686" [ResolvedInstall TkSbcl rt] "/overlay"
+  df <-
+    renderMapped
+      "i686"
+      [ResolvedInstall TkSbcl rt, overlayQlotInstall "1.8.4" "x86"]
+      "/overlay"
   assertTrue
     "ENV SBCL_HOME lib"
     ("ENV SBCL_HOME=/usr/lib/sbcl" `T.isInfixOf` df)
@@ -469,6 +496,16 @@ testRenderSbclX86Libdir = do
   assertTrue
     "not lib64 on x86"
     (not ("/usr/lib64/sbcl" `T.isInfixOf` df))
+  assertTrue
+    "qlot emerge spec"
+    (">=dev-lisp/qlot-1.8.4::mndz" `T.isInfixOf` df)
+  assertTrue
+    "no Quicklisp installer fetch"
+    (not ("beta.quicklisp.org" `T.isInfixOf` df))
+  let qlotRuns = filter ("dev-lisp/qlot" `T.isInfixOf`) (T.splitOn "RUN " df)
+  assertTrue
+    "overlay bind on qlot RUN"
+    (all ("from=overlay" `T.isInfixOf`) qlotRuns)
 
 renderMapped :: String -> [ResolvedInstall] -> FilePath -> IO T.Text
 renderMapped uname installs overlay =
@@ -484,6 +521,16 @@ bunInstall ver kw =
       { rtAtom = "dev-lang/bun-bin",
         rtEmergeSpec = ">=dev-lang/bun-bin-" <> ver <> "::mndz",
         rtAcceptLine = Just (">=dev-lang/bun-bin-" <> ver <> "::mndz ~" <> kw)
+      }
+
+overlayQlotInstall :: T.Text -> T.Text -> ResolvedInstall
+overlayQlotInstall ver kw =
+  ResolvedInstall
+    TkQlot
+    ResolvedToolchain
+      { rtAtom = "dev-lisp/qlot",
+        rtEmergeSpec = ">=dev-lisp/qlot-" <> ver <> "::mndz",
+        rtAcceptLine = Just (">=dev-lisp/qlot-" <> ver <> "::mndz ~" <> kw)
       }
 
 goInstall :: T.Text -> ResolvedInstall
@@ -815,6 +862,52 @@ testGeneratorMismatchRebuilds =
       Left err -> assertFailure err
       Right side ->
         assertEq "records current generator" materializeGeneratorId (isGenerator side)
+
+testNewerQlotRebuilds :: IO ()
+testNewerQlotRebuilds =
+  withSystemTempDirectory "om-ensure-qlot" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:old-qlot"
+        gentoo = tmp </> "gentoo"
+    createDirectoryIfMissing True overlay
+    writeRuntimeEbuild (gentoo </> "dev-lisp" </> "sbcl") "sbcl" "2.6.6" "~amd64"
+    writeRuntimeEbuild (overlay </> "dev-lisp" </> "qlot") "qlot" "1.8.5" "~amd64"
+    createDirectoryIfMissing True sidecar
+    let side0 =
+          ImageSidecar
+            { isVersion = imageSidecarSchemaVersion,
+              isId = T.pack iid,
+              isTag = T.pack defaultMaterializeImage,
+              isSatisfies =
+                emptyFloors
+                  { nfSbcl = Just "2.6.6",
+                    nfQlot = Just "1.8.4"
+                  },
+              isGenerator = materializeGeneratorId,
+              isBuiltAt = epoch
+            }
+    BS.writeFile (sidecarImageJsonPath sidecar) (LBS.toStrict (encodeImageSidecar side0))
+    builds <- mkLogRef
+    fake <- mkFakeDocker True iid builds
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    let needed =
+          emptyFloors
+            { nfSbcl = Just "2.6.6",
+              nfQlot = Just "1.8.5"
+            }
+    got <- ensureMaterializeImage cfg needed
+    assertEq "rebuilt for newer qlot" (Right EnsureBuilt) got
+    calls <- readIORef builds
+    assertTrue "docker build ran" (any ("-t" `elem`) calls)
+    bs <- BS.readFile (sidecarImageJsonPath sidecar)
+    case decodeImageSidecar bs of
+      Left err -> assertFailure err
+      Right side ->
+        assertEq "records newer qlot" (Just "1.8.5") (nfQlot (isSatisfies side))
+    df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
+    assertTrue "recipe emerges overlay qlot" (">=dev-lisp/qlot-1.8.5::mndz" `T.isInfixOf` df)
+    assertTrue "no Quicklisp fetch" (not ("beta.quicklisp.org" `T.isInfixOf` df))
 
 testUnmappedDefaultNoBuild :: IO ()
 testUnmappedDefaultNoBuild =

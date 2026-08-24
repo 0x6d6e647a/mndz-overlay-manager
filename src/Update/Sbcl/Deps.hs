@@ -8,10 +8,9 @@ module Update.Sbcl.Deps
     mkSbclDepsOps,
     buildSbclDepsTarball,
     parseSbclVersionFloor,
-    defaultQuicklispSetup,
-    imageQuicklispSetup,
     materializeHome,
     sanitizeQlotConfs,
+    qlotInstall,
   )
 where
 
@@ -47,12 +46,11 @@ import Update.Process
 -- | Injectable host ops for SBCL deps materialize.
 data SbclDepsOps = SbclDepsOps
   { sdoClone :: Text -> Text -> FilePath -> IO (Either Text ()),
-    sdoQlotInstall :: FilePath -> FilePath -> FilePath -> IO (Either Text ()),
+    sdoQlotInstall :: FilePath -> IO (Either Text ()),
     -- | Copy @src/.qlot@ into @stage/.qlot@ (dereference symlinks).
     sdoCopyQlot :: FilePath -> FilePath -> IO (Either Text ()),
     sdoMaterializeFff :: FilePath -> FilePath -> IO (Either Text ()),
-    sdoPackTarball :: FilePath -> FilePath -> IO (Either Text ()),
-    sdoQuicklispSetup :: IO (Either Text FilePath)
+    sdoPackTarball :: FilePath -> FilePath -> IO (Either Text ())
   }
 
 data SbclDepsProgress = SbclDepsProgress
@@ -73,24 +71,15 @@ mkSbclDepsOps run =
       sdoQlotInstall = qlotInstall run,
       sdoCopyQlot = copyQlotTree run,
       sdoMaterializeFff = materializeFff run,
-      sdoPackTarball = packDepsTarball run,
-      sdoQuicklispSetup = defaultQuicklispSetup
+      sdoPackTarball = packDepsTarball run
     }
 
 productionSbclDepsOps :: SbclDepsOps
 productionSbclDepsOps = mkSbclDepsOps productionCommandRunner
 
--- | Generic home used for qlot\/Quicklisp (container @HOME@, not the operator).
+-- | Generic home used for qlot (container @HOME@, not the operator).
 materializeHome :: FilePath
 materializeHome = "/home/builder"
-
--- | Image-local Quicklisp setup (not the operator @~\/quicklisp/setup.lisp@).
-imageQuicklispSetup :: FilePath
-imageQuicklispSetup = materializeHome </> "quicklisp" </> "setup.lisp"
-
--- | Default Quicklisp setup path inside the materialize image.
-defaultQuicklispSetup :: IO (Either Text FilePath)
-defaultQuicklispSetup = pure (Right imageQuicklispSetup)
 
 -- | Parse trimmed @sbcl.version@ content as a dotted numeric floor.
 parseSbclVersionFloor :: Text -> Maybe Text
@@ -135,60 +124,56 @@ buildSbclDepsTarball
         outPath = outDir </> tarballName
         cloneDir = workDir </> "src"
         stageDir = workDir </> "stage"
-    qlResult <- sdoQuicklispSetup ops
-    case qlResult of
+    createDirectoryIfMissing True stageDir
+    sdpOnCloneStart progress
+    cloned <- sdoClone ops url tag cloneDir
+    case cloned of
       Left err -> pure (Left err)
-      Right qlSetup -> do
-        createDirectoryIfMissing True stageDir
-        sdpOnCloneStart progress
-        cloned <- sdoClone ops url tag cloneDir
-        case cloned of
+      Right () -> do
+        sdpOnCloneDone progress
+        spaceOk <- checkPostCloneForClass FullSbcl cloneDir
+        case spaceOk of
           Left err -> pure (Left err)
-          Right () -> do
-            sdpOnCloneDone progress
-            spaceOk <- checkPostCloneForClass FullSbcl cloneDir
-            case spaceOk of
+          Right () ->
+            preflightClone cloneDir >>= \case
               Left err -> pure (Left err)
-              Right () ->
-                preflightClone cloneDir >>= \case
+              Right () -> do
+                sdpOnQlotStart progress
+                qlot <- sdoQlotInstall ops cloneDir
+                case qlot of
                   Left err -> pure (Left err)
                   Right () -> do
-                    sdpOnQlotStart progress
-                    qlot <- sdoQlotInstall ops cloneDir "sbcl" qlSetup
-                    case qlot of
+                    sdpOnQlotDone progress
+                    qlotOk <- sdoCopyQlot ops cloneDir stageDir
+                    case qlotOk of
                       Left err -> pure (Left err)
                       Right () -> do
-                        sdpOnQlotDone progress
-                        qlotOk <- sdoCopyQlot ops cloneDir stageDir
-                        case qlotOk of
+                        operatorHome <- getHomeDirectory
+                        sanitized <- sanitizeQlotConfs stageDir operatorHome
+                        case sanitized of
                           Left err -> pure (Left err)
                           Right () -> do
-                            operatorHome <- getHomeDirectory
-                            sanitized <- sanitizeQlotConfs stageDir operatorHome
-                            case sanitized of
+                            sdpOnFffStart progress
+                            fff <- sdoMaterializeFff ops cloneDir stageDir
+                            case fff of
                               Left err -> pure (Left err)
                               Right () -> do
-                                sdpOnFffStart progress
-                                fff <- sdoMaterializeFff ops cloneDir stageDir
-                                case fff of
+                                sdpOnFffDone progress
+                                sdpOnCompressStart progress
+                                packed <- sdoPackTarball ops stageDir outPath
+                                case packed of
                                   Left err -> pure (Left err)
                                   Right () -> do
-                                    sdpOnFffDone progress
-                                    sdpOnCompressStart progress
-                                    packed <- sdoPackTarball ops stageDir outPath
-                                    case packed of
-                                      Left err -> pure (Left err)
-                                      Right () -> do
-                                        sdpOnCompressDone progress
-                                        hasTar <- doesFileExist outPath
-                                        pure $
-                                          if hasTar
-                                            then Right outPath
-                                            else
-                                              Left
-                                                ( "SBCL deps pack did not produce tarball at "
-                                                    <> T.pack outPath
-                                                )
+                                    sdpOnCompressDone progress
+                                    hasTar <- doesFileExist outPath
+                                    pure $
+                                      if hasTar
+                                        then Right outPath
+                                        else
+                                          Left
+                                            ( "SBCL deps pack did not produce tarball at "
+                                                <> T.pack outPath
+                                            )
 
 preflightClone :: FilePath -> IO (Either Text ())
 preflightClone root = do
@@ -309,76 +294,22 @@ gitCloneTag run url tag dest = do
 qlotInstall ::
   CommandRunner ->
   FilePath ->
-  FilePath ->
-  FilePath ->
   IO (Either Text ())
-qlotInstall run root sbclBin qlSetup = do
-  let installer = root </> "script" </> "qlot-install.lisp"
-  hasInstaller <- doesFileExist installer
+qlotInstall run root = do
   env0 <- getEnvironment
   let env = ("HOME", materializeHome) : filter ((/= "HOME") . fst) env0
-  if hasInstaller && qlSetup == imageQuicklispSetup
-    then do
-      res <-
-        run
-          ProcessRequest
-            { prMode =
-                ExecCmd
-                  sbclBin
-                  [ "--noinform",
-                    "--non-interactive",
-                    "--no-userinit",
-                    "--no-sysinit",
-                    "--load",
-                    installer
-                  ],
-              prCwd = Just root,
-              prEnv = Just env,
-              prStdin = ""
-            }
-      pure $
-        if prExitCode res == ExitSuccess
-          then Right ()
-          else Left ("qlot install failed: " <> T.pack (prStderr res))
-    else do
-      let lisp =
-            T.unpack $
-              T.unlines
-                [ "(require :asdf)",
-                  "(load \"" <> T.pack qlSetup <> "\")",
-                  "(ql:quickload :qlot :silent t)",
-                  "(let ((qlot-project-root (find-symbol \"*PROJECT-ROOT*\" \"QLOT\")))",
-                  "  (unless qlot-project-root",
-                  "    (error \"The loaded Qlot does not expose its project root.\"))",
-                  "  (progv (list qlot-project-root) (list #p\""
-                    <> T.pack root
-                    <> "/\")",
-                  "    (uiop:with-current-directory (#p\""
-                    <> T.pack root
-                    <> "/\")",
-                  "      (uiop:symbol-call '#:qlot '#:install))))"
-                ]
-      res <-
-        run
-          ProcessRequest
-            { prMode =
-                ExecCmd
-                  sbclBin
-                  [ "--noinform",
-                    "--non-interactive",
-                    "--no-userinit",
-                    "--no-sysinit",
-                    "--eval",
-                    lisp
-                  ],
-              prCwd = Just root,
-              prEnv = Just env,
-              prStdin = ""
-            }
-      pure $
-        if prExitCode res == ExitSuccess
-          then Right ()
-          else Left ("qlot install failed: " <> T.pack (prStderr res))
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "qlot" ["install"],
+          prCwd = Just root,
+          prEnv = Just env,
+          prStdin = ""
+        }
+  pure $
+    if prExitCode res == ExitSuccess
+      then Right ()
+      else Left ("qlot install failed: " <> T.pack (prStderr res))
 
 materializeFff :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
 materializeFff run root stageDir = do

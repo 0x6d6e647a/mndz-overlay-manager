@@ -16,7 +16,7 @@ module Update.Materialize.Floors
 where
 
 import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:?), (.=))
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 import Data.Text (Text)
 import Overlay.Version (EbuildVersion, comparePV, renderPV)
 import Update.Apply.Plan
@@ -44,7 +44,9 @@ data NeededFloors = NeededFloors
     nfNode :: Maybe Text,
     nfBun :: Maybe Text,
     nfRust :: Maybe Text,
-    nfSbcl :: Maybe Text
+    nfSbcl :: Maybe Text,
+    -- | Overlay qlot PV the recipe will emerge when SBCL is needed.
+    nfQlot :: Maybe Text
   }
   deriving (Eq, Show)
 
@@ -56,7 +58,8 @@ instance ToJSON NeededFloors where
           ("node" .=) <$> nfNode f,
           ("bun" .=) <$> nfBun f,
           ("rust" .=) <$> nfRust f,
-          ("sbcl" .=) <$> nfSbcl f
+          ("sbcl" .=) <$> nfSbcl f,
+          ("qlot" .=) <$> nfQlot f
         ]
 
 instance FromJSON NeededFloors where
@@ -67,6 +70,7 @@ instance FromJSON NeededFloors where
       <*> o .:? "bun"
       <*> o .:? "rust"
       <*> o .:? "sbcl"
+      <*> o .:? "qlot"
 
 emptyFloors :: NeededFloors
 emptyFloors =
@@ -75,14 +79,15 @@ emptyFloors =
       nfNode = Nothing,
       nfBun = Nothing,
       nfRust = Nothing,
-      nfSbcl = Nothing
+      nfSbcl = Nothing,
+      nfQlot = Nothing
     }
 
 floorsIsEmpty :: NeededFloors -> Bool
 floorsIsEmpty f =
   all
     (== Nothing)
-    [nfGo f, nfNode f, nfBun f, nfRust f, nfSbcl f]
+    [nfGo f, nfNode f, nfBun f, nfRust f, nfSbcl f, nfQlot f]
 
 -- | Monotonic max of two version tokens ('Nothing' loses).
 maxFloor :: Maybe Text -> Maybe Text -> Maybe Text
@@ -101,7 +106,8 @@ unionFloors a b =
       nfNode = maxFloor (nfNode a) (nfNode b),
       nfBun = maxFloor (nfBun a) (nfBun b),
       nfRust = maxFloor (nfRust a) (nfRust b),
-      nfSbcl = maxFloor (nfSbcl a) (nfSbcl b)
+      nfSbcl = maxFloor (nfSbcl a) (nfSbcl b),
+      nfQlot = maxFloor (nfQlot a) (nfQlot b)
     }
 
 -- | Recorded image satisfies this prepare when every needed toolchain is
@@ -113,6 +119,7 @@ floorsSatisfy recorded needed =
     && fieldOk (nfBun recorded) (nfBun needed)
     && fieldOk (nfRust recorded) (nfRust needed)
     && fieldOk (nfSbcl recorded) (nfSbcl needed)
+    && fieldOk (nfQlot recorded) (nfQlot needed)
   where
     fieldOk _ Nothing = True
     fieldOk Nothing (Just _) = False
@@ -123,13 +130,15 @@ floorsSatisfy recorded needed =
         Nothing -> False
 
 -- | Floors from classified full-path units plus overlay bun-bin PV when Bun
--- is needed. GitMv / reuse-path units do not contribute.
+-- is needed and overlay qlot PV when SBCL is needed. GitMv / reuse-path
+-- units do not contribute.
 neededFloorsFromClassified ::
   [ClassifyPackageResult] ->
   [PackagePlanResult] ->
   Maybe Text ->
+  Maybe Text ->
   NeededFloors
-neededFloorsFromClassified classifyResults planResults mOverlayBun =
+neededFloorsFromClassified classifyResults planResults mOverlayBun mOverlayQlot =
   let plansByKey =
         [ (planResultKey r, r)
         | r <- planResults
@@ -147,7 +156,11 @@ neededFloorsFromClassified classifyResults planResults mOverlayBun =
         if any bunFull classifyResults
           then fromUnits {nfBun = maxFloor (nfBun fromUnits) mOverlayBun}
           else fromUnits
-   in withBun
+      withQlot =
+        if isJust (nfSbcl withBun)
+          then withBun {nfQlot = needAtLeast mOverlayQlot}
+          else withBun
+   in withQlot
   where
     bunFull (ClassifyOk _ us) = any (ecosystemIsBun . cpuEco) (filter isFull us)
     bunFull _ = False

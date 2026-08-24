@@ -252,6 +252,16 @@ When activity indicators are enabled and `update` will `docker build` a recipe t
 - **THEN** progress indicates bun-bin is being committed
 - **AND** withheld ralph-tui remains in waiting presentation until that commit exists
 
+### Requirement: qlot Manifest wait is visible
+
+When activity indicators are enabled and `update` will `docker build` a recipe that emerges overlay qlot, and overlay qlot needs `GitMvAndManifest` file work, the program SHALL show qlot Manifest / egencache work so that wait is not indistinguishable from a hung ensure. The program SHALL NOT show Autolith (or other packages) as waiting on `dev-lisp/qlot`.
+
+#### Scenario: qlot manifest is a visible status
+
+- **WHEN** indicators are enabled, qlot needs GitMv work, and ensure will emerge overlay qlot
+- **THEN** qlot’s apply row (or a sequential step) indicates Manifest regeneration before `docker build` starts
+- **AND** Autolith is not shown as waiting on `dev-lisp/qlot`
+
 ### Requirement: Materialize image ensure is visible in progress
 
 When activity indicators are enabled and `update` ensures the materialize image as specified by `ensure-materialize-image`, the program SHALL show that work so a long `docker build` is not indistinguishable from a hung apply panel. At the first ensure in the run (t0 full-path), a sequential step (or equivalent) SHALL indicate ensuring the materialize image. When consumers remain withheld until bun-bin’s signed commit after that ensure, their rows SHALL stay in waiting presentation naming the provider; the program SHALL NOT open a second apply panel solely for that admit. Full-path packages waiting on ensure SHALL use waiting presentation, not hard-fail, until ensure succeeds or fails.

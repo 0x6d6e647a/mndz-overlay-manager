@@ -40,6 +40,10 @@ hardcodedPolicies =
         )
         GitMvAndManifest,
       policy
+        "dev-lisp/qlot"
+        (GitHub "fukamachi" "qlot" "")
+        GitMvAndManifest,
+      policy
         "dev-db/dolt"
         (GitHub "dolthub" "dolt" "v")
         (DepsAndAssets (Go (Just "go"))),

@@ -34,11 +34,12 @@ data ResolvedToolchain = ResolvedToolchain
   }
   deriving (Eq, Show)
 
--- | Toolchain RUN kind; recipe extras (pycargoebuild, Quicklisp, overlay bind)
--- are decided from this, not from the atom string.
+-- | Toolchain RUN kind; recipe extras (pycargoebuild, overlay qlot, overlay
+-- bind) are decided from this, not from the atom string.
 data ToolchainKind
   = TkRust
   | TkSbcl
+  | TkQlot
   | TkNode
   | TkGo
   | TkBun
@@ -97,6 +98,9 @@ goAtom = "dev-lang/go"
 bunBinAtom :: Text
 bunBinAtom = "dev-lang/bun-bin"
 
+qlotAtom :: Text
+qlotAtom = "dev-lisp/qlot"
+
 -- | Prefer @-bin@ when a host-arch ebuild (plain or tilde) meets the floor;
 -- otherwise the source package; otherwise a miss. Prefer @-bin@ even when that
 -- forces @~arch@ and source would be plain-visible.
@@ -136,8 +140,17 @@ resolveNeededInstalls ::
   GentooToolchainMetas ->
   -- | Overlay @dev-lang/bun-bin@ metas (empty if the dir is missing).
   [RuntimeEbuildMeta] ->
+  -- | Overlay @dev-lisp/qlot@ metas (empty if the dir is missing).
+  [RuntimeEbuildMeta] ->
   Either Text [ResolvedInstall]
-resolveNeededInstalls arch floors metas bunMetas = do
+resolveNeededInstalls arch floors metas bunMetas qlotMetas = do
+  let qlotFloorTok =
+        case nfQlot floors of
+          Just q -> Just q
+          Nothing ->
+            case nfSbcl floors of
+              Just _ -> Just "0"
+              Nothing -> Nothing
   rust <-
     forFloor (nfRust floors) $ \fl ->
       ResolvedInstall TkRust
@@ -193,7 +206,18 @@ resolveNeededInstalls arch floors metas bunMetas = do
           bunBinAtom
           []
           mndzRepoName
-  pure (catMaybes [rust, sbcl, node, go, bun])
+  qlot <-
+    forFloor qlotFloorTok $ \fl ->
+      ResolvedInstall TkQlot
+        <$> resolveToolchain
+          arch
+          fl
+          qlotAtom
+          qlotMetas
+          qlotAtom
+          []
+          mndzRepoName
+  pure (catMaybes [rust, sbcl, qlot, node, go, bun])
 
 forFloor ::
   Maybe Text ->

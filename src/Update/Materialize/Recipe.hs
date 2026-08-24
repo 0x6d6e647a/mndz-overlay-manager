@@ -54,8 +54,9 @@ binpkgsCacheId = "mndz-materialize-binpkgs"
 --
 -- Overlay is bind-mounted at the host path (read-only) via an extra build
 -- context named @overlay@; distfiles/binpkgs use stable-id cache mounts. Bun is
--- @dev-lang/bun-bin::mndz@ only. No official go.dev / nodejs.org / GitHub zip
--- toolchain URLs. @FROM@ uses the OpenRC Hub tag. Layer order is rust → sbcl →
+-- @dev-lang/bun-bin::mndz@ only. Qlot is overlay @dev-lisp/qlot::mndz@ after
+-- @ENV SBCL_HOME@. No official go.dev / nodejs.org / GitHub zip toolchain
+-- URLs. @FROM@ uses the OpenRC Hub tag. Layer order is rust → sbcl → qlot →
 -- node → go → bun.
 renderMaterializeDockerfile ::
   RecipeArch ->
@@ -101,9 +102,10 @@ kindRank :: ToolchainKind -> Int
 kindRank = \case
   TkRust -> 0
   TkSbcl -> 1
-  TkNode -> 2
-  TkGo -> 3
-  TkBun -> 4
+  TkQlot -> 2
+  TkNode -> 3
+  TkGo -> 4
+  TkBun -> 5
 
 -- | Gentoo @get_libdir@ for mapped KEYWORDS tokens.
 gentooLibdir :: Text -> Text
@@ -123,24 +125,16 @@ installRuns overlay keywords (ResolvedInstall kind rt) = case kind of
           "",
           "ENV SBCL_HOME=/usr/" <> libdir <> "/sbcl",
           "ENV SBCL_SOURCE_ROOT=/usr/" <> libdir <> "/sbcl/src",
-          "",
-          "RUN mkdir -p /home/builder \\",
-          " && aria2c --dir=/tmp --out=quicklisp.lisp --allow-overwrite=true https://beta.quicklisp.org/quicklisp.lisp \\",
-          " && sbcl --non-interactive --no-userinit --no-sysinit \\",
-          "      --load /tmp/quicklisp.lisp \\",
-          "      --eval '(quicklisp-quickstart:install :path \"/home/builder/quicklisp/\")' \\",
-          "      --eval '(ql:quickload :qlot :silent t)' \\",
-          "      --quit \\",
-          " && rm -f /tmp/quicklisp.lisp \\",
-          " && chmod -R a+rX /home/builder/quicklisp",
           ""
         ]
+  TkQlot ->
+    [runCacheOverlay overlay (overlayBindCmds overlay rt kind), ""]
   TkNode ->
     [runCache (portageCmds rt kind []), ""]
   TkGo ->
     [runCache (portageCmds rt kind []), ""]
   TkBun ->
-    [runCacheOverlay overlay (bunCmds overlay rt kind), ""]
+    [runCacheOverlay overlay (overlayBindCmds overlay rt kind), ""]
 
 portageCmds :: ResolvedToolchain -> ToolchainKind -> [Text] -> [Text]
 portageCmds rt kind extra =
@@ -149,15 +143,15 @@ portageCmds rt kind extra =
     <> [emergeCmd rt]
     <> extra
 
-bunCmds :: Text -> ResolvedToolchain -> ToolchainKind -> [Text]
-bunCmds overlay rt kind =
+overlayBindCmds :: Text -> ResolvedToolchain -> ToolchainKind -> [Text]
+overlayBindCmds overlay rt kind =
   [ "emerge-webrsync",
     "mkdir -p /etc/portage/repos.conf /etc/portage/package.accept_keywords",
     "printf '[mndz]\\nlocation = "
       <> overlay
       <> "\\nmaster = gentoo\\nauto-sync = no\\n' > /etc/portage/repos.conf/mndz.conf"
   ]
-    <> bunAcceptCmds kind rt
+    <> overlayAcceptCmds kind rt
     <> [emergeCmd rt]
 
 emergeCmd :: ResolvedToolchain -> Text
@@ -171,9 +165,9 @@ acceptCmds kind rt = case rtAcceptLine rt of
       printfAccept kind line
     ]
 
--- | Bun RUN already created @package.accept_keywords@ next to repos.conf.
-bunAcceptCmds :: ToolchainKind -> ResolvedToolchain -> [Text]
-bunAcceptCmds kind rt = case rtAcceptLine rt of
+-- | Overlay-bind RUN already created @package.accept_keywords@ next to repos.conf.
+overlayAcceptCmds :: ToolchainKind -> ResolvedToolchain -> [Text]
+overlayAcceptCmds kind rt = case rtAcceptLine rt of
   Nothing -> []
   Just line -> [printfAccept kind line]
 
@@ -188,6 +182,7 @@ kindFile :: ToolchainKind -> Text
 kindFile = \case
   TkRust -> "rust"
   TkSbcl -> "sbcl"
+  TkQlot -> "qlot"
   TkNode -> "node"
   TkGo -> "go"
   TkBun -> "bun"
