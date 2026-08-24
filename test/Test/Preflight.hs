@@ -564,7 +564,8 @@ testAssetsPfReuseOnlyGo = do
                 pdSource = GitHub "o" "r" "v",
                 pdPlan = emptyDepsPlan,
                 pdLocalPVs = [],
-                pdContentFix = [pv]
+                pdContentFix = [pv],
+                pdHypoProvider = Nothing
               }
         ]
       classify =
@@ -597,7 +598,8 @@ testAssetsPfCargo = do
                 pdSource = GitHub "o" "r" "v",
                 pdPlan = emptyDepsPlan,
                 pdLocalPVs = [],
-                pdContentFix = [pv]
+                pdContentFix = [pv],
+                pdHypoProvider = Nothing
               }
         ]
       classify =
@@ -657,7 +659,8 @@ testReuseCargoWithoutPycargo = do
                   pdSource = GitHub "o" "r" "v",
                   pdPlan = emptyDepsPlan,
                   pdLocalPVs = [],
-                  pdContentFix = [pv]
+                  pdContentFix = [pv],
+                  pdHypoProvider = Nothing
                 }
           ]
 

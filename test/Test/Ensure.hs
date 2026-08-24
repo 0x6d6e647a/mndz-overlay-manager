@@ -181,7 +181,8 @@ testBunOnlyOmitsSbcl = do
                 pdSource = GitHub "subsy" "ralph-tui" "v",
                 pdPlan = bunPlan "1.2.0",
                 pdLocalPVs = [],
-                pdContentFix = [parseEbuildVersion "1.0.0"]
+                pdContentFix = [parseEbuildVersion "1.0.0"],
+                pdHypoProvider = Nothing
               }
         ]
       needed = neededFloorsFromClassified classify plan (Just "1.2.0")
@@ -317,7 +318,8 @@ testFullPathFloorIgnoresReuseSibling = do
                       (pvReuse, "1.26.5")
                     ],
                 pdLocalPVs = [pvFull, pvReuse],
-                pdContentFix = []
+                pdContentFix = [],
+                pdHypoProvider = Nothing
               }
         ]
       needed = neededFloorsFromClassified classify plan Nothing

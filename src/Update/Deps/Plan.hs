@@ -5,7 +5,6 @@ module Update.Deps.Plan
     productionDepsPlanOps,
     planDepsPackageWithProgress,
     planDepsPackageWithCeilings,
-    invalidateBunCeilingsCache,
     toGoPlanOps,
   )
 where
@@ -168,11 +167,6 @@ planDepsPackageWithCeilings ops progress eco src locals ceilings =
     NpmEco -> planNpm ops progress src locals
     Cargo mLock mPkg -> planCargo ops progress src mLock mPkg locals
     Sbcl -> planSbcl ops progress src locals
-
--- | Drop the in-process bun-bin ceiling snapshot so the next plan rediscovers.
-invalidateBunCeilingsCache :: DepsPlanOps -> IO ()
-invalidateBunCeilingsCache ops =
-  modifyMVar_ (dpoBunCeilingsCache ops) (\_ -> pure Nothing)
 
 ------------------------------------------------------------------------
 -- Go

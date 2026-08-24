@@ -175,7 +175,7 @@ floorsForFullUnit ::
   NeededFloors
 floorsForFullUnit plansByKey u =
   case lookup (cpuKey u) plansByKey of
-    Just (PlanNeedsWork _ (PlannedDeps eco _ plan _ _)) ->
+    Just (PlanNeedsWork _ (PlannedDeps eco _ plan _ _ _)) ->
       let req = needAtLeast (reqForPv plan (cpuPV u))
        in case eco of
             Go _ -> emptyFloors {nfGo = req}

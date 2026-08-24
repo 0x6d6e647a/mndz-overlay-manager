@@ -1,27 +1,4 @@
-## Purpose
-
-Define overlay-internal apply wait-edges from update technique so `update` withholds runtime-lane consumers until an overlay ceiling provider’s signed commit, using a hypothetical-at-remote working plan when that provider is selected and needs work; and so an unselected stale provider is a hard-fail of the consumer on plan-delta (fail-closed when that provider’s latest cannot be fetched).
-
-## Requirements
-
-### Requirement: Overlay wait-edges follow technique ceiling source
-
-For `DepsAndAssets` packages whose runtime-lane ceiling source is a package in the configured overlay, that overlay package SHALL be the overlay wait-edge **provider** and the `DepsAndAssets` package SHALL be the **consumer**. Today that mapping is: ecosystem `Bun` waits on `dev-lang/bun-bin`. Ecosystems whose ceilings come from the gentoo repository (Go, Npm, Cargo, Sbcl) SHALL NOT create overlay wait-edges. The program SHALL NOT parse ebuild `DEPEND`, `RDEPEND`, or `BDEPEND` to discover these edges, and SHALL NOT require a second per-package edge map. Adding a package whose technique is `DepsAndAssets Bun` SHALL create the bun-bin wait-edge without a separate edge-table edit.
-
-#### Scenario: ralph waits on bun-bin
-
-- **WHEN** policy for `dev-util/ralph-tui` is `DepsAndAssets Bun` and `dev-lang/bun-bin` is in the `update` selection
-- **THEN** ralph-tui has an overlay wait-edge on bun-bin
-
-#### Scenario: mise has no overlay wait-edge
-
-- **WHEN** policy for `dev-util/mise` is `DepsAndAssets Cargo`
-- **THEN** mise has no overlay wait-edge
-
-#### Scenario: New Bun package inherits the edge
-
-- **WHEN** a newly configured overlay package uses `DepsAndAssets Bun`
-- **THEN** that package waits on `dev-lang/bun-bin` without a separate edge-table entry
+## ADDED Requirements
 
 ### Requirement: Selected provider needs-work uses hypothetical ceilings as the working plan
 
@@ -55,6 +32,8 @@ Before overlay mutation (ebuild rewrite, Manifest, egencache, signed commit) of 
 
 - **WHEN** ralph-tui’s working plan assumed bun-bin `1.4.0` and overlay bun-bin’s newest non-live ebuild is `1.4.0`
 - **THEN** the assert does not fail solely for that PV match
+
+## MODIFIED Requirements
 
 ### Requirement: Admit-when-ready apply under overlay wait-edges
 
@@ -110,38 +89,3 @@ When an overlay wait-edge provider that was withholding consumers hard-fails (in
 - **WHEN** bun-bin hard-fails during apply and ralph-tui was withheld on bun-bin
 - **THEN** ralph-tui hard-fails naming bun-bin
 - **AND** ralph-tui is not mutated using the on-disk-ceiling plan or the hypothetical working plan
-
-### Requirement: Unselected provider refuse is plan-delta
-
-When a selected consumer has an overlay wait-edge provider that is **not** in this `update` selection, the program SHALL NOT add that provider to the selection. The program SHALL fetch (or use a valid check-cache latest payload for) that provider’s GitMv remote latest, even though the provider is unselected.
-
-**Plan-delta** holds when the consumer’s runtime-lane planned unique PV set or needs-work determination under **hypothetical** overlay ceilings differs from the result under on-disk overlay ceilings. Hypothetical overlay ceilings SHALL be those ceiling discovery would compute from the current overlay provider package if the newest non-live provider ebuild’s version were the provider’s remote latest and that ebuild’s KEYWORDS were unchanged.
-
-- When plan-delta holds, the consumer SHALL hard-fail (refuse) without overlay mutation. The message SHALL name the provider and SHALL mention recovery by updating that provider or running untargeted `update`.
-- When plan-delta does not hold, the consumer MAY be planned and applied against on-disk overlay ceilings.
-- When the provider latest-fetch (and check-cache latest lookup) fails so plan-delta cannot be evaluated, the consumer SHALL hard-fail (**fail-closed**). The message SHALL name the provider and SHALL indicate that its upstream latest could not be checked. The program SHALL NOT apply the on-disk-ceiling plan in that case.
-
-Other selected packages SHALL continue. Soft-skip SHALL NOT be used for refuse or fail-closed: a run that targeted only the consumer SHALL exit with status `1`.
-
-#### Scenario: Targeted ralph refuses while bun-bin is stale
-
-- **WHEN** the user runs `update dev-util/ralph-tui`, bun-bin is not selected, bun-bin’s remote latest is newer than on-disk, and ralph-tui’s plan under hypothetical bun-bin-at-remote ceilings would select a different unique PV set than under on-disk ceilings
-- **THEN** ralph-tui hard-fails naming bun-bin
-- **AND** no ralph-tui overlay mutation occurs
-
-#### Scenario: No plan-delta allows on-disk apply
-
-- **WHEN** the user runs `update dev-util/ralph-tui`, bun-bin is not selected, bun-bin is outdated, and ralph-tui’s planned unique PVs and needs-work would be the same under hypothetical remote bun-bin ceilings
-- **THEN** ralph-tui may apply against on-disk bun-bin ceilings
-
-#### Scenario: Provider latest fetch fail-closed
-
-- **WHEN** the user runs `update dev-util/ralph-tui`, bun-bin is not selected, and bun-bin’s remote latest cannot be obtained
-- **THEN** ralph-tui hard-fails naming bun-bin
-- **AND** the message indicates the provider upstream could not be checked
-- **AND** ralph-tui is not applied under on-disk ceilings
-
-#### Scenario: Selection is not auto-expanded
-
-- **WHEN** the user runs `update dev-util/ralph-tui` and bun-bin is outdated
-- **THEN** the run does not apply `dev-lang/bun-bin`

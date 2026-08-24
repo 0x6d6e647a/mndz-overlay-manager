@@ -46,6 +46,7 @@ import Data.Text qualified as T
 import Overlay.Types (Ebuild (..))
 import Overlay.Version
   ( EbuildVersion,
+    comparePV,
     renderPVNoRev,
   )
 import System.FilePath ((</>))
@@ -95,9 +96,11 @@ import Update.Go.Lanes
 import Update.Go.Plan (PlanProgress (..), localNonLivePVs)
 import Update.Hardcoded (lookupPolicy)
 import Update.OverlayWaves
-  ( computeOverlayProviderFingerprint,
+  ( bunBinPackageKey,
+    computeOverlayProviderFingerprint,
     fetchOverlayProviderLatest,
     hypotheticalCeilings,
+    newestNonLivePv,
     overlayCeilingProvider,
     overlayFailClosedMessage,
     overlayRefuseMessage,
@@ -142,7 +145,9 @@ data PlannedWork
         pdSource :: UpdateSource,
         pdPlan :: RuntimeLanePlan,
         pdLocalPVs :: [EbuildVersion],
-        pdContentFix :: [EbuildVersion]
+        pdContentFix :: [EbuildVersion],
+        -- | Working plan used hypothetical provider-at-remote ceilings.
+        pdHypoProvider :: Maybe (PackageKey, EbuildVersion)
       }
   deriving (Eq, Show)
 
@@ -166,7 +171,7 @@ needsWorkDepsAssets = \case
 
 needsWorkCargo :: PackagePlanResult -> Bool
 needsWorkCargo = \case
-  PlanNeedsWork _ (PlannedDeps eco _ _ _ _) -> ecosystemIsCargo eco
+  PlanNeedsWork _ (PlannedDeps eco _ _ _ _ _) -> ecosystemIsCargo eco
   _ -> False
 
 ------------------------------------------------------------------------
@@ -279,31 +284,176 @@ planDeps env entry locals src eco = do
       progress = planProgress mh key eco
       localPVs = localNonLivePVs locals
       tech = DepsAndAssets eco
-  fp <- computeFingerprint src locals
-  mProvFp <-
-    case dpoOverlayRoot depsOps of
-      Just overlayRoot -> computeOverlayProviderFingerprint overlayRoot tech
-      Nothing -> pure Nothing
-  let requireProv = overlayCeilingProvider tech
-      lookupProv =
-        case requireProv of
-          Nothing -> Nothing
-          Just _
-            | Just pfp <- mProvFp -> Just pfp
-            | otherwise ->
-                -- Required but unreadable: force a miss.
-                Nothing
-  mCached <-
-    case (requireProv, mProvFp) of
-      (Just _, Nothing) -> pure Nothing
-      _ -> lookupDeps cache key fp lookupProv
-  planResult <- case mCached of
-    Just plan -> do
-      recordHit cache
-      pure (Right plan)
-    Nothing -> do
-      recordFetch cache
-      planDepsPackageWithProgress depsOps progress eco src localPVs
+      provider = overlayCeilingProvider tech
+      providerSelected =
+        maybe False (`elem` peSelectedKeys env) provider
+  useHypo <-
+    case (provider, providerSelected, dpoOverlayRoot depsOps) of
+      (Just p, True, Just overlayRoot) ->
+        selectedProviderNeedsWork env overlayRoot p
+      _ -> pure False
+  if useHypo
+    then planDepsHypo env entry locals src eco localPVs
+    else do
+      fp <- computeFingerprint src locals
+      mProvFp <-
+        case dpoOverlayRoot depsOps of
+          Just overlayRoot -> computeOverlayProviderFingerprint overlayRoot tech
+          Nothing -> pure Nothing
+      let requireProv = overlayCeilingProvider tech
+          lookupProv =
+            case requireProv of
+              Nothing -> Nothing
+              Just _
+                | Just pfp <- mProvFp -> Just pfp
+                | otherwise ->
+                    -- Required but unreadable: force a miss.
+                    Nothing
+      mCached <-
+        case (requireProv, mProvFp) of
+          (Just _, Nothing) -> pure Nothing
+          _ -> lookupDeps cache key fp lookupProv
+      planResult <- case mCached of
+        Just plan -> do
+          recordHit cache
+          pure (Right plan)
+        Nothing -> do
+          recordFetch cache
+          planDepsPackageWithProgress depsOps progress eco src localPVs
+      case planResult of
+        Left err ->
+          pure $
+            PlanHardFail
+              key
+              ("runtime-lane plan failed: " <> planErrorMessage err)
+        Right plan -> do
+          case mCached of
+            Nothing -> storeDeps cache key fp mProvFp plan
+            Just _ -> pure ()
+          contentFix <- contentFixPVs depsOps eco src locals plan
+          let onDiskNeed = planNeedsWork localPVs contentFix plan
+          refuse <- refuseUnselectedProvider env key eco src localPVs locals plan onDiskNeed
+          case refuse of
+            Just failMsg -> pure $ PlanHardFail key failMsg
+            Nothing ->
+              if not onDiskNeed
+                then pure $ PlanSoftSkip key "already matches runtime-lane plan"
+                else
+                  pure $
+                    PlanNeedsWork
+                      key
+                      PlannedDeps
+                        { pdEco = eco,
+                          pdSource = src,
+                          pdPlan = plan,
+                          pdLocalPVs = localPVs,
+                          pdContentFix = contentFix,
+                          pdHypoProvider = Nothing
+                        }
+
+-- | Selected overlay provider is needs-work (GitMv local PV < remote latest).
+selectedProviderNeedsWork ::
+  PlanEnv ->
+  FilePath ->
+  PackageKey ->
+  IO Bool
+selectedProviderNeedsWork env overlayRoot provider = do
+  eRemote <-
+    fetchOverlayProviderLatest
+      (peFetcher env)
+      (peCheckCache env)
+      overlayRoot
+      provider
+  eMetas <-
+    if provider == bunBinPackageKey
+      then discoverBunBinMetas overlayRoot
+      else pure (Left "no overlay metas")
+  pure $ case (eRemote, eMetas) of
+    (Right remote, Right metas) ->
+      case newestNonLivePv metas of
+        Just local -> comparePV local remote == Just LT
+        Nothing -> False
+    _ -> False
+
+-- | Working plan against hypothetical provider-at-remote ceilings (not stored).
+planDepsHypo ::
+  PlanEnv ->
+  PackageEntry ->
+  [Ebuild] ->
+  UpdateSource ->
+  EcosystemSpec ->
+  [EbuildVersion] ->
+  IO PackagePlanResult
+planDepsHypo env entry locals src eco localPVs =
+  case (overlayCeilingProvider (DepsAndAssets eco), dpoOverlayRoot (peDepsPlanOps env)) of
+    (Just provider, Just overlayRoot) -> do
+      let key = peKey entry
+          depsOps = peDepsPlanOps env
+          progress = planProgress (peMulti env) key eco
+      eRemote <-
+        fetchOverlayProviderLatest
+          (peFetcher env)
+          (peCheckCache env)
+          overlayRoot
+          provider
+      eMetas <- discoverBunBinMetas overlayRoot
+      case (eRemote, eMetas) of
+        (Right remote, Right metas) -> do
+          recordFetch (peCheckCache env)
+          let hypoCeil = hypotheticalCeilings metas remote
+          hypoResult <-
+            planDepsPackageWithCeilings
+              depsOps
+              progress
+              eco
+              src
+              localPVs
+              hypoCeil
+          case hypoResult of
+            Left err ->
+              pure $
+                PlanHardFail
+                  key
+                  ("runtime-lane plan failed: " <> planErrorMessage err)
+            Right hypoPlan -> do
+              -- Hypothetical-ceiling plans are not stored (check-cache option A).
+              contentFix <- contentFixPVs depsOps eco src locals hypoPlan
+              let hypoNeed = planNeedsWork localPVs contentFix hypoPlan
+              if not hypoNeed
+                then pure $ PlanSoftSkip key "already matches runtime-lane plan"
+                else
+                  pure $
+                    PlanNeedsWork
+                      key
+                      PlannedDeps
+                        { pdEco = eco,
+                          pdSource = src,
+                          pdPlan = hypoPlan,
+                          pdLocalPVs = localPVs,
+                          pdContentFix = contentFix,
+                          pdHypoProvider = Just (provider, remote)
+                        }
+        _ ->
+          -- Provider is selected; fall back to on-disk planning if latest/metas fail.
+          -- The provider's own GitMv plan will hard-fail and cascade.
+          planDepsOnDiskFallback env entry locals src eco localPVs
+    _ -> planDepsOnDiskFallback env entry locals src eco localPVs
+
+-- | On-disk plan without cache store (hypo-path fallback only).
+planDepsOnDiskFallback ::
+  PlanEnv ->
+  PackageEntry ->
+  [Ebuild] ->
+  UpdateSource ->
+  EcosystemSpec ->
+  [EbuildVersion] ->
+  IO PackagePlanResult
+planDepsOnDiskFallback env entry locals src eco localPVs = do
+  let key = peKey entry
+      depsOps = peDepsPlanOps env
+      progress = planProgress (peMulti env) key eco
+  recordFetch (peCheckCache env)
+  planResult <- planDepsPackageWithProgress depsOps progress eco src localPVs
   case planResult of
     Left err ->
       pure $
@@ -311,28 +461,22 @@ planDeps env entry locals src eco = do
           key
           ("runtime-lane plan failed: " <> planErrorMessage err)
     Right plan -> do
-      case mCached of
-        Nothing -> storeDeps cache key fp mProvFp plan
-        Just _ -> pure ()
       contentFix <- contentFixPVs depsOps eco src locals plan
-      let onDiskNeed = planNeedsWork localPVs contentFix plan
-      refuse <- refuseUnselectedProvider env key eco src localPVs locals plan onDiskNeed
-      case refuse of
-        Just failMsg -> pure $ PlanHardFail key failMsg
-        Nothing ->
-          if not onDiskNeed
-            then pure $ PlanSoftSkip key "already matches runtime-lane plan"
-            else
-              pure $
-                PlanNeedsWork
-                  key
-                  PlannedDeps
-                    { pdEco = eco,
-                      pdSource = src,
-                      pdPlan = plan,
-                      pdLocalPVs = localPVs,
-                      pdContentFix = contentFix
-                    }
+      let need = planNeedsWork localPVs contentFix plan
+      if not need
+        then pure $ PlanSoftSkip key "already matches runtime-lane plan"
+        else
+          pure $
+            PlanNeedsWork
+              key
+              PlannedDeps
+                { pdEco = eco,
+                  pdSource = src,
+                  pdPlan = plan,
+                  pdLocalPVs = localPVs,
+                  pdContentFix = contentFix,
+                  pdHypoProvider = Nothing
+                }
 
 -- | When the overlay ceiling provider is not in this selection, refuse on
 -- plan-delta or fail-closed if its GitMv latest cannot be fetched.
@@ -505,7 +649,7 @@ classifyPackageUnits ::
 classifyPackageUnits releaseOps owner repo overlayRoot key pn work =
   case work of
     PlannedGitMv {} -> pure (ClassifyOk key [])
-    PlannedDeps eco _src plan localPVs contentFix -> do
+    PlannedDeps eco _src plan localPVs contentFix _hypo -> do
       let needPVs = missingTargets localPVs plan <> contentFix
           pkgDir = case splitPackageKey key of
             Just (cat, p) -> overlayRoot </> T.unpack cat </> T.unpack p

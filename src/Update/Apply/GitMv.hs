@@ -4,6 +4,9 @@
 module Update.Apply.GitMv
   ( applyGitMv,
     applyGitMvWithRemote,
+    applyGitMvFilesWithRemote,
+    commitPendingGitMv,
+    PendingGitMvCommit (..),
     requirePackageMd5Cache,
     newEbuildFileName,
   )
@@ -15,7 +18,11 @@ import Data.Text qualified as T
 import Overlay.Version (EbuildVersion, comparePV, prettyVersion, renderPV, renderPVNoRev)
 import System.Directory (doesFileExist, renameFile)
 import System.FilePath (takeDirectory, takeFileName, (</>))
-import Update.Apply.Commit (egencacheAndSignedCommit, unitCommitMessage)
+import Update.Apply.Commit
+  ( egencacheUnitPaths,
+    signedOverlayCommit,
+    unitCommitMessage,
+  )
 import Update.Apply.Env (ApplyEnv (..))
 import Update.Apply.Errors
   ( ApplyUnitError (..),
@@ -31,6 +38,10 @@ import Update.CheckCache
   )
 import Update.Git (GitOps (..), relativeOverlayPath)
 import Update.Md5Cache (inspectPackageCache)
+import Update.OverlayWaves
+  ( committingOverlayStatus,
+    regeneratingManifestStatus,
+  )
 import Update.Types
   ( ApplyOutcome (..),
     PackageKey (..),
@@ -39,6 +50,15 @@ import Update.Types
     packageKeyText,
     splitPackageKey,
   )
+
+-- | GitMv file work finished; signed overlay commit not yet created.
+data PendingGitMvCommit = PendingGitMvCommit
+  { pgcKey :: PackageKey,
+    pgcLines :: [SuccessLine],
+    pgcPaths :: [FilePath],
+    pgcMessage :: Text
+  }
+  deriving (Eq, Show)
 
 -- | Hard-fail without mutation when package md5-cache is incomplete or mismatched.
 requirePackageMd5Cache ::
@@ -102,6 +122,23 @@ applyGitMvWithRemote ::
   EbuildVersion ->
   IO ApplyOutcome
 applyGitMvWithRemote env overlayRoot entry src remote = do
+  result <- applyGitMvFilesWithRemote env overlayRoot entry src remote
+  case result of
+    Left outcome -> pure outcome
+    Right pending -> commitPendingGitMv env overlayRoot pending
+
+-- | Rename, @ebuild … manifest@, and package @egencache@ without committing.
+--
+-- 'Left' is a terminal skip/fail (or incomparable). 'Right' is emergeable
+-- on disk; call 'commitPendingGitMv' for the signed overlay commit.
+applyGitMvFilesWithRemote ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  UpdateSource ->
+  EbuildVersion ->
+  IO (Either ApplyOutcome PendingGitMvCommit)
+applyGitMvFilesWithRemote env overlayRoot entry src remote = do
   let key = peKey entry
       local = peLocal entry
       oldPath = pePath entry
@@ -112,38 +149,56 @@ applyGitMvWithRemote env overlayRoot entry src remote = do
   case comparePV local remote of
     Just LT -> do
       mhStatus mh key "applying"
-      outcome <- gitMvDo env key local remote oldPath pkgDir pn overlayRoot
-      case outcome of
-        ApplySuccess {} -> do
+      result <- gitMvFiles env key local remote oldPath pkgDir pn overlayRoot
+      case result of
+        Right pending -> do
           fp' <- computeFingerprintFromDir src pkgDir pn
           storeLatest cache key fp' remote
-        _ -> pure ()
-      pure outcome
+          pure (Right pending)
+        Left outcome -> pure (Left outcome)
     Just EQ ->
-      pure $ ApplySoftSkip key "already at latest upstream version"
+      pure $ Left $ ApplySoftSkip key "already at latest upstream version"
     Just GT ->
       pure $
-        ApplySoftSkip
-          key
-          ( "local version is ahead of upstream ("
-              <> prettyVersion local
-              <> " > "
-              <> prettyVersion remote
-              <> ")"
-          )
+        Left $
+          ApplySoftSkip
+            key
+            ( "local version is ahead of upstream ("
+                <> prettyVersion local
+                <> " > "
+                <> prettyVersion remote
+                <> ")"
+            )
     Nothing ->
       pure $
-        ApplyHardFail
-          key
-          ( "incomparable versions: local="
-              <> T.pack (show local)
-              <> " remote="
-              <> T.pack (show remote)
-          )
-          False
-          False
+        Left $
+          ApplyHardFail
+            key
+            ( "incomparable versions: local="
+                <> T.pack (show local)
+                <> " remote="
+                <> T.pack (show remote)
+            )
+            False
+            False
 
-gitMvDo ::
+-- | Create the signed overlay commit for previously finished GitMv file work.
+commitPendingGitMv ::
+  ApplyEnv ->
+  FilePath ->
+  PendingGitMvCommit ->
+  IO ApplyOutcome
+commitPendingGitMv env overlayRoot pending = do
+  let key = pgcKey pending
+      mh = aeMulti env
+  mhStatus mh key committingOverlayStatus
+  committed <-
+    signedOverlayCommit env overlayRoot (pgcPaths pending) (pgcMessage pending)
+  pure $ case committed of
+    Right () -> ApplySuccess key (pgcLines pending) (pgcPaths pending)
+    Left err -> ApplyHardFail key err True False
+
+gitMvFiles ::
   ApplyEnv ->
   PackageKey ->
   EbuildVersion ->
@@ -152,22 +207,24 @@ gitMvDo ::
   FilePath ->
   Text ->
   FilePath ->
-  IO ApplyOutcome
-gitMvDo env key local remote oldPath pkgDir pn overlayRoot = do
+  IO (Either ApplyOutcome PendingGitMvCommit)
+gitMvFiles env key local remote oldPath pkgDir pn overlayRoot = do
   let gitOps = aeGitOps env
       ebuildRun = aeEbuildRunner env
+      mh = aeMulti env
   cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
   case cacheGate of
-    Left unitErr -> pure $ applyUnitHardFail key unitErr False False
+    Left unitErr ->
+      pure $ Left $ applyUnitHardFail key unitErr False False
     Right () -> do
       ebuildRel <- relativeOverlayPath overlayRoot oldPath
       let manifestAbs = pkgDir </> "Manifest"
       manRel0 <- relativeOverlayPath overlayRoot manifestAbs
       dirty' <- goPathsDirty gitOps overlayRoot [ebuildRel, manRel0]
       case dirty' of
-        Left err -> pure $ ApplyHardFail key err False False
+        Left err -> pure $ Left $ ApplyHardFail key err False False
         Right True ->
-          pure $ applyUnitHardFail key ApplyDirtyInvolvedPaths False False
+          pure $ Left $ applyUnitHardFail key ApplyDirtyInvolvedPaths False False
         Right False -> do
           let newName = newEbuildFileName pn remote
               newPath = pkgDir </> newName
@@ -175,11 +232,12 @@ gitMvDo env key local remote oldPath pkgDir pn overlayRoot = do
           if existsNew && takeFileName oldPath /= newName
             then
               pure $
-                ApplyHardFail
-                  key
-                  ("target ebuild already exists: " <> T.pack newName)
-                  False
-                  False
+                Left $
+                  ApplyHardFail
+                    key
+                    ("target ebuild already exists: " <> T.pack newName)
+                    False
+                    False
             else do
               renamed <-
                 if takeFileName oldPath == newName
@@ -187,9 +245,11 @@ gitMvDo env key local remote oldPath pkgDir pn overlayRoot = do
                   else do
                     renameFile oldPath newPath
                     pure True
+              mhStatus mh key regeneratingManifestStatus
               manResult <- ebuildRun pkgDir newName
               case manResult of
-                Left err -> pure $ ApplyHardFail key err renamed False
+                Left err ->
+                  pure $ Left $ ApplyHardFail key err renamed False
                 Right () -> do
                   newRel <- relativeOverlayPath overlayRoot newPath
                   manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
@@ -206,8 +266,17 @@ gitMvDo env key local remote oldPath pkgDir pn overlayRoot = do
                             }
                         ]
                       msg = unitCommitMessage key (renderPV remote)
-                  committed <-
-                    egencacheAndSignedCommit env overlayRoot key unitPaths msg
-                  pure $ case committed of
-                    Right paths -> ApplySuccess key lines_ paths
-                    Left err -> ApplyHardFail key err True False
+                  ePaths <-
+                    egencacheUnitPaths env overlayRoot key unitPaths
+                  case ePaths of
+                    Left err ->
+                      pure $ Left $ ApplyHardFail key err True False
+                    Right paths ->
+                      pure $
+                        Right
+                          PendingGitMvCommit
+                            { pgcKey = key,
+                              pgcLines = lines_,
+                              pgcPaths = paths,
+                              pgcMessage = msg
+                            }

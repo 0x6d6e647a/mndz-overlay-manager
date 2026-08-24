@@ -4,6 +4,7 @@
 module Test.OverlayWaves (tests) where
 
 import Data.Text (Text)
+import Data.Text qualified as T
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
 import Test.Assert (assertEq, assertTrue)
 import Test.Tasty (TestTree, testGroup)
@@ -17,6 +18,8 @@ import Update.OverlayWaves
     hypotheticalCeilings,
     overlayCeilingProvider,
     overlayCeilingProviderForKey,
+    overlayDirtyPreflightMessage,
+    overlayProviderPvMismatchMessage,
     planDeltaHolds,
     replaceNewestNonLivePv,
   )
@@ -47,7 +50,9 @@ tests =
       testCase "Admit: provider already current does not withhold" testAdmitProviderSkip,
       testCase "Waiting keys are not in the ready/job set" testWaitingNotReady,
       testCase "Hypothetical ceilings replace newest PV keep KEYWORDS" testHypotheticalCeilings,
-      testCase "Plan-delta on unique PVs and needs-work" testPlanDelta
+      testCase "Plan-delta on unique PVs and needs-work" testPlanDelta,
+      testCase "Dirty preflight message names path and package" testDirtyPreflightMessage,
+      testCase "Provider PV mismatch names both PVs" testProviderPvMismatchMessage
     ]
 
 ralph :: PackageKey
@@ -207,3 +212,32 @@ emptyPlan pvs =
       glpUniquePVs = pvs,
       glpRuntimeAtom = bunBinRuntimeAtom
     }
+
+testDirtyPreflightMessage :: IO ()
+testDirtyPreflightMessage = do
+  let msg =
+        overlayDirtyPreflightMessage
+          bunBinPackageKey
+          "dev-lang/bun-bin"
+  assertTrue "names package" ("dev-lang/bun-bin" `T.isInfixOf` msg)
+  assertTrue "names path" ("dev-lang/bun-bin" `T.isInfixOf` msg)
+  assertTrue "restore" ("restore or finish" `T.isInfixOf` msg)
+  assertTrue "HEAD" ("git HEAD" `T.isInfixOf` msg)
+
+testProviderPvMismatchMessage :: IO ()
+testProviderPvMismatchMessage = do
+  let consumer = mkPackageKey "dev-util" "ralph-tui"
+      planned = parseEbuildVersion "1.4.0"
+      overlayPv = parseEbuildVersion "1.3.14"
+      msg =
+        overlayProviderPvMismatchMessage
+          consumer
+          bunBinPackageKey
+          planned
+          overlayPv
+  assertTrue "names consumer" ("dev-util/ralph-tui" `T.isInfixOf` msg)
+  assertTrue "names provider" ("dev-lang/bun-bin" `T.isInfixOf` msg)
+  assertTrue "planned PV" ("1.4.0" `T.isInfixOf` msg)
+  assertTrue "overlay PV" ("1.3.14" `T.isInfixOf` msg)
+  assertTrue "not mutated" ("not mutated" `T.isInfixOf` msg)
+  assertTrue "recovery" ("Restore or finish" `T.isInfixOf` msg)

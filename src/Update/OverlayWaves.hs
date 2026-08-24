@@ -19,6 +19,13 @@ module Update.OverlayWaves
     overlayRefuseMessage,
     overlayFailClosedMessage,
     overlayProviderCascadeMessage,
+    overlayDirtyPreflightMessage,
+    overlayProviderPvMismatchMessage,
+    overlayPackageRelDir,
+    newestNonLivePv,
+    regeneratingManifestStatus,
+    committingOverlayStatus,
+    dirtyPreflightStepLabel,
     computeOverlayProviderFingerprint,
     fetchOverlayProviderLatest,
     blockedOnLabel,
@@ -29,7 +36,7 @@ import Data.List (sort)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Overlay.Version (EbuildVersion, comparePV)
+import Overlay.Version (EbuildVersion, comparePV, renderPV)
 import System.Directory (doesDirectoryExist)
 import System.FilePath ((</>))
 import Update.CheckCache
@@ -197,6 +204,59 @@ overlayProviderCascadeMessage provider =
   "overlay ceiling provider "
     <> packageKeyText provider
     <> " hard-failed; not applying under a dirty overlay"
+
+-- | Spine dirty-preflight hard-fail: names a path or package and recovery.
+overlayDirtyPreflightMessage :: PackageKey -> FilePath -> Text
+overlayDirtyPreflightMessage key rel =
+  "overlay path "
+    <> T.pack rel
+    <> " ("
+    <> packageKeyText key
+    <> ") is dirty vs git HEAD (including untracked or deleted files); "
+    <> "restore or finish that tree relative to git HEAD"
+
+-- | Hypo-planned consumer overlay write: provider PV did not land.
+overlayProviderPvMismatchMessage ::
+  PackageKey ->
+  PackageKey ->
+  EbuildVersion ->
+  EbuildVersion ->
+  Text
+overlayProviderPvMismatchMessage consumer provider planned overlayPv =
+  packageKeyText consumer
+    <> ": overlay ceiling provider "
+    <> packageKeyText provider
+    <> " is "
+    <> renderPV overlayPv
+    <> " but this plan assumed "
+    <> renderPV planned
+    <> "; the provider bump did not land as planned and this package was not mutated. "
+    <> "Restore or finish "
+    <> packageKeyText provider
+    <> " relative to git HEAD, then retry"
+
+-- | Overlay-relative package directory pathspec (@category/package@).
+overlayPackageRelDir :: PackageKey -> Maybe FilePath
+overlayPackageRelDir key =
+  case splitPackageKey key of
+    Just (cat, pn) -> Just (T.unpack cat </> T.unpack pn)
+    Nothing -> Nothing
+
+-- | Newest non-live PV among overlay runtime metas.
+newestNonLivePv :: [RuntimeEbuildMeta] -> Maybe EbuildVersion
+newestNonLivePv = fmap remPV . pickNewest
+
+-- | Apply-row status while GitMv regenerates Manifest (before docker).
+regeneratingManifestStatus :: Text
+regeneratingManifestStatus = "regenerating Manifest"
+
+-- | Apply-row status for a delayed overlay signed commit after ensure.
+committingOverlayStatus :: Text
+committingOverlayStatus = "committing"
+
+-- | Sequential step label for start-of-run overlay dirty preflight.
+dirtyPreflightStepLabel :: Text
+dirtyPreflightStepLabel = "Checking overlay git status"
 
 -- | Fingerprint of the overlay ceiling-provider tree, when the technique has one.
 computeOverlayProviderFingerprint ::

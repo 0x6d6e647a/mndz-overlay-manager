@@ -10,9 +10,15 @@ import Colog (LogAction (..))
 import Config.Types (CheckCacheTtl (..))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (race)
-import Control.Concurrent.MVar (modifyMVar_, newMVar)
+import Control.Concurrent.MVar
+  ( modifyMVar_,
+    newEmptyMVar,
+    newMVar,
+    putMVar,
+    takeMVar,
+  )
 import Data.ByteString qualified as BS
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -21,7 +27,7 @@ import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion, parseEbuildVersion, prettyVersion)
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesFileExist, renameFile)
 import System.FilePath (takeBaseName, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (callProcess)
@@ -37,11 +43,15 @@ import Update.Assets.Release
     ReleaseOps (..),
   )
 import Update.Check (PackageEntry (..), groupNewest)
-import Update.CheckCache (openCheckCache)
+import Update.CheckCache
+  ( computeFingerprintFromDir,
+    lookupDeps,
+    openCheckCache,
+  )
 import Update.Deps.Plan (DepsPlanOps (..))
 import Update.DiskSpace (DiskSpaceProbe (..))
 import Update.Git (GitOps (..))
-import Update.Materialize (EnsureOutcome (..), NeededFloors)
+import Update.Materialize (EnsureOutcome (..), NeededFloors (..))
 import Update.Preflight (AssetsPreflight (..))
 import Update.Spine
   ( UpdateSpineDeps (..),
@@ -88,7 +98,31 @@ integrationTests =
         testFailedReEnsureKeepsCommit,
       testCase
         "second ensure after bun-bin commit"
-        testSecondEnsureAfterBunBin
+        testSecondEnsureAfterBunBin,
+      testCase
+        "leftover bun-bin dirt fails update dolt without ensure"
+        testDirtyBunBinFailsUpdateDolt,
+      testCase
+        "dirty selected package fails before mutate"
+        testDirtySelectedPackageFails,
+      testCase
+        "overlay-root README dirt does not fail"
+        testOverlayRootDirtOk,
+      testCase
+        "ensure waits for bun-bin Manifest"
+        testEnsureWaitsForBunBinManifest,
+      testCase
+        "grok-build-bin may overlap ensure"
+        testGrokBuildBinOverlapsEnsure,
+      testCase
+        "t0 ensure bun floor is hypo remote"
+        testT0EnsureHypoBunFloor,
+      testCase
+        "safety-assert mismatch hard-fails ralph"
+        testSafetyAssertMismatch,
+      testCase
+        "hypo ralph plan is not cached under old bun-bin fingerprint"
+        testHypoPlanNotCachedUnderOldBunBin
     ]
 
 ------------------------------------------------------------------------
@@ -348,16 +382,14 @@ testProviderHardFailCascade =
     ralphPath <- seedRalph overlay
     initGitDir assets
     createDirectoryIfMissing True dist
-    let gitOps =
-          cleanGit
-            { goPathsDirty = \_ paths ->
-                pure $
-                  Right
-                    (any (\p -> "bun-bin" `T.isInfixOf` T.pack p) paths)
-            }
+    let failBunManifest pkgDir name =
+          if "bun-bin" `T.isInfixOf` T.pack name
+            then pure (Left "bun-bin manifest failed")
+            else fakeEbuildRun pkgDir name
         (entries, ebuilds) = mkEntries bunPath ralphPath
-    deps <-
-      baseSpine overlay assets dist gitOps releaseMissing 2 preflightNoDocker
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 2 preflightNoDocker
+    let deps = deps0 {usdEbuildRunner = failBunManifest}
     result <- runUpdatePhases deps entries ebuilds entries
     case result of
       Left err -> assertFailure $ "spine failed: " <> T.unpack err
@@ -630,4 +662,387 @@ testSecondEnsureAfterBunBin =
           "bun-bin success"
           (any (\case ApplySuccess k _ _ -> k == bunKey; _ -> False) outs)
         n <- readIORef nEnsure
-        assertTrue "re-entry ensure ran" (n >= 1)
+        assertEq "one t0 ensure; no second after bun-bin commit" 1 n
+
+seedDolt :: FilePath -> IO FilePath
+seedDolt overlay = do
+  let pkgDir = overlay </> "dev-db" </> "dolt"
+      name = "dolt-1.0.0.ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile (pkgDir </> name) "EAPI=8\nKEYWORDS=\"~amd64\"\n"
+  TIO.writeFile (pkgDir </> "Manifest") "DIST dolt 1\n"
+  writeMatchingCachesForPackage overlay "dev-db" "dolt" pkgDir
+  pure (pkgDir </> name)
+
+seedGrok :: FilePath -> T.Text -> IO FilePath
+seedGrok overlay ver = do
+  let pkgDir = overlay </> "dev-util" </> "grok-build-bin"
+      name = "grok-build-bin-" <> T.unpack ver <> ".ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile
+    (pkgDir </> name)
+    "EAPI=8\nKEYWORDS=\"~amd64\"\n"
+  TIO.writeFile (pkgDir </> "Manifest") "DIST grok 1\n"
+  writeMatchingCachesForPackage overlay "dev-util" "grok-build-bin" pkgDir
+  pure (pkgDir </> name)
+
+dirtyIfPathContains :: T.Text -> GitOps
+dirtyIfPathContains needle =
+  cleanGit
+    { goPathsDirty = \_ paths ->
+        pure $
+          Right
+            (any (\p -> needle `T.isInfixOf` T.pack p) paths)
+    }
+
+testDirtyBunBinFailsUpdateDolt :: IO ()
+testDirtyBunBinFailsUpdateDolt =
+  withSystemTempDirectory "om-wave-dirty-dolt" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    _bunPath <- seedBunBin overlay "1.1.0"
+    doltPath <- seedDolt overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    nEnsure <- newIORef (0 :: Int)
+    let ebuilds = [Ebuild "dev-db" "dolt" "1.0.0" doltPath]
+        entries = groupNewest ebuilds
+    deps0 <-
+      baseSpine
+        overlay
+        assets
+        dist
+        (dirtyIfPathContains "bun-bin")
+        releaseMissing
+        2
+        preflightOk
+    let deps =
+          deps0
+            { usdEnsureImage = countingEnsure nEnsure,
+              usdFetcher = \_ -> pure (Right (parseEbuildVersion "1.0.1"))
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> do
+        assertTrue "names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` err)
+        assertTrue "restore/finish" ("restore or finish" `T.isInfixOf` err)
+      Right _ -> assertFailure "expected dirty preflight hard-fail"
+    n <- readIORef nEnsure
+    assertEq "no ensure after dirty bun-bin" 0 n
+    still <- doesFileExist doltPath
+    assertTrue "dolt not mutated" still
+
+testDirtySelectedPackageFails :: IO ()
+testDirtySelectedPackageFails =
+  withSystemTempDirectory "om-wave-dirty-sel" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    nEnsure <- newIORef (0 :: Int)
+    let (entries, ebuilds) = mkEntries bunPath ralphPath
+    deps0 <-
+      baseSpine
+        overlay
+        assets
+        dist
+        (dirtyIfPathContains "ralph-tui")
+        releaseMissing
+        2
+        preflightOk
+    let deps = deps0 {usdEnsureImage = countingEnsure nEnsure}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err ->
+        assertTrue "names ralph" ("ralph-tui" `T.isInfixOf` err)
+      Right _ -> assertFailure "expected dirty selected package to fail"
+    n <- readIORef nEnsure
+    assertEq "no ensure" 0 n
+
+testOverlayRootDirtOk :: IO ()
+testOverlayRootDirtOk =
+  withSystemTempDirectory "om-wave-readme-dirt" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    nEnsure <- newIORef (0 :: Int)
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath]
+        entries = groupNewest ebuilds
+    deps0 <-
+      baseSpine
+        overlay
+        assets
+        dist
+        (dirtyIfPathContains "README")
+        releaseMissing
+        2
+        preflightOk
+    let deps = deps0 {usdEnsureImage = countingEnsure nEnsure}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err ->
+        assertFailure $
+          "README-only dirt should not fail preflight: " <> T.unpack err
+      Right res -> do
+        let bunKey = mkPackageKey "dev-lang" "bun-bin"
+        assertTrue
+          "bun-bin proceeded"
+          ( any
+              ( \case
+                  ApplySuccess k _ _ -> k == bunKey
+                  ApplyHardFail k _ _ _ -> k == bunKey
+                  ApplySoftSkip k _ -> k == bunKey
+              )
+              (usrOutcomes res)
+          )
+        n <- readIORef nEnsure
+        assertEq "GitMv-only no ensure" 0 n
+
+testEnsureWaitsForBunBinManifest :: IO ()
+testEnsureWaitsForBunBinManifest =
+  withSystemTempDirectory "om-wave-manifest-gate" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+        bunMan = overlay </> "dev-lang" </> "bun-bin" </> "Manifest"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    sawReady <- newIORef False
+    let delayedEbuild pkgDir name = do
+          threadDelay 150_000
+          fakeEbuildRun pkgDir name
+        gatedEnsure _floors = do
+          man <- TIO.readFile bunMan
+          writeIORef sawReady ("bun-bin-1.2.0" `T.isInfixOf` man)
+          pure (Right EnsureSkipped)
+        (entries, ebuilds) = mkEntries bunPath ralphPath
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    let deps =
+          deps0
+            { usdEbuildRunner = delayedEbuild,
+              usdEnsureImage = gatedEnsure
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right _ -> do
+        ready <- readIORef sawReady
+        assertTrue "ensure saw Manifest DIST for new bun-bin PV" ready
+
+testGrokBuildBinOverlapsEnsure :: IO ()
+testGrokBuildBinOverlapsEnsure =
+  withSystemTempDirectory "om-wave-grok-overlap" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    grokPath <- seedGrok overlay "0.2.99"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    grokUnblock <- newEmptyMVar
+    ensureStarted <- newIORef False
+    let blockGrok pkgDir name =
+          if "grok-build-bin" `T.isInfixOf` T.pack name
+            then do
+              takeMVar grokUnblock
+              fakeEbuildRun pkgDir name
+            else fakeEbuildRun pkgDir name
+        overlappingEnsure _ = do
+          writeIORef ensureStarted True
+          putMVar grokUnblock ()
+          pure (Right EnsureSkipped)
+        fetchMix src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          Http {} ->
+            pure (Right (parseEbuildVersion "0.2.101"))
+          _ ->
+            pure (Left "unexpected fetch")
+        ebuilds =
+          [ Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath,
+            Ebuild "dev-util" "ralph-tui" "1.0.0" ralphPath,
+            Ebuild "dev-util" "grok-build-bin" "0.2.99" grokPath
+          ]
+        entries = groupNewest ebuilds
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    let deps =
+          deps0
+            { usdFetcher = fetchMix,
+              usdEbuildRunner = blockGrok,
+              usdEnsureImage = overlappingEnsure
+            }
+    raced <-
+      race
+        (threadDelay 15_000_000)
+        (runUpdatePhases deps entries ebuilds entries)
+    case raced of
+      Left () ->
+        assertFailure
+          "deadlock: ensure likely waited on grok-build-bin Manifest"
+      Right (Left err) ->
+        assertFailure $ "spine failed: " <> T.unpack err
+      Right (Right _) -> do
+        started <- readIORef ensureStarted
+        assertTrue "ensure started (did not wait on grok-build-bin)" started
+
+testT0EnsureHypoBunFloor :: IO ()
+testT0EnsureHypoBunFloor =
+  withSystemTempDirectory "om-wave-hypo-floor" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.3.14"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    floorsRef <- newIORef (Nothing :: Maybe NeededFloors)
+    let recordFloors floors = do
+          writeIORef floorsRef (Just floors)
+          pure (Right EnsureSkipped)
+        fetch14 src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.4.0"))
+          _ -> fetchBunLatest src
+        bunEngines14 _o _r _p pv =
+          pure $
+            Right $
+              case pv of
+                "1.0.0" -> "1.3.14"
+                "1.5.0" -> "1.4.0"
+                _ -> "1.0.0"
+        ebuilds =
+          [ Ebuild "dev-lang" "bun-bin" "1.3.14" bunPath,
+            Ebuild "dev-util" "ralph-tui" "1.0.0" ralphPath
+          ]
+        entries = groupNewest ebuilds
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    ops <- liveBunOps overlay
+    let ops14 = ops {dpoFetchBunEngines = bunEngines14}
+        deps =
+          deps0
+            { usdFetcher = fetch14,
+              usdDepsPlanOps = ops14,
+              usdEnsureImage = recordFloors
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right _ -> do
+        mf <- readIORef floorsRef
+        case mf of
+          Nothing -> assertFailure "expected t0 ensure to run"
+          Just floors ->
+            assertEq "hypo bun floor is remote 1.4.0" (Just "1.4.0") (nfBun floors)
+
+testSafetyAssertMismatch :: IO ()
+testSafetyAssertMismatch =
+  withSystemTempDirectory "om-wave-safety-assert" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let revertAfterCommit _root paths _msg = do
+          if any (\p -> "bun-bin" `T.isInfixOf` T.pack p) paths
+            then do
+              let bunDir = overlay </> "dev-lang" </> "bun-bin"
+              renameFile
+                (bunDir </> "bun-bin-1.2.0.ebuild")
+                (bunDir </> "bun-bin-1.1.0.ebuild")
+              pure (Right ())
+            else pure (Right ())
+        gitOps = cleanGit {goAddAndCommit = revertAfterCommit}
+        ebuildReuse pkgDir name = do
+          let base = T.pack (takeBaseName name)
+              tarball = base <> "-deps.tar.xz"
+              digests = hashBytes bunAssetBytes
+          TIO.writeFile
+            (pkgDir </> "Manifest")
+            ( "DIST "
+                <> tarball
+                <> " 1 SHA512 "
+                <> digestSHA512 digests
+                <> "\n"
+            )
+          pure (Right ())
+        (entries, ebuilds) = mkEntries bunPath ralphPath
+    deps0 <-
+      baseSpine overlay assets dist gitOps releaseRalphReuse 2 preflightOk
+    let deps = deps0 {usdEbuildRunner = ebuildReuse}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res -> do
+        let ralphKey = mkPackageKey "dev-util" "ralph-tui"
+            bunKey = mkPackageKey "dev-lang" "bun-bin"
+            outs = usrOutcomes res
+        assertTrue
+          "bun-bin success"
+          (any (\case ApplySuccess k _ _ -> k == bunKey; _ -> False) outs)
+        case [m | ApplyHardFail k m _ _ <- outs, k == ralphKey] of
+          (msg : _) -> do
+            assertTrue "names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` msg)
+            assertTrue "names planned PV" ("1.2.0" `T.isInfixOf` msg)
+            assertTrue "names overlay PV" ("1.1.0" `T.isInfixOf` msg)
+            assertTrue "not mutated" ("not mutated" `T.isInfixOf` msg)
+          [] -> assertFailure "expected ralph safety-assert hard-fail"
+        still <- doesFileExist ralphPath
+        assertTrue "ralph overlay not rewritten" still
+
+testHypoPlanNotCachedUnderOldBunBin :: IO ()
+testHypoPlanNotCachedUnderOldBunBin =
+  withSystemTempDirectory "om-wave-hypo-cache" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+        cacheDir = tmp </> "check-cache"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    (cache, _) <- openCheckCache (CacheTtl (60 * 60)) False overlay
+    bunFp <-
+      computeFingerprintFromDir
+        (GitHub "oven-sh" "bun" "bun-v")
+        (overlay </> "dev-lang" </> "bun-bin")
+        "bun-bin"
+    ralphFp <-
+      computeFingerprintFromDir
+        (GitHub "subsy" "ralph-tui" "v")
+        (overlay </> "dev-util" </> "ralph-tui")
+        "ralph-tui"
+    let (entries, ebuilds) = mkEntries bunPath ralphPath
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    let deps =
+          deps0
+            { usdCheckCache = cache,
+              usdEnsureImage = failingEnsure
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right _ -> do
+        hit <- lookupDeps cache ralphKey ralphFp (Just bunFp)
+        assertEq
+          "no 1.2.0 hypo plan under bun-bin 1.1.0 fingerprint"
+          Nothing
+          hit
+        -- Silence unused cacheDir (handle is in-memory + overlay path).
+        createDirectoryIfMissing True cacheDir

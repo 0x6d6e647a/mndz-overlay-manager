@@ -36,6 +36,7 @@ tests =
     "Git"
     [ testCase "Is Git Work Tree" testIsGitWorkTree,
       testCase "Paths Dirty Clean And Dirty" testPathsDirty,
+      testCase "Paths Dirty Treats Deleted And Untracked" testPathsDirtyDeletedUntracked,
       testCase "Paths Dirty Git Status Failure" testPathsDirtyStatusFailure,
       testCase "Relative Overlay Path" testRelativeOverlayPath,
       testCase "Git Push No Remote Fails" testGitPushNoRemote,
@@ -80,6 +81,25 @@ testPathsDirty =
     -- missing pathspec is still a successful status (not dirty)
     missing <- assertRight "missing path" =<< pathsDirty root ["no-such-file"]
     assertEq "missing not dirty" False missing
+
+testPathsDirtyDeletedUntracked :: IO ()
+testPathsDirtyDeletedUntracked =
+  withSystemTempDirectory "git-dirty-du" $ \tmp -> do
+    let root = tmp </> "repo"
+        pkg = root </> "dev-lang" </> "bun-bin"
+    createDirectoryIfMissing True pkg
+    initRepo root
+    writeFile (pkg </> "bun-bin-1.3.14.ebuild") "EAPI=8\n"
+    callProcess "git" ["-C", root, "add", "dev-lang/bun-bin"]
+    callProcess "git" ["-C", root, "commit", "-m", "bun-bin"]
+    callProcess
+      "git"
+      ["-C", root, "rm", "-q", "dev-lang/bun-bin/bun-bin-1.3.14.ebuild"]
+    createDirectoryIfMissing True pkg
+    writeFile (pkg </> "bun-bin-1.4.0.ebuild") "EAPI=8\n"
+    dirty <-
+      assertRight "D and ??" =<< pathsDirty root ["dev-lang/bun-bin"]
+    assertEq "untracked and deleted count as dirty" True dirty
 
 testPathsDirtyStatusFailure :: IO ()
 testPathsDirtyStatusFailure =

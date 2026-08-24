@@ -9,6 +9,7 @@ module Update.Apply
     applyOverlayFromPlan,
     WavePrepare,
     ImageEnsure,
+    MutateEnsure (..),
     foldExitHardFail,
     EbuildRunner,
     productionEbuildRunner,
@@ -33,13 +34,14 @@ import CLI.Progress
 import Control.Concurrent (newQSem, signalQSem, waitQSem)
 import Control.Concurrent.Async (mapConcurrently_, wait, withAsync)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (bracket_)
-import Control.Monad (replicateM_, unless, when)
+import Control.Monad (replicateM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (isJust, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Update.Apply.Env
@@ -48,7 +50,13 @@ import Update.Apply.Env
     mkEbuildRunner,
     productionEbuildRunner,
   )
-import Update.Apply.GitMv (applyGitMv, applyGitMvWithRemote)
+import Update.Apply.GitMv
+  ( PendingGitMvCommit (..),
+    applyGitMv,
+    applyGitMvFilesWithRemote,
+    applyGitMvWithRemote,
+    commitPendingGitMv,
+  )
 import Update.Apply.Materialize
   ( applyDepsAndAssets,
     applyDepsAndAssetsFromPlan,
@@ -124,6 +132,18 @@ type WavePrepare =
 -- | t0 image ensure: runs outside the package job limiter.
 type ImageEnsure = MultiHandle -> IO (Either Text ())
 
+-- | Mutate-phase ensure / GitMv sequencing for bun-bin-before-docker.
+data MutateEnsure = MutateEnsure
+  { meFullPathKeys :: [PackageKey],
+    meImageEnsure :: ImageEnsure,
+    -- | GitMv key whose signed commit waits until ensure finishes.
+    meDelayCommit :: Maybe PackageKey,
+    -- | GitMv key whose file work must finish before @docker build@.
+    meGateEnsureOnFiles :: Maybe PackageKey,
+    -- | Run t0 ensure even when no admitted full-path package exists.
+    meRunEnsure :: Bool
+  }
+
 planKindOf :: PackagePlanResult -> OverlayPlanKind
 planKindOf = \case
   PlanSoftSkip {} -> OverlayPlanSkip
@@ -140,11 +160,9 @@ applyOverlayFromPlan ::
   [PackageEntry] ->
   [PackagePlanResult] ->
   WavePrepare ->
-  -- | Admitted full-path keys that wait on image ensure (not a job slot).
-  [PackageKey] ->
-  ImageEnsure ->
+  MutateEnsure ->
   IO [ApplyOutcome]
-applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare fullPathKeys imageEnsure = do
+applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare mutate = do
   isGit <- goIsWorkTree (aeGitOps env) overlayRoot
   if not isGit
     then
@@ -179,25 +197,31 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare fullPathKe
           withheldPairs = asWithheld admit
           panelTotal = length admittedWork + length withheldPairs
           (readyWork, ensureWork) =
-            partitionEnsure fullPathKeys admittedWork
+            partitionEnsure (meFullPathKeys mutate) admittedWork
       nested <-
-        if panelTotal <= 0
+        if panelTotal <= 0 && not (meRunEnsure mutate)
           then pure []
-          else withMultiProgress pcfg "Updating packages" panelTotal $ \mh -> do
+          else withMultiProgress pcfg "Updating packages" (max 1 panelTotal) $ \mh -> do
             for_ withheldPairs $ \(consumer, provider) ->
               mhWait mh consumer ("waiting on " <> packageKeyText provider)
             for_ ensureWork $ \(e, _) ->
               mhWait mh (peKey e) waitingOnMaterializeImage
             let env' = env {aeMulti = mh}
-            runAdmitPool
-              env'
-              overlayRoot
-              readyWork
-              ensureWork
-              imageEnsure
-              withheldSet
-              byEntry
-              prepare
+            if panelTotal <= 0
+              then do
+                -- Ensure-only (no admitted/withheld rows): still run t0 ensure.
+                void (meImageEnsure mutate mh)
+                pure []
+              else
+                runAdmitPool
+                  env'
+                  overlayRoot
+                  readyWork
+                  ensureWork
+                  mutate
+                  withheldSet
+                  byEntry
+                  prepare
       let outcomes = carried <> nested
       unless (any outcomeIsHardFail outcomes) $
         cleanupRunSuccess (aeTempRun env)
@@ -220,15 +244,18 @@ runAdmitPool ::
   FilePath ->
   [(PackageEntry, PlannedWork)] ->
   [(PackageEntry, PlannedWork)] ->
-  ImageEnsure ->
+  MutateEnsure ->
   Map PackageKey PackageKey ->
   Map PackageKey PackageEntry ->
   WavePrepare ->
   IO [ApplyOutcome]
-runAdmitPool env overlayRoot readyWork ensureWork imageEnsure withheld0 byEntry prepare = do
+runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepare = do
   let jobs = max 1 (aeJobs env)
       mh = aeMulti env
       panelCount = length readyWork + length ensureWork + Map.size withheld0
+      delayKey = meDelayCommit mutate
+      delayInReady =
+        maybe False (\k -> any (\(e, _) -> peKey e == k) readyWork) delayKey
   if panelCount == 0
     then pure []
     else do
@@ -237,6 +264,10 @@ runAdmitPool env overlayRoot readyWork ensureWork imageEnsure withheld0 byEntry 
       remaining <- newIORef panelCount
       outcomesRef <- newIORef ([] :: [ApplyOutcome])
       withheldRef <- newIORef withheld0
+      filesReady <- newEmptyMVar
+      pendingVar <- newEmptyMVar
+      unless delayInReady $
+        putMVar filesReady (Right ())
       for_ readyWork $ \item -> writeChan chan (Just item)
       let finishOne = do
             n <- atomicModifyIORef' remaining (\x -> let x' = x - 1 in (x', x'))
@@ -282,36 +313,137 @@ runAdmitPool env overlayRoot readyWork ensureWork imageEnsure withheld0 byEntry 
                   else do
                     results <- prepare key waiting mh
                     admitResults key waiting results
+          failEnsureWork err = do
+            for_ ensureWork $ \(e, _) -> do
+              let k = peKey e
+              mhFail mh k (shortApplyReason err)
+              recordOutcomes [ApplyHardFail k err False False]
+              finishOne
+          delayedGitMv key work =
+            delayKey == Just key
+              && case work of
+                PlannedGitMv {} -> True
+                _ -> False
           worker = do
             item <- readChan chan
             case item of
               Nothing -> pure ()
-              Just (entry, work) -> do
-                outs <-
-                  bracket_
-                    (waitQSem sem)
-                    (signalQSem sem)
-                    (applyNeedsWorkTracked env overlayRoot entry work)
-                handleDone (peKey entry) outs
-                worker
-          runEnsure =
-            if null ensureWork
-              then pure ()
-              else do
-                result <- imageEnsure mh
+              Just (entry, work)
+                | delayedGitMv (peKey entry) work -> do
+                    fileResult <-
+                      bracket_
+                        (waitQSem sem)
+                        (signalQSem sem)
+                        (runDelayedGitMvFiles env overlayRoot entry work)
+                    case fileResult of
+                      Left outcome -> do
+                        presentApplyChrome mh (peKey entry) [outcome]
+                        putMVar filesReady (Left (outcomeMessage outcome))
+                        handleDone (peKey entry) [outcome]
+                        worker
+                      Right pending -> do
+                        putMVar pendingVar pending
+                        putMVar filesReady (Right ())
+                        worker
+                | otherwise -> do
+                    outs <-
+                      bracket_
+                        (waitQSem sem)
+                        (signalQSem sem)
+                        (applyNeedsWorkTracked env overlayRoot entry work)
+                    handleDone (peKey entry) outs
+                    worker
+          gated = isJust (meGateEnsureOnFiles mutate)
+          runEnsure = do
+            filesBefore <-
+              if gated
+                then takeMVar filesReady
+                else pure (Right ())
+            case filesBefore of
+              Left err ->
+                when (meRunEnsure mutate || not (null ensureWork)) $
+                  failEnsureWork err
+              Right () -> do
+                result <-
+                  if meRunEnsure mutate || not (null ensureWork)
+                    then meImageEnsure mutate mh
+                    else pure (Right ())
+                filesAfter <-
+                  if delayInReady && not gated
+                    then takeMVar filesReady
+                    else pure filesBefore
+                case (meDelayCommit mutate, filesAfter) of
+                  (Just bunKey, Right ())
+                    | delayInReady -> do
+                        pending <- takeMVar pendingVar
+                        out <- commitPendingGitMv env overlayRoot pending
+                        presentApplyChrome mh bunKey [out]
+                        handleDone bunKey [out]
+                  _ -> pure ()
                 case result of
-                  Left err ->
-                    for_ ensureWork $ \(e, _) -> do
-                      let k = peKey e
-                      mhFail mh k (shortApplyReason err)
-                      recordOutcomes [ApplyHardFail k err False False]
-                      finishOne
+                  Left err -> failEnsureWork err
                   Right () ->
                     for_ ensureWork $ \item -> writeChan chan (Just item)
       withAsync runEnsure $ \ea -> do
         mapConcurrently_ (const worker) [1 .. jobs]
         wait ea
       readIORef outcomesRef
+
+runDelayedGitMvFiles ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  PlannedWork ->
+  IO (Either ApplyOutcome PendingGitMvCommit)
+runDelayedGitMvFiles env overlayRoot entry work = do
+  let key = peKey entry
+      mh = aeMulti env
+  mhStart mh key
+  case work of
+    PlannedGitMv remote ->
+      case lookupPolicy key of
+        Just policy ->
+          applyGitMvFilesWithRemote
+            env
+            overlayRoot
+            entry
+            (policySource policy)
+            remote
+        Nothing ->
+          pure $ Left $ ApplySoftSkip key "no hardcoded policy for package"
+    _ ->
+      pure $
+        Left $
+          ApplyHardFail key "internal: delayed commit is GitMv-only" False False
+
+presentApplyChrome :: MultiHandle -> PackageKey -> [ApplyOutcome] -> IO ()
+presentApplyChrome mh key outcomes =
+  case outcomes of
+    [] -> mhSuccess mh key
+    _ ->
+      if any outcomeIsHardFail outcomes
+        then
+          let msg = case [m | ApplyHardFail _ m _ _ <- outcomes] of
+                (m : _) -> m
+                [] -> "hard fail"
+           in mhFail mh key (shortReason msg)
+        else
+          if all isSoft outcomes
+            then
+              let reason = case [r | ApplySoftSkip _ r <- outcomes] of
+                    (r : _) -> r
+                    [] -> "skipped"
+               in mhSkip mh key (shortReason reason)
+            else mhSuccess mh key
+  where
+    isSoft ApplySoftSkip {} = True
+    isSoft _ = False
+
+outcomeMessage :: ApplyOutcome -> Text
+outcomeMessage = \case
+  ApplyHardFail _ m _ _ -> m
+  ApplySoftSkip _ r -> r
+  ApplySuccess {} -> "ok"
 
 shortApplyReason :: Text -> Text
 shortApplyReason t =
@@ -372,7 +504,7 @@ applyNeedsWork env overlayRoot entry = \case
             remote
       Nothing ->
         pure [ApplySoftSkip (peKey entry) "no hardcoded policy for package"]
-  PlannedDeps eco src plan localPVs contentFix ->
+  PlannedDeps eco src plan localPVs contentFix mHypo ->
     applyDepsAndAssetsFromPlan
       env
       overlayRoot
@@ -382,6 +514,7 @@ applyNeedsWork env overlayRoot entry = \case
       plan
       localPVs
       contentFix
+      mHypo
       0
 
 applyPackagePhase1Tracked ::

@@ -3,6 +3,7 @@
 -- | Signed overlay commit helpers under the overlay lock.
 module Update.Apply.Commit
   ( signedOverlayCommit,
+    egencacheUnitPaths,
     egencacheAndSignedCommit,
     unitCommitMessage,
     pruneCommitMessage,
@@ -29,7 +30,27 @@ signedOverlayCommit env overlayRoot paths msg =
   withMVar (aeOverlayLock env) $ \() ->
     goAddAndCommit (aeGitOps env) overlayRoot paths msg
 
--- | Package-scoped @egencache@ then signed commit under the overlay lock.
+-- | Package-scoped @egencache@ under the overlay lock (no commit).
+-- Returns unit paths plus md5-cache pathspecs.
+egencacheUnitPaths ::
+  ApplyEnv ->
+  FilePath ->
+  PackageKey ->
+  [FilePath] ->
+  IO (Either Text [FilePath])
+egencacheUnitPaths env overlayRoot key unitPaths =
+  withMVar (aeOverlayLock env) $ \() -> do
+    cacheResult <-
+      runPackageEgencache
+        (aeEgencacheRunner env)
+        overlayRoot
+        key
+        (Just (aeJobs env))
+    pure $ case cacheResult of
+      Left err -> Left err
+      Right cachePaths -> Right (nubOrd (unitPaths <> cachePaths))
+
+-- | Package-scoped @egencache@ then signed commit under one overlay lock.
 -- Returns the full staged path list (unit paths plus md5-cache pathspecs).
 egencacheAndSignedCommit ::
   ApplyEnv ->

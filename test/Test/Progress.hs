@@ -233,6 +233,10 @@ import Update.Md5Cache
     readCacheMd5Field,
   )
 import Update.Npm.Cache (productionNpmCacheOps)
+import Update.OverlayWaves
+  ( committingOverlayStatus,
+    regeneratingManifestStatus,
+  )
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
@@ -289,7 +293,8 @@ unitTests =
       testCase "Step Progress Panel Fail Success" testStepProgressPanelFailSuccess,
       testCase "Pause Clear Throw Lock Not Stuck" testPauseClearThrowLockNotStuck,
       testCase "Waiting is not hard-fail chrome" testWaitingNotHardFail,
-      testCase "Full-path waiting on ensure is not hard-fail" testWaitingOnEnsureNotHardFail
+      testCase "Full-path waiting on ensure is not hard-fail" testWaitingOnEnsureNotHardFail,
+      testCase "Ralph stays waiting on bun-bin through Manifest and commit" testRalphWaitsThroughManifestAndCommit
     ]
 
 -- | Soft-skip handle drives ApplyEnv / PlanOps apply path.
@@ -481,6 +486,41 @@ testWaitingOnEnsureNotHardFail = do
     (ensuringMaterializeImageStatus `T.isInfixOf` frame)
   assertTrue "not fail glyph" (not ("✗" `T.isInfixOf` frame))
   assertTrue "panel not complete" ("0/2" `T.isInfixOf` frame)
+
+-- | Withheld ralph stays waiting on bun-bin through Manifest regen and commit.
+testRalphWaitsThroughManifestAndCommit :: IO ()
+testRalphWaitsThroughManifestAndCommit = do
+  stateRef <-
+    newIORef
+      MultiState
+        { msLabel = "Updating packages",
+          msTotal = 2,
+          msSucceeded = 0,
+          msJobs = Map.empty,
+          msTick = 0
+        }
+  let mh = multiHandle stateRef
+      bun = mkPackageKey "dev-lang" "bun-bin"
+      ralph = mkPackageKey "dev-util" "ralph-tui"
+  mhStart mh bun
+  mhWait mh ralph "waiting on dev-lang/bun-bin"
+  mhStatus mh bun regeneratingManifestStatus
+  mhStatus mh bun committingOverlayStatus
+  s0 <- readIORef stateRef
+  case Map.lookup ralph (msJobs s0) of
+    Just (JobWaiting reason) ->
+      assertEq
+        "ralph still waiting on bun-bin"
+        "waiting on dev-lang/bun-bin"
+        reason
+    other -> do
+      hPutStrLn stderr ("expected JobWaiting, got: " <> show other)
+      exitFailure
+  let frame = T.pack (renderMulti ColorOff s0)
+  assertTrue "waiting in frame" ("waiting on dev-lang/bun-bin" `T.isInfixOf` frame)
+  assertTrue "commit status on bun-bin" (committingOverlayStatus `T.isInfixOf` frame)
+  assertTrue "not fail glyph" (not ("✗" `T.isInfixOf` frame))
+  assertTrue "one panel still 0/2" ("0/2" `T.isInfixOf` frame)
 
 -- | Soft-skip-only package outcomes call mhSkip, not mhFail.
 testApplyProgressSoftSkipHandle :: IO ()

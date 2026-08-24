@@ -25,6 +25,7 @@ import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Apply
   ( PackagePlanResult (..),
     PlanEnv (..),
+    PlannedWork (..),
     planPackage,
   )
 import Update.Check
@@ -47,6 +48,7 @@ import Update.Go.Lanes
   )
 import Update.Go.ModFetch (GoModKey (..))
 import Update.Go.Plan (noopPlanProgress)
+import Update.OverlayWaves (bunBinPackageKey)
 import Update.Runtime.Ceilings (RuntimeCeilings (..))
 import Update.Types
   ( EcosystemSpec (..),
@@ -95,7 +97,8 @@ unitTests =
         [ testCase "refuse when bun-bin unselected and plan-delta" testRefusePlanDelta,
           testCase "no-delta still plans on-disk" testNoPlanDeltaAllowsOnDisk,
           testCase "provider fetch fail-closed" testRefuseFailClosed,
-          testCase "ralph refuses, mise still plans" testRefuseRalphStillPlansMise
+          testCase "ralph refuses, mise still plans" testRefuseRalphStillPlansMise,
+          testCase "selected bun-bin uses hypo working plan" testSelectedBunBinHypoWorkingPlan
         ]
     ]
 
@@ -1218,6 +1221,52 @@ testRefuseRalphStillPlansMise =
           "mise is not overlay-refuse"
           (not ("dev-lang/bun-bin" `T.isInfixOf` msg))
       _ -> pure ()
+
+testSelectedBunBinHypoWorkingPlan :: IO ()
+testSelectedBunBinHypoWorkingPlan =
+  withSystemTempDirectory "om-selected-hypo" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["1.5.0", "1.0.0"])
+        bunEnginesForDelta
+    cache <- disabledCache
+    let fetch src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          _ -> pure (Left "unexpected source")
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+        e =
+          PackageEntry
+            { peKey = ralphKey,
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "1.0.0"]
+        env =
+          mkRalphPlanEnv
+            fetch
+            ops
+            cache
+            [ralphKey, bunBinPackageKey]
+    result <- planPackage env (groupByPackage locals) e
+    case result of
+      PlanNeedsWork k (PlannedDeps {pdPlan = plan, pdHypoProvider = hypo}) -> do
+        assertEq "ralph key" ralphKey k
+        assertTrue
+          "hypo unique PVs include 1.5.0"
+          (parseEbuildVersion "1.5.0" `elem` glpUniquePVs plan)
+        case hypo of
+          Just (prov, pv) -> do
+            assertEq "provider" bunBinPackageKey prov
+            assertEq "remote PV" (parseEbuildVersion "1.2.0") pv
+          Nothing -> assertFailure "expected hypo provider on working plan"
+      other ->
+        assertFailure $ "expected hypo needs-work, got " <> show other
 
 testOutdatedBlockedOn :: IO ()
 testOutdatedBlockedOn =

@@ -377,7 +377,8 @@ mkDepsWork eco needPVs =
             glpRuntimeAtom = "dev-lang/go"
           },
       pdLocalPVs = [],
-      pdContentFix = []
+      pdContentFix = [],
+      pdHypoProvider = Nothing
     }
 
 testClassifyReuseWithSize :: IO ()

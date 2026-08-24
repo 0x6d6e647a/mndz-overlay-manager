@@ -44,6 +44,7 @@ import Network.HTTP.Types (statusCode)
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Version
   ( EbuildVersion (..),
+    comparePV,
     parseEbuildVersion,
     renderPV,
     renderPVNoRev,
@@ -153,9 +154,13 @@ import Update.Npm.Cache
     buildNpmDepsTarball,
   )
 import Update.OverlayWaves
-  ( computeOverlayProviderFingerprint,
+  ( bunBinPackageKey,
+    computeOverlayProviderFingerprint,
+    newestNonLivePv,
     overlayCeilingProvider,
+    overlayProviderPvMismatchMessage,
   )
+import Update.Runtime.Ceilings (discoverBunBinMetas)
 import Update.Sbcl.Deps
   ( SbclDepsProgress (..),
     buildSbclDepsTarball,
@@ -175,6 +180,7 @@ import Update.Types
     SuccessLine (..),
     UpdateSource (..),
     UpdateTechnique (..),
+    packageKeyText,
     splitPackageKey,
   )
 
@@ -240,6 +246,7 @@ applyDepsAndAssets env overlayRoot entry src eco = do
             plan
             localPVs
             contentFix
+            Nothing
             =<< readIORef planDoneRef
 
 -- | Mutate using a plan-phase result (skip re-plan / re-content-fix).
@@ -252,6 +259,8 @@ applyDepsAndAssetsFromPlan ::
   RuntimeLanePlan ->
   [EbuildVersion] ->
   [EbuildVersion] ->
+  -- | Hypothetical provider + assumed remote PV, when the working plan used hypo ceilings.
+  Maybe (PackageKey, EbuildVersion) ->
   Int ->
   IO [ApplyOutcome]
 applyDepsAndAssetsFromPlan
@@ -263,6 +272,7 @@ applyDepsAndAssetsFromPlan
   plan
   localPVs
   contentFix
+  mHypo
   planDone = do
     let key = peKey entry
         pkgDir = takeDirectory (pePath entry)
@@ -270,30 +280,67 @@ applyDepsAndAssetsFromPlan
     if not (planNeedsWork localPVs contentFix plan)
       then pure [ApplySoftSkip key "already matches runtime-lane plan"]
       else do
-        cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
-        case cacheGate of
-          Left unitErr -> pure [applyUnitHardFail key unitErr False False]
+        asserted <- assertHypoProviderPv overlayRoot key mHypo
+        case asserted of
+          Left msg ->
+            pure [ApplyHardFail key msg False False]
           Right () -> do
-            outcomes <-
-              materializeDepsPlan
-                env
-                overlayRoot
-                entry
-                src
-                eco
-                plan
-                localPVs
-                contentFix
-                planDone
-            when (any isApplySuccess outcomes) $ do
-              fp' <- computeFingerprintFromDir src pkgDir pn
-              mProvFp' <-
-                computeOverlayProviderFingerprint overlayRoot (DepsAndAssets eco)
-              storeDeps (aeCheckCache env) key fp' mProvFp' plan
-            pure outcomes
+            cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
+            case cacheGate of
+              Left unitErr -> pure [applyUnitHardFail key unitErr False False]
+              Right () -> do
+                outcomes <-
+                  materializeDepsPlan
+                    env
+                    overlayRoot
+                    entry
+                    src
+                    eco
+                    plan
+                    localPVs
+                    contentFix
+                    planDone
+                when (any isApplySuccess outcomes) $ do
+                  fp' <- computeFingerprintFromDir src pkgDir pn
+                  mProvFp' <-
+                    computeOverlayProviderFingerprint overlayRoot (DepsAndAssets eco)
+                  storeDeps (aeCheckCache env) key fp' mProvFp' plan
+                pure outcomes
     where
       isApplySuccess ApplySuccess {} = True
       isApplySuccess _ = False
+
+-- | Overlay write of a hypo-planned consumer requires the provider PV to match.
+assertHypoProviderPv ::
+  FilePath ->
+  PackageKey ->
+  Maybe (PackageKey, EbuildVersion) ->
+  IO (Either Text ())
+assertHypoProviderPv _overlayRoot _key Nothing = pure (Right ())
+assertHypoProviderPv overlayRoot key (Just (provider, plannedPv)) = do
+  eMetas <-
+    if provider == bunBinPackageKey
+      then discoverBunBinMetas overlayRoot
+      else pure (Left "no overlay provider metas")
+  let overlayPv = case eMetas of
+        Right metas -> newestNonLivePv metas
+        Left _ -> Nothing
+  pure $ case overlayPv of
+    Just got
+      | comparePV got plannedPv == Just EQ -> Right ()
+      | otherwise ->
+          Left (overlayProviderPvMismatchMessage key provider plannedPv got)
+    Nothing ->
+      Left
+        ( packageKeyText key
+            <> ": overlay ceiling provider "
+            <> packageKeyText provider
+            <> " has no newest non-live ebuild (plan assumed "
+            <> renderPV plannedPv
+            <> "); the provider bump did not land as planned and this package was not mutated. Restore or finish "
+            <> packageKeyText provider
+            <> " relative to git HEAD, then retry"
+        )
 
 -- | Planning progress during update apply (same 3-step model as outdated).
 depsApplyPlanProgress ::
