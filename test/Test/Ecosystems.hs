@@ -16,6 +16,7 @@ import Data.Text.IO qualified as TIO
 import System.Directory
   ( createDirectoryIfMissing,
     createFileLink,
+    doesDirectoryExist,
     doesFileExist,
     getSymbolicLinkTarget,
     pathIsSymbolicLink,
@@ -105,10 +106,12 @@ import Update.Sbcl.Deps
   ( SbclDepsOps (..),
     SbclDepsProgress (..),
     buildSbclDepsTarball,
+    materializeFff,
     materializeHome,
     parseSbclVersionFloor,
     qlotInstall,
     sanitizeQlotConfs,
+    stripUnusedFffTrees,
   )
 import Update.Types (PackageKey (..))
 
@@ -141,7 +144,11 @@ unitTests =
         [ testCase "parseSbclVersionFloor" testParseSbclVersionFloor,
           testCase "buildSbclDepsTarball success + progress" testSbclBuilderSuccess,
           testCase "buildSbclDepsTarball clone failure" testSbclBuilderCloneFail,
-          testCase "sanitizeQlotConfs rewrites operator home" testSanitizeQlotConfs,
+          testCase "sanitizeQlotConfs drops builder keys and /home/" testSanitizeQlotConfs,
+          testCase "sanitizeQlotConfs leftover /home/ hard-fails" testSanitizeQlotConfsHomeLeftover,
+          testCase "stripUnusedFffTrees omits plugin trees" testStripUnusedFffTrees,
+          testCase "materializeFff smokes fff-c and strips unused" testMaterializeFffStripAndSmoke,
+          testCase "materializeFff cargo smoke failure hard-fails" testMaterializeFffSmokeFail,
           testCase "qlotInstall argv is qlot on PATH" testQlotInstallArgv
         ],
       testGroup
@@ -1466,16 +1473,151 @@ testSanitizeQlotConfs =
     let qlot = tmp </> ".qlot"
         conf = qlot </> "qlot.conf"
         srcReg = qlot </> "source-registry.conf"
-        operatorHome = "/home/operator"
     createDirectoryIfMissing True qlot
-    TIO.writeFile conf (T.pack operatorHome <> "/quicklisp/setup.lisp\n")
-    TIO.writeFile srcReg (":directory \"" <> T.pack operatorHome <> "/quicklisp/local-projects/\"\n")
-    assertRight "sanitize" =<< sanitizeQlotConfs tmp operatorHome
+    TIO.writeFile
+      conf
+      "(:qlot-source-directory \"/home/operator/quicklisp/dists/quicklisp/software/qlot-1.8.2/\"\n\
+      \ :qlot-version \"1.8.2\"\n\
+      \ :setup-file \"/home/operator/quicklisp/setup.lisp\")\n"
+    TIO.writeFile
+      srcReg
+      "(:source-registry\n\
+      \ :ignore-inherited-configuration\n\
+      \ (:also-exclude \".qlot\")\n\
+      \ (:also-exclude \".bundle-libs\")\n\
+      \ (:directory #P\"/home/operator/quicklisp/dists/quicklisp/software/qlot-1.8.2/\"))\n"
+    assertRight "sanitize" =<< sanitizeQlotConfs tmp
     confBody <- TIO.readFile conf
     srcBody <- TIO.readFile srcReg
-    assertTrue "qlot.conf no operator home" (not (T.pack operatorHome `T.isInfixOf` confBody))
-    assertTrue "source-registry no operator home" (not (T.pack operatorHome `T.isInfixOf` srcBody))
-    assertTrue "rewritten to builder home" ("/home/builder" `T.isInfixOf` confBody)
+    assertTrue "qlot.conf no /home/" (not ("/home/" `T.isInfixOf` confBody))
+    assertTrue "source-registry no /home/" (not ("/home/" `T.isInfixOf` srcBody))
+    assertTrue "no builder home rewrite" (not ("/home/builder" `T.isInfixOf` confBody))
+    assertTrue "dropped qlot-source-directory" (not (":qlot-source-directory" `T.isInfixOf` confBody))
+    assertTrue "dropped setup-file" (not (":setup-file" `T.isInfixOf` confBody))
+    assertTrue "kept qlot-version" (":qlot-version" `T.isInfixOf` confBody)
+    assertTrue "dropped :directory" (not (":directory" `T.isInfixOf` srcBody))
+    assertTrue "kept also-exclude qlot" ("(:also-exclude \".qlot\")" `T.isInfixOf` srcBody)
+    assertTrue
+      "kept also-exclude bundle"
+      ("(:also-exclude \".bundle-libs\")" `T.isInfixOf` srcBody)
+
+testSanitizeQlotConfsHomeLeftover :: IO ()
+testSanitizeQlotConfsHomeLeftover =
+  withSystemTempDirectory "mndz-qlot-leftover-" $ \tmp -> do
+    let qlot = tmp </> ".qlot"
+        conf = qlot </> "qlot.conf"
+    createDirectoryIfMissing True qlot
+    TIO.writeFile
+      conf
+      "(:qlot-version \"1.8.2\"\n\
+      \ :notes \"/home/builder/leftover\")\n"
+    err <- assertLeft "leftover home" =<< sanitizeQlotConfs tmp
+    assertTrue "mentions /home/" ("/home/" `T.isInfixOf` err)
+
+testStripUnusedFffTrees :: IO ()
+testStripUnusedFffTrees =
+  withSystemTempDirectory "mndz-fff-strip-" $ \tmp -> do
+    populateUnusedFffTrees tmp
+    createDirectoryIfMissing True (tmp </> "crates" </> "fff-c")
+    createDirectoryIfMissing True (tmp </> "vendor")
+    createDirectoryIfMissing True (tmp </> ".cargo")
+    TIO.writeFile (tmp </> "Cargo.toml") "[workspace]\n"
+    stripUnusedFffTrees tmp
+    assertTrue "plugin gone" . not =<< doesDirectoryExist (tmp </> "plugin")
+    assertTrue "lua gone" . not =<< doesDirectoryExist (tmp </> "lua")
+    assertTrue "tests gone" . not =<< doesDirectoryExist (tmp </> "tests")
+    assertTrue "github gone" . not =<< doesDirectoryExist (tmp </> ".github")
+    assertTrue "packages gone" . not =<< doesDirectoryExist (tmp </> "packages")
+    assertTrue "flake.nix gone" . not =<< doesFileExist (tmp </> "flake.nix")
+    assertTrue "flake.lock gone" . not =<< doesFileExist (tmp </> "flake.lock")
+    assertTrue "crates kept" =<< doesDirectoryExist (tmp </> "crates" </> "fff-c")
+    assertTrue "vendor kept" =<< doesDirectoryExist (tmp </> "vendor")
+    assertTrue "cargo config dir kept" =<< doesDirectoryExist (tmp </> ".cargo")
+
+populateUnusedFffTrees :: FilePath -> IO ()
+populateUnusedFffTrees root = do
+  for_ ["plugin", "lua", "tests", ".github", "packages"] $ \rel -> do
+    createDirectoryIfMissing True (root </> rel)
+    TIO.writeFile (root </> rel </> "marker") "x\n"
+  TIO.writeFile (root </> "flake.nix") "{}\n"
+  TIO.writeFile (root </> "flake.lock") "{}\n"
+
+testMaterializeFffStripAndSmoke :: IO ()
+testMaterializeFffStripAndSmoke =
+  withSystemTempDirectory "mndz-fff-smoke-" $ \tmp -> do
+    let clone = tmp </> "src"
+        stage = tmp </> "stage"
+        commit = "abc123def"
+    createDirectoryIfMissing True (clone </> "native" </> "fff")
+    TIO.writeFile (clone </> "native" </> "fff" </> "commit") (T.pack commit <> "\n")
+    cargoBuildArgs <- newIORef ([] :: [[String]])
+    let run req = case prMode req of
+          ExecCmd "git" args
+            | "clone" `elem` args -> do
+                populateFffCloneDest (last args)
+                pure (okResult "")
+            | "rev-parse" `elem` args ->
+                pure (okResult (commit <> "\n"))
+            | otherwise -> pure (okResult "")
+          ExecCmd "cargo" args
+            | "vendor" `elem` args -> do
+                for_ (prCwd req) $ \cwd ->
+                  createDirectoryIfMissing True (cwd </> "vendor")
+                pure (okResult "")
+            | "build" `elem` args -> do
+                atomicModifyIORef' cargoBuildArgs (\rs -> (args : rs, ()))
+                pure (okResult "")
+            | otherwise ->
+                pure (failResult ("unexpected cargo: " <> show args))
+          _ -> pure (failResult "unexpected command")
+    assertRight "fff" =<< materializeFff run clone stage
+    let fff = stage </> "fff"
+    assertTrue "plugin gone" . not =<< doesDirectoryExist (fff </> "plugin")
+    assertTrue "lua gone" . not =<< doesDirectoryExist (fff </> "lua")
+    assertTrue "packages gone" . not =<< doesDirectoryExist (fff </> "packages")
+    assertTrue "vendor kept" =<< doesDirectoryExist (fff </> "vendor")
+    assertTrue "crates kept" =<< doesDirectoryExist (fff </> "crates" </> "fff-c")
+    assertTrue "cargo config kept" =<< doesFileExist (fff </> ".cargo" </> "config.toml")
+    reqs <- reverse <$> readIORef cargoBuildArgs
+    assertEq
+      "cargo smoke argv"
+      [["build", "--offline", "--locked", "-p", "fff-c"]]
+      reqs
+
+testMaterializeFffSmokeFail :: IO ()
+testMaterializeFffSmokeFail =
+  withSystemTempDirectory "mndz-fff-smoke-fail-" $ \tmp -> do
+    let clone = tmp </> "src"
+        stage = tmp </> "stage"
+        commit = "abc123def"
+    createDirectoryIfMissing True (clone </> "native" </> "fff")
+    TIO.writeFile (clone </> "native" </> "fff" </> "commit") (T.pack commit <> "\n")
+    let run req = case prMode req of
+          ExecCmd "git" args
+            | "clone" `elem` args -> do
+                populateFffCloneDest (last args)
+                pure (okResult "")
+            | "rev-parse" `elem` args ->
+                pure (okResult (commit <> "\n"))
+            | otherwise -> pure (okResult "")
+          ExecCmd "cargo" args
+            | "vendor" `elem` args -> pure (okResult "")
+            | "build" `elem` args ->
+                pure (failResult "fff-c missing workspace member")
+            | otherwise ->
+                pure (failResult ("unexpected cargo: " <> show args))
+          _ -> pure (failResult "unexpected command")
+    err <- assertLeft "smoke fail" =<< materializeFff run clone stage
+    assertTrue
+      "names fff-c smoke"
+      ("offline cargo build -p fff-c" `T.isInfixOf` err)
+
+populateFffCloneDest :: FilePath -> IO ()
+populateFffCloneDest dest = do
+  createDirectoryIfMissing True dest
+  populateUnusedFffTrees dest
+  createDirectoryIfMissing True (dest </> "crates" </> "fff-c")
+  TIO.writeFile (dest </> "Cargo.toml") "[workspace]\n"
 
 testDockerWrapRequest :: IO ()
 testDockerWrapRequest = do

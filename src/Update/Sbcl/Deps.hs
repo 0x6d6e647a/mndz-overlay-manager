@@ -10,12 +10,15 @@ module Update.Sbcl.Deps
     parseSbclVersionFloor,
     materializeHome,
     sanitizeQlotConfs,
+    stripUnusedFffTrees,
+    materializeFff,
     qlotInstall,
   )
 where
 
 import Control.Monad (foldM, when)
 import Data.Char (isDigit)
+import Data.Foldable (for_)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -23,7 +26,6 @@ import System.Directory
   ( createDirectoryIfMissing,
     doesDirectoryExist,
     doesFileExist,
-    getHomeDirectory,
     removePathForcibly,
   )
 import System.Environment (getEnvironment)
@@ -148,8 +150,7 @@ buildSbclDepsTarball
                     case qlotOk of
                       Left err -> pure (Left err)
                       Right () -> do
-                        operatorHome <- getHomeDirectory
-                        sanitized <- sanitizeQlotConfs stageDir operatorHome
+                        sanitized <- sanitizeQlotConfs stageDir
                         case sanitized of
                           Left err -> pure (Left err)
                           Right () -> do
@@ -221,46 +222,170 @@ copyQlotTree run cloneDir stageDir = do
           then Right ()
           else Left ("copy .qlot failed: " <> T.pack (prStderr res))
 
--- | Rewrite operator-home pathnames in packed qlot configs, or hard-fail.
-sanitizeQlotConfs :: FilePath -> FilePath -> IO (Either Text ())
-sanitizeQlotConfs stageDir operatorHome = do
+-- | Drop builder qlot-source keys from packed confs; hard-fail on leftover @/home/@.
+sanitizeQlotConfs :: FilePath -> IO (Either Text ())
+sanitizeQlotConfs stageDir = do
   let confs =
         [ stageDir </> ".qlot" </> "qlot.conf",
           stageDir </> ".qlot" </> "source-registry.conf"
         ]
-      homeT = T.pack operatorHome
-      genericT = T.pack materializeHome
   foldM
     ( \acc path ->
         case acc of
           Left err -> pure (Left err)
-          Right () -> sanitizeOne path homeT genericT
+          Right () -> sanitizeOne path
     )
     (Right ())
     confs
 
-sanitizeOne :: FilePath -> Text -> Text -> IO (Either Text ())
-sanitizeOne path operatorHome genericHome = do
+sanitizeOne :: FilePath -> IO (Either Text ())
+sanitizeOne path = do
   exists <- doesFileExist path
   if not exists
     then pure (Right ())
     else do
       body <- TIO.readFile path
-      let rewritten =
-            if operatorHome `T.isInfixOf` body
-              then T.replace operatorHome genericHome body
-              else body
+      let rewritten = rewriteQlotConf path body
       when (rewritten /= body) (TIO.writeFile path rewritten)
       leftover <- TIO.readFile path
-      pure $
-        if operatorHome `T.isInfixOf` leftover
-          then
-            Left
-              ( "packed qlot config still contains operator home ("
-                  <> T.pack path
-                  <> ")"
-              )
-          else Right ()
+      pure (qlotConfLeftoverError path leftover)
+
+rewriteQlotConf :: FilePath -> Text -> Text
+rewriteQlotConf path body
+  | "qlot.conf" `T.isSuffixOf` T.pack path =
+      dropKeywordAndValue ":setup-file" $
+        dropKeywordAndValue ":qlot-source-directory" body
+  | "source-registry.conf" `T.isSuffixOf` T.pack path =
+      dropDirectoryForms body
+  | otherwise = body
+
+qlotConfLeftoverError :: FilePath -> Text -> Either Text ()
+qlotConfLeftoverError path leftover
+  | "/home/" `T.isInfixOf` leftover =
+      Left
+        ( "packed qlot config still contains a /home/ pathname ("
+            <> T.pack path
+            <> ")"
+        )
+  | isQlotConf && ":qlot-source-directory" `T.isInfixOf` leftover =
+      Left
+        ( "packed qlot.conf still contains :qlot-source-directory ("
+            <> T.pack path
+            <> ")"
+        )
+  | isQlotConf && ":setup-file" `T.isInfixOf` leftover =
+      Left
+        ( "packed qlot.conf still contains :setup-file ("
+            <> T.pack path
+            <> ")"
+        )
+  | isSrcReg && ":directory" `T.isInfixOf` leftover =
+      Left
+        ( "packed source-registry.conf still contains a :directory entry ("
+            <> T.pack path
+            <> ")"
+        )
+  | otherwise = Right ()
+  where
+    name = T.pack path
+    isQlotConf = "qlot.conf" `T.isSuffixOf` name
+    isSrcReg = "source-registry.conf" `T.isSuffixOf` name
+
+isLispSpace :: Char -> Bool
+isLispSpace c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+dropKeywordAndValue :: Text -> Text -> Text
+dropKeywordAndValue kw = go
+  where
+    go t =
+      case T.breakOn kw t of
+        (_, rest) | T.null rest -> t
+        (pre, rest) ->
+          let afterWs = T.dropWhile isLispSpace (T.drop (T.length kw) rest)
+           in case takeLispValue afterWs of
+                Nothing -> t
+                Just (_val, afterVal) ->
+                  go (pre <> T.dropWhile isLispSpace afterVal)
+
+dropDirectoryForms :: Text -> Text
+dropDirectoryForms t =
+  case T.breakOn "(:directory" t of
+    (_, rest) | T.null rest -> t
+    (pre, rest) ->
+      case takeLispValue rest of
+        Nothing -> t
+        Just (_form, after) ->
+          dropDirectoryForms (pre <> T.dropWhile isLispSpace after)
+
+takeLispValue :: Text -> Maybe (Text, Text)
+takeLispValue t
+  | T.null t = Nothing
+  | T.head t == '"' = splitDoubleQuoted 0 t
+  | "#P\"" `T.isPrefixOf` t || "#p\"" `T.isPrefixOf` t =
+      splitDoubleQuoted 2 t
+  | T.head t == '(' = splitBalanced t
+  | otherwise =
+      let (atom, rest) = T.break (\c -> isLispSpace c || c == ')') t
+       in if T.null atom then Nothing else Just (atom, rest)
+
+-- | Split a Lisp double-quoted string starting at the quote, optionally
+-- preceded by @prefixLen@ characters (e.g. @#P@ before @\"...\"@).
+splitDoubleQuoted :: Int -> Text -> Maybe (Text, Text)
+splitDoubleQuoted prefixLen t =
+  case T.uncons (T.drop prefixLen t) of
+    Just ('"', more) -> go False more
+    _ -> Nothing
+  where
+    go escaped remaining =
+      case T.uncons remaining of
+        Nothing -> Nothing
+        Just ('\\', more) | not escaped -> go True more
+        Just ('"', more)
+          | not escaped ->
+              let consumed = T.length t - T.length more
+               in Just (T.take consumed t, more)
+        Just (_c, more) -> go False more
+
+splitBalanced :: Text -> Maybe (Text, Text)
+splitBalanced t =
+  case T.uncons t of
+    Just ('(', more) -> go (1 :: Int) False False more
+    _ -> Nothing
+  where
+    go :: Int -> Bool -> Bool -> Text -> Maybe (Text, Text)
+    go depth inStr escaped remaining
+      | depth <= 0 =
+          let consumed = T.length t - T.length remaining
+           in Just (T.take consumed t, remaining)
+      | otherwise =
+          case T.uncons remaining of
+            Nothing -> Nothing
+            Just (c, more)
+              | escaped -> go depth inStr False more
+              | inStr && c == '\\' -> go depth True True more
+              | inStr && c == '"' -> go depth False False more
+              | inStr -> go depth True False more
+              | c == '"' -> go depth True False more
+              | c == '(' -> go (depth + 1) False False more
+              | c == ')' -> go (depth - 1) False False more
+              | otherwise -> go depth False False more
+
+-- | Omit neovim/lua/plugin/tests/GitHub/flake/node trees from packed @fff/@.
+stripUnusedFffTrees :: FilePath -> IO ()
+stripUnusedFffTrees fffDir =
+  for_ unusedFffRelPaths $ \rel ->
+    removePathForcibly (fffDir </> rel)
+
+unusedFffRelPaths :: [FilePath]
+unusedFffRelPaths =
+  [ "plugin",
+    "lua",
+    "tests",
+    ".github",
+    "packages",
+    "flake.nix",
+    "flake.lock"
+  ]
 
 ------------------------------------------------------------------------
 -- Production command runners
@@ -409,19 +534,46 @@ materializeFff run root stageDir = do
                                 <> T.pack (prStderr vendorRes)
                             )
                         )
-                    else do
-                      createDirectoryIfMissing True (fffDir </> ".cargo")
-                      TIO.writeFile
-                        (fffDir </> ".cargo" </> "config.toml")
-                        "# Generated by mndz-overlay-manager for offline Portage builds.\n\
-                        \[source.crates-io]\n\
-                        \replace-with = \"vendored-sources\"\n\
-                        \\n\
-                        \[source.vendored-sources]\n\
-                        \directory = \"vendor\"\n"
-                      removePathForcibly (fffDir </> ".git")
-                      removePathForcibly (fffDir </> "target")
-                      pure (Right ())
+                    else finishFffStage run fffDir
+
+finishFffStage :: CommandRunner -> FilePath -> IO (Either Text ())
+finishFffStage run fffDir = do
+  createDirectoryIfMissing True (fffDir </> ".cargo")
+  TIO.writeFile (fffDir </> ".cargo" </> "config.toml") cargoVendorConfig
+  removePathForcibly (fffDir </> ".git")
+  removePathForcibly (fffDir </> "target")
+  stripUnusedFffTrees fffDir
+  smokeRes <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "cargo"
+              ["build", "--offline", "--locked", "-p", "fff-c"],
+          prCwd = Just fffDir,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  if prExitCode smokeRes /= ExitSuccess
+    then
+      pure
+        ( Left
+            ( "offline cargo build -p fff-c failed on staged fff tree: "
+                <> T.pack (prStderr smokeRes)
+            )
+        )
+    else do
+      removePathForcibly (fffDir </> "target")
+      pure (Right ())
+
+cargoVendorConfig :: Text
+cargoVendorConfig =
+  "# Generated by mndz-overlay-manager for offline Portage builds.\n\
+  \[source.crates-io]\n\
+  \replace-with = \"vendored-sources\"\n\
+  \\n\
+  \[source.vendored-sources]\n\
+  \directory = \"vendor\"\n"
 
 packDepsTarball :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
 packDepsTarball run stageDir =

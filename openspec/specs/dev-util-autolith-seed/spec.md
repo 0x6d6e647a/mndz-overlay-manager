@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Requirements for the manually seeded `dev-util/autolith` overlay package (v0.17.2), including offline deps assets (`.qlot/` + vendored fff), SBCL floor and identity stamping, private install layout, USE/test/KEYWORDS, and operator smoke acceptance. This is overlay/seed product truth, not mndz-overlay-manager runtime behavior.
+Requirements for the manually seeded `dev-util/autolith` overlay package (v0.17.2), including offline deps assets (`.qlot/` + vendored fff), SBCL floor and identity stamping, LICENSE inventory (Autolith, installed `.qlot`, fff-c crate SPDX, overlay COLL-Attribution), two-dest private layout (`/usr/share/autolith`, `/usr/$(get_libdir)/autolith`, and `/usr/bin/autolith` wrapper), a pruned installed share set (Autolith Lisp, runtime `.qlot/`, packed fabricated `.git`, wrapper launchers, recovery/image scripts — not a full source checkout), USE/test/KEYWORDS, and operator smoke acceptance. This is overlay/seed product truth, not mndz-overlay-manager runtime behavior.
 
 ## Requirements
 
@@ -18,12 +18,24 @@ The seeded package SHALL be `dev-util/autolith` at Portage version `0.17.2`, cor
 
 ### Requirement: Metadata description and license
 
-The ebuild SHALL set `DESCRIPTION` to a short summary synthesizing upstream README and GitHub (live self-modifying Common Lisp AI agent), `HOMEPAGE` to `https://github.com/luciusmagn/autolith`, and `LICENSE="ISC"`. `metadata.xml` SHALL declare GitHub remote-id `luciusmagn/autolith`.
+The ebuild SHALL set `DESCRIPTION` to a short summary synthesizing upstream README and GitHub (live self-modifying Common Lisp AI agent), `HOMEPAGE` to `https://github.com/luciusmagn/autolith`, and a `LICENSE` field that lists Gentoo `licenses/` tokens covering Autolith itself (ISC) **and** every installed `.qlot` software project, colorlisp vendor trees shipped with those sources, fff itself (MIT), and unique SPDX tokens from crates linked into `libfff_c.so`. The field SHALL NOT be solely `ISC`. Token names SHALL match files under Gentoo `licenses/` or overlay `licenses/`. When a shipped project uses COLL-Attribution, the overlay SHALL provide `licenses/COLL-Attribution` and the ebuild SHALL include that token. An ebuild comment SHALL name each inventoried `.qlot` project (and Autolith / fff) mapped to its token; fff-c crate licenses MAY be summarized as unique SPDX tokens rather than one line per crate. `metadata.xml` SHALL declare GitHub remote-id `luciusmagn/autolith`.
 
 #### Scenario: License and homepage
 
 - **WHEN** the ebuild is inspected
-- **THEN** it uses Gentoo license name `ISC` and the GitHub homepage above
+- **THEN** the homepage is `https://github.com/luciusmagn/autolith`
+- **AND** `LICENSE` includes `ISC`
+- **AND** `LICENSE` includes at least one additional Gentoo or overlay license token required by an installed `.qlot` project or fff-c crate that is not ISC
+
+#### Scenario: COLL-Attribution overlay token
+
+- **WHEN** the ebuild `LICENSE` includes `COLL-Attribution`
+- **THEN** overlay `licenses/COLL-Attribution` exists
+
+#### Scenario: fff-c crate tokens are present
+
+- **WHEN** the ebuild `LICENSE` is inspected after the inventory
+- **THEN** it includes `Apache-2.0` and `MPL-2.0` in addition to `ISC` and `MIT`
 
 ### Requirement: Offline deps assets publish
 
@@ -70,12 +82,48 @@ The packaged install SHALL NOT download SBCL binaries or sources from the networ
 
 ### Requirement: Private application layout and wrapper
 
-The package SHALL install Autolith under a private prefix (not the global `common-lisp-3` library registry as the primary layout) and SHALL install a `/usr/bin/autolith` wrapper that sets required environment variables (SBCL, SBCL source root, native library paths, core paths as applicable). Compile SHALL be able to fabricate git provenance in the source tree when recovery/active image builders require it.
+The package SHALL install Autolith as a private application (not the global `common-lisp-3` library registry as the primary layout) using **two dests**: arch-independent files under `/usr/share/autolith` and architecture-specific files under `/usr/$(get_libdir)/autolith`. Share SHALL contain Autolith Lisp (`src/`, `autolith.asd`, `qlfile`, `qlfile.lock`, `sbcl.version`), the `.qlot/` tree required at runtime (Quicklisp client, dist software, ColorLisp `languages/` queries), fabricated `.git`, launchers the `/usr/bin/autolith` wrapper execs (`bin/autolith`, `bin/autolith-active`, `bin/autolith-runtime`, `bin/autolith-search-worker`), recovery sources and image-builder scripts hashed into cores, `sbcl-source-releases.sha256`, and synthetic `sbcl-source`. Libdir SHALL contain ELF shared objects, `libexec` helper, and recovery/active cores plus manifests. The wrapper SHALL set required environment variables (SBCL, SBCL source root under share, native library paths and core paths under libdir, git `safe.directory` equal to the share tree). Compile SHALL fabricate git provenance in the source tree **after** the installed tracked file set is known, then pack that repo (`git gc --prune=now`, stat-less index via `read-tree HEAD`, no `git init` sample hooks) so `HEAD` matches the installed tree. The package SHALL NOT inherit `common-lisp-3` as the primary layout.
 
 #### Scenario: Wrapper entrypoint
 
 - **WHEN** the package is emerged
 - **THEN** `/usr/bin/autolith` exists and runs the packaged Autolith for `autolith --version`
+
+#### Scenario: Two dests after emerge
+
+- **WHEN** the package is emerged
+- **THEN** `/usr/share/autolith/bin/autolith` exists
+- **AND** `/usr/$(get_libdir)/autolith/lib/libfff_c.so` exists
+- **AND** `/usr/share/common-lisp/systems/autolith.asd` is not installed by this package
+
+#### Scenario: Fabricated git matches installed tracked files
+
+- **WHEN** the package is emerged
+- **THEN** `/usr/share/autolith/.git` exists
+- **AND** `git -C /usr/share/autolith status --porcelain` (with `safe.directory` equal to that tree) is empty of tracked modifications
+
+### Requirement: Installed share omits packaging and compile-only trees
+
+`src_install` SHALL NOT copy the full `${S}` tree. Share SHALL NOT contain `.github/`, `flake.nix`, `flake.lock`, `nix/`, `server/`, `bin/autolith-release`, `script/install`, `script/bootstrap`, `script/qlot-install.lisp`, `script/build-fff`, `script/build-fff.lisp`, `sbcl-source.sha256`, `native/fff/`, or `tests/`. Share SHALL NOT contain packaged `AGENTS.md` or `AUTOLITH.org` (workspace copies live in the user’s project). Human-only `docs/` files that no Autolith Lisp at that tag loads (release notes, guide, architecture) SHALL NOT be installed; files a later tag loads as prompt templates (`docs/system-prompt.org`, `docs/request-context.org`) SHALL be installed when present. `USE=test` SHALL NOT cause `tests/` to be installed; Portage `src_test` remains an offline load/version check.
+
+#### Scenario: Packaging trees are absent after emerge
+
+- **WHEN** the package is emerged
+- **THEN** `/usr/share/autolith/tests` does not exist
+- **AND** `/usr/share/autolith/server` does not exist
+- **AND** `/usr/share/autolith/flake.nix` does not exist
+- **AND** `/usr/share/autolith/.github` does not exist
+
+### Requirement: ColorLisp vendor C is compile-only
+
+`src_compile` SHALL build `libcolorlisp-tree-sitter.so` from the deps tarball ColorLisp vendor C. After that library exists, `src_install` SHALL NOT install ColorLisp `vendor/grammars/`, `vendor/tree-sitter/`, `vendor/common/`, or `native/colorlisp-tree-sitter.c`. Share SHALL keep ColorLisp Lisp sources, `.asd`, and `languages/` query files. The deps tarball SHALL still contain the vendor C for compile. Installed `.qlot` MAY omit tmp leftovers, `cl-exec-sandbox` `build/` helper copies, bordeaux-threads `docs/`, ironclad `testing/`, cffi `doc/`/`tests`/`examples`, and nested `.github/` under dist software. Installed `.qlot` SHALL keep local-time `zoneinfo/` and ironclad `doc/` when that directory is an `ironclad/core` ASDF component.
+
+#### Scenario: Highlight queries remain, parser C does not
+
+- **WHEN** the package is emerged
+- **THEN** `/usr/$(get_libdir)/autolith/lib/libcolorlisp-tree-sitter.so` exists
+- **AND** ColorLisp `languages/` exists under `/usr/share/autolith/.qlot`
+- **AND** ColorLisp `vendor/grammars` does not exist under `/usr/share/autolith/.qlot`
 
 ### Requirement: Offline native and Lisp compile
 
