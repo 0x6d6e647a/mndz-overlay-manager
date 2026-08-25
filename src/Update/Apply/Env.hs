@@ -36,6 +36,7 @@ import Update.Process
     ProcessResult (..),
     productionCommandRunner,
   )
+import Update.Process.Docker (MaterializeDockerCfg)
 import Update.Sbcl.Deps (SbclDepsOps)
 import Update.TempWorkspace (RunRoot)
 import Update.Types (Fetcher)
@@ -93,5 +94,9 @@ data ApplyEnv = ApplyEnv
     -- | Product temp workspace run root for heavy materialize scratch.
     aeTempRun :: RunRoot,
     -- | Shared check cache (disabled handle is a no-op).
-    aeCheckCache :: CheckCacheHandle
+    aeCheckCache :: CheckCacheHandle,
+    -- | When @Just@, full-path materialize opens a per-unit Docker session
+    -- (image\/user\/run-id plus the inner @docker@ CLI runner). @Nothing@
+    -- keeps injected @ae*Ops@ (tests).
+    aeMaterializeDocker :: Maybe (MaterializeDockerCfg, CommandRunner)
   }

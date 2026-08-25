@@ -86,11 +86,13 @@ import Update.Bun.Cache
   ( BunCacheProgress (..),
     buildBunDepsTarball,
     bunPackagingModeFor,
+    mkBunCacheOps,
   )
 import Update.Cargo.Crates
   ( CargoProgress (..),
     CargoResult (..),
     buildCargoCratesTarball,
+    mkCargoOps,
   )
 import Update.Cargo.Msrv
   ( combineMsrv,
@@ -147,11 +149,13 @@ import Update.Go.Vendor
   ( VendorProgress (..),
     VendorResult (..),
     buildVendorTarball,
+    mkVendorOps,
     versionTag,
   )
 import Update.Npm.Cache
   ( NpmCacheProgress (..),
     buildNpmDepsTarball,
+    mkNpmCacheOps,
   )
 import Update.OverlayWaves
   ( bunBinPackageKey,
@@ -160,10 +164,15 @@ import Update.OverlayWaves
     overlayCeilingProvider,
     overlayProviderPvMismatchMessage,
   )
+import Update.Process.Docker
+  ( MaterializeUnitRef (..),
+    withUnitMaterializeSession,
+  )
 import Update.Runtime.Ceilings (discoverBunBinMetas)
 import Update.Sbcl.Deps
   ( SbclDepsProgress (..),
     buildSbclDepsTarball,
+    mkSbclDepsOps,
     parseSbclVersionFloor,
   )
 import Update.TempWorkspace
@@ -943,19 +952,20 @@ fullDepsPublishAndOverlay
         unit <-
           ensureUnit (aeTempRun env) category pn pvNoRev UnitFull
         built <-
-          materializeDistfiles
-            env
-            eco
-            src
-            entry
-            key
-            pn
-            pvNoRev
-            (udWork unit)
-            (udOut unit)
-            assetNames
-            stepsDoneRef
-            mh
+          withFullPathMaterializeSession env unit category pn pvNoRev $ \env' ->
+            materializeDistfiles
+              env'
+              eco
+              src
+              entry
+              key
+              pn
+              pvNoRev
+              (udWork unit)
+              (udOut unit)
+              assetNames
+              stepsDoneRef
+              mh
         case built of
           Left err ->
             pure $
@@ -1357,9 +1367,52 @@ cargoCratesProgress stepsDoneRef mh key =
       cgpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
       cgpOnPycargoStart = mhStatus mh key "pycargoebuild",
       cgpOnPycargoDone = markMaterializeStep stepsDoneRef mh key "pycargoebuild",
+      cgpOnStageCrate = \k n ->
+        mhStatus
+          mh
+          key
+          ( "staging crates "
+              <> T.pack (show k)
+              <> "/"
+              <> T.pack (show n)
+          ),
       cgpOnPackStart = mhStatus mh key "crates pack",
       cgpOnPackDone = markMaterializeStep stepsDoneRef mh key "crates pack"
     }
+
+-- | Open a per-unit Docker session when configured; otherwise keep injected ops.
+withFullPathMaterializeSession ::
+  ApplyEnv ->
+  UnitDirs ->
+  Text ->
+  Text ->
+  Text ->
+  (ApplyEnv -> IO (Either Text a)) ->
+  IO (Either Text a)
+withFullPathMaterializeSession env unit category pn pv action =
+  case aeMaterializeDocker env of
+    Nothing -> action env
+    Just (cfg, dockerRun) ->
+      withUnitMaterializeSession
+        dockerRun
+        cfg
+        MaterializeUnitRef
+          { murCategory = category,
+            murPackage = pn,
+            murPV = pv
+          }
+        unit
+        ( \runner ->
+            action
+              ( env
+                  { aeVendorOps = mkVendorOps runner,
+                    aeNpmCacheOps = mkNpmCacheOps runner,
+                    aeBunCacheOps = mkBunCacheOps runner,
+                    aeCargoOps = mkCargoOps runner,
+                    aeSbclDepsOps = mkSbclDepsOps runner
+                  }
+              )
+        )
 
 -- | Full-path SBCL materialize has more host steps than the generic 7-slot
 -- budget (clone, qlot, fff, compress); only clone/compress mark the shared

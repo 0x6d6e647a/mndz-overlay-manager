@@ -17,7 +17,7 @@ import CLI.Progress
   )
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
-import Control.Monad (void)
+import Control.Monad (unless, void)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -26,6 +26,7 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import Overlay.Types (Ebuild)
 import Overlay.Version (renderPV)
+import System.Exit (ExitCode (..))
 import Update.Apply
   ( ApplyEnv (..),
     EbuildRunner,
@@ -95,7 +96,8 @@ import Update.Preflight
     buildGitMvUnitPlans,
     validateAssetsPath,
   )
-import Update.Process.Docker (productionMaterializeRunner)
+import Update.Process (CommandRunner, ProcessResult (..))
+import Update.Process.Docker (resolveMaterializeDockerCfg)
 import Update.Sbcl.Deps (mkSbclDepsOps)
 import Update.SshAgent
   ( SshAgentOps,
@@ -134,7 +136,12 @@ data UpdateSpineDeps = UpdateSpineDeps
     -- | Ensure the materialize image for these floors (fake in tests).
     usdEnsureImage :: NeededFloors -> IO (Either Text EnsureOutcome),
     -- | After mutate: rmi previous default-tag id if unused, then prune -f.
-    usdPruneMaterialize :: IO ()
+    usdPruneMaterialize :: IO (),
+    -- | Best-effort leftover materialize-session sweep (no-op in tests).
+    usdSweepMaterialize :: IO (),
+    -- | Inner @docker@ CLI for per-unit sessions. @Nothing@ keeps placeholder
+    -- ops (tests). Production is @Just productionCommandRunner@.
+    usdMaterializeDockerRunner :: Maybe CommandRunner
   }
 
 data UpdateSpineResult = UpdateSpineResult
@@ -393,18 +400,34 @@ runUpdatePhases deps entries allEbuilds selected = do
                     assetsLock <- newMVar ()
                     overlayLock <- newMVar ()
                     tempRun <- openRunRoot
-                    matRunner <- productionMaterializeRunner (rrPath tempRun)
-                    let env =
+                    unless (null t0FullKeys) $
+                      usdSweepMaterialize deps
+                    mMatDocker <-
+                      case usdMaterializeDockerRunner deps of
+                        Nothing -> pure Nothing
+                        Just inner
+                          | null t0FullKeys -> pure Nothing
+                          | otherwise -> do
+                              cfg <- resolveMaterializeDockerCfg (rrRunId tempRun)
+                              pure (Just (cfg, inner))
+                    let closedRun _ =
+                          pure
+                            ProcessResult
+                              { prExitCode = ExitFailure 127,
+                                prStdout = "",
+                                prStderr = "internal: materialize session not opened"
+                              }
+                        env =
                           ApplyEnv
                             { aeFetcher = usdFetcher deps,
                               aeGitOps = usdGitOps deps,
                               aeEbuildRunner = usdEbuildRunner deps,
                               aeEgencacheRunner = usdEgencacheRunner deps,
-                              aeVendorOps = mkVendorOps matRunner,
-                              aeNpmCacheOps = mkNpmCacheOps matRunner,
-                              aeBunCacheOps = mkBunCacheOps matRunner,
-                              aeCargoOps = mkCargoOps matRunner,
-                              aeSbclDepsOps = mkSbclDepsOps matRunner,
+                              aeVendorOps = mkVendorOps closedRun,
+                              aeNpmCacheOps = mkNpmCacheOps closedRun,
+                              aeBunCacheOps = mkBunCacheOps closedRun,
+                              aeCargoOps = mkCargoOps closedRun,
+                              aeSbclDepsOps = mkSbclDepsOps closedRun,
                               aeReleaseOps = releaseOps,
                               aeFetchModelsDev = fetchModelsDevApiJson,
                               aeAssetsRoot = mAssetsRoot,
@@ -418,7 +441,8 @@ runUpdatePhases deps entries allEbuilds selected = do
                               aePlanOps = toGoPlanOps (usdDepsPlanOps deps),
                               aeDepsPlanOps = usdDepsPlanOps deps,
                               aeTempRun = tempRun,
-                              aeCheckCache = cache
+                              aeCheckCache = cache,
+                              aeMaterializeDocker = mMatDocker
                             }
                         overlapReady =
                           [ r

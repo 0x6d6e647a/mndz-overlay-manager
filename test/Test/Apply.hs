@@ -70,7 +70,7 @@ import Overlay.Version
     prettyVersion,
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
@@ -237,6 +237,14 @@ import Update.Md5Cache
   )
 import Update.Npm.Cache (productionNpmCacheOps)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
+import Update.Process
+  ( ProcessRequest (..),
+    ProcessResult (..),
+  )
+import Update.Process.Docker
+  ( MaterializeDockerCfg (..),
+    defaultMaterializeImage,
+  )
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
   ( ArchCeilings (..),
@@ -736,10 +744,32 @@ testGitMvCommitsOnSuccess =
         Nothing
         assetsLock
         overlayLock
-    let env = env0 {aeFetcher = \_ -> pure (Right remote)}
+    dockerReqs <- newIORef ([] :: [ProcessRequest])
+    let dockerRun req = do
+          atomicModifyIORef' dockerReqs (\rs -> (req : rs, ()))
+          pure
+            ProcessResult
+              { prExitCode = ExitFailure 1,
+                prStdout = "",
+                prStderr = "docker should not run on GitMv"
+              }
+        dockerCfg =
+          MaterializeDockerCfg
+            { mdcImage = defaultMaterializeImage,
+              mdcUser = "1000:1000",
+              mdcRunId = "test-run",
+              mdcCliPid = "1"
+            }
+        env =
+          env0
+            { aeFetcher = \_ -> pure (Right remote),
+              aeMaterializeDocker = Just (dockerCfg, dockerRun)
+            }
     outcomes <- applyPackagePhase1 env overlayRoot entry
     case outcomes of
       [ApplySuccess _ _ paths] -> do
+        dockerCalls <- readIORef dockerReqs
+        assertEq "GitMv starts no docker session" 0 (length dockerCalls)
         n <- readIORef commitCount
         assertEq "exactly one signed commit" 1 n
         msgs <- readIORef commitMsgs
@@ -1419,7 +1449,27 @@ testReusePathApplyProgressSequence =
         (Just assetsRoot)
         assetsLock
         overlayLock
-    let env = env0 {aeMulti = mh}
+    dockerReqs <- newIORef ([] :: [ProcessRequest])
+    let dockerRun req = do
+          atomicModifyIORef' dockerReqs (\rs -> (req : rs, ()))
+          pure
+            ProcessResult
+              { prExitCode = ExitFailure 1,
+                prStdout = "",
+                prStderr = "docker should not run on reuse"
+              }
+        dockerCfg =
+          MaterializeDockerCfg
+            { mdcImage = defaultMaterializeImage,
+              mdcUser = "1000:1000",
+              mdcRunId = "test-run",
+              mdcCliPid = "1"
+            }
+        env =
+          env0
+            { aeMulti = mh,
+              aeMaterializeDocker = Just (dockerCfg, dockerRun)
+            }
     outcome <-
       goPublishAndOverlay
         env
@@ -1435,7 +1485,9 @@ testReusePathApplyProgressSequence =
         stepsDone
         1
     case outcome of
-      ApplySuccess _ sls _ ->
+      ApplySuccess _ sls _ -> do
+        dockerCalls <- readIORef dockerReqs
+        assertEq "reuse starts no docker session" 0 (length dockerCalls)
         assertTrue "reuse marks lines" (all slAssetsReused sls)
       other -> do
         hPutStrLn stderr ("expected reuse success, got: " <> show other)

@@ -379,7 +379,9 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
         usdEgencacheRunner = mockEgencacheWriteMatching,
         usdPreflightTools = preflight,
         usdEnsureImage = \_ -> pure (Right EnsureSkipped),
-        usdPruneMaterialize = pure ()
+        usdPruneMaterialize = pure (),
+        usdSweepMaterialize = pure (),
+        usdMaterializeDockerRunner = Nothing
       }
 
 outcomeKey :: ApplyOutcome -> PackageKey

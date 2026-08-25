@@ -337,7 +337,8 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aePlanOps = planOps,
         aeDepsPlanOps = depsOps,
         aeTempRun = tempRun,
-        aeCheckCache = cache
+        aeCheckCache = cache,
+        aeMaterializeDocker = Nothing
       }
 
 -- | Write a matching md5-dict cache file for one ebuild.

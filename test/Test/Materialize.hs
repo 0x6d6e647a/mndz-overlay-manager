@@ -95,6 +95,7 @@ integrationTests =
       testCase "opencode multi-asset reuse path" testOpencodeMultiAssetReusePath,
       testCase "opencode partial release does not reuse" testOpencodePartialReleaseFullPath,
       testCase "cargo full-path applyDepsAndAssets success" testCargoFullPathSuccess,
+      testCase "cargo full-path staging crates then crates pack" testCargoFullPathStagingStatus,
       testCase "cargo reuse-path apply success" testCargoReusePathSuccess,
       testCase "npm full-path materialize progress sequence" testNpmFullPathProgressSequence,
       testCase "go residual applyDepsAndAssets full path" testGoResidualApplyDepsAndAssets,
@@ -248,7 +249,9 @@ fakeCargoSuccessOps =
         body <- TIO.readFile ebuildPath
         TIO.writeFile ebuildPath (body <> "\n# pycargoebuild\n")
         pure (Right ()),
-      coPackCrates = \_lock _dist _stage outPath -> do
+      coPackCrates = \onStage onArchive _lock _dist _stage outPath -> do
+        onStage 1 1
+        onArchive
         BS.writeFile outPath cargoAssetBytes
         pure (Right ())
     }
@@ -1371,6 +1374,68 @@ testCargoFullPathSuccess =
     outcomes <- applyPackagePhase1 env overlayRoot entry
     expectSuccess "cargo full" outcomes
 
+testCargoFullPathStagingStatus :: IO ()
+testCargoFullPathStagingStatus =
+  withSystemTempDirectory "mndz-mat-cargo-stage-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "hk"
+        pn = "hk" :: T.Text
+        local = parseEbuildVersion "0.40.0"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "hk",
+              pePN = pn,
+              peLocal = local,
+              pePath = pkgDir </> "hk-0.40.0.ebuild"
+            }
+    events <- newIORef ([] :: [T.Text])
+    createDirectoryIfMissing True assetsRoot
+    seedCargoLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["0.50.0", "0.40.0"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        cargoTomls
+        (Just overlayRoot)
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir cratesKind cargoAssetBytes)
+        releaseMissing
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        (Just (recordingMulti events))
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectSuccess "cargo staging" outcomes
+    evs <- reverse <$> readIORef events
+    let statuses = [e | e <- evs, "status:" `T.isPrefixOf` e]
+        steps = [e | e <- evs, "step:" `T.isPrefixOf` e]
+        expectedMat =
+          [ "step:cloning upstream",
+            "step:pycargoebuild",
+            "step:crates pack",
+            "step:committing assets",
+            "step:pushing assets",
+            "step:uploading release asset",
+            "step:regenerating manifest"
+          ]
+        matSteps = filter (`elem` expectedMat) steps
+    assertTrue
+      "staging crates label"
+      ("status:staging crates 1/1" `elem` statuses)
+    assertTrue
+      "crates pack status after staging"
+      ("status:crates pack" `elem` statuses)
+    assertEq "seven materialize steps" fullPathMaterializeSteps (length matSteps)
+
 testCargoReusePathSuccess :: IO ()
 testCargoReusePathSuccess =
   withSystemTempDirectory "mndz-mat-cargo-reuse-" $ \tmp -> do
@@ -1407,7 +1472,7 @@ testCargoReusePathSuccess =
               coPycargoebuild = \_ _ _ _ -> do
                 atomicModifyIORef' pycargoCalls (\n -> (n + 1, ()))
                 pure (Left "pycargo should not run on reuse"),
-              coPackCrates = \_ _ _ _ -> do
+              coPackCrates = \_ _ _ _ _ _ -> do
                 atomicModifyIORef' packCalls (\n -> (n + 1, ()))
                 pure (Left "pack should not run on reuse")
             }

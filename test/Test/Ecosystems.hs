@@ -5,12 +5,13 @@
 module Test.Ecosystems (unitTests, integrationTests) where
 
 import Control.Concurrent.MVar (newMVar)
+import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (void)
 import Data.ByteString qualified as BS
 import Data.Foldable (for_)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory
@@ -23,6 +24,7 @@ import System.Directory
   )
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, (</>))
+import System.IO.Error (userError)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Support
@@ -57,6 +59,7 @@ import Update.Cargo.Crates
     maxRustVersionInTree,
     mkCargoOps,
     packCratesTarball,
+    packCratesTarballWith,
     parseRegistryPackages,
   )
 import Update.Git (GitOps (..))
@@ -97,9 +100,19 @@ import Update.Process
   )
 import Update.Process.Docker
   ( MaterializeDockerCfg (..),
+    MaterializeUnitRef (..),
     defaultMaterializeImage,
     materializeBuilderHome,
-    wrapMaterializeRequest,
+    materializeCreateArgs,
+    materializeExecArgs,
+    materializePidLabelKey,
+    materializeProductLabel,
+    materializeProductLabelKey,
+    materializeRunLabelKey,
+    materializeSessionName,
+    sweepStaleMaterializeSessions,
+    withUnitMaterializeSession,
+    wrapMaterializeExecRequest,
   )
 import Update.Runtime.Ceilings (gentooRepoPath, mkPortageqRunner)
 import Update.Sbcl.Deps
@@ -113,6 +126,7 @@ import Update.Sbcl.Deps
     sanitizeQlotConfs,
     stripUnusedFffTrees,
   )
+import Update.TempWorkspace (UnitDirs (..))
 import Update.Types (PackageKey (..))
 
 unitTests :: TestTree
@@ -178,7 +192,8 @@ unitTests =
           testCase "buildCargoCratesTarball pack failure" testCargoBuilderPackFail,
           testCase "packCratesTarball tiny fixture" testPackCratesTarballFixture,
           testCase "packCratesTarball missing crate" testPackCratesTarballMissingCrate,
-          testCase "packCratesTarball records XZ_OPT and -J / .xz temp" testPackCratesTarballXzArgv
+          testCase "packCratesTarball records XZ_OPT and -J / .xz temp" testPackCratesTarballXzArgv,
+          testCase "crate staging progress then crates pack" testCargoStagingProgress
         ],
       testGroup
         "xz pack helpers"
@@ -193,7 +208,14 @@ unitTests =
           testCase "vendor mk path success + failure" testVendorMkCommandRunner,
           testCase "cargo mk path success + failure" testCargoMkCommandRunner,
           testCase "ebuild/egencache/portageq mk runners" testSimpleRunnersMk,
-          testCase "docker wrap uses bind-mount HOME and strips secrets" testDockerWrapRequest
+          testCase "docker create binds unit work/out not run root" testDockerCreateArgs,
+          testCase "docker exec go version keeps GOMODCACHE strips secrets" testDockerExecGoVersion,
+          testCase "session name sanitizes slash and includes labels" testDockerSessionNameAndLabels,
+          testCase "withUnitMaterializeSession create/start/exec/rm bracket" testDockerSessionBracket,
+          testCase "session create failure is Left and does not exec" testDockerSessionCreateFail,
+          testCase "exec into a dead session hard-fails without a new create" testDockerSessionDeadExec,
+          testCase "sequential unit sessions are two create/rm pairs" testDockerSequentialSessions,
+          testCase "sweep removes dead pid, keeps live overlay-manager, ignores errors" testDockerSweep
         ]
     ]
 
@@ -525,6 +547,7 @@ noopCargoProgress =
       cgpOnCloneDone = pure (),
       cgpOnPycargoStart = pure (),
       cgpOnPycargoDone = pure (),
+      cgpOnStageCrate = \_ _ -> pure (),
       cgpOnPackStart = pure (),
       cgpOnPackDone = pure ()
     }
@@ -913,7 +936,8 @@ fakeCargoSuccessOps =
         -- Simulate inplace ebuild update; pack step writes the tarball.
         TIO.writeFile ebuildPath (donorEbuild <> "\n# pycargoebuild\n")
         pure (Right ()),
-      coPackCrates = \_lock _dist _stage outPath -> do
+      coPackCrates = \_onStage onArchive _lock _dist _stage outPath -> do
+        onArchive
         writeFile outPath "crates-tarball"
         pure (Right ())
     }
@@ -929,6 +953,8 @@ testCargoBuilderSuccess =
               cgpOnCloneDone = logEv "clone-done",
               cgpOnPycargoStart = logEv "pycargo-start",
               cgpOnPycargoDone = logEv "pycargo-done",
+              cgpOnStageCrate = \k n ->
+                logEv ("stage-" <> T.pack (show k) <> "/" <> T.pack (show n)),
               cgpOnPackStart = logEv "pack-start",
               cgpOnPackDone = logEv "pack-done"
             }
@@ -990,7 +1016,7 @@ testCargoBuilderCloneFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
         CargoOps
           { coClone = \_ _ _ -> pure (Left "git clone failed: offline"),
             coPycargoebuild = \_ _ _ _ -> pure (Left "should not run"),
-            coPackCrates = \_ _ _ _ -> pure (Left "should not pack")
+            coPackCrates = \_ _ _ _ _ _ -> pure (Left "should not pack")
           }
   result <-
     buildCargoCratesTarball
@@ -1019,7 +1045,7 @@ testCargoBuilderMissingLock = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> 
               createDirectoryIfMissing True dest
               pure (Right ()),
             coPycargoebuild = \_ _ _ _ -> pure (Left "should not run"),
-            coPackCrates = \_ _ _ _ -> pure (Left "should not pack")
+            coPackCrates = \_ _ _ _ _ _ -> pure (Left "should not pack")
           }
   result <-
     buildCargoCratesTarball
@@ -1046,7 +1072,7 @@ testCargoBuilderPycargoFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> 
   let ops =
         fakeCargoSuccessOps
           { coPycargoebuild = \_ _ _ _ -> pure (Left "pycargoebuild failed: boom"),
-            coPackCrates = \_ _ _ _ -> do
+            coPackCrates = \_ _ _ _ _ _ -> do
               atomicModifyIORef' packCalls (\n -> (n + 1, ()))
               pure (Left "should not pack after pycargo fail")
           }
@@ -1077,7 +1103,7 @@ testCargoBuilderPackFail :: IO ()
 testCargoBuilderPackFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   let ops =
         fakeCargoSuccessOps
-          { coPackCrates = \_ _ _ _ ->
+          { coPackCrates = \_ _ _ _ _ _ ->
               pure (Left "cargo crates pack failed: missing registry crate serde-1.0.0.crate")
           }
   result <-
@@ -1280,6 +1306,60 @@ testPackCratesTarballXzArgv =
             assertTrue "XZ_OPT has -T1" ("-T1" `isInfixOf` v)
             assertTrue "XZ_OPT has -9e" ("-9e" `isInfixOf` v)
             assertEq "XZ_OPT exact preset" xzOptValue v
+
+testCargoStagingProgress :: IO ()
+testCargoStagingProgress =
+  withSystemTempDirectory "mndz-cargo-stage-" $ \tmp -> do
+    let lockRoot = tmp </> "src"
+        distDir = tmp </> "distdir"
+        stageDir = tmp </> "stage"
+        outPath = tmp </> "pkg-0.1.0-crates.tar.xz"
+        crateDir = tmp </> "serde-1.0.200"
+        cratePath = distDir </> "serde-1.0.200.crate"
+    events <- newIORef ([] :: [T.Text])
+    let logEv e = atomicModifyIORef' events (\es -> (e : es, ()))
+    createDirectoryIfMissing True lockRoot
+    createDirectoryIfMissing True distDir
+    createDirectoryIfMissing True crateDir
+    TIO.writeFile (crateDir </> "Cargo.toml") "[package]\nname = \"serde\"\n"
+    void $
+      productionCommandRunner
+        ProcessRequest
+          { prMode =
+              ExecCmd
+                "tar"
+                ["-czf", cratePath, "-C", tmp, "serde-1.0.200"],
+            prCwd = Nothing,
+            prEnv = Nothing,
+            prStdin = ""
+          }
+    TIO.writeFile
+      (lockRoot </> "Cargo.lock")
+      ( T.unlines
+          [ "version = 4",
+            "[[package]]",
+            "name = \"serde\"",
+            "version = \"1.0.200\"",
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            "checksum = \"abc123\""
+          ]
+      )
+    assertRight "staged pack"
+      =<< packCratesTarballWith
+        productionCommandRunner
+        (\k n -> logEv ("staging crates " <> T.pack (show k) <> "/" <> T.pack (show n)))
+        (logEv "crates pack")
+        lockRoot
+        distDir
+        stageDir
+        outPath
+    evs <- reverse <$> readIORef events
+    assertEq
+      "staging then pack"
+      ["staging crates 1/1", "crates pack"]
+      evs
+    exists <- doesFileExist outPath
+    assertTrue "tarball exists" exists
 
 testVerifyXzFile :: IO ()
 testVerifyXzFile =
@@ -1619,59 +1699,392 @@ populateFffCloneDest dest = do
   createDirectoryIfMissing True (dest </> "crates" </> "fff-c")
   TIO.writeFile (dest </> "Cargo.toml") "[workspace]\n"
 
-testDockerWrapRequest :: IO ()
-testDockerWrapRequest = do
-  let cfg =
-        MaterializeDockerCfg
-          { mdcImage = defaultMaterializeImage,
-            mdcUser = "1000:1000",
-            mdcBindPath = "/tmp/mndz/overlay-manager/run1"
-          }
-      req =
-        ProcessRequest
-          { prMode = ExecCmd "go" ["version"],
-            prCwd = Just "/tmp/mndz/overlay-manager/run1/work",
-            prEnv =
-              Just
-                [ ("HOME", "/home/operator"),
-                  ("GITHUB_TOKEN", "secret"),
-                  ("GNUPGHOME", "/home/operator/.gnupg"),
-                  ("SSH_AUTH_SOCK", "/tmp/ssh.sock"),
-                  ("SBCL_HOME", "/usr/lib64/sbcl"),
-                  ("SBCL_SOURCE_ROOT", "/usr/lib64/sbcl/src"),
-                  ("GOMODCACHE", "/tmp/mndz/overlay-manager/run1/work/go-mod"),
-                  ("XZ_OPT", "-T1 -9e")
-                ],
-            prStdin = ""
-          }
-      wrapped = wrapMaterializeRequest cfg req
-  case prMode wrapped of
-    ExecCmd cmd args -> do
-      assertEq "docker binary" "docker" cmd
-      assertTrue "run --rm" (["run", "--rm"] `isInfixOf` args)
-      assertTrue "--user host uid" (["--user", "1000:1000"] `isInfixOf` args)
-      assertTrue
-        "HOME=/home/builder"
-        (any (("HOME=" <> materializeBuilderHome) `isInfixOf`) args)
-      assertTrue
-        "bind-mount same path"
-        ( any
-            (isInfixOf "type=bind,src=/tmp/mndz/overlay-manager/run1,dst=/tmp/mndz/overlay-manager/run1")
-            args
+sampleDockerCfg :: MaterializeDockerCfg
+sampleDockerCfg =
+  MaterializeDockerCfg
+    { mdcImage = defaultMaterializeImage,
+      mdcUser = "1000:1000",
+      mdcRunId = "20260810T154207-0700-4242.a8f3",
+      mdcCliPid = "4242"
+    }
+
+sampleUnitRef :: MaterializeUnitRef
+sampleUnitRef =
+  MaterializeUnitRef
+    { murCategory = "dev-util",
+      murPackage = "mise",
+      murPV = "2026.8.12"
+    }
+
+sampleUnitDirs :: FilePath -> UnitDirs
+sampleUnitDirs tmp =
+  UnitDirs
+    { udPath = tmp </> "unit",
+      udOut = tmp </> "unit" </> "out",
+      udWork = tmp </> "unit" </> "work"
+    }
+
+goVersionReq :: ProcessRequest
+goVersionReq =
+  ProcessRequest
+    { prMode = ExecCmd "go" ["version"],
+      prCwd = Just "/tmp/mndz/overlay-manager/run1/work",
+      prEnv =
+        Just
+          [ ("HOME", "/home/operator"),
+            ("GITHUB_TOKEN", "secret"),
+            ("GNUPGHOME", "/home/operator/.gnupg"),
+            ("SSH_AUTH_SOCK", "/tmp/ssh.sock"),
+            ("SBCL_HOME", "/usr/lib64/sbcl"),
+            ("SBCL_SOURCE_ROOT", "/usr/lib64/sbcl/src"),
+            ("GOMODCACHE", "/tmp/mndz/overlay-manager/run1/work/go-mod"),
+            ("XZ_OPT", "-T1 -9e")
+          ],
+      prStdin = ""
+    }
+
+dockerArgv :: ProcessRequest -> Maybe [String]
+dockerArgv req = case prMode req of
+  ExecCmd "docker" args -> Just args
+  _ -> Nothing
+
+isDockerSub :: String -> ProcessRequest -> Bool
+isDockerSub sub req =
+  case dockerArgv req of
+    Just (s : _) -> s == sub
+    _ -> False
+
+scriptedDocker ::
+  IORef [ProcessRequest] ->
+  (ProcessRequest -> IO ProcessResult) ->
+  ProcessRequest ->
+  IO ProcessResult
+scriptedDocker reqsRef handle req = do
+  atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
+  handle req
+
+sessionOkHandler :: ProcessRequest -> IO ProcessResult
+sessionOkHandler req = case dockerArgv req of
+  Just ("create" : _) -> pure (okResult "cid\n")
+  Just ("start" : _) -> pure (okResult "")
+  Just ("inspect" : _) -> pure (okResult "true\n")
+  Just ("exec" : _) -> pure (okResult "go version go1.22.5 linux/amd64\n")
+  Just ("rm" : _) -> pure (okResult "")
+  Just ("ps" : _) -> pure (okResult "")
+  _ -> pure (failResult ("unexpected docker: " <> show (prMode req)))
+
+testDockerCreateArgs :: IO ()
+testDockerCreateArgs =
+  withSystemTempDirectory "mndz-docker-create-" $ \tmp -> do
+    let dirs = sampleUnitDirs tmp
+        args = materializeCreateArgs sampleDockerCfg sampleUnitRef dirs
+        work = udWork dirs
+        out = udOut dirs
+        runRoot = tmp
+    assertTrue "create not run" ("create" `elem` args)
+    assertTrue "--rm" ("--rm" `elem` args)
+    assertTrue "no docker run" ("run" `notElem` args)
+    assertTrue "no --init" ("--init" `notElem` args)
+    assertTrue "no restart" (not (any ("--restart" `isInfixOf`) args))
+    assertTrue "--user host uid" (["--user", "1000:1000"] `isInfixOf` args)
+    assertTrue
+      "HOME=/home/builder"
+      (any (("HOME=" <> materializeBuilderHome) `isInfixOf`) args)
+    assertTrue
+      "work bind"
+      (any (isInfixOf ("type=bind,src=" <> work <> ",dst=" <> work)) args)
+    assertTrue
+      "out bind"
+      (any (isInfixOf ("type=bind,src=" <> out <> ",dst=" <> out)) args)
+    assertTrue
+      "run root is not a bind"
+      (not (any (isInfixOf ("src=" <> runRoot <> ",dst=" <> runRoot)) args))
+    assertTrue "PID 1 sleep infinity" (["sleep", "infinity"] `isInfixOf` args)
+    assertTrue "image tag" (defaultMaterializeImage `elem` args)
+    assertTrue
+      "product label"
+      (["--label", materializeProductLabel] `isInfixOf` args)
+
+testDockerExecGoVersion :: IO ()
+testDockerExecGoVersion = do
+  let name = materializeSessionName sampleDockerCfg sampleUnitRef
+      args = materializeExecArgs sampleDockerCfg name goVersionReq
+      wrapped = wrapMaterializeExecRequest sampleDockerCfg name goVersionReq
+  assertTrue "exec not run" ("exec" `elem` args)
+  assertTrue "no docker run" ("run" `notElem` args)
+  assertTrue "--user host uid" (["--user", "1000:1000"] `isInfixOf` args)
+  assertTrue "workdir" (["--workdir", "/tmp/mndz/overlay-manager/run1/work"] `isInfixOf` args)
+  assertTrue "inner go version" (["go", "version"] `isInfixOf` args)
+  assertTrue "named session" (name `elem` args)
+  assertTrue "no GITHUB_TOKEN" (not (any ("GITHUB_TOKEN" `isInfixOf`) args))
+  assertTrue "no GNUPGHOME" (not (any ("GNUPGHOME" `isInfixOf`) args))
+  assertTrue "no SSH_AUTH_SOCK" (not (any ("SSH_AUTH_SOCK" `isInfixOf`) args))
+  assertTrue "no SBCL_HOME" (not (any ("SBCL_HOME" `isInfixOf`) args))
+  assertTrue "no SBCL_SOURCE_ROOT" (not (any ("SBCL_SOURCE_ROOT" `isInfixOf`) args))
+  assertTrue "keeps GOMODCACHE" (any ("GOMODCACHE=" `isInfixOf`) args)
+  assertTrue "keeps XZ_OPT" (any ("XZ_OPT=" `isInfixOf`) args)
+  assertTrue "no -i when stdin empty" ("-i" `notElem` args)
+  let withStdin = goVersionReq {prStdin = "payload"}
+      iArgs = materializeExecArgs sampleDockerCfg name withStdin
+  assertTrue "-i when stdin non-empty" ("-i" `elem` iArgs)
+  assertEq "cwd consumed" Nothing (prCwd wrapped)
+  assertEq "env not on host docker" Nothing (prEnv wrapped)
+
+testDockerSessionNameAndLabels :: IO ()
+testDockerSessionNameAndLabels =
+  withSystemTempDirectory "mndz-docker-name-" $ \tmp -> do
+    let slashUnit =
+          MaterializeUnitRef
+            { murCategory = "dev-lang",
+              murPackage = "go/compiler",
+              murPV = "1.22.0"
+            }
+        name = materializeSessionName sampleDockerCfg slashUnit
+        args = materializeCreateArgs sampleDockerCfg slashUnit (sampleUnitDirs tmp)
+    assertTrue "product prefix" ("mndz-mat-" `isInfixOf` name)
+    assertTrue "run id" (mdcRunId sampleDockerCfg `isInfixOf` name)
+    assertTrue "category" ("dev-lang" `isInfixOf` name)
+    assertTrue "slash became dash" ("go-compiler" `isInfixOf` name)
+    assertTrue "no slash in name" ('/' `notElem` name)
+    assertTrue "pv" ("1.22.0" `isInfixOf` name)
+    assertTrue
+      "product label key"
+      (materializeProductLabelKey `isInfixOf` materializeProductLabel)
+    assertTrue
+      "run label"
+      ( any
+          (isInfixOf (materializeRunLabelKey <> "=" <> mdcRunId sampleDockerCfg))
+          args
+      )
+    assertTrue
+      "pid label"
+      ( any
+          (isInfixOf (materializePidLabelKey <> "=" <> mdcCliPid sampleDockerCfg))
+          args
+      )
+
+testDockerSessionBracket :: IO ()
+testDockerSessionBracket =
+  withSystemTempDirectory "mndz-docker-bracket-" $ \tmp -> do
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    let run = scriptedDocker reqsRef sessionOkHandler
+        dirs = sampleUnitDirs tmp
+    result <-
+      withUnitMaterializeSession run sampleDockerCfg sampleUnitRef dirs $ \runner -> do
+        res <- runner goVersionReq
+        assertEq "exec ok" ExitSuccess (prExitCode res)
+        pure (Right (prStdout res))
+    out <- assertRight "session ok" result
+    assertTrue "go version stdout" ("go1.22.5" `isInfixOf` out)
+    reqs <- reverse <$> readIORef reqsRef
+    let subs = mapMaybe dockerArgv reqs
+        heads = mapMaybe listToMaybe subs
+    assertTrue "created once" (length (filter (== "create") heads) == 1)
+    assertTrue "started" ("start" `elem` heads)
+    assertTrue "inspected" ("inspect" `elem` heads)
+    assertTrue "exec once" (length (filter (== "exec") heads) == 1)
+    assertTrue "rm -f" (any (\a -> ["rm", "-f"] `isInfixOf` a) subs)
+    assertTrue "no per-command run" ("run" `notElem` heads)
+    -- Exception path also rm -f.
+    reqs2 <- newIORef ([] :: [ProcessRequest])
+    let run2 = scriptedDocker reqs2 sessionOkHandler
+    threw <-
+      try @SomeException $
+        withUnitMaterializeSession run2 sampleDockerCfg sampleUnitRef dirs $ \_ ->
+          throwIO (userError "boom")
+    case threw of
+      Left _ -> pure ()
+      Right _ -> fail "expected exception"
+    reqsEx <- reverse <$> readIORef reqs2
+    assertTrue
+      "rm after exception"
+      (any (isDockerSub "rm") reqsEx)
+
+testDockerSessionCreateFail :: IO ()
+testDockerSessionCreateFail =
+  withSystemTempDirectory "mndz-docker-create-fail-" $ \tmp -> do
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    execRan <- newIORef False
+    let handle req = case dockerArgv req of
+          Just ("create" : _) -> pure (failResult "image missing")
+          Just ("rm" : _) -> pure (okResult "")
+          _ -> pure (failResult ("should not continue: " <> show (prMode req)))
+        run = scriptedDocker reqsRef handle
+    err <-
+      assertLeft "create fail"
+        =<< withUnitMaterializeSession
+          run
+          sampleDockerCfg
+          sampleUnitRef
+          (sampleUnitDirs tmp)
+          ( \_ -> do
+              writeIORef execRan True
+              pure (Right ())
+          )
+    assertTrue "create error" ("could not create materialize session" `T.isInfixOf` err)
+    ran <- readIORef execRan
+    assertTrue "continuation not run" (not ran)
+    reqs <- reverse <$> readIORef reqsRef
+    let heads =
+          mapMaybe
+            ( \r -> case dockerArgv r of
+                Just (h : _) -> Just h
+                _ -> Nothing
+            )
+            reqs
+    assertTrue "no start after create fail" ("start" `notElem` heads)
+    assertTrue "no exec after create fail" ("exec" `notElem` heads)
+
+testDockerSessionDeadExec :: IO ()
+testDockerSessionDeadExec =
+  withSystemTempDirectory "mndz-docker-dead-exec-" $ \tmp -> do
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    inspectN <- newIORef (0 :: Int)
+    let handle req = case dockerArgv req of
+          Just ("create" : _) -> pure (okResult "cid\n")
+          Just ("start" : _) -> pure (okResult "")
+          Just ("inspect" : _) -> do
+            n <- atomicModifyIORef' inspectN (\x -> (x + 1, x + 1))
+            if n == 1
+              then pure (okResult "true\n")
+              else pure (okResult "false\n")
+          Just ("exec" : _) -> pure (failResult "container is not running")
+          Just ("rm" : _) -> pure (okResult "")
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+        run = scriptedDocker reqsRef handle
+    err <-
+      assertLeft "dead exec"
+        =<< withUnitMaterializeSession
+          run
+          sampleDockerCfg
+          sampleUnitRef
+          (sampleUnitDirs tmp)
+          ( \runner -> do
+              res <- runner goVersionReq
+              if prExitCode res == ExitSuccess
+                then pure (Right ())
+                else pure (Left (T.pack (prStderr res)))
+          )
+    assertTrue "dead session message" ("materialize session is not running" `T.isInfixOf` err)
+    reqs <- reverse <$> readIORef reqsRef
+    let heads =
+          mapMaybe
+            ( \r -> case dockerArgv r of
+                Just (h : _) -> Just h
+                _ -> Nothing
+            )
+            reqs
+    assertEq "still one create" 1 (length (filter (== "create") heads))
+
+testDockerSequentialSessions :: IO ()
+testDockerSequentialSessions =
+  withSystemTempDirectory "mndz-docker-seq-" $ \tmp -> do
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    let run = scriptedDocker reqsRef sessionOkHandler
+        unit1 =
+          sampleUnitRef {murPV = "0.1.0"}
+        unit2 =
+          sampleUnitRef {murPV = "0.2.0"}
+        dirs1 =
+          (sampleUnitDirs tmp)
+            { udWork = tmp </> "u1" </> "work",
+              udOut = tmp </> "u1" </> "out"
+            }
+        dirs2 =
+          (sampleUnitDirs tmp)
+            { udWork = tmp </> "u2" </> "work",
+              udOut = tmp </> "u2" </> "out"
+            }
+    r1 <-
+      withUnitMaterializeSession run sampleDockerCfg unit1 dirs1 $ \runner -> do
+        _ <- runner goVersionReq
+        pure (Right ())
+    r2 <-
+      withUnitMaterializeSession run sampleDockerCfg unit2 dirs2 $ \runner -> do
+        _ <- runner goVersionReq
+        pure (Right ())
+    _ <- assertRight "pv1" r1
+    _ <- assertRight "pv2" r2
+    reqs <- reverse <$> readIORef reqsRef
+    let heads =
+          mapMaybe
+            ( \r -> case dockerArgv r of
+                Just (h : _) -> Just h
+                _ -> Nothing
+            )
+            reqs
+        createNames =
+          [ n
+          | req <- reqs,
+            Just args <- [dockerArgv req],
+            "create" : _ <- [args],
+            n <- nameFlags args
+          ]
+        name1 = materializeSessionName sampleDockerCfg unit1
+        name2 = materializeSessionName sampleDockerCfg unit2
+    assertEq "two creates" 2 (length (filter (== "create") heads))
+    assertEq "two rms" 2 (length (filter (== "rm") heads))
+    assertTrue "distinct names" (name1 /= name2)
+    assertTrue "name1 created" (name1 `elem` createNames)
+    assertTrue "name2 created" (name2 `elem` createNames)
+    -- First rm must appear before second create.
+    let indexed = zip [0 :: Int ..] heads
+        firstRm = [i | (i, "rm") <- indexed]
+        creates = [i | (i, "create") <- indexed]
+    case (firstRm, creates) of
+      (r : _, _ : c2 : _) ->
+        assertTrue "rm before second create" (r < c2)
+      _ -> fail "expected two creates and at least one rm"
+
+nameFlags :: [String] -> [String]
+nameFlags [] = []
+nameFlags ("--name" : n : rest) = n : nameFlags rest
+nameFlags (_ : rest) = nameFlags rest
+
+testDockerSweep :: IO ()
+testDockerSweep = do
+  -- dead pid is removed
+  reqsDead <- newIORef ([] :: [ProcessRequest])
+  let handleDead req = case dockerArgv req of
+        Just ("ps" : _) -> pure (okResult "abc123\n")
+        Just ("inspect" : _) -> pure (okResult "99\n")
+        Just ("rm" : _) -> pure (okResult "")
+        _ -> pure (failResult ("unexpected sweep: " <> show (prMode req)))
+  sweepStaleMaterializeSessions
+    (scriptedDocker reqsDead handleDead)
+    (\_pid -> pure False)
+  deadReqs <- reverse <$> readIORef reqsDead
+  assertTrue
+    "ps filter product label"
+    ( any
+        ( \r ->
+            case dockerArgv r of
+              Just args ->
+                ["ps", "-aq"] `isInfixOf` args
+                  && any (isInfixOf materializeProductLabel) args
+              Nothing -> False
         )
-      assertTrue "workdir" (["--workdir", "/tmp/mndz/overlay-manager/run1/work"] `isInfixOf` args)
-      assertTrue "inner go version" (["go", "version"] `isInfixOf` args)
-      assertTrue "image tag" (defaultMaterializeImage `elem` args)
-      assertTrue "no GITHUB_TOKEN" (not (any ("GITHUB_TOKEN" `isInfixOf`) args))
-      assertTrue "no GNUPGHOME" (not (any ("GNUPGHOME" `isInfixOf`) args))
-      assertTrue "no SSH_AUTH_SOCK" (not (any ("SSH_AUTH_SOCK" `isInfixOf`) args))
-      assertTrue "no SBCL_HOME" (not (any ("SBCL_HOME" `isInfixOf`) args))
-      assertTrue "no SBCL_SOURCE_ROOT" (not (any ("SBCL_SOURCE_ROOT" `isInfixOf`) args))
-      assertTrue "keeps GOMODCACHE" (any ("GOMODCACHE=" `isInfixOf`) args)
-      assertTrue "keeps XZ_OPT" (any ("XZ_OPT=" `isInfixOf`) args)
-    ShellCmd _ -> fail "expected ExecCmd docker"
-  assertEq "cwd consumed by --workdir" Nothing (prCwd wrapped)
-  assertEq "env not inherited on host docker" Nothing (prEnv wrapped)
+        deadReqs
+    )
+  assertTrue "removed dead pid" (any (isDockerSub "rm") deadReqs)
+  -- live overlay-manager pid is kept
+  reqsLive <- newIORef ([] :: [ProcessRequest])
+  let handleLive req = case dockerArgv req of
+        Just ("ps" : _) -> pure (okResult "livecid\n")
+        Just ("inspect" : _) -> pure (okResult "4242\n")
+        Just ("rm" : _) -> pure (failResult "should not rm live")
+        _ -> pure (failResult ("unexpected live sweep: " <> show (prMode req)))
+  sweepStaleMaterializeSessions
+    (scriptedDocker reqsLive handleLive)
+    ( \pid -> do
+        assertEq "pid from label" "4242" pid
+        pure True
+    )
+  liveReqs <- reverse <$> readIORef reqsLive
+  assertTrue "did not rm live pid" (not (any (isDockerSub "rm") liveReqs))
+  -- sweep error is ignored
+  let boom _ = pure (failResult "docker daemon down")
+  sweepStaleMaterializeSessions boom (\_ -> pure False)
 
 ------------------------------------------------------------------------
 -- Production mk*Ops / runners via scripted CommandRunner

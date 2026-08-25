@@ -14,6 +14,7 @@ module Update.Cargo.Crates
     parseRegistryPackages,
     cargoChecksumJson,
     packCratesTarball,
+    packCratesTarballWith,
   )
 where
 
@@ -71,8 +72,16 @@ data CargoOps = CargoOps
   { coClone :: Text -> Text -> FilePath -> IO (Either Text ()),
     -- | Run pycargoebuild: ebuild path, lock root / pkg dir, tarball out path, temp distdir.
     coPycargoebuild :: FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ()),
-    -- | Pack registry crates: lock root, distdir, stage dir, final tarball path.
-    coPackCrates :: FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+    -- | Pack registry crates: staging callback @k N@, archive-start, lock
+    -- root, distdir, stage dir, final tarball path.
+    coPackCrates ::
+      (Int -> Int -> IO ()) ->
+      IO () ->
+      FilePath ->
+      FilePath ->
+      FilePath ->
+      FilePath ->
+      IO (Either Text ())
   }
 
 data CargoProgress = CargoProgress
@@ -80,6 +89,8 @@ data CargoProgress = CargoProgress
     cgpOnCloneDone :: IO (),
     cgpOnPycargoStart :: IO (),
     cgpOnPycargoDone :: IO (),
+    -- | Called as @k N@ while extracting each registry crate (1-based @k@).
+    cgpOnStageCrate :: Int -> Int -> IO (),
     cgpOnPackStart :: IO (),
     cgpOnPackDone :: IO ()
   }
@@ -90,7 +101,7 @@ mkCargoOps run =
   CargoOps
     { coClone = gitCloneTag run,
       coPycargoebuild = runPycargoebuild run,
-      coPackCrates = packCratesTarball run
+      coPackCrates = packCratesTarballWith run
     }
 
 productionCargoOps :: CargoOps
@@ -186,10 +197,11 @@ buildCargoCratesTarball
                   Left err -> pure (Left err)
                   Right () -> do
                     cgpOnPycargoDone progress
-                    cgpOnPackStart progress
                     packed <-
                       coPackCrates
                         ops
+                        (cgpOnStageCrate progress)
+                        (cgpOnPackStart progress)
                         lockRoot
                         distDir
                         stageDir
@@ -343,7 +355,20 @@ packCratesTarball ::
   FilePath ->
   FilePath ->
   IO (Either Text ())
-packCratesTarball run lockRoot distDir stageDir outPath = do
+packCratesTarball run =
+  packCratesTarballWith run (\_ _ -> pure ()) (pure ())
+
+-- | Like 'packCratesTarball' with staging (@k@ of @N@) and archive-start hooks.
+packCratesTarballWith ::
+  CommandRunner ->
+  (Int -> Int -> IO ()) ->
+  IO () ->
+  FilePath ->
+  FilePath ->
+  FilePath ->
+  FilePath ->
+  IO (Either Text ())
+packCratesTarballWith run onStage onArchiveStart lockRoot distDir stageDir outPath = do
   let lockPath = lockRoot </> "Cargo.lock"
   hasLock <- doesFileExist lockPath
   if not hasLock
@@ -352,29 +377,36 @@ packCratesTarball run lockRoot distDir stageDir outPath = do
       body <- TIO.readFile lockPath
       case parseRegistryPackages body of
         Left err -> pure $ Left ("cargo crates pack failed: " <> err)
-        Right pkgs -> stageAndArchive run pkgs distDir stageDir outPath
+        Right pkgs ->
+          stageAndArchive run onStage onArchiveStart pkgs distDir stageDir outPath
 
 stageAndArchive ::
   CommandRunner ->
+  (Int -> Int -> IO ()) ->
+  IO () ->
   [RegistryPackage] ->
   FilePath ->
   FilePath ->
   FilePath ->
   IO (Either Text ())
-stageAndArchive run pkgs distDir stageDir outPath = do
+stageAndArchive run onStage onArchiveStart pkgs distDir stageDir outPath = do
   let gentooDir = stageDir </> "cargo_home" </> "gentoo"
   createDirectoryIfMissing True gentooDir
-  staged <- stageAll pkgs
+  staged <- stageAll 1 pkgs
   case staged of
     Left err -> pure (Left err)
-    Right () -> createArchiveAtomic run stageDir outPath
+    Right () -> do
+      onArchiveStart
+      createArchiveAtomic run stageDir outPath
   where
-    stageAll [] = pure (Right ())
-    stageAll (p : rest) = do
+    n = length pkgs
+    stageAll _ [] = pure (Right ())
+    stageAll k (p : rest) = do
+      onStage k n
       r <- stageOne p
       case r of
         Left err -> pure (Left err)
-        Right () -> stageAll rest
+        Right () -> stageAll (k + 1) rest
 
     stageOne p = do
       let cratePath = distDir </> crateFilename p

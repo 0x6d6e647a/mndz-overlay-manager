@@ -84,7 +84,11 @@ import Update.Preflight
     preflightUpdateTools,
   )
 import Update.Process (productionCommandRunner)
-import Update.Process.Docker (materializeImageEnvVar)
+import Update.Process.Docker
+  ( isLiveOverlayManagerPid,
+    materializeImageEnvVar,
+    sweepStaleMaterializeSessions,
+  )
 import Update.Runtime.Ceilings (gentooRepoPath, productionPortageqRunner)
 import Update.Spine
   ( UpdateSpineDeps (..),
@@ -301,7 +305,13 @@ runUpdate rt refresh pkgArgs = do
                           usdPreflightTools = preflightUpdateTools,
                           usdEnsureImage = ensureMaterializeImage ensureCfg,
                           usdPruneMaterialize =
-                            prunePreviousMaterializeImage ensureCfg
+                            prunePreviousMaterializeImage ensureCfg,
+                          usdSweepMaterialize =
+                            sweepStaleMaterializeSessions
+                              productionCommandRunner
+                              isLiveOverlayManagerPid,
+                          usdMaterializeDockerRunner =
+                            Just productionCommandRunner
                         }
                 runUpdatePhases deps entries ebuilds selected
             )
