@@ -138,7 +138,8 @@ data MutateEnsure = MutateEnsure
     meImageEnsure :: ImageEnsure,
     -- | GitMv key whose signed commit waits until ensure finishes.
     meDelayCommit :: Maybe PackageKey,
-    -- | GitMv keys whose overlay file work must finish before @docker build@.
+    -- | Overlay keys whose file work (GitMv or DepsAndAssets rewrite /
+    -- Manifest) must finish before @docker build@.
     meGateEnsureOnFiles :: [PackageKey],
     -- | Run t0 ensure even when no admitted full-path package exists.
     meRunEnsure :: Bool
@@ -263,11 +264,13 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
           False
           (\k -> any (\(e, w) -> peKey e == k && isGitMvWork w) readyWork)
           delayKey
+      isFileGateWork key work =
+        key `elem` gateKeys && not (delayKey == Just key && isGitMvWork work)
       nGates =
         length
           [ k
           | k <- gateKeys,
-            any (\(e, w) -> peKey e == k && isGitMvWork w) readyWork
+            any (\(e, _) -> peKey e == k) readyWork
           ]
   if panelCount == 0
     then pure []
@@ -336,8 +339,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
               finishOne
           delayedGitMv key work =
             delayKey == Just key && isGitMvWork work
-          gatedGitMv key work =
-            key `elem` gateKeys && isGitMvWork work && delayKey /= Just key
+          gatedFileWork = isFileGateWork
           signalFiles result = void $ tryPutMVar filesReady result
           signalGateDone result = case result of
             Left err -> signalFiles (Left err)
@@ -365,7 +367,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                         putMVar pendingVar pending
                         signalGateDone (Right ())
                         worker
-                | gatedGitMv (peKey entry) work -> do
+                | gatedFileWork (peKey entry) work -> do
                     outs <-
                       bracket_
                         (waitQSem sem)

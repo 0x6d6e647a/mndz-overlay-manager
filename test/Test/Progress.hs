@@ -295,7 +295,8 @@ unitTests =
       testCase "Waiting is not hard-fail chrome" testWaitingNotHardFail,
       testCase "Full-path waiting on ensure is not hard-fail" testWaitingOnEnsureNotHardFail,
       testCase "Ralph stays waiting on bun-bin through Manifest and commit" testRalphWaitsThroughManifestAndCommit,
-      testCase "qlot Manifest is visible; Autolith is not waiting on qlot" testQlotManifestVisibleAutolithNotWaiting
+      testCase "qlot Manifest is visible; Autolith is not waiting on qlot" testQlotManifestVisibleAutolithNotWaiting,
+      testCase "node-gyp Manifest is visible; opencode is not waiting on node-gyp" testNodeGypManifestVisibleOpencodeNotWaiting
     ]
 
 -- | Soft-skip handle drives ApplyEnv / PlanOps apply path.
@@ -556,6 +557,42 @@ testQlotManifestVisibleAutolithNotWaiting = do
   assertTrue
     "autolith not waiting on qlot"
     (not ("waiting on dev-lisp/qlot" `T.isInfixOf` frame))
+  assertTrue "image wait in frame" (waitingOnMaterializeImage `T.isInfixOf` frame)
+  assertTrue "not fail glyph" (not ("✗" `T.isInfixOf` frame))
+
+-- | node-gyp Manifest regen is visible; opencode waits on the image, not node-gyp.
+testNodeGypManifestVisibleOpencodeNotWaiting :: IO ()
+testNodeGypManifestVisibleOpencodeNotWaiting = do
+  stateRef <-
+    newIORef
+      MultiState
+        { msLabel = "Updating packages",
+          msTotal = 2,
+          msSucceeded = 0,
+          msJobs = Map.empty,
+          msTick = 0
+        }
+  let mh = multiHandle stateRef
+      nodeGyp = mkPackageKey "dev-build" "node-gyp"
+      opencode = mkPackageKey "dev-util" "opencode"
+  mhStart mh nodeGyp
+  mhWait mh opencode waitingOnMaterializeImage
+  mhStatus mh nodeGyp regeneratingManifestStatus
+  s0 <- readIORef stateRef
+  case Map.lookup opencode (msJobs s0) of
+    Just (JobWaiting reason) ->
+      assertEq
+        "opencode waits on image"
+        waitingOnMaterializeImage
+        reason
+    other -> do
+      hPutStrLn stderr ("expected JobWaiting, got: " <> show other)
+      exitFailure
+  let frame = T.pack (renderMulti ColorOff s0)
+  assertTrue "node-gyp Manifest status" (regeneratingManifestStatus `T.isInfixOf` frame)
+  assertTrue
+    "opencode not waiting on node-gyp"
+    (not ("waiting on dev-build/node-gyp" `T.isInfixOf` frame))
   assertTrue "image wait in frame" (waitingOnMaterializeImage `T.isInfixOf` frame)
   assertTrue "not fail glyph" (not ("✗" `T.isInfixOf` frame))
 

@@ -27,6 +27,7 @@ module Update.Materialize.Ensure
     containerdRootUnresolvedMessage,
     readOverlayBunFloor,
     readOverlayQlotFloor,
+    readOverlayNodeGypFloor,
     ensureMaterializeImage,
     prunePreviousMaterializeImage,
     defaultMaterializeSidecarDir,
@@ -119,6 +120,7 @@ import Update.Process.Docker
 import Update.Runtime.Ceilings
   ( RuntimeEbuildMeta,
     discoverBunBinMetas,
+    discoverNodeGypMetas,
     discoverQlotMetas,
     discoverRuntimeMetasInDir,
     goBinPackageDir,
@@ -233,6 +235,11 @@ readOverlayQlotFloor overlayRoot = do
   metas <- loadQlotMetas overlayRoot
   pure (overlayBunFloorFromMetas metas)
 
+readOverlayNodeGypFloor :: FilePath -> IO (Maybe Text)
+readOverlayNodeGypFloor overlayRoot = do
+  metas <- loadNodeGypMetas overlayRoot
+  pure (overlayBunFloorFromMetas metas)
+
 -- | Missing package dir (including @-bin@) is an empty meta list, not a fail.
 loadGentooToolchainMetas :: FilePath -> IO GentooToolchainMetas
 loadGentooToolchainMetas gentooRoot =
@@ -256,6 +263,13 @@ loadBunMetas overlayRoot = do
 loadQlotMetas :: FilePath -> IO [RuntimeEbuildMeta]
 loadQlotMetas overlayRoot = do
   eMetas <- discoverQlotMetas overlayRoot
+  pure $ case eMetas of
+    Left _ -> []
+    Right metas -> metas
+
+loadNodeGypMetas :: FilePath -> IO [RuntimeEbuildMeta]
+loadNodeGypMetas overlayRoot = do
+  eMetas <- discoverNodeGypMetas overlayRoot
   pure $ case eMetas of
     Left _ -> []
     Right metas -> metas
@@ -334,7 +348,8 @@ ensureDefault cfg needed = do
               metas <- loadGentooToolchainMetas gentooRoot
               bunMetas <- loadBunMetas (ecOverlayRoot cfg)
               qlotMetas <- loadQlotMetas (ecOverlayRoot cfg)
-              case resolveNeededInstalls (raKeywords arch) unioned metas bunMetas qlotMetas of
+              nodeGypMetas <- loadNodeGypMetas (ecOverlayRoot cfg)
+              case resolveNeededInstalls (raKeywords arch) unioned metas bunMetas qlotMetas nodeGypMetas of
                 Left err ->
                   pure (Left (ensureFailedMessage err))
                 Right installs -> do

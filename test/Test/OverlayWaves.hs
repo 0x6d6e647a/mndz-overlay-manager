@@ -96,6 +96,10 @@ testHardcodedEdges = do
   assertEq "bun-bin itself" Nothing (overlayCeilingProviderForKey bunBinPackageKey)
   assertEq "qlot" Nothing (overlayCeilingProviderForKey (mkPackageKey "dev-lisp" "qlot"))
   assertEq
+    "node-gyp"
+    Nothing
+    (overlayCeilingProviderForKey (mkPackageKey "dev-build" "node-gyp"))
+  assertEq
     "autolith"
     Nothing
     (overlayCeilingProviderForKey (mkPackageKey "dev-util" "autolith"))

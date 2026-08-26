@@ -49,8 +49,11 @@ tests =
         [ testCase "accept bare" $ parseEnginesMinimum "1.2.3" @?= Just "1.2.3",
           testCase "accept v prefix" $ parseEnginesMinimum "v1.2.3" @?= Just "1.2.3",
           testCase "accept >=" $ parseEnginesMinimum ">=1.2.3" @?= Just "1.2.3",
-          testCase "reject caret" $ parseEnginesMinimum "^1.2.3" @?= Nothing,
-          testCase "reject or" $ parseEnginesMinimum "1.0.0 || 2.0.0" @?= Nothing,
+          testCase "accept caret" $ parseEnginesMinimum "^1.2.3" @?= Just "1.2.3",
+          testCase "accept or lowest" $ parseEnginesMinimum "1.0.0 || 2.0.0" @?= Just "1.0.0",
+          testCase
+            "accept node-gyp disjunction"
+            $ parseEnginesMinimum "^22.22.2 || ^24.15.0 || >=26.0.0" @?= Just "22.22.2",
           testCase "reject star" $ parseEnginesMinimum "1.*" @?= Nothing,
           testCase "reject empty" $ parseEnginesMinimum "" @?= Nothing,
           testProperty "complex ranges rejected" propEnginesComplexRejected
@@ -112,5 +115,16 @@ propParseEbuildFileName =
 
 propEnginesComplexRejected :: Property
 propEnginesComplexRejected =
-  forAll (elements ["^1.2.3", "~1.2.3", "1.0 || 2.0", "1.*", ">=1.0 <2.0", "1.0.0,2.0.0"]) $ \s ->
-    parseEnginesMinimum (T.pack s) === Nothing
+  forAll
+    ( elements
+        [ "~1.2.3",
+          "1.*",
+          ">=1.0 <2.0",
+          "1.0.0,2.0.0",
+          "1.0.0 - 2.0.0",
+          "*",
+          "<2.0.0"
+        ]
+    )
+    $ \s ->
+      parseEnginesMinimum (T.pack s) === Nothing

@@ -418,10 +418,16 @@ testEnginesMinimumParse = do
   assertEq ">= form" (Just "20.19.0") (parseEnginesMinimum ">=20.19.0")
   assertEq "bare" (Just "1.3.6") (parseEnginesMinimum "1.3.6")
   assertEq "v prefix" (Just "1.2.3") (parseEnginesMinimum "v1.2.3")
-  assertEq "complex caret" Nothing (parseEnginesMinimum "^20.0.0")
-  assertEq "complex or" Nothing (parseEnginesMinimum ">=18 || >=20")
+  assertEq "caret" (Just "22.22.2") (parseEnginesMinimum "^22.22.2")
+  assertEq
+    "node-gyp disjunction"
+    (Just "22.22.2")
+    (parseEnginesMinimum "^22.22.2 || ^24.15.0 || >=26.0.0")
+  assertEq "or lowest bound" (Just "18.0.0") (parseEnginesMinimum ">=18.0.0 || >=20.0.0")
   assertEq "star" Nothing (parseEnginesMinimum "*")
   assertEq "empty" Nothing (parseEnginesMinimum "")
+  assertEq "hyphen range" Nothing (parseEnginesMinimum "1.0.0 - 2.0.0")
+  assertEq "less-than" Nothing (parseEnginesMinimum "<20.0.0")
 
 testCargoMsrvAndCeilings :: IO ()
 testCargoMsrvAndCeilings = do

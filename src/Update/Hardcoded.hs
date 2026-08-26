@@ -44,6 +44,10 @@ hardcodedPolicies =
         (GitHub "fukamachi" "qlot" "")
         GitMvAndManifest,
       policy
+        "dev-build/node-gyp"
+        (Npm "node-gyp")
+        (DepsAndAssets NpmEco),
+      policy
         "dev-db/dolt"
         (GitHub "dolthub" "dolt" "v")
         (DepsAndAssets (Go (Just "go"))),

@@ -393,6 +393,16 @@ testPolicyClassification = do
     other -> do
       hPutStrLn stderr $ "qlot technique: " <> show other
       exitFailure
+  case lookupPolicy (PackageKey "dev-build/node-gyp") of
+    Just
+      ( PackagePolicy
+          (Npm "node-gyp")
+          (DepsAndAssets NpmEco)
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "node-gyp technique: " <> show other
+      exitFailure
   assertEq "unmapped" Nothing (lookupPolicy (PackageKey "dev-lang/haskell"))
   case lookupPolicy (PackageKey "dev-lang/bun-bin") of
     Just (PackagePolicy (GitHub "oven-sh" "bun" "bun-v") GitMvAndManifest) -> pure ()
@@ -915,7 +925,7 @@ testFetchNpmEnginesWithFake = do
           ( Right
               ( fakeResponse
                   200
-                  "{\"engines\":{\"node\":\"^18 || >=20\"}}"
+                  "{\"engines\":{\"node\":\"*\"}}"
               )
           )
   errUnp <-

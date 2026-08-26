@@ -277,14 +277,18 @@ testParseEnginesBun = do
     Nothing
     (parseEnginesBunFromPackageJson "not-json")
   assertEq
-    "complex range falls through without packageManager"
-    Nothing
+    "caret engines.bun is a minimum"
+    (Just "1.2.3")
     (parseEnginesBunFromPackageJson "{\"engines\":{\"bun\":\"^1.2.3\"}}")
   assertEq
-    "complex engines falls through to packageManager"
+    "star engines falls through without packageManager"
+    Nothing
+    (parseEnginesBunFromPackageJson "{\"engines\":{\"bun\":\"*\"}}")
+  assertEq
+    "star engines falls through to packageManager"
     (Just "1.3.14")
     ( parseEnginesBunFromPackageJson
-        "{\"engines\":{\"bun\":\"^1.2.3\"},\"packageManager\":\"bun@1.3.14\"}"
+        "{\"engines\":{\"bun\":\"*\"},\"packageManager\":\"bun@1.3.14\"}"
     )
 
 testHostMeetsBunRequirement :: IO ()
@@ -1790,6 +1794,18 @@ testDockerCreateArgs =
     assertTrue
       "HOME=/home/builder"
       (any (("HOME=" <> materializeBuilderHome) `isInfixOf`) args)
+    assertTrue
+      "npm_config_nodedir=/usr"
+      (any ("npm_config_nodedir=/usr" `isInfixOf`) args)
+    assertTrue
+      "npm_config_python"
+      (any ("npm_config_python=/usr/bin/python3" `isInfixOf`) args)
+    assertTrue
+      "PYTHON=/usr/bin/python3"
+      (any ("PYTHON=/usr/bin/python3" `isInfixOf`) args)
+    assertTrue
+      "no npm_config_offline"
+      (not (any ("npm_config_offline" `isInfixOf`) args))
     assertTrue
       "work bind"
       (any (isInfixOf ("type=bind,src=" <> work <> ",dst=" <> work)) args)

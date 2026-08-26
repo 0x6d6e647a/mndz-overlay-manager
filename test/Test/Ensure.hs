@@ -119,6 +119,9 @@ unitTests =
       testCase "skip docker build when satisfies" testSkipWhenSatisfies,
       testCase "generator mismatch rebuilds despite floors" testGeneratorMismatchRebuilds,
       testCase "newer overlay qlot rebuilds despite language floors" testNewerQlotRebuilds,
+      testCase "newer overlay node-gyp rebuilds despite language floors" testNewerNodeGypRebuilds,
+      testCase "bun recipe emerges overlay node-gyp after node" testBunRecipeEmergesNodeGypAfterNode,
+      testCase "Go-only recipe omits node-gyp" testGoOnlyOmitsNodeGyp,
       testCase "unmapped uname hard-fails without docker build" testUnmappedDefaultNoBuild,
       testCase "override on unmapped uname skips generate" testOverrideUnmappedNoBuild,
       testCase "override missing hard-fails without build" testOverrideMissingNoBuild,
@@ -158,11 +161,28 @@ testUnionSatisfy = do
   assertEq "union adds Bun" (Just "1.3.0") (nfBun unioned)
   assertEq "union does not invent SBCL" Nothing (nfSbcl unioned)
   assertEq "union does not invent qlot" Nothing (nfQlot unioned)
+  assertEq "union does not invent node-gyp" Nothing (nfNodeGyp unioned)
   let recQlot = emptyFloors {nfQlot = Just "1.8.4"}
       needQlot = emptyFloors {nfQlot = Just "1.8.5"}
   assertTrue "1.8.5 does not satisfy as recorded 1.8.4" (not (floorsSatisfy recQlot needQlot))
   assertTrue "missing recorded qlot is a miss" (not (floorsSatisfy emptyFloors needQlot))
   assertTrue "1.8.5 satisfies 1.8.4" (floorsSatisfy needQlot recQlot)
+  let recGyp = emptyFloors {nfNodeGyp = Just "13.0.0"}
+      needGyp = emptyFloors {nfNodeGyp = Just "13.0.1"}
+  assertTrue "13.0.1 does not satisfy as recorded 13.0.0" (not (floorsSatisfy recGyp needGyp))
+  assertTrue "missing recorded node-gyp is a miss" (not (floorsSatisfy emptyFloors needGyp))
+  assertTrue "13.0.1 satisfies 13.0.0" (floorsSatisfy needGyp recGyp)
+  let oldJson =
+        "{\"go\":\"1.26.5\"}"
+  case decodeImageSidecar
+    ( encodeUtf8
+        "{\"version\":1,\"id\":\"sha256:x\",\"tag\":\"t\",\"satisfies\":"
+        <> encodeUtf8 oldJson
+        <> ",\"generator\":\"g\",\"built_at\":\"2026-01-01T00:00:00Z\"}"
+    ) of
+    Left err -> assertFailure ("old sidecar decode: " <> err)
+    Right side ->
+      assertEq "old sidecar nodeGyp missing" Nothing (nfNodeGyp (isSatisfies side))
 
 testBunOnlyOmitsSbcl :: IO ()
 testBunOnlyOmitsSbcl = do
@@ -192,8 +212,9 @@ testBunOnlyOmitsSbcl = do
                 pdHypoProvider = Nothing
               }
         ]
-      needed = neededFloorsFromClassified classify plan (Just "1.2.0") Nothing
+      needed = neededFloorsFromClassified classify plan (Just "1.2.0") Nothing (Just "13.0.0")
   assertEq "bun floor" (Just "1.2.0") (nfBun needed)
+  assertEq "node-gyp floor when bun" (Just "13.0.0") (nfNodeGyp needed)
   assertEq "no SBCL on first bun-only" Nothing (nfSbcl needed)
   assertEq "no qlot on bun-only" Nothing (nfQlot needed)
   assertEq "no Go on bun-only" Nothing (nfGo needed)
@@ -331,10 +352,11 @@ testFullPathFloorIgnoresReuseSibling = do
                 pdHypoProvider = Nothing
               }
         ]
-      needed = neededFloorsFromClassified classify plan Nothing Nothing
+      needed = neededFloorsFromClassified classify plan Nothing Nothing (Just "13.0.0")
   assertEq "Go floor from full-path PV only" (Just "1.24.0") (nfGo needed)
   assertEq "no unused toolchains" Nothing (nfSbcl needed)
   assertEq "no qlot without SBCL" Nothing (nfQlot needed)
+  assertEq "no node-gyp without bun or node" Nothing (nfNodeGyp needed)
 
 testRenderMndzNoOfficial :: IO ()
 testRenderMndzNoOfficial = do
@@ -541,6 +563,26 @@ goInstall ver =
       { rtAtom = "dev-lang/go",
         rtEmergeSpec = ">=dev-lang/go-" <> ver,
         rtAcceptLine = Nothing
+      }
+
+nodeInstall :: T.Text -> ResolvedInstall
+nodeInstall ver =
+  ResolvedInstall
+    TkNode
+    ResolvedToolchain
+      { rtAtom = "net-libs/nodejs",
+        rtEmergeSpec = ">=net-libs/nodejs-" <> ver,
+        rtAcceptLine = Nothing
+      }
+
+overlayNodeGypInstall :: T.Text -> T.Text -> ResolvedInstall
+overlayNodeGypInstall ver kw =
+  ResolvedInstall
+    TkNodeGyp
+    ResolvedToolchain
+      { rtAtom = "dev-build/node-gyp",
+        rtEmergeSpec = ">=dev-build/node-gyp-" <> ver <> "::mndz",
+        rtAcceptLine = Just (">=dev-build/node-gyp-" <> ver <> "::mndz ~" <> kw)
       }
 
 meta :: T.Text -> [T.Text] -> RuntimeEbuildMeta
@@ -908,6 +950,84 @@ testNewerQlotRebuilds =
     df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
     assertTrue "recipe emerges overlay qlot" (">=dev-lisp/qlot-1.8.5::mndz" `T.isInfixOf` df)
     assertTrue "no Quicklisp fetch" (not ("beta.quicklisp.org" `T.isInfixOf` df))
+
+testNewerNodeGypRebuilds :: IO ()
+testNewerNodeGypRebuilds =
+  withSystemTempDirectory "om-ensure-node-gyp" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:old-node-gyp"
+        gentoo = tmp </> "gentoo"
+    createDirectoryIfMissing True overlay
+    writeRuntimeEbuild (gentoo </> "net-libs" </> "nodejs") "nodejs" "22.22.2" "~amd64"
+    writeRuntimeEbuild (overlay </> "dev-build" </> "node-gyp") "node-gyp" "13.0.1" "~amd64"
+    createDirectoryIfMissing True sidecar
+    let side0 =
+          ImageSidecar
+            { isVersion = imageSidecarSchemaVersion,
+              isId = T.pack iid,
+              isTag = T.pack defaultMaterializeImage,
+              isSatisfies =
+                emptyFloors
+                  { nfNode = Just "22.22.2",
+                    nfNodeGyp = Just "13.0.0"
+                  },
+              isGenerator = materializeGeneratorId,
+              isBuiltAt = epoch
+            }
+    BS.writeFile (sidecarImageJsonPath sidecar) (LBS.toStrict (encodeImageSidecar side0))
+    builds <- mkLogRef
+    fake <- mkFakeDocker True iid builds
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    let needed =
+          emptyFloors
+            { nfNode = Just "22.22.2",
+              nfNodeGyp = Just "13.0.1"
+            }
+    got <- ensureMaterializeImage cfg needed
+    assertEq "rebuilt for newer node-gyp" (Right EnsureBuilt) got
+    calls <- readIORef builds
+    assertTrue "docker build ran" (any ("-t" `elem`) calls)
+    bs <- BS.readFile (sidecarImageJsonPath sidecar)
+    case decodeImageSidecar bs of
+      Left err -> assertFailure err
+      Right side ->
+        assertEq "records newer node-gyp" (Just "13.0.1") (nfNodeGyp (isSatisfies side))
+    df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
+    assertTrue
+      "recipe emerges overlay node-gyp"
+      (">=dev-build/node-gyp-13.0.1::mndz" `T.isInfixOf` df)
+
+testBunRecipeEmergesNodeGypAfterNode :: IO ()
+testBunRecipeEmergesNodeGypAfterNode = do
+  df <-
+    renderMapped
+      "x86_64"
+      [ nodeInstall "22.22.2",
+        overlayNodeGypInstall "13.0.0" "amd64",
+        bunInstall "1.2.0" "amd64"
+      ]
+      "/overlay"
+  assertTrue
+    "node-gyp emerge spec"
+    (">=dev-build/node-gyp-13.0.0::mndz" `T.isInfixOf` df)
+  assertTrue
+    "node-gyp accept ::mndz ~amd64"
+    (">=dev-build/node-gyp-13.0.0::mndz ~amd64" `T.isInfixOf` df)
+  let (beforeGyp, afterGyp) = T.breakOn "dev-build/node-gyp" df
+  assertTrue "Node install before node-gyp" ("net-libs/nodejs" `T.isInfixOf` beforeGyp)
+  assertTrue "bun after node-gyp" ("dev-lang/bun-bin" `T.isInfixOf` afterGyp)
+  let gypRuns = filter ("dev-build/node-gyp" `T.isInfixOf`) (T.splitOn "RUN " df)
+  assertTrue "node-gyp has a RUN" (not (null gypRuns))
+  assertTrue
+    "overlay bind on node-gyp RUN"
+    (all ("from=overlay" `T.isInfixOf`) gypRuns)
+
+testGoOnlyOmitsNodeGyp :: IO ()
+testGoOnlyOmitsNodeGyp = do
+  df <- renderMapped "x86_64" [goInstall "1.26.5"] "/overlay"
+  assertTrue "go via portage" ("dev-lang/go" `T.isInfixOf` df)
+  assertTrue "Go-only omits node-gyp" (not ("dev-build/node-gyp" `T.isInfixOf` df))
 
 testUnmappedDefaultNoBuild :: IO ()
 testUnmappedDefaultNoBuild =

@@ -75,6 +75,7 @@ import Update.Materialize
     fullPathKeysFromClassify,
     neededFloorsFromClassified,
     readOverlayBunFloor,
+    readOverlayNodeGypFloor,
     readOverlayQlotFloor,
   )
 import Update.Md5Cache (EgencacheRunner)
@@ -85,6 +86,7 @@ import Update.OverlayWaves
     bunBinPackageKey,
     classifyAdmit,
     dirtyPreflightStepLabel,
+    nodeGypPackageKey,
     overlayCeilingProviderForKey,
     overlayDirtyPreflightMessage,
     overlayPackageRelDir,
@@ -273,12 +275,14 @@ runUpdatePhases deps entries allEbuilds selected = do
               t0EnsureOutcome <- newIORef (Nothing :: Maybe (Either Text ()))
               bunFloor <- bunFloorForEnsure overlayRoot planResults'
               qlotFloor <- qlotFloorForEnsure overlayRoot planResults'
+              nodeGypFloor <- nodeGypFloorForEnsure overlayRoot
               let t0Floors =
                     neededFloorsFromClassified
                       classifyResults
                       planResults'
                       bunFloor
                       qlotFloor
+                      nodeGypFloor
                   bunNeedsGitMv =
                     any
                       ( \case
@@ -295,6 +299,14 @@ runUpdatePhases deps entries allEbuilds selected = do
                           _ -> False
                       )
                       planResults'
+                  nodeGypNeedsWork =
+                    any
+                      ( \case
+                          PlanNeedsWork k _ ->
+                            k == nodeGypPackageKey
+                          _ -> False
+                      )
+                      planResults'
                   willEnsure = not (null t0FullKeys)
                   delayCommit =
                     if willEnsure && bunNeedsGitMv
@@ -308,6 +320,9 @@ runUpdatePhases deps entries allEbuilds selected = do
                           ),
                           ( willEnsure && qlotNeedsGitMv && isJust (nfSbcl t0Floors),
                             qlotPackageKey
+                          ),
+                          ( willEnsure && nodeGypNeedsWork && isJust (nfNodeGyp t0Floors),
+                            nodeGypPackageKey
                           )
                         ]
                     ]
@@ -317,12 +332,14 @@ runUpdatePhases deps entries allEbuilds selected = do
                   runEnsure classifyForFloors plansForFloors mh = do
                     bunFl <- bunFloorForEnsure overlayRoot plansForFloors
                     qlotFl <- qlotFloorForEnsure overlayRoot plansForFloors
+                    nodeGypFl <- nodeGypFloorForEnsure overlayRoot
                     let floors =
                           neededFloorsFromClassified
                             classifyForFloors
                             plansForFloors
                             bunFl
                             qlotFl
+                            nodeGypFl
                     if floorsIsEmpty floors
                       then recordEnsure (Right ())
                       else do
@@ -535,37 +552,49 @@ runUpdatePhases deps entries allEbuilds selected = do
               case eDirtyQlot of
                 Left err -> pure (Left err)
                 Right () -> do
-                  outcomes <-
-                    if needDeps
+                  eDirtyNodeGyp <-
+                    if isJust (nfNodeGyp t0Floors)
                       then
-                        bracket
-                          (ensureSshAgent (usdSshOps deps))
-                          ( \case
-                              Left _ -> pure ()
-                              Right sess -> teardownSshSession (usdSshOps deps) sess
-                          )
-                          ( \case
-                              Left err ->
-                                pure
-                                  [ ApplyHardFail
-                                      (PackageKey "")
-                                      ("SSH agent setup failed: " <> err)
-                                      False
-                                      False
-                                  ]
-                              Right _sess -> runMutate
-                          )
-                      else runMutate
-                  usdPruneMaterialize deps
-                  flushCheckCache cache
-                  mSummary <- cacheSummaryLine cache
-                  pure $
-                    Right
-                      UpdateSpineResult
-                        { usrOutcomes = outcomes,
-                          usrWarnings = warns,
-                          usrCacheSummary = mSummary
-                        }
+                        runDirtyPreflight
+                          pcfg
+                          (usdGitOps deps)
+                          overlayRoot
+                          [nodeGypPackageKey]
+                      else pure (Right ())
+                  case eDirtyNodeGyp of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                      outcomes <-
+                        if needDeps
+                          then
+                            bracket
+                              (ensureSshAgent (usdSshOps deps))
+                              ( \case
+                                  Left _ -> pure ()
+                                  Right sess -> teardownSshSession (usdSshOps deps) sess
+                              )
+                              ( \case
+                                  Left err ->
+                                    pure
+                                      [ ApplyHardFail
+                                          (PackageKey "")
+                                          ("SSH agent setup failed: " <> err)
+                                          False
+                                          False
+                                      ]
+                                  Right _sess -> runMutate
+                              )
+                          else runMutate
+                      usdPruneMaterialize deps
+                      flushCheckCache cache
+                      mSummary <- cacheSummaryLine cache
+                      pure $
+                        Right
+                          UpdateSpineResult
+                            { usrOutcomes = outcomes,
+                              usrWarnings = warns,
+                              usrCacheSummary = mSummary
+                            }
 
 -- | Promote classify hard-fails into plan results so mutate skips them.
 mergeClassifyHardFails ::
@@ -638,6 +667,11 @@ bunFloorForEnsure overlayRoot =
 qlotFloorForEnsure :: FilePath -> [PackagePlanResult] -> IO (Maybe Text)
 qlotFloorForEnsure overlayRoot =
   overlayGitMvFloorForEnsure qlotPackageKey (readOverlayQlotFloor overlayRoot)
+
+-- | Overlay node-gyp floor for ensure: newest non-live overlay PV (scan after
+-- file work when that work precedes docker).
+nodeGypFloorForEnsure :: FilePath -> IO (Maybe Text)
+nodeGypFloorForEnsure = readOverlayNodeGypFloor
 
 overlayGitMvFloorForEnsure ::
   PackageKey ->

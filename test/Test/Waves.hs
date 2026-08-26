@@ -142,7 +142,10 @@ integrationTests =
         testQlotOnlyNeverEnsure,
       testCase
         "ensure waits for qlot Manifest; qlot commit is not delayed"
-        testEnsureWaitsForQlotManifestCommitNotDelayed
+        testEnsureWaitsForQlotManifestCommitNotDelayed,
+      testCase
+        "leftover node-gyp dirt fails ralph without ensure"
+        testDirtyNodeGypFailsRalph
     ]
 
 ------------------------------------------------------------------------
@@ -1254,3 +1257,61 @@ testEnsureWaitsForQlotManifestCommitNotDelayed =
         committed <- readIORef sawCommit
         assertTrue "ensure saw Manifest DIST for new qlot PV" ready
         assertTrue "qlot commit completed before ensure" committed
+
+seedNodeGyp :: FilePath -> T.Text -> IO FilePath
+seedNodeGyp overlay ver = do
+  let pkgDir = overlay </> "dev-build" </> "node-gyp"
+      name = "node-gyp-" <> T.unpack ver <> ".ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile
+    (pkgDir </> name)
+    "EAPI=8\nKEYWORDS=\"~amd64\"\n"
+  TIO.writeFile (pkgDir </> "Manifest") ("DIST node-gyp-" <> ver <> ".tgz 1\n")
+  writeMatchingCachesForPackage overlay "dev-build" "node-gyp" pkgDir
+  pure (pkgDir </> name)
+
+fetchRalphLatest :: UpdateSource -> IO (Either T.Text EbuildVersion)
+fetchRalphLatest src = case src of
+  GitHub "subsy" "ralph-tui" _ ->
+    pure (Right (parseEbuildVersion "1.5.0"))
+  _ -> fetchBunLatest src
+
+testDirtyNodeGypFailsRalph :: IO ()
+testDirtyNodeGypFailsRalph =
+  withSystemTempDirectory "om-wave-dirty-node-gyp" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    _gypPath <- seedNodeGyp overlay "13.0.0"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    nEnsure <- newIORef (0 :: Int)
+    let (entries, ebuilds) = mkEntries bunPath ralphPath
+    ops <- liveBunOps overlay
+    deps0 <-
+      baseSpine
+        overlay
+        assets
+        dist
+        (dirtyIfPathContains "node-gyp")
+        releaseMissing
+        2
+        preflightOk
+    let deps =
+          deps0
+            { usdEnsureImage = countingEnsure nEnsure,
+              usdFetcher = fetchRalphLatest,
+              usdDepsPlanOps = ops
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> do
+        assertTrue "names node-gyp" ("dev-build/node-gyp" `T.isInfixOf` err)
+        assertTrue "restore/finish" ("restore or finish" `T.isInfixOf` err)
+      Right _ -> assertFailure "expected dirty node-gyp preflight hard-fail"
+    n <- readIORef nEnsure
+    assertEq "no ensure after dirty node-gyp" 0 n
+    still <- doesFileExist ralphPath
+    assertTrue "ralph not mutated" still

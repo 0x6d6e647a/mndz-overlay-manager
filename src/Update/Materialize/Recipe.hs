@@ -55,9 +55,10 @@ binpkgsCacheId = "mndz-materialize-binpkgs"
 -- Overlay is bind-mounted at the host path (read-only) via an extra build
 -- context named @overlay@; distfiles/binpkgs use stable-id cache mounts. Bun is
 -- @dev-lang/bun-bin::mndz@ only. Qlot is overlay @dev-lisp/qlot::mndz@ after
--- @ENV SBCL_HOME@. No official go.dev / nodejs.org / GitHub zip toolchain
+-- @ENV SBCL_HOME@. Node-gyp is overlay @dev-build/node-gyp::mndz@ after Node
+-- and before go/bun. No official go.dev / nodejs.org / GitHub zip toolchain
 -- URLs. @FROM@ uses the OpenRC Hub tag. Layer order is rust → sbcl → qlot →
--- node → go → bun.
+-- node → node-gyp → go → bun.
 renderMaterializeDockerfile ::
   RecipeArch ->
   -- | Host overlay path (bind destination and repos.conf location).
@@ -104,8 +105,9 @@ kindRank = \case
   TkSbcl -> 1
   TkQlot -> 2
   TkNode -> 3
-  TkGo -> 4
-  TkBun -> 5
+  TkNodeGyp -> 4
+  TkGo -> 5
+  TkBun -> 6
 
 -- | Gentoo @get_libdir@ for mapped KEYWORDS tokens.
 gentooLibdir :: Text -> Text
@@ -131,6 +133,8 @@ installRuns overlay keywords (ResolvedInstall kind rt) = case kind of
     [runCacheOverlay overlay (overlayBindCmds overlay rt kind), ""]
   TkNode ->
     [runCache (portageCmds rt kind []), ""]
+  TkNodeGyp ->
+    [runCacheOverlay overlay (overlayBindCmds overlay rt kind), ""]
   TkGo ->
     [runCache (portageCmds rt kind []), ""]
   TkBun ->
@@ -184,6 +188,7 @@ kindFile = \case
   TkSbcl -> "sbcl"
   TkQlot -> "qlot"
   TkNode -> "node"
+  TkNodeGyp -> "node-gyp"
   TkGo -> "go"
   TkBun -> "bun"
 

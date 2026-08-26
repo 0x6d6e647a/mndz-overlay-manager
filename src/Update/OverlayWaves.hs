@@ -9,6 +9,7 @@
 module Update.OverlayWaves
   ( bunBinPackageKey,
     qlotPackageKey,
+    nodeGypPackageKey,
     overlayCeilingProvider,
     overlayCeilingProviderForKey,
     OverlayPlanKind (..),
@@ -73,6 +74,10 @@ bunBinPackageKey = PackageKey "dev-lang/bun-bin"
 -- | Overlay qlot atom emerged into SBCL materialize images.
 qlotPackageKey :: PackageKey
 qlotPackageKey = PackageKey "dev-lisp/qlot"
+
+-- | Overlay node-gyp atom emerged into bun/node materialize images.
+nodeGypPackageKey :: PackageKey
+nodeGypPackageKey = PackageKey "dev-build/node-gyp"
 
 -- | Overlay wait-edge provider for a technique, if any.
 overlayCeilingProvider :: UpdateTechnique -> Maybe PackageKey

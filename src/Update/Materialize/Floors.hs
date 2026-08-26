@@ -46,7 +46,9 @@ data NeededFloors = NeededFloors
     nfRust :: Maybe Text,
     nfSbcl :: Maybe Text,
     -- | Overlay qlot PV the recipe will emerge when SBCL is needed.
-    nfQlot :: Maybe Text
+    nfQlot :: Maybe Text,
+    -- | Overlay node-gyp PV the recipe will emerge when bun or node is needed.
+    nfNodeGyp :: Maybe Text
   }
   deriving (Eq, Show)
 
@@ -59,7 +61,8 @@ instance ToJSON NeededFloors where
           ("bun" .=) <$> nfBun f,
           ("rust" .=) <$> nfRust f,
           ("sbcl" .=) <$> nfSbcl f,
-          ("qlot" .=) <$> nfQlot f
+          ("qlot" .=) <$> nfQlot f,
+          ("nodeGyp" .=) <$> nfNodeGyp f
         ]
 
 instance FromJSON NeededFloors where
@@ -71,6 +74,7 @@ instance FromJSON NeededFloors where
       <*> o .:? "rust"
       <*> o .:? "sbcl"
       <*> o .:? "qlot"
+      <*> o .:? "nodeGyp"
 
 emptyFloors :: NeededFloors
 emptyFloors =
@@ -80,14 +84,15 @@ emptyFloors =
       nfBun = Nothing,
       nfRust = Nothing,
       nfSbcl = Nothing,
-      nfQlot = Nothing
+      nfQlot = Nothing,
+      nfNodeGyp = Nothing
     }
 
 floorsIsEmpty :: NeededFloors -> Bool
 floorsIsEmpty f =
   all
     (== Nothing)
-    [nfGo f, nfNode f, nfBun f, nfRust f, nfSbcl f, nfQlot f]
+    [nfGo f, nfNode f, nfBun f, nfRust f, nfSbcl f, nfQlot f, nfNodeGyp f]
 
 -- | Monotonic max of two version tokens ('Nothing' loses).
 maxFloor :: Maybe Text -> Maybe Text -> Maybe Text
@@ -107,7 +112,8 @@ unionFloors a b =
       nfBun = maxFloor (nfBun a) (nfBun b),
       nfRust = maxFloor (nfRust a) (nfRust b),
       nfSbcl = maxFloor (nfSbcl a) (nfSbcl b),
-      nfQlot = maxFloor (nfQlot a) (nfQlot b)
+      nfQlot = maxFloor (nfQlot a) (nfQlot b),
+      nfNodeGyp = maxFloor (nfNodeGyp a) (nfNodeGyp b)
     }
 
 -- | Recorded image satisfies this prepare when every needed toolchain is
@@ -120,6 +126,7 @@ floorsSatisfy recorded needed =
     && fieldOk (nfRust recorded) (nfRust needed)
     && fieldOk (nfSbcl recorded) (nfSbcl needed)
     && fieldOk (nfQlot recorded) (nfQlot needed)
+    && fieldOk (nfNodeGyp recorded) (nfNodeGyp needed)
   where
     fieldOk _ Nothing = True
     fieldOk Nothing (Just _) = False
@@ -130,15 +137,16 @@ floorsSatisfy recorded needed =
         Nothing -> False
 
 -- | Floors from classified full-path units plus overlay bun-bin PV when Bun
--- is needed and overlay qlot PV when SBCL is needed. GitMv / reuse-path
--- units do not contribute.
+-- is needed, overlay qlot PV when SBCL is needed, and overlay node-gyp PV
+-- when bun or node is needed. GitMv / reuse-path units do not contribute.
 neededFloorsFromClassified ::
   [ClassifyPackageResult] ->
   [PackagePlanResult] ->
   Maybe Text ->
   Maybe Text ->
+  Maybe Text ->
   NeededFloors
-neededFloorsFromClassified classifyResults planResults mOverlayBun mOverlayQlot =
+neededFloorsFromClassified classifyResults planResults mOverlayBun mOverlayQlot mOverlayNodeGyp =
   let plansByKey =
         [ (planResultKey r, r)
         | r <- planResults
@@ -160,7 +168,11 @@ neededFloorsFromClassified classifyResults planResults mOverlayBun mOverlayQlot 
         if isJust (nfSbcl withBun)
           then withBun {nfQlot = needAtLeast mOverlayQlot}
           else withBun
-   in withQlot
+      withNodeGyp =
+        if isJust (nfBun withQlot) || isJust (nfNode withQlot)
+          then withQlot {nfNodeGyp = needAtLeast mOverlayNodeGyp}
+          else withQlot
+   in withNodeGyp
   where
     bunFull (ClassifyOk _ us) = any (ecosystemIsBun . cpuEco) (filter isFull us)
     bunFull _ = False

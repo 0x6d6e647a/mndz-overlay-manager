@@ -17,6 +17,7 @@ module Update.Runtime.Ceilings
     nodejsBinPackageDir,
     bunBinPackageDir,
     qlotPackageDir,
+    nodeGypPackageDir,
     parseKeywordsField,
     normalizeArchToken,
     keywordsHasBare,
@@ -32,6 +33,7 @@ module Update.Runtime.Ceilings
     discoverRuntimeMetasInDir,
     discoverBunBinMetas,
     discoverQlotMetas,
+    discoverNodeGypMetas,
     discoverGoCeilingsWith,
     discoverNodejsCeilingsWith,
     discoverBunBinCeilings,
@@ -201,6 +203,9 @@ bunBinPackageDir overlayRoot = overlayRoot </> "dev-lang" </> "bun-bin"
 
 qlotPackageDir :: FilePath -> FilePath
 qlotPackageDir overlayRoot = overlayRoot </> "dev-lisp" </> "qlot"
+
+nodeGypPackageDir :: FilePath -> FilePath
+nodeGypPackageDir overlayRoot = overlayRoot </> "dev-build" </> "node-gyp"
 
 rustPackageDir :: FilePath -> FilePath
 rustPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "rust"
@@ -385,6 +390,11 @@ discoverBunBinMetas overlayRoot =
 discoverQlotMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])
 discoverQlotMetas overlayRoot =
   discoverRuntimeMetasInDir (qlotPackageDir overlayRoot) (Just "qlot-")
+
+-- | Overlay node-gyp non-live ebuild metadata.
+discoverNodeGypMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])
+discoverNodeGypMetas overlayRoot =
+  discoverRuntimeMetasInDir (nodeGypPackageDir overlayRoot) (Just "node-gyp-")
 
 -- | Scan a package directory of @*.ebuild@ files for ceilings.
 discoverRuntimeCeilingsInDir ::

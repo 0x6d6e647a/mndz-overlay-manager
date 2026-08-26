@@ -99,7 +99,10 @@ forcedEnvKeys =
     "XDG_CACHE_HOME",
     "PATH",
     "SBCL_HOME",
-    "SBCL_SOURCE_ROOT"
+    "SBCL_SOURCE_ROOT",
+    "npm_config_nodedir",
+    "npm_config_python",
+    "PYTHON"
   ]
 
 -- | Image + identity for one materialize session (binds come from the unit).
@@ -188,6 +191,12 @@ materializeCreateArgs cfg unit dirs =
     "XDG_CONFIG_HOME=" <> materializeBuilderHome <> "/.config",
     "--env",
     "XDG_CACHE_HOME=/tmp/builder-cache",
+    "--env",
+    "npm_config_nodedir=/usr",
+    "--env",
+    "npm_config_python=/usr/bin/python3",
+    "--env",
+    "PYTHON=/usr/bin/python3",
     "--mount",
     bindMount (udWork dirs),
     "--mount",
