@@ -34,6 +34,7 @@ module Update.CheckCache
     openCheckCacheAt,
     lookupLatest,
     lookupDeps,
+    cachedCargoPlanUsable,
     storeLatest,
     storeDeps,
     recordHit,
@@ -80,6 +81,7 @@ import Overlay.Version
   ( EbuildVersion,
     parseEbuildVersion,
     renderPV,
+    samePV,
   )
 import System.Directory
   ( createDirectoryIfMissing,
@@ -102,6 +104,7 @@ import System.Posix.IO
     waitToSetLock,
   )
 import System.Posix.Types (Fd)
+import Update.Cargo.Msrv (cargoFloorPolicyKey)
 import Update.Go.Lanes
   ( LaneId (..),
     LaneTarget (..),
@@ -111,7 +114,8 @@ import Update.Go.Lanes
 import Update.Go.Plan (isLivePackageVersion)
 import Update.Runtime.Ceilings (KeywordTier (..))
 import Update.Types
-  ( PackageKey (..),
+  ( EcosystemSpec (..),
+    PackageKey (..),
     UpdateSource (..),
     packageKeyText,
   )
@@ -399,11 +403,28 @@ decodeCheckCacheDoc bs = do
 
 planToJSON :: RuntimeLanePlan -> Value
 planToJSON plan =
-  object
+  object $
     [ "lanes" .= map laneTargetToJSON (glpLanes plan),
       "ebuilds" .= map plannedEbuildToJSON (glpEbuilds plan),
       "unique_pvs" .= map renderPV (glpUniquePVs plan),
       "runtime_atom" .= glpRuntimeAtom plan
+    ]
+      <> cargoPlanFields plan
+
+cargoPlanFields :: RuntimeLanePlan -> [Pair]
+cargoPlanFields plan =
+  case glpFloorPolicy plan of
+    Nothing -> []
+    Just pol ->
+      [ "direct_tag_floors" .= map tagFloorToJSON (glpDirectTagFloors plan),
+        "cargo_floor_policy" .= pol
+      ]
+
+tagFloorToJSON :: (EbuildVersion, Maybe Text) -> Value
+tagFloorToJSON (pv, mFloor) =
+  object
+    [ "pv" .= renderPV pv,
+      "floor" .= mFloor
     ]
 
 planFromJSON :: Value -> Parser RuntimeLanePlan
@@ -412,13 +433,26 @@ planFromJSON = withObject "RuntimeLanePlan" $ \o -> do
   ebuilds <- o .: "ebuilds" >>= mapM plannedEbuildFromJSON
   uniqueTxt <- o .: "unique_pvs" :: Parser [Text]
   atom <- o .: "runtime_atom"
+  mPolicy <- o .:? "cargo_floor_policy"
+  mFloors <- o .:? "direct_tag_floors"
+  floors <- case mFloors of
+    Nothing -> pure []
+    Just vs -> mapM tagFloorFromJSON vs
   pure
     RuntimeLanePlan
       { glpLanes = lanes,
         glpEbuilds = ebuilds,
         glpUniquePVs = map parseEbuildVersion uniqueTxt,
-        glpRuntimeAtom = atom
+        glpRuntimeAtom = atom,
+        glpDirectTagFloors = floors,
+        glpFloorPolicy = mPolicy
       }
+
+tagFloorFromJSON :: Value -> Parser (EbuildVersion, Maybe Text)
+tagFloorFromJSON = withObject "direct_tag_floor" $ \o -> do
+  pvTxt <- o .: "pv"
+  mFloor <- o .:? "floor"
+  pure (parseEbuildVersion pvTxt, mFloor)
 
 laneTargetToJSON :: LaneTarget -> Value
 laneTargetToJSON lt =
@@ -647,6 +681,21 @@ lookupLatest h key fp = do
             LatestPayload remote <- cePayload e ->
               Just (parseEbuildVersion remote)
         _ -> Nothing
+
+-- | Whether a cached deps plan is usable for this ecosystem. Pre-change Cargo
+-- entries without snapshots, or plans produced under a different probe policy,
+-- are misses.
+cachedCargoPlanUsable :: EcosystemSpec -> UpdateSource -> RuntimeLanePlan -> Bool
+cachedCargoPlanUsable eco src plan =
+  case (eco, src) of
+    (Cargo mLock mPkg, GitHub _ _ prefix) ->
+      glpFloorPolicy plan == Just (cargoFloorPolicyKey prefix mPkg mLock)
+        && snapshotsCover (glpUniquePVs plan) (glpDirectTagFloors plan)
+    (Cargo {}, _) -> False
+    _ -> True
+  where
+    snapshotsCover uniquePVs floors =
+      all (\pv -> any (\(p, _) -> samePV p pv) floors) uniquePVs
 
 lookupDeps ::
   CheckCacheHandle ->

@@ -380,6 +380,16 @@ testEbuildEdit = do
   assertTrue
     "manifest missing other dist"
     (not (manifestHasVendorDist man "crush-0.84.0-vendor.tar.xz"))
+  let sidecar =
+        "DIST pkg-1-models.json.asc 1 SHA512 abcdef\n"
+  assertTrue
+    "sidecar does not satisfy exact basename"
+    (not (manifestHasVendorDist sidecar "pkg-1-models.json"))
+  let distance =
+        "DISTANCE pkg-1-models.json 1 SHA512 abcdef\n"
+  assertTrue
+    "DISTANCE token is not DIST"
+    (not (manifestHasVendorDist distance "pkg-1-models.json"))
 
 testGoVersionParse :: IO ()
 testGoVersionParse = do

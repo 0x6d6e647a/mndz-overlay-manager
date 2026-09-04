@@ -8,7 +8,7 @@ module Update.Apply.OverlayWrite
 where
 
 import Data.Containers.ListUtils (nubOrd)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -35,10 +35,14 @@ import Update.EbuildEdit
     ensureRustMinVer,
     ensureSbclAtom,
     parameterizeAssetsSrcUri,
-    parseManifestVendorSHA512,
     setKeywords,
   )
+import Update.EbuildSelection
+  ( InventoryFile (..),
+    selectCanonicalSamePV,
+  )
 import Update.Git (GitOps (..), relativeOverlayPath)
+import Update.Manifest.Dist (exactDistSHA512)
 import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
@@ -170,32 +174,35 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
 findTemplate :: FilePath -> Text -> EbuildVersion -> FilePath -> IO FilePath
 findTemplate pkgDir pn targetVer fallback = do
   names <- listDirectory pkgDir
-  let same =
-        [ pkgDir </> n
+  let files =
+        [ InventoryFile (parseEbuildVersion (T.pack verStr)) (pkgDir </> n)
         | n <- names,
           Just (pkg, verStr) <- [parseEbuildFileName n],
-          T.pack pkg == pn,
-          case comparePV (parseEbuildVersion (T.pack verStr)) targetVer of
-            Just EQ -> True
-            _ -> False
+          T.pack pkg == pn
         ]
-  pure $ case same of
-    (p : _) -> p
-    [] -> fallback
+  pure $ case selectCanonicalSamePV targetVer files of
+    Right (Just f) -> invPath f
+    _ -> fallback
 
 -- | Every published distfile's SHA512 must appear in Manifest.
 verifyManifestDigests :: Text -> [(FilePath, FileDigests)] -> Either Text ()
 verifyManifestDigests _ [] =
   Left "no distfile digests provided for Manifest verification"
 verifyManifestDigests manText distDigests =
-  case [name | (name, digests) <- distDigests, not (shaMatches name digests)] of
-    [] -> Right ()
-    missing ->
-      Left $
-        "Manifest SHA512 does not match published distfile(s): "
-          <> T.intercalate ", " (map (T.pack . takeFileName) missing)
+  case mapM checkOne distDigests of
+    Left err -> Left err
+    Right names ->
+      case catMaybes names of
+        [] -> Right ()
+        missing ->
+          Left $
+            "Manifest SHA512 does not match published distfile(s): "
+              <> T.intercalate ", " (map (T.pack . takeFileName) missing)
   where
-    shaMatches name digests =
-      case parseManifestVendorSHA512 manText name of
-        Just manSha -> manSha == digestSHA512 digests
-        Nothing -> False
+    checkOne (name, digests) =
+      case exactDistSHA512 manText name of
+        Left err -> Left err
+        Right (Just manSha)
+          | manSha == digestSHA512 digests -> Right Nothing
+          | otherwise -> Right (Just name)
+        Right Nothing -> Right (Just name)

@@ -538,7 +538,7 @@ applyNeedsWork env overlayRoot entry = \case
             remote
       Nothing ->
         pure [ApplySoftSkip (peKey entry) "no hardcoded policy for package"]
-  PlannedDeps eco src plan localPVs contentFix mHypo ->
+  PlannedDeps eco src plan localPVs contentFix forceFull mHypo ->
     applyDepsAndAssetsFromPlan
       env
       overlayRoot
@@ -548,6 +548,7 @@ applyNeedsWork env overlayRoot entry = \case
       plan
       localPVs
       contentFix
+      forceFull
       mHypo
       0
 

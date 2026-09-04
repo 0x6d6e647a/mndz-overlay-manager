@@ -28,6 +28,7 @@ import Update.Apply
     PlannedWork (..),
     planPackage,
   )
+import Update.Cargo.Msrv (CargoTomlFetch (..))
 import Update.Check
   ( PackageEntry (..),
     checkOverlayWithDepsPlan,
@@ -114,6 +115,7 @@ integrationTests =
       testCase "contentFix Npm content-only reusable" testContentFixNpmReusable,
       testCase "contentFix Bun content-only reusable" testContentFixBunReusable,
       testCase "contentFix Cargo content-only reusable" testContentFixCargoReusable,
+      testCase "Cargo written floor above tag is adequate" testCargoWrittenAboveTagAdequate,
       testCase "checkPackageDeps Sbcl outdated floor" testCheckPackageDepsSbclOutdated,
       testCase "outdated ralph blocked on bun-bin" testOutdatedBlockedOn,
       testCase "outdated fail-closed when bun-bin latest missing" testOutdatedFailClosed,
@@ -160,7 +162,7 @@ mkDepsPlanOps ::
   (GoModKey -> IO (Either T.Text T.Text)) ->
   (T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
   (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
-  (T.Text -> T.Text -> T.Text -> T.Text -> Maybe FilePath -> IO (Either T.Text T.Text)) ->
+  (T.Text -> T.Text -> T.Text -> T.Text -> Maybe FilePath -> IO CargoTomlFetch) ->
   Maybe FilePath ->
   IO DepsPlanOps
 mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
@@ -205,8 +207,8 @@ unusedCargo ::
   T.Text ->
   T.Text ->
   Maybe FilePath ->
-  IO (Either T.Text T.Text)
-unusedCargo _ _ _ _ _ = pure (Left "cargo toml unused")
+  IO CargoTomlFetch
+unusedCargo _ _ _ _ _ = pure (CargoTomlError "cargo toml unused")
 
 unusedFetch :: UpdateSource -> IO (Either T.Text EbuildVersion)
 unusedFetch _ = pure (Left "provider latest unused")
@@ -491,10 +493,10 @@ testPlanCargoSuccess = do
           pure $
             case (pv, mSub) of
               ("0.40.0", Nothing) ->
-                Right " [package]\nrust-version = \"1.80.0\"\n"
+                CargoTomlBody " [package]\nrust-version = \"1.80.0\"\n"
               ("0.50.0", Nothing) ->
-                Right " [package]\nrust-version = \"1.85.0\"\n"
-              _ -> Left "missing Cargo.toml"
+                CargoTomlBody " [package]\nrust-version = \"1.85.0\"\n"
+              _ -> CargoTomlMissing
       )
       Nothing
   plan <-
@@ -970,8 +972,8 @@ testContentFixCargoReusable =
         ( \_o _r _p _pv mSub ->
             pure $
               case mSub of
-                Nothing -> Right " [package]\nrust-version = \"1.85.0\"\n"
-                _ -> Left "no sub"
+                Nothing -> CargoTomlBody " [package]\nrust-version = \"1.85.0\"\n"
+                _ -> CargoTomlMissing
         )
         Nothing
     let e =
@@ -1007,6 +1009,63 @@ testContentFixCargoReusable =
         src
         (Cargo Nothing Nothing)
     assertOkStatus "cargo content ok" (reportStatus reportOk)
+
+-- | usage-style: written 1.95 vs tag 1.91 is adequate (too-low-only).
+testCargoWrittenAboveTagAdequate :: IO ()
+testCargoWrittenAboveTagAdequate =
+  withSystemTempDirectory "mndz-cf-usage-" $ \tmp -> do
+    let pkgDir = tmp </> "dev-util" </> "usage"
+        pn = "usage" :: T.Text
+        ver = "6.4.1" :: T.Text
+        ebuildPath = pkgDir </> "usage-6.4.1.ebuild"
+        body =
+          T.unlines
+            [ "EAPI=8",
+              "inherit cargo",
+              "RUST_MIN_VER=\"1.85.0\"",
+              "KEYWORDS=\"~amd64 ~arm64\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/usage-${PV}/usage-${PV}-crates.tar.xz\"",
+              "CRATES=\"\""
+            ]
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath body
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST usage-6.4.1-crates.tar.xz 1 SHA512 deadbeef\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["6.4.1"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        ( \_o _r _p _pv mSub ->
+            pure $
+              case mSub of
+                Just "cli" -> CargoTomlBody "[package]\nrust-version = \"1.80\"\n"
+                _ -> CargoTomlMissing
+        )
+        Nothing
+    let e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "usage",
+              pePN = pn,
+              peLocal = parseEbuildVersion ver,
+              pePath = ebuildPath
+            }
+        locals = [Ebuild "dev-util" pn ver ebuildPath]
+        src = GitHub "jdx" "usage" "v"
+    cache <- disabledCache
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        unusedFetch
+        ops
+        cache
+        e
+        locals
+        src
+        (Cargo Nothing (Just "cli"))
+    assertOkStatus "usage 1.85 vs tag 1.80" (reportStatus report)
 
 ------------------------------------------------------------------------
 -- Overlay wait-edge plan-delta / outdated blocked-on

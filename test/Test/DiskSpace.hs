@@ -374,10 +374,13 @@ mkDepsWork eco needPVs =
               | pv <- needPVs
               ],
             glpUniquePVs = needPVs,
-            glpRuntimeAtom = "dev-lang/go"
+            glpRuntimeAtom = "dev-lang/go",
+            glpDirectTagFloors = [],
+            glpFloorPolicy = Nothing
           },
       pdLocalPVs = [],
       pdContentFix = [],
+      pdForceFull = [],
       pdHypoProvider = Nothing
     }
 

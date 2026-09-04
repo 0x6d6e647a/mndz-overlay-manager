@@ -219,7 +219,9 @@ emptyPlan pvs =
     { glpLanes = [],
       glpEbuilds = [],
       glpUniquePVs = pvs,
-      glpRuntimeAtom = bunBinRuntimeAtom
+      glpRuntimeAtom = bunBinRuntimeAtom,
+      glpDirectTagFloors = [],
+      glpFloorPolicy = Nothing
     }
 
 testDirtyPreflightMessage :: IO ()

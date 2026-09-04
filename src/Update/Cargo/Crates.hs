@@ -9,6 +9,7 @@ module Update.Cargo.Crates
     buildCargoCratesTarball,
     crateTarballPrefix,
     maxRustVersionInTree,
+    harvestRegistryPackageRoots,
     -- Pack helpers (unit-tested)
     RegistryPackage (..),
     parseRegistryPackages,
@@ -18,7 +19,6 @@ module Update.Cargo.Crates
   )
 where
 
-import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -37,10 +37,9 @@ import Update.Cargo.Lock
     parseRegistryPackages,
   )
 import Update.Cargo.Msrv
-  ( combineMsrv,
-    maxRustVersion,
+  ( maxMaybeRustVersions,
+    parseDirectRustVersion,
     parseRustMinVerFromEbuild,
-    parseRustVersionField,
   )
 import Update.DiskSpace
   ( MaterializeClass (FullCargo),
@@ -121,6 +120,10 @@ buildCargoCratesTarball ::
   Maybe FilePath ->
   -- | Donor ebuild content (from overlay template).
   Text ->
+  -- | Planned direct tag floor (authoritative; not re-fetched).
+  Maybe Text ->
+  -- | Include canonical same-PV donor floor (same-PV rewrite only).
+  Bool ->
   -- | Overlay package name (for ebuild filename in work dir).
   Text ->
   -- | Unit @work/@ (clone, distdir, stage, donor ebuild).
@@ -139,6 +142,8 @@ buildCargoCratesTarball
   mLockSub
   mPkgSub
   donorContent
+  tagFloor
+  useDonorFloor
   pn
   workDir
   outDir
@@ -166,9 +171,6 @@ buildCargoCratesTarball
           Right () -> do
             let lockRoot = case mLockSub of
                   Nothing -> cloneDir
-                  Just sub -> cloneDir </> sub
-                pkgDir = case mPkgSub of
-                  Nothing -> lockRoot
                   Just sub -> cloneDir </> sub
                 -- pycargoebuild rejects workspace roots; run in the package member
                 -- when set (e.g. usage's cli/). Cargo.lock is still resolved upward.
@@ -220,46 +222,73 @@ buildCargoCratesTarball
                                 )
                           else do
                             ebuildBody <- TIO.readFile ebuildPath
-                            rootToml <- readOptionalToml (pkgDir </> "Cargo.toml")
-                            let mRoot = parseRustVersionField =<< rootToml
-                            mDeps <- maxRustVersionInTree lockRoot
-                            let mDonor = parseRustMinVerFromEbuild donorContent
-                            case combineMsrv mRoot mDeps mDonor of
-                              Nothing ->
-                                pure $
-                                  Left
-                                    "could not determine RUST_MIN_VER (no package.rust-version, \
-                                    \dependency rust-version, or donor RUST_MIN_VER)"
-                              Just msrv ->
-                                pure $
-                                  Right
-                                    CargoResult
-                                      { crTarballPath = outPath,
-                                        crMsrv = msrv,
-                                        crEbuildBody = ebuildBody
-                                      }
+                            cloneH <- maxRustVersionInTree lockRoot
+                            regH <-
+                              harvestRegistryPackageRoots
+                                (stageDir </> "cargo_home" </> "gentoo")
+                            let mDonor =
+                                  if useDonorFloor
+                                    then parseRustMinVerFromEbuild donorContent
+                                    else Nothing
+                            pure $
+                              case (cloneH, regH) of
+                                (Left err, _) -> Left err
+                                (_, Left err) -> Left err
+                                (Right mClone, Right mReg) ->
+                                  case maxMaybeRustVersions [tagFloor, mClone, mReg, mDonor] of
+                                    Nothing ->
+                                      Left
+                                        "could not determine RUST_MIN_VER (no direct tag \
+                                        \rust-version, clone/registry harvest, or same-PV \
+                                        \donor RUST_MIN_VER)"
+                                    Just msrv ->
+                                      Right
+                                        CargoResult
+                                          { crTarballPath = outPath,
+                                            crMsrv = msrv,
+                                            crEbuildBody = ebuildBody
+                                          }
 
-readOptionalToml :: FilePath -> IO (Maybe Text)
-readOptionalToml path = do
-  exists <- doesFileExist path
-  if exists then Just <$> TIO.readFile path else pure Nothing
-
--- | Max declared @package.rust-version@ under a lock/workspace tree.
-maxRustVersionInTree :: FilePath -> IO (Maybe Text)
+-- | Max direct rust-version under a lock/workspace tree. Malformed manifests
+-- hard-fail rather than being skipped.
+maxRustVersionInTree :: FilePath -> IO (Either Text (Maybe Text))
 maxRustVersionInTree root = do
   tomls <- findCargoTomls root
-  vers <- mapM readVer tomls
+  maxDirectRustFromFiles tomls
+
+-- | Direct rust-version from immediate extracted registry package roots only
+-- (@cargo_home/gentoo/{name}-{version}/Cargo.toml@). Nested examples are ignored.
+harvestRegistryPackageRoots :: FilePath -> IO (Either Text (Maybe Text))
+harvestRegistryPackageRoots gentooDir = do
+  exists <- doesDirectoryExist gentooDir
+  if not exists
+    then pure (Right Nothing)
+    else do
+      names <- listDirectory gentooDir
+      paths <-
+        concat
+          <$> mapM
+            ( \n -> do
+                let dir = gentooDir </> n
+                    toml = dir </> "Cargo.toml"
+                isDir <- doesDirectoryExist dir
+                hasToml <- doesFileExist toml
+                pure [toml | isDir && hasToml]
+            )
+            names
+      maxDirectRustFromFiles paths
+
+maxDirectRustFromFiles :: [FilePath] -> IO (Either Text (Maybe Text))
+maxDirectRustFromFiles paths = do
+  parsed <- mapM readOne paths
   pure $
-    case catMaybes vers of
-      [] -> Nothing
-      (x : xs) -> foldl' merge (Just x) xs
+    case sequence parsed of
+      Left err -> Left err
+      Right ms -> Right (maxMaybeRustVersions ms)
   where
-    readVer path = do
+    readOne path = do
       body <- TIO.readFile path
-      pure (parseRustVersionField body)
-    merge acc y = case acc of
-      Nothing -> Just y
-      Just a -> maxRustVersion a y
+      pure (parseDirectRustVersion body)
 
 findCargoTomls :: FilePath -> IO [FilePath]
 findCargoTomls root = do

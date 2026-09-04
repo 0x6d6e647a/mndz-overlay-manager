@@ -11,6 +11,7 @@ module Update.EbuildEdit
     ebuildNeedsContentFix,
     ebuildNeedsContentFixAtom,
     ebuildNeedsCargoContentFix,
+    ebuildNeedsCargoBodyFix,
     goBdependAtom,
     nodejsBdependAtom,
     bunBdependAtom,
@@ -33,13 +34,17 @@ module Update.EbuildEdit
   )
 where
 
-import Data.Char (isAlpha, isDigit, isHexDigit)
+import Data.Char (isAlpha, isDigit)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), renderPV, samePV)
-import System.FilePath (takeFileName)
-import Update.Cargo.Msrv (normalizeRustVersion, parseRustMinVerFromEbuild)
+import Update.Cargo.Msrv
+  ( normalizeRustVersion,
+    parseRustMinVerFromEbuild,
+    rustMinVerTooLow,
+  )
+import Update.Manifest.Dist (exactDistSHA512, manifestHasExactDist)
 import Update.TextUtil (stripSurroundingQuotes)
 
 assetsMarker :: Text
@@ -142,34 +147,13 @@ ebuildFileNameWithRev pn ver =
 
 parseManifestVendorSHA512 :: Text -> FilePath -> Maybe Text
 parseManifestVendorSHA512 manifestContent distfile =
-  let name = T.pack (takeFileName distfile)
-      matching =
-        [ ln
-        | ln <- T.lines manifestContent,
-          "DIST" `T.isPrefixOf` ln,
-          name `T.isInfixOf` ln
-        ]
-   in case matching of
-        (ln : _) -> extractSha512 ln
-        [] -> Nothing
-  where
-    extractSha512 ln =
-      let go [] = Nothing
-          go ("SHA512" : hex : _)
-            | T.all isHexDigit hex = Just (T.toLower hex)
-            | otherwise = Nothing
-          go (_ : xs) = go xs
-       in go (T.words ln)
+  case exactDistSHA512 manifestContent distfile of
+    Right m -> m
+    Left _ -> Nothing
 
--- | True when Manifest has a DIST line for the vendor tarball basename.
+-- | True when Manifest has an exact DIST record for the basename.
 manifestHasVendorDist :: Text -> FilePath -> Bool
-manifestHasVendorDist manifestContent distfile =
-  let name = T.pack (takeFileName distfile)
-   in any
-        ( \ln ->
-            "DIST" `T.isPrefixOf` ln && name `T.isInfixOf` ln
-        )
-        (T.lines manifestContent)
+manifestHasVendorDist = manifestHasExactDist
 
 -- | True when ebuild content needs overlay fix (SRC_URI / BDEPEND / KEYWORDS).
 --
@@ -192,21 +176,23 @@ ebuildNeedsContentFixAtom keywords content mAtom =
       Just atom -> not (atom `T.isInfixOf` content)
       Nothing -> False
 
--- | Cargo content fix: assets crates SRC_URI, KEYWORDS, RUST_MIN_VER, no list-era form.
-ebuildNeedsCargoContentFix :: [Text] -> Text -> Maybe Text -> Bool
-ebuildNeedsCargoContentFix keywords content mRequiredMsrv =
+-- | Cargo body fix excluding RUST_MIN_VER (SRC_URI, KEYWORDS, CRATES, list-era).
+ebuildNeedsCargoBodyFix :: [Text] -> Text -> Bool
+ebuildNeedsCargoBodyFix keywords content =
   not (assetsSrcUriParameterized content)
     || not (keywordsMatch keywords content)
     || not (hasCratesAssetsSrcUri content)
     || hasListEraCargoDeps content
     || cratesFieldNonEmpty content
+
+-- | Cargo content fix: body plus too-low-only RUST_MIN_VER vs the decision floor.
+ebuildNeedsCargoContentFix :: [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsCargoContentFix keywords content mRequiredMsrv =
+  ebuildNeedsCargoBodyFix keywords content
     || case mRequiredMsrv of
       Just ver ->
         case parseRustMinVerFromEbuild content of
-          Just existing ->
-            case (normalizeRustVersion existing, normalizeRustVersion ver) of
-              (Just a, Just b) -> a /= b
-              _ -> True
+          Just existing -> rustMinVerTooLow existing ver
           Nothing -> True
       Nothing -> False
 
@@ -385,6 +371,7 @@ ensureEmptyCrates content =
        in not (T.null t) && T.last t == '"'
 
 -- | Ensure @RUST_MIN_VER="…"@ is present and matches @ver@ (normalized).
+-- Removes every duplicate direct assignment so the body has exactly one.
 ensureRustMinVer :: Text -> Text -> Either Text Text
 ensureRustMinVer ver content =
   case normalizeRustVersion ver of
@@ -393,8 +380,9 @@ ensureRustMinVer ver content =
       let line = "RUST_MIN_VER=\"" <> norm <> "\""
           lns = T.lines content
           (pre, post) = break isRustMin lns
+          restWithout = filter (not . isRustMin) (drop 1 post)
        in case post of
-            (_old : rest) -> Right (T.unlines (pre <> [line] <> rest))
+            (_old : _) -> Right (T.unlines (pre <> [line] <> restWithout))
             [] ->
               case findLastInheritIdx lns of
                 Nothing -> Right (T.unlines (lns <> ["", line]))

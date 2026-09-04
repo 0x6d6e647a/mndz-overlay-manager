@@ -24,6 +24,7 @@ module Update.Go.Lanes
     assembleKeywords,
     planFromTargets,
     planFromTargetsWithAtom,
+    withCargoTagFloors,
     planNeedsWork,
     extrasToDelete,
     missingTargets,
@@ -156,7 +157,13 @@ data RuntimeLanePlan = RuntimeLanePlan
     glpEbuilds :: [PlannedEbuild],
     glpUniquePVs :: [EbuildVersion],
     -- | Runtime package atom for labels (e.g. @dev-lang/go@).
-    glpRuntimeAtom :: Text
+    glpRuntimeAtom :: Text,
+    -- | Selected-PV direct tag floors (Cargo). @Nothing@ values are explicit
+    -- absence. Empty for non-Cargo plans.
+    glpDirectTagFloors :: [(EbuildVersion, Maybe Text)],
+    -- | Cargo floor-policy key; 'Nothing' for non-Cargo plans and old cache
+    -- entries that lack snapshots.
+    glpFloorPolicy :: Maybe Text
   }
   deriving (Eq, Show)
 
@@ -266,8 +273,22 @@ planFromTargetsWithAtom atom targets =
         { glpLanes = targets,
           glpEbuilds = ebuilds,
           glpUniquePVs = map pePV ebuilds,
-          glpRuntimeAtom = atom
+          glpRuntimeAtom = atom,
+          glpDirectTagFloors = [],
+          glpFloorPolicy = Nothing
         }
+
+-- | Attach selected Cargo tag-floor snapshots and the policy key that produced them.
+withCargoTagFloors ::
+  [(EbuildVersion, Maybe Text)] ->
+  Text ->
+  RuntimeLanePlan ->
+  RuntimeLanePlan
+withCargoTagFloors snaps policy plan =
+  plan
+    { glpDirectTagFloors = snaps,
+      glpFloorPolicy = Just policy
+    }
 
 -- | True when local set differs from planned unique PVs or content needs work.
 planNeedsWork ::

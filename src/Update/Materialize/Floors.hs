@@ -18,7 +18,7 @@ where
 import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:?), (.=))
 import Data.Maybe (catMaybes, isJust)
 import Data.Text (Text)
-import Overlay.Version (EbuildVersion, comparePV, renderPV)
+import Overlay.Version (EbuildVersion, comparePV, renderPV, samePV)
 import Update.Apply.Plan
   ( ClassifiedPvUnit (..),
     ClassifyPackageResult (..),
@@ -200,7 +200,7 @@ floorsForFullUnit ::
   NeededFloors
 floorsForFullUnit plansByKey u =
   case lookup (cpuKey u) plansByKey of
-    Just (PlanNeedsWork _ (PlannedDeps eco _ plan _ _ _)) ->
+    Just (PlanNeedsWork _ (PlannedDeps eco _ plan _ _ _ _)) ->
       let req = needAtLeast (reqForPv plan (cpuPV u))
        in case eco of
             Go _ -> emptyFloors {nfGo = req}
@@ -212,9 +212,19 @@ floorsForFullUnit plansByKey u =
 
 reqForPv :: RuntimeLanePlan -> EbuildVersion -> Maybe Text
 reqForPv plan pv =
-  case [ltGoReq lt | lt <- glpLanes plan, ltPackagePV lt == Just pv] of
-    (r : _) -> r
-    [] -> Nothing
+  case glpDirectTagFloors plan of
+    [] ->
+      case [ltGoReq lt | lt <- glpLanes plan, ltPackagePV lt == Just pv] of
+        (r : _) -> r
+        [] -> Nothing
+    floors ->
+      case [f | (p, f) <- floors, p == pv] of
+        (Just v : _) -> Just v
+        (Nothing : _) -> Nothing
+        [] ->
+          case [f | (p, f) <- floors, samePV p pv] of
+            (Just v : _) -> Just v
+            _ -> Nothing
 
 -- | Any-version floor when the probe did not yield a token.
 needAtLeast :: Maybe Text -> Maybe Text

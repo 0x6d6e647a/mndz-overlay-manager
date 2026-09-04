@@ -47,6 +47,7 @@ import Update.Assets.Release
     ReleaseInfo (..),
     ReleaseOps (..),
   )
+import Update.Cargo.Msrv (CargoTomlFetch (..))
 import Update.Check (PackageEntry (..), groupNewest)
 import Update.CheckCache
   ( computeFingerprintFromDir,
@@ -248,7 +249,7 @@ mkWavePlanOps listVers fetchBun overlay = do
         dpoFetchGoMod = \_ -> pure (Left "go.mod unused"),
         dpoFetchNpmEngines = \_ _ -> pure (Left "npm unused"),
         dpoFetchBunEngines = fetchBun,
-        dpoFetchCargoToml = \_ _ _ _ _ -> pure (Left "cargo unused"),
+        dpoFetchCargoToml = \_ _ _ _ _ -> pure (CargoTomlError "cargo unused"),
         dpoFetchSbclVersion = \_ _ _ _ -> pure (Left "sbcl unused"),
         dpoWorkBudget = budget,
         dpoGoCeilingsCache = goCache,

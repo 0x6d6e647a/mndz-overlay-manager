@@ -9,9 +9,17 @@ module Update.Check
     checkPackage,
     checkPackageDeps,
     contentFixPVs,
+    assessOverlayContent,
     productionFetcherWithToken,
     statusFromCompare,
     renderPVNoRev,
+    selectCanonicalSamePV,
+    selectHighestNonLive,
+    InventoryFile (..),
+    inventoryFromEbuild,
+    ContentAssessment (..),
+    PresentPvOutcome (..),
+    requiredAssetBasenames,
   )
 where
 
@@ -19,6 +27,7 @@ import CLI.Jobs (mapConcurrentlyN)
 import CLI.Progress (MultiHandle (..))
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -28,10 +37,19 @@ import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPVNoRev, samePV)
 import System.Directory (doesFileExist)
 import System.FilePath (takeDirectory, (</>))
-import Update.Assets.Layout (distfileKindForEcosystem, distfileTarballName)
-import Update.Cargo.Msrv (probeRustVersionFromCargoTomls)
+import Update.Adequacy
+  ( ContentAssessment (..),
+    PlannedPvFacts (..),
+    PresentPvOutcome (..),
+    assessPlannedFacts,
+    lookupDirectTagFloor,
+    plannedRuntimeReq,
+    requiredAssetBasenames,
+  )
+import Update.Cargo.Msrv (parseRustMinVerFromEbuild)
 import Update.CheckCache
   ( CheckCacheHandle,
+    cachedCargoPlanUsable,
     computeFingerprint,
     lookupDeps,
     lookupLatest,
@@ -45,14 +63,11 @@ import Update.Deps.Plan
     planDepsPackageWithCeilings,
     planDepsPackageWithProgress,
   )
-import Update.EbuildEdit
-  ( bunBdependAtom,
-    ebuildNeedsCargoContentFix,
-    ebuildNeedsContentFix,
-    ebuildNeedsContentFixAtom,
-    manifestHasVendorDist,
-    nodejsBdependAtom,
-    sbclBdependAtom,
+import Update.EbuildSelection
+  ( InventoryFile (..),
+    inventoryFromEbuild,
+    selectCanonicalSamePV,
+    selectHighestNonLive,
   )
 import Update.GitHub (fetchGitHubWith)
 import Update.Go.Lanes
@@ -64,12 +79,10 @@ import Update.Go.Lanes
     planErrorMessage,
     planNeedsWork,
   )
-import Update.Go.ModFetch (GoModKey (..), parseGoReqFromMod)
 import Update.Go.Plan
   ( PlanProgress (..),
     localNonLivePVs,
   )
-import Update.Go.Vendor (versionTag)
 import Update.Hardcoded (lookupPolicy)
 import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
@@ -84,7 +97,6 @@ import Update.OverlayWaves
   )
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings (discoverBunBinMetas)
-import Update.Sbcl.Deps (parseSbclVersionFloor)
 import Update.Types
   ( EcosystemSpec (..),
     Fetcher,
@@ -274,10 +286,11 @@ checkPackageDeps mh fetch depsOps cache entry locals src eco = do
       (Just _, Just pfp) -> lookupDeps cache key fp (Just pfp)
       (Nothing, _) -> lookupDeps cache key fp Nothing
   case mCached of
-    Just plan -> do
-      recordHit cache
-      reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan
-    Nothing -> do
+    Just plan
+      | cachedCargoPlanUsable eco src plan -> do
+          recordHit cache
+          reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan
+    _ -> do
       recordFetch cache
       planResult <-
         planDepsPackageWithProgress depsOps progress eco src localPVs
@@ -306,50 +319,68 @@ reportFromDepsPlan ::
   IO UpdateReport
 reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan = do
   let key = peKey entry
-  contentFix <- contentFixPVs depsOps eco src locals plan
-  let onDiskNeed = planNeedsWork localPVs contentFix plan
-      missing = missingTargets localPVs plan
-      needsWork = missing <> contentFix
-      gaps =
-        if onDiskNeed
-          then buildGapLines localPVs needsWork plan
-          else []
-      contentFixSet = contentFix
-      isContentOnly toPV =
-        any (samePV toPV) contentFixSet
-          && not (any (samePV toPV) missing)
-      baseReport =
+      pn = pePN entry
+  assessed <- assessOverlayContent eco key pn locals plan
+  case assessed of
+    Left err ->
+      pure
         UpdateReport
           { reportKey = key,
-            reportStatus =
-              if null gaps
-                then case localPVs of
-                  (v : _) -> Ok v
-                  [] -> Ok (peLocal entry)
-                else
-                  Outdated
-                    [ OutdatedLine
-                        { olFrom = glFrom g,
-                          olTo = glTo g,
-                          olLabel = Just (glLabel g),
-                          olAssetsReusable = isContentOnly (glTo g)
-                        }
-                    | g <- gaps
-                    ]
+            reportStatus = FetchError err
           }
-  applyOverlayBlockIndication
-    mh
-    fetch
-    depsOps
-    cache
-    eco
-    src
-    entry
-    locals
-    localPVs
-    plan
-    onDiskNeed
-    baseReport
+    Right (ca, _, _) -> do
+      let missing = missingTargets localPVs plan
+          contentFix =
+            [ pv
+            | pv <- caNeedsWorkPVs ca,
+              not (any (samePV pv) missing)
+            ]
+          forceFull = caForceFullPVs ca
+          onDiskNeed = planNeedsWork localPVs contentFix plan
+          needsWork = missing <> contentFix
+          gaps =
+            if onDiskNeed
+              then buildGapLines localPVs needsWork plan
+              else []
+          isContentOnly toPV =
+            any (samePV toPV) contentFix
+              && not (any (samePV toPV) missing)
+          -- Marker is conservative until release lookup is plumbed: never
+          -- claim reusable for forced-full PVs.
+          mayReuse toPV =
+            isContentOnly toPV && not (any (samePV toPV) forceFull)
+          baseReport =
+            UpdateReport
+              { reportKey = key,
+                reportStatus =
+                  if null gaps
+                    then case localPVs of
+                      (v : _) -> Ok v
+                      [] -> Ok (peLocal entry)
+                    else
+                      Outdated
+                        [ OutdatedLine
+                            { olFrom = glFrom g,
+                              olTo = glTo g,
+                              olLabel = Just (glLabel g),
+                              olAssetsReusable = mayReuse (glTo g)
+                            }
+                        | g <- gaps
+                        ]
+              }
+      applyOverlayBlockIndication
+        mh
+        fetch
+        depsOps
+        cache
+        eco
+        src
+        entry
+        locals
+        localPVs
+        plan
+        onDiskNeed
+        baseReport
 
 -- | Overlay wait-edge consumers: plan-delta blocked-on, fail-closed on fetch.
 applyOverlayBlockIndication ::
@@ -494,6 +525,7 @@ depsPlanProgress mh key eco =
           ppOnProbeDone = mhStep mh key probeLabel
         }
 
+-- | Present-PV content-fix list (legacy wrapper). Missing PVs are excluded.
 contentFixPVs ::
   DepsPlanOps ->
   EcosystemSpec ->
@@ -501,133 +533,98 @@ contentFixPVs ::
   [Ebuild] ->
   RuntimeLanePlan ->
   IO [EbuildVersion]
-contentFixPVs depsOps eco src locals plan = do
-  let planned = glpEbuilds plan
-  concat <$> mapM (checkOneEbuild locals) planned
+contentFixPVs _depsOps eco _src locals plan = do
+  let pn =
+        case locals of
+          (e : _) -> ebuildPackage e
+          [] -> ""
+      key =
+        case locals of
+          (e : _) -> mkPackageKey (ebuildCategory e) (ebuildPackage e)
+          [] -> PackageKey ""
+  assessed <- assessOverlayContent eco key pn locals plan
+  pure $ case assessed of
+    Left _ -> []
+    Right (ca, _, _) ->
+      let missing = missingTargets (localNonLivePVs locals) plan
+       in [ pv
+          | pv <- caNeedsWorkPVs ca,
+            not (any (samePV pv) missing)
+          ]
+
+-- | Shared overlay content assessment: canonical same-PV selection, planned
+-- requirement snapshots, no upstream fetch.
+assessOverlayContent ::
+  EcosystemSpec ->
+  PackageKey ->
+  Text ->
+  [Ebuild] ->
+  RuntimeLanePlan ->
+  IO
+    ( Either
+        Text
+        ( ContentAssessment,
+          [(EbuildVersion, FilePath)],
+          Maybe FilePath
+        )
+    )
+assessOverlayContent eco key pn locals plan = do
+  let inv = map inventoryFromEbuild locals
+  case selectHighestNonLive inv of
+    Left err -> pure (Left err)
+    Right mFallback ->
+      case mapM (\pe -> selectCanonicalSamePV (pePV pe) inv) (glpEbuilds plan) of
+        Left err -> pure (Left err)
+        Right sameSels -> do
+          let pkgDir =
+                case locals of
+                  (e : _) -> takeDirectory (ebuildPath e)
+                  [] -> "."
+              manPath = pkgDir </> "Manifest"
+          manExists <- doesFileExist manPath
+          mMan <-
+            if manExists
+              then Just <$> TIO.readFile manPath
+              else pure Nothing
+          mFallbackFloor <- templateFloor mFallback
+          facts <-
+            mapM
+              (mkFacts mMan mFallbackFloor)
+              (zip (glpEbuilds plan) sameSels)
+          let samePaths =
+                [ (pePV pe, invPath f)
+                | (pe, Just f) <- zip (glpEbuilds plan) sameSels
+                ]
+              ca = assessPlannedFacts key eco pn facts
+          pure (Right (ca, samePaths, invPath <$> mFallback))
   where
-    kind = distfileKindForEcosystem eco
-    checkOneEbuild es pe = do
-      let matches =
-            [ e
-            | e <- es,
-              samePV
-                (parseEbuildVersion (ebuildVersion e))
-                (pePV pe)
-            ]
-      case matches of
-        [] -> pure []
-        (e : _) -> do
-          exists <- doesFileExist (ebuildPath e)
-          if not exists
-            then pure [pePV pe]
-            else do
-              content <- TIO.readFile (ebuildPath e)
-              let pkgDir = takeDirectory (ebuildPath e)
-                  pn = ebuildPackage e
-                  pvNoRev = renderPVNoRev (pePV pe)
-                  tarball = distfileTarballName kind pn pvNoRev
-                  manPath = pkgDir </> "Manifest"
-              manMissing <- do
-                manExists <- doesFileExist manPath
-                if not manExists
-                  then pure True
-                  else do
-                    manText <- TIO.readFile manPath
-                    pure (not (manifestHasVendorDist manText tarball))
-              bad <- case eco of
-                Go mSub -> do
-                  mGoVer <- fetchGoModForPV depsOps src mSub pvNoRev
-                  pure $
-                    ebuildNeedsContentFix (peKeywords pe) content mGoVer
-                      || manMissing
-                NpmEco -> do
-                  mAtom <- fetchNpmAtom depsOps src pvNoRev
-                  pure $
-                    ebuildNeedsContentFixAtom (peKeywords pe) content mAtom
-                      || manMissing
-                Bun -> do
-                  mAtom <- fetchBunAtom depsOps src pvNoRev
-                  pure $
-                    ebuildNeedsContentFixAtom (peKeywords pe) content mAtom
-                      || manMissing
-                Cargo mLock mPkg -> do
-                  mMsrv <- fetchCargoMsrv depsOps src mLock mPkg pvNoRev
-                  pure $
-                    ebuildNeedsCargoContentFix (peKeywords pe) content mMsrv
-                      || manMissing
-                Sbcl -> do
-                  mAtom <- fetchSbclAtom depsOps src pvNoRev
-                  pure $
-                    ebuildNeedsContentFixAtom (peKeywords pe) content mAtom
-                      || manMissing
-              pure [pePV pe | bad]
-
-fetchGoModForPV ::
-  DepsPlanOps ->
-  UpdateSource ->
-  Maybe FilePath ->
-  Text ->
-  IO (Maybe Text)
-fetchGoModForPV depsOps src mSub pvNoRev =
-  case src of
-    GitHub owner repo prefix -> do
-      let tag = versionTag prefix pvNoRev
-          key =
-            GoModKey
-              { gmkOwner = owner,
-                gmkRepo = repo,
-                gmkTag = tag,
-                gmkSubdir = mSub
-              }
-      eres <- dpoFetchGoMod depsOps key
-      pure $ case eres of
-        Right body -> parseGoReqFromMod body
-        Left _ -> Nothing
-    _ -> pure Nothing
-
-fetchNpmAtom :: DepsPlanOps -> UpdateSource -> Text -> IO (Maybe Text)
-fetchNpmAtom depsOps src pvNoRev =
-  case src of
-    Npm npmPkg -> do
-      eres <- dpoFetchNpmEngines depsOps npmPkg pvNoRev
-      pure $ case eres of
-        Right ver -> Just (nodejsBdependAtom ver)
-        Left _ -> Nothing
-    _ -> pure Nothing
-
-fetchBunAtom :: DepsPlanOps -> UpdateSource -> Text -> IO (Maybe Text)
-fetchBunAtom depsOps src pvNoRev =
-  case src of
-    GitHub owner repo prefix -> do
-      eres <- dpoFetchBunEngines depsOps owner repo prefix pvNoRev
-      pure $ case eres of
-        Right ver -> Just (bunBdependAtom ver)
-        Left _ -> Nothing
-    _ -> pure Nothing
-
-fetchCargoMsrv ::
-  DepsPlanOps ->
-  UpdateSource ->
-  Maybe FilePath ->
-  Maybe FilePath ->
-  Text ->
-  IO (Maybe Text)
-fetchCargoMsrv depsOps src mLock mPkg pvNoRev =
-  case src of
-    GitHub owner repo prefix ->
-      probeRustVersionFromCargoTomls mPkg mLock $ \mSub ->
-        dpoFetchCargoToml depsOps owner repo prefix pvNoRev mSub
-    _ -> pure Nothing
-
-fetchSbclAtom :: DepsPlanOps -> UpdateSource -> Text -> IO (Maybe Text)
-fetchSbclAtom depsOps src pvNoRev =
-  case src of
-    GitHub owner repo prefix -> do
-      eres <- dpoFetchSbclVersion depsOps owner repo prefix pvNoRev
-      pure $ case eres of
-        Right body -> sbclBdependAtom <$> parseSbclVersionFloor body
-        Left _ -> Nothing
-    _ -> pure Nothing
+    templateFloor Nothing = pure Nothing
+    templateFloor (Just f) = do
+      exists <- doesFileExist (invPath f)
+      if not exists
+        then pure Nothing
+        else parseRustMinVerFromEbuild <$> TIO.readFile (invPath f)
+    mkFacts mMan mFallbackFloor (pe, mSame) = do
+      mContent <- case mSame of
+        Nothing -> pure Nothing
+        Just f -> do
+          exists <- doesFileExist (invPath f)
+          if exists then Just <$> TIO.readFile (invPath f) else pure Nothing
+      let mTag =
+            case eco of
+              Cargo {} -> fromMaybe Nothing (lookupDirectTagFloor plan (pePV pe))
+              _ -> Nothing
+          mTemplate = maybe mFallbackFloor parseRustMinVerFromEbuild mContent
+      pure
+        PlannedPvFacts
+          { ppfPV = pePV pe,
+            ppfKeywords = peKeywords pe,
+            ppfPresentContent = mContent,
+            ppfManifest = mMan,
+            ppfTagFloor = mTag,
+            ppfRuntimeReq = plannedRuntimeReq plan (pePV pe),
+            ppfTemplateFloor = mTemplate
+          }
 
 statusFromCompare :: EbuildVersion -> EbuildVersion -> UpdateStatus
 statusFromCompare local remote =

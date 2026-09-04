@@ -380,7 +380,9 @@ testContentFixManifest =
                     }
                 ],
               glpUniquePVs = [pv],
-              glpRuntimeAtom = "dev-lang/go"
+              glpRuntimeAtom = "dev-lang/go",
+              glpDirectTagFloors = [],
+              glpFloorPolicy = Nothing
             }
         planOps =
           PlanOps
@@ -822,7 +824,9 @@ testGoMultiPvSequentialCommits =
                 ],
               -- Include tip so prune does not add a third commit in this test.
               glpUniquePVs = [tip, pv1, pv2],
-              glpRuntimeAtom = "dev-lang/go"
+              glpRuntimeAtom = "dev-lang/go",
+              glpDirectTagFloors = [],
+              glpFloorPolicy = Nothing
             }
         assetBytes = encodeUtf8 "vendor-bytes-multi-pv"
         digests0 = hashBytes assetBytes
@@ -986,7 +990,9 @@ testGoMultiPvStopOnHardFail =
                   PlannedEbuild {pePV = pv3, peKeywords = ["~amd64"], peLanes = []}
                 ],
               glpUniquePVs = [pv1, pv2, pv3],
-              glpRuntimeAtom = "dev-lang/go"
+              glpRuntimeAtom = "dev-lang/go",
+              glpDirectTagFloors = [],
+              glpFloorPolicy = Nothing
             }
         assetBytes = encodeUtf8 "vendor-bytes-fail-test"
         digests0 = hashBytes assetBytes

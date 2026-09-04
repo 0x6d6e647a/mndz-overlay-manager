@@ -77,7 +77,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Support (dualArchGoCeilings)
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase)
+import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Apply
   ( ApplyEnv (..),
     EbuildRunner,
@@ -117,12 +117,22 @@ import Update.Auth (resolveGitHubTokenWith)
 import Update.Bun.Cache (productionBunCacheOps)
 import Update.Cargo.Crates (productionCargoOps)
 import Update.Cargo.Msrv
-  ( combineMsrv,
+  ( CargoTomlFetch (..),
+    combineMsrv,
+    maxRustVersion,
     normalizeRustVersion,
+    orderedCargoTomlProbePaths,
     parseRustMinVerFromEbuild,
     parseRustVersionField,
+    probeDirectTagFloor,
   )
-import Update.Check (PackageEntry (..), groupNewest)
+import Update.Check
+  ( InventoryFile (..),
+    PackageEntry (..),
+    groupNewest,
+    selectCanonicalSamePV,
+    selectHighestNonLive,
+  )
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
@@ -284,6 +294,8 @@ unitTests =
       testCase "Candidate Version Filter" testCandidateVersionFilter,
       testCase "Engines Minimum Parse" testEnginesMinimumParse,
       testCase "Cargo Msrv And Ceilings" testCargoMsrvAndCeilings,
+      testCase "Cargo Toml Probe Order" testCargoTomlProbeOrder,
+      testCase "Canonical Ebuild Revision" testCanonicalEbuildRevision,
       testCase "Go Lane Selection" testGoLaneSelection,
       testCase "Go Lane Collapse" testGoLaneCollapse,
       testCase "Go Gap Lines" testGoGapLines,
@@ -435,8 +447,50 @@ testCargoMsrvAndCeilings = do
   assertEq "normalize full" (Just "1.88.0") (normalizeRustVersion "1.88.0")
   assertEq
     "parse rust-version"
-    (Just "1.88.0")
-    (parseRustVersionField "name = \"hk\"\nrust-version = \"1.88.0\"\n")
+    (Right (Just "1.88.0"))
+    (parseRustVersionField "[package]\nname = \"hk\"\nrust-version = \"1.88.0\"\n")
+  assertEq
+    "package precedes workspace.package"
+    (Right (Just "1.91.0"))
+    ( parseRustVersionField
+        "[package]\nrust-version = \"1.91\"\n[workspace.package]\nrust-version = \"1.95\"\n"
+    )
+  assertEq
+    "workspace.package used when package absent"
+    (Right (Just "1.70.0"))
+    ( parseRustVersionField
+        "[workspace.package]\nrust-version = \"1.70\"\n"
+    )
+  assertEq
+    "inheritance marker is absent not malformed"
+    (Right Nothing)
+    ( parseRustVersionField
+        "[package]\nrust-version.workspace = true\n"
+    )
+  assertEq
+    "wrong-table rust-version ignored"
+    (Right Nothing)
+    ( parseRustVersionField
+        "[dependencies]\nrust-version = \"1.99\"\n"
+    )
+  assertEq
+    "malformed TOML fails"
+    True
+    ( case parseRustVersionField "[[[ not toml" of
+        Left _ -> True
+        Right _ -> False
+    )
+  assertEq
+    "malformed present value fails"
+    True
+    ( case parseRustVersionField "[package]\nrust-version = \"not-a-version\"\n" of
+        Left _ -> True
+        Right _ -> False
+    )
+  assertEq
+    "numeric 1.100 > 1.99"
+    (Just "1.100.0")
+    (maxRustVersion "1.100" "1.99")
   assertEq
     "parse RUST_MIN_VER"
     (Just "1.95.0")
@@ -510,6 +564,80 @@ testCargoMsrvAndCeilings = do
     "normalize rejects quote junk"
     Nothing
     (normalizeArchToken "x86\"")
+
+testCargoTomlProbeOrder :: IO ()
+testCargoTomlProbeOrder = do
+  assertEq
+    "package then lock then root"
+    [Just "cli", Just "lock", Nothing]
+    (orderedCargoTomlProbePaths (Just "cli") (Just "lock"))
+  assertEq
+    "effective package is lock when package unset"
+    [Just "lock", Nothing]
+    (orderedCargoTomlProbePaths Nothing (Just "lock"))
+  assertEq
+    "dedup identical package and lock"
+    [Just "cli", Nothing]
+    (orderedCargoTomlProbePaths (Just "cli") (Just "cli"))
+  logRef <- newIORef ([] :: [Maybe FilePath])
+  let fetch mSub = do
+        modifyIORef' logRef (<> [mSub])
+        pure CargoTomlMissing
+  r <- probeDirectTagFloor (Just "cli") (Just "lock") fetch
+  assertEq "all missing is absent" (Right Nothing) r
+  got <- readIORef logRef
+  assertEq "fetch order" [Just "cli", Just "lock", Nothing] got
+  rFail <-
+    probeDirectTagFloor Nothing Nothing $ \mSub ->
+      pure $
+        if isNothing mSub
+          then CargoTomlError "boom"
+          else CargoTomlMissing
+  assertEq "fetch error fails closed" (Left "boom") rFail
+  rParse <-
+    probeDirectTagFloor (Just "cli") Nothing $ \mSub ->
+      pure $
+        case mSub of
+          Just "cli" -> CargoTomlBody "[[[ not toml"
+          _ -> CargoTomlBody "[package]\nrust-version = \"1.91\"\n"
+  assertEq
+    "parse error does not fall through"
+    True
+    ( case rParse of
+        Left _ -> True
+        Right _ -> False
+    )
+  rOk <-
+    probeDirectTagFloor (Just "cli") Nothing $ \mSub ->
+      pure $
+        case mSub of
+          Just "cli" -> CargoTomlMissing
+          Nothing -> CargoTomlBody "[package]\nrust-version = \"1.91\"\n"
+          _ -> CargoTomlMissing
+  assertEq "fallback after missing" (Right (Just "1.91.0")) rOk
+
+testCanonicalEbuildRevision :: IO ()
+testCanonicalEbuildRevision = do
+  let mk v = InventoryFile (parseEbuildVersion v)
+      files =
+        [ mk "1.0.0-r2" "b.ebuild",
+          mk "1.0.0" "a.ebuild",
+          mk "1.0.0-r10" "c.ebuild",
+          mk "9999" "live.ebuild",
+          mk "2.0.0" "other.ebuild"
+        ]
+  case selectCanonicalSamePV (parseEbuildVersion "1.0.0") files of
+    Right (Just f) -> assertEq "highest rev r10" "c.ebuild" (invPath f)
+    other -> assertFailure ("expected r10, got " <> show other)
+  case selectHighestNonLive files of
+    Right (Just f) -> assertEq "highest non-live PV" "other.ebuild" (invPath f)
+    other -> assertFailure ("expected 2.0.0, got " <> show other)
+  case selectCanonicalSamePV (parseEbuildVersion "1.0.0") [mk "9999" "live.ebuild"] of
+    Right Nothing -> pure ()
+    other -> assertFailure ("live excluded, got " <> show other)
+  case selectHighestNonLive [mk "1.0.0" "a.ebuild", mk "foo" "raw.ebuild"] of
+    Left _ -> pure ()
+    other -> assertFailure ("incomparable should fail, got " <> show other)
 
 testGoLaneSelection :: IO ()
 testGoLaneSelection = do

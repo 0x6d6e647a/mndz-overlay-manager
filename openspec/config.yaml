@@ -43,10 +43,7 @@ rules:
     - Living SoT MUST NOT say “in this change”, “at the time of this change”, “as today”, or similar delta residue.
     - Use DepsAndAssets (and ecosystem) vocabulary; never GoVendorAndAssets as a technique name.
     - When listing DepsAndAssets ecosystems in shared apply/update rules, include Cargo alongside Go/Npm/Bun where first-class apply applies.
-    - Package-target model for work commands: category/package | bare package | empty; hard-fail unknown/ambiguous.
+    - "Package-target model for work commands: category/package | bare package | empty; hard-fail unknown/ambiguous."
   tasks:
     - Break work into checkable items; mark complete only when the relevant gate is green.
     - Include SoT merge/scrub and openspec validate / hk check when the change touches product or specs.
-  apply:
-    - Implement from tasks.md; keep README/CONTRIBUTING/AGENTS in the same change when operator/agent surfaces move (project-docs).
-    - After SoT hygiene, rg openspec/specs for GoVendorAndAssets and “in this change” should be clean.

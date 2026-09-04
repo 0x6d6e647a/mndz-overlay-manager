@@ -26,6 +26,7 @@ import Data.ByteString.Lazy qualified as LBS
 import Data.Containers.ListUtils (nubOrd)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sortOn)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -42,6 +43,7 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (statusCode)
 import Overlay.Discovery (parseEbuildFileName)
+import Overlay.Types (Ebuild (..))
 import Overlay.Version
   ( EbuildVersion (..),
     comparePV,
@@ -57,6 +59,11 @@ import System.Directory
     removeFile,
   )
 import System.FilePath (takeDirectory, takeFileName, (</>))
+import Update.Adequacy
+  ( cargoReuseWriteFloor,
+    lookupDirectTagFloor,
+    requiredAssetBasenames,
+  )
 import Update.Apply.Commit (egencacheAndSignedCommit, pruneCommitMessage)
 import Update.Apply.Env (ApplyEnv (..))
 import Update.Apply.Errors
@@ -70,8 +77,6 @@ import Update.Assets.Hash (FileDigests (..), hashFile, writeSidecars)
 import Update.Assets.Layout
   ( SidecarPaths (..),
     commitMessage,
-    distfileKindForEcosystem,
-    distfileTarballName,
     modelsDistfileName,
     releaseName,
     releaseTag,
@@ -95,13 +100,16 @@ import Update.Cargo.Crates
     mkCargoOps,
   )
 import Update.Cargo.Msrv
-  ( combineMsrv,
-    parseRustMinVerFromEbuild,
-    probeRustVersionFromCargoTomls,
+  ( parseRustMinVerFromEbuild,
   )
-import Update.Check (PackageEntry (..))
+import Update.Check
+  ( ContentAssessment (..),
+    PackageEntry (..),
+    assessOverlayContent,
+  )
 import Update.CheckCache
-  ( computeFingerprintFromDir,
+  ( cachedCargoPlanUsable,
+    computeFingerprintFromDir,
     lookupDeps,
     recordFetch,
     recordHit,
@@ -120,12 +128,7 @@ import Update.DiskSpace
   )
 import Update.EbuildEdit
   ( bunBdependAtom,
-    ebuildFileNameWithRev,
-    ebuildNeedsCargoContentFix,
-    ebuildNeedsContentFix,
-    ebuildNeedsContentFixAtom,
     goBdependAtom,
-    manifestHasVendorDist,
     nodejsBdependAtom,
     sbclBdependAtom,
     writeVersionForPlannedPV,
@@ -138,6 +141,7 @@ import Update.Go.Lanes
     buildGapLines,
     missingTargets,
     planErrorMessage,
+    planFromTargets,
     planNeedsWork,
   )
 import Update.Go.ModFetch (GoModKey (..), parseGoReqFromMod)
@@ -217,10 +221,11 @@ applyDepsAndAssets env overlayRoot entry src eco = do
       (Just _, Just pfp) -> lookupDeps cache key fp (Just pfp)
       (Nothing, _) -> lookupDeps cache key fp Nothing
   planResult <- case mCached of
-    Just plan -> do
-      recordHit cache
-      pure (Right plan)
-    Nothing -> do
+    Just plan
+      | cachedCargoPlanUsable eco src plan -> do
+          recordHit cache
+          pure (Right plan)
+    _ -> do
       recordFetch cache
       planDepsPackageWithProgress
         (aeDepsPlanOps env)
@@ -242,21 +247,34 @@ applyDepsAndAssets env overlayRoot entry src eco = do
       case mCached of
         Nothing -> storeDeps cache key fp mProvFp plan
         Just _ -> pure ()
-      contentFix <- contentFixNeededEnv env eco src pkgDir pn key plan
-      if not (planNeedsWork localPVs contentFix plan)
-        then pure [ApplySoftSkip key "already matches runtime-lane plan"]
-        else
-          applyDepsAndAssetsFromPlan
-            env
-            overlayRoot
-            entry
-            src
-            eco
-            plan
-            localPVs
-            contentFix
-            Nothing
-            =<< readIORef planDoneRef
+      locals <- listLocalEbuilds key pn pkgDir
+      assessed <- assessOverlayContent eco key pn locals plan
+      case assessed of
+        Left err ->
+          pure [ApplyHardFail key err False False]
+        Right (ca, _, _) -> do
+          let missing = missingTargets localPVs plan
+              contentFix =
+                [ pv
+                | pv <- caNeedsWorkPVs ca,
+                  not (any (samePV pv) missing)
+                ]
+              forceFull = caForceFullPVs ca
+          if not (planNeedsWork localPVs contentFix plan)
+            then pure [ApplySoftSkip key "already matches runtime-lane plan"]
+            else
+              applyDepsAndAssetsFromPlan
+                env
+                overlayRoot
+                entry
+                src
+                eco
+                plan
+                localPVs
+                contentFix
+                forceFull
+                Nothing
+                =<< readIORef planDoneRef
 
 -- | Mutate using a plan-phase result (skip re-plan / re-content-fix).
 applyDepsAndAssetsFromPlan ::
@@ -266,6 +284,7 @@ applyDepsAndAssetsFromPlan ::
   UpdateSource ->
   EcosystemSpec ->
   RuntimeLanePlan ->
+  [EbuildVersion] ->
   [EbuildVersion] ->
   [EbuildVersion] ->
   -- | Hypothetical provider + assumed remote PV, when the working plan used hypo ceilings.
@@ -281,6 +300,7 @@ applyDepsAndAssetsFromPlan
   plan
   localPVs
   contentFix
+  forceFull
   mHypo
   planDone = do
     let key = peKey entry
@@ -308,6 +328,7 @@ applyDepsAndAssetsFromPlan
                     plan
                     localPVs
                     contentFix
+                    forceFull
                     planDone
                 when (any isApplySuccess outcomes) $ do
                   fp' <- computeFingerprintFromDir src pkgDir pn
@@ -397,6 +418,39 @@ listLocalNonLivePVs pkgDir pn = do
   pure vers
 
 -- | Present planned PVs whose ebuild content, BDEPEND, or Manifest needs fix.
+contentFixFromAssessment ::
+  EcosystemSpec ->
+  PackageKey ->
+  Text ->
+  FilePath ->
+  RuntimeLanePlan ->
+  IO [EbuildVersion]
+contentFixFromAssessment eco key pn pkgDir plan = do
+  locals <- listLocalEbuilds key pn pkgDir
+  assessed <- assessOverlayContent eco key pn locals plan
+  pure $ case assessed of
+    Left _ -> []
+    Right (ca, _, _) ->
+      let missing = missingTargets (map (parseEbuildVersion . ebuildVersion) locals) plan
+       in [ pv
+          | pv <- caNeedsWorkPVs ca,
+            not (any (samePV pv) missing)
+          ]
+
+listLocalEbuilds :: PackageKey -> Text -> FilePath -> IO [Ebuild]
+listLocalEbuilds key pn pkgDir = do
+  names <- listDirectory pkgDir
+  let cat = case splitPackageKey key of
+        Just (c, _) -> c
+        Nothing -> ""
+  pure
+    [ Ebuild cat pn (T.pack verStr) (pkgDir </> n)
+    | n <- names,
+      Just (pkg, verStr) <- [parseEbuildFileName n],
+      T.pack pkg == pn
+    ]
+
+-- | Present planned PVs whose ebuild content, BDEPEND, or Manifest needs fix.
 contentFixNeededEnv ::
   ApplyEnv ->
   EcosystemSpec ->
@@ -406,64 +460,8 @@ contentFixNeededEnv ::
   PackageKey ->
   RuntimeLanePlan ->
   IO [EbuildVersion]
-contentFixNeededEnv env eco src pkgDir pn key plan =
-  concat <$> mapM checkPlanned (glpEbuilds plan)
-  where
-    checkPlanned pe = do
-      let name = ebuildFileNameWithRev pn (pePV pe)
-          path = pkgDir </> name
-          pvNoRev = renderPVNoRev (pePV pe)
-          required = requiredAssetBasenames key eco pn pvNoRev
-      exists <- doesFileExist path
-      paths <-
-        if exists
-          then pure [path]
-          else do
-            names <- listDirectory pkgDir
-            pure
-              [ pkgDir </> n
-              | n <- names,
-                Just (pkg, verStr) <- [parseEbuildFileName n],
-                T.pack pkg == pn,
-                samePV (parseEbuildVersion (T.pack verStr)) (pePV pe)
-              ]
-      case paths of
-        [] -> pure []
-        (p : _) -> do
-          content <- TIO.readFile p
-          manMissing <- anyManifestMissing pkgDir required
-          bad <- case eco of
-            Go mSub -> do
-              mGoVer <- case src of
-                GitHub owner repo prefix ->
-                  fetchGoModVersion env owner repo prefix pvNoRev mSub
-                _ -> pure Nothing
-              pure $
-                ebuildNeedsContentFix (peKeywords pe) content mGoVer || manMissing
-            Cargo mLock mPkg -> do
-              mMsrv <- fetchCargoMsrvForPV env src mLock mPkg pvNoRev content
-              pure $
-                ebuildNeedsCargoContentFix (peKeywords pe) content mMsrv || manMissing
-            _ -> do
-              mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
-              pure $
-                ebuildNeedsContentFixAtom (peKeywords pe) content mAtom || manMissing
-          pure [pePV pe | bad]
-
--- | Required release asset basenames for a package/PV (primary + companions).
-requiredAssetBasenames :: PackageKey -> EcosystemSpec -> Text -> Text -> [FilePath]
-requiredAssetBasenames key eco pn pvNoRev =
-  let primary = distfileTarballName (distfileKindForEcosystem eco) pn pvNoRev
-      extras =
-        case key of
-          PackageKey "dev-util/opencode" -> [modelsDistfileName pn pvNoRev]
-          _ -> []
-   in primary : extras
-
-anyManifestMissing :: FilePath -> [FilePath] -> IO Bool
-anyManifestMissing pkgDir names = do
-  checks <- mapM (vendorManifestMissing pkgDir) names
-  pure (or checks)
+contentFixNeededEnv _env eco _src pkgDir pn key =
+  contentFixFromAssessment eco key pn pkgDir
 
 -- | Full required BDEPEND atom for a planned PV, when obtainable.
 fetchRequiredBdependAtom ::
@@ -497,25 +495,6 @@ fetchRequiredBdependAtom env eco src pvNoRev =
     (Cargo {}, _) -> pure Nothing
     _ -> pure Nothing
 
--- | Plan/content-fix MSRV: root Cargo.toml (+ donor when content provided).
-fetchCargoMsrvForPV ::
-  ApplyEnv ->
-  UpdateSource ->
-  Maybe FilePath ->
-  Maybe FilePath ->
-  Text ->
-  Text ->
-  IO (Maybe Text)
-fetchCargoMsrvForPV env src mLock mPkg pvNoRev donorContent =
-  case src of
-    GitHub owner repo prefix -> do
-      mRoot <-
-        probeRustVersionFromCargoTomls mPkg mLock $ \mSub ->
-          dpoFetchCargoToml (aeDepsPlanOps env) owner repo prefix pvNoRev mSub
-      let mDonor = parseRustMinVerFromEbuild donorContent
-      pure (combineMsrv mRoot Nothing mDonor)
-    _ -> pure (parseRustMinVerFromEbuild donorContent)
-
 -- | Legacy Go-only content fix (tests).
 contentFixNeeded ::
   ApplyEnv ->
@@ -536,17 +515,6 @@ contentFixNeeded env owner repo prefix mSub pkgDir pn =
     pn
     (PackageKey (T.pack "legacy/" <> pn))
 
--- | True when package Manifest lacks a DIST line for the vendor tarball.
-vendorManifestMissing :: FilePath -> FilePath -> IO Bool
-vendorManifestMissing pkgDir tarballName = do
-  let manPath = pkgDir </> "Manifest"
-  exists <- doesFileExist manPath
-  if not exists
-    then pure True
-    else do
-      manText <- TIO.readFile manPath
-      pure (not (manifestHasVendorDist manText tarballName))
-
 materializeDepsPlan ::
   ApplyEnv ->
   FilePath ->
@@ -556,9 +524,10 @@ materializeDepsPlan ::
   RuntimeLanePlan ->
   [EbuildVersion] ->
   [EbuildVersion] ->
+  [EbuildVersion] ->
   Int ->
   IO [ApplyOutcome]
-materializeDepsPlan env overlayRoot entry src eco plan localPVs contentFix planDone = do
+materializeDepsPlan env overlayRoot entry src eco plan localPVs contentFix forceFull planDone = do
   let key = peKey entry
       mh = aeMulti env
       needPVs =
@@ -620,6 +589,7 @@ materializeDepsPlan env overlayRoot entry src eco plan localPVs contentFix planD
           eco
           localPVs
           plan
+          forceFull
           pe
           stepsDoneRef
           (length remaining)
@@ -661,13 +631,17 @@ materializePlan ::
   [EbuildVersion] ->
   Int ->
   IO [ApplyOutcome]
-materializePlan env overlayRoot entry owner repo prefix mSub =
+materializePlan env overlayRoot entry owner repo prefix mSub plan localPVs contentFix =
   materializeDepsPlan
     env
     overlayRoot
     entry
     (GitHub owner repo prefix)
     (Go mSub)
+    plan
+    localPVs
+    contentFix
+    []
 
 gapSuccessLines :: [EbuildVersion] -> [EbuildVersion] -> RuntimeLanePlan -> [SuccessLine]
 gapSuccessLines localPVs needs plan =
@@ -692,15 +666,17 @@ materializeOneDeps ::
   EcosystemSpec ->
   [EbuildVersion] ->
   RuntimeLanePlan ->
+  [EbuildVersion] ->
   PlannedEbuild ->
   IORef Int ->
   Int ->
   IO ApplyOutcome
-materializeOneDeps env overlayRoot entry src eco localPVs plan pe stepsDoneRef remainingPVs = do
+materializeOneDeps env overlayRoot entry src eco localPVs plan forceFull pe stepsDoneRef remainingPVs = do
   let targetVer = case pePV pe of
         Numeric comps _ -> Numeric comps Nothing
         Raw t -> Raw t
       writeVer = writeVersionForPlannedPV targetVer localPVs
+      forced = any (samePV targetVer) forceFull
       lines_ =
         filter
           (\sl -> samePV (slTo sl) targetVer)
@@ -711,6 +687,8 @@ materializeOneDeps env overlayRoot entry src eco localPVs plan pe stepsDoneRef r
     entry
     src
     eco
+    plan
+    forced
     (peKeywords pe)
     lines_
     writeVer
@@ -792,13 +770,15 @@ depsPublishAndOverlay ::
   PackageEntry ->
   UpdateSource ->
   EcosystemSpec ->
+  RuntimeLanePlan ->
+  Bool ->
   [Text] ->
   [SuccessLine] ->
   EbuildVersion ->
   IORef Int ->
   Int ->
   IO ApplyOutcome
-depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer stepsDoneRef remainingPVs = do
+depsPublishAndOverlay env overlayRoot entry src eco plan forced keywords lines_ targetVer stepsDoneRef remainingPVs = do
   let key = peKey entry
       pn = pePN entry
       pvNoRev = renderPVNoRev targetVer
@@ -825,15 +805,37 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
               (aeAssetsRepo env)
               tag
               (map T.pack assetNames)
-          case looked of
-            Left err ->
+          tagExists <-
+            roGetReleaseByTag
+              (aeReleaseOps env)
+              (aeAssetsOwner env)
+              (aeAssetsRepo env)
+              tag
+          let conflictMsg =
+                "existing release "
+                  <> aeAssetsOwner env
+                  <> "/"
+                  <> aeAssetsRepo env
+                  <> " "
+                  <> tag
+                  <> " cannot be reused or fully published; remove or repair that \
+                     \release externally before retrying"
+          case (looked, tagExists, forced) of
+            (Left err, _, _) ->
               pure $
                 ApplyHardFail
                   key
                   ("release asset lookup failed: " <> err)
                   False
                   False
-            Right (Just downloadUrls) -> do
+            (_, Left err, _) ->
+              pure $
+                ApplyHardFail
+                  key
+                  ("release asset lookup failed: " <> err)
+                  False
+                  False
+            (Right (Just downloadUrls), Right (Just _), False) -> do
               done <- readIORef stepsDoneRef
               mhSteps
                 mh
@@ -849,6 +851,7 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
                 entry
                 src
                 eco
+                plan
                 keywords
                 lines_
                 targetVer
@@ -858,7 +861,7 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
                 pvNoRev
                 (zip assetNames downloadUrls)
                 stepsDoneRef
-            Right Nothing -> do
+            (Right Nothing, Right Nothing, _) -> do
               done <- readIORef stepsDoneRef
               mhSteps
                 mh
@@ -874,6 +877,7 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
                 entry
                 src
                 eco
+                plan
                 keywords
                 lines_
                 targetVer
@@ -885,6 +889,9 @@ depsPublishAndOverlay env overlayRoot entry src eco keywords lines_ targetVer st
                 mh
                 key
                 stepsDoneRef
+            _ ->
+              pure $
+                ApplyHardFail key conflictMsg False False
 
 goPublishAndOverlay ::
   ApplyEnv ->
@@ -907,6 +914,8 @@ goPublishAndOverlay env overlayRoot entry owner repo prefix mSub =
     entry
     (GitHub owner repo prefix)
     (Go mSub)
+    (planFromTargets [])
+    False
 
 fullDepsPublishAndOverlay ::
   ApplyEnv ->
@@ -914,6 +923,7 @@ fullDepsPublishAndOverlay ::
   PackageEntry ->
   UpdateSource ->
   EcosystemSpec ->
+  RuntimeLanePlan ->
   [Text] ->
   [SuccessLine] ->
   EbuildVersion ->
@@ -932,6 +942,7 @@ fullDepsPublishAndOverlay
   entry
   src
   eco
+  plan
   keywords
   lines_
   targetVer
@@ -959,6 +970,7 @@ fullDepsPublishAndOverlay
               src
               entry
               key
+              plan
               pn
               pvNoRev
               (udWork unit)
@@ -1069,6 +1081,7 @@ materializeDistfiles ::
   UpdateSource ->
   PackageEntry ->
   PackageKey ->
+  RuntimeLanePlan ->
   Text ->
   Text ->
   -- | Unit @work/@.
@@ -1079,7 +1092,7 @@ materializeDistfiles ::
   IORef Int ->
   MultiHandle ->
   IO (Either Text ([FilePath], Maybe Text, Maybe Text))
-materializeDistfiles env eco src entry key pn pvNoRev workDir outDir assetNames stepsDoneRef mh =
+materializeDistfiles env eco src entry key plan pn pvNoRev workDir outDir assetNames stepsDoneRef mh =
   case assetNames of
     [] -> pure (Left "no required assets for materialize")
     (primaryName : companionNames) -> do
@@ -1090,6 +1103,7 @@ materializeDistfiles env eco src entry key pn pvNoRev workDir outDir assetNames 
           src
           entry
           key
+          plan
           pvNoRev
           workDir
           outDir
@@ -1112,6 +1126,7 @@ materializePrimaryDistfile ::
   UpdateSource ->
   PackageEntry ->
   PackageKey ->
+  RuntimeLanePlan ->
   Text ->
   FilePath ->
   FilePath ->
@@ -1119,7 +1134,7 @@ materializePrimaryDistfile ::
   IORef Int ->
   MultiHandle ->
   IO (Either Text (FilePath, Maybe Text, Maybe Text))
-materializePrimaryDistfile env eco src entry key pvNoRev workDir outDir tarballName stepsDoneRef mh =
+materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tarballName stepsDoneRef mh =
   case (eco, src) of
     (Go mSub, GitHub owner repo prefix) -> do
       built <-
@@ -1200,6 +1215,13 @@ materializePrimaryDistfile env eco src entry key pvNoRev workDir outDir tarballN
         else do
           donorContent <- TIO.readFile donorPath
           let progress = cargoCratesProgress stepsDoneRef mh key
+              plannedPv' = parseEbuildVersion pvNoRev
+              tagFloor = fromMaybe Nothing (lookupDirectTagFloor plan plannedPv')
+              samePv =
+                case parseEbuildFileName (takeFileName donorPath) of
+                  Just (_, verStr) ->
+                    samePV (parseEbuildVersion (T.pack verStr)) plannedPv'
+                  Nothing -> False
           built <-
             buildCargoCratesTarball
               (aeCargoOps env)
@@ -1211,6 +1233,8 @@ materializePrimaryDistfile env eco src entry key pvNoRev workDir outDir tarballN
               mLock
               mPkg
               donorContent
+              tagFloor
+              samePv
               (pePN entry)
               workDir
               outDir
@@ -1436,6 +1460,7 @@ reuseDepsReleaseAsset ::
   PackageEntry ->
   UpdateSource ->
   EcosystemSpec ->
+  RuntimeLanePlan ->
   [Text] ->
   [SuccessLine] ->
   EbuildVersion ->
@@ -1453,6 +1478,7 @@ reuseDepsReleaseAsset
   entry
   src
   eco
+  plan
   keywords
   lines_
   targetVer
@@ -1500,7 +1526,7 @@ reuseDepsReleaseAsset
                   GitHub owner repo prefix ->
                     fetchGoModVersion env owner repo prefix pvNoRev mSub
                   _ -> pure Nothing
-              Cargo mLock mPkg -> do
+              Cargo {} -> do
                 donorPath <-
                   findTemplate
                     (takeDirectory (pePath entry))
@@ -1523,15 +1549,9 @@ reuseDepsReleaseAsset
                           True
                   else do
                     donorContent <- TIO.readFile donorPath
-                    m <-
-                      fetchCargoMsrvForPV
-                        env
-                        src
-                        mLock
-                        mPkg
-                        pvNoRev
-                        donorContent
-                    pure (Right m)
+                    let mTag = fromMaybe Nothing (lookupDirectTagFloor plan targetVer)
+                        mTemplate = parseRustMinVerFromEbuild donorContent
+                    pure (Right (cargoReuseWriteFloor mTag mTemplate))
               Sbcl ->
                 case src of
                   GitHub owner repo prefix -> do

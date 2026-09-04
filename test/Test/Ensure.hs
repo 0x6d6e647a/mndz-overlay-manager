@@ -209,6 +209,7 @@ testBunOnlyOmitsSbcl = do
                 pdPlan = bunPlan "1.2.0",
                 pdLocalPVs = [],
                 pdContentFix = [parseEbuildVersion "1.0.0"],
+                pdForceFull = [],
                 pdHypoProvider = Nothing
               }
         ]
@@ -349,6 +350,7 @@ testFullPathFloorIgnoresReuseSibling = do
                     ],
                 pdLocalPVs = [pvFull, pvReuse],
                 pdContentFix = [],
+                pdForceFull = [],
                 pdHypoProvider = Nothing
               }
         ]
@@ -636,7 +638,9 @@ bunPlan req =
         ],
       glpEbuilds = [],
       glpUniquePVs = [parseEbuildVersion "1.0.0"],
-      glpRuntimeAtom = "dev-lang/bun-bin"
+      glpRuntimeAtom = "dev-lang/bun-bin",
+      glpDirectTagFloors = [],
+      glpFloorPolicy = Nothing
     }
 
 goPlan :: [(EbuildVersion, T.Text)] -> RuntimeLanePlan
@@ -653,7 +657,9 @@ goPlan rows =
         ],
       glpEbuilds = [],
       glpUniquePVs = [pv | (pv, _) <- rows],
-      glpRuntimeAtom = "dev-lang/go"
+      glpRuntimeAtom = "dev-lang/go",
+      glpDirectTagFloors = [],
+      glpFloorPolicy = Nothing
     }
 
 testDefaultSidecarPath :: IO ()

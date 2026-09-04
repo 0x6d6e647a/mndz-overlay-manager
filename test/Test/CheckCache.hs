@@ -26,6 +26,7 @@ import Update.CheckCache
     CacheStats (..),
     CheckCacheHandle,
     cacheStats,
+    cachedCargoPlanUsable,
     checkCacheFileName,
     computeFingerprintFromDir,
     defaultCheckCacheDirFromEnv,
@@ -41,7 +42,8 @@ import Update.CheckCache
   )
 import Update.Go.Lanes (RuntimeLanePlan (..))
 import Update.Types
-  ( PackageKey (..),
+  ( EcosystemSpec (..),
+    PackageKey (..),
     UpdateSource (..),
   )
 
@@ -62,7 +64,9 @@ tests =
       testCase "Corrupt is empty" testCorruptEmpty,
       testCase "Bun-bin tree change misses ralph deps" testOverlayProviderMiss,
       testCase "GitMv latest ignores overlay provider field" testLatestNoProviderField,
-      testCase "Missing overlay-provider field is a miss" testMissingOverlayProviderMiss
+      testCase "Missing overlay-provider field is a miss" testMissingOverlayProviderMiss,
+      testCase "Old Cargo plan without snapshots is unusable" testOldCargoPlanUnusable,
+      testCase "Non-Cargo plan remains usable without snapshots" testNonCargoPlanUsableWithoutSnapshots
     ]
 
 testXdgDir :: IO ()
@@ -250,7 +254,9 @@ emptyDepsPlan =
     { glpLanes = [],
       glpEbuilds = [],
       glpUniquePVs = [],
-      glpRuntimeAtom = "dev-lang/bun-bin"
+      glpRuntimeAtom = "dev-lang/bun-bin",
+      glpDirectTagFloors = [],
+      glpFloorPolicy = Nothing
     }
 
 setupBunBin :: FilePath -> IO FilePath
@@ -335,3 +341,25 @@ testMissingOverlayProviderMiss =
     storeDeps h key consumerFp Nothing emptyDepsPlan
     miss <- lookupDeps h key consumerFp (Just dummyProv)
     assertEq "missing overlay-provider field is a miss" Nothing miss
+
+testOldCargoPlanUnusable :: IO ()
+testOldCargoPlanUnusable =
+  assertEq
+    "old cargo without snapshots"
+    False
+    ( cachedCargoPlanUsable
+        (Cargo Nothing Nothing)
+        (GitHub "o" "r" "v")
+        emptyDepsPlan
+    )
+
+testNonCargoPlanUsableWithoutSnapshots :: IO ()
+testNonCargoPlanUsableWithoutSnapshots =
+  assertEq
+    "go plan without cargo fields"
+    True
+    ( cachedCargoPlanUsable
+        (Go Nothing)
+        (GitHub "o" "r" "v")
+        emptyDepsPlan
+    )

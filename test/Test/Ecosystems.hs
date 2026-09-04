@@ -56,6 +56,7 @@ import Update.Cargo.Crates
     buildCargoCratesTarball,
     cargoChecksumJson,
     crateTarballPrefix,
+    harvestRegistryPackageRoots,
     maxRustVersionInTree,
     mkCargoOps,
     packCratesTarball,
@@ -150,6 +151,7 @@ unitTests =
         "cargo pure"
         [ testCase "crateTarballPrefix" testCrateTarballPrefix,
           testCase "maxRustVersionInTree" testMaxRustVersionInTree,
+          testCase "harvestRegistryPackageRoots skips nested examples" testHarvestRegistryRoots,
           testCase "parseRegistryPackages fixtures" testParseRegistryPackages,
           testCase "cargoChecksumJson shape" testCargoChecksumJson
         ],
@@ -457,10 +459,25 @@ testMaxRustVersionInTree =
     TIO.writeFile
       (root </> "target" </> "Cargo.toml")
       "[package]\nrust-version = \"9.9.9\"\n"
-    m <- maxRustVersionInTree root
+    m <- assertRight "tree harvest" =<< maxRustVersionInTree root
     assertEq "max across tree (skips target)" (Just "1.88.0") m
-    emptyM <- maxRustVersionInTree (root </> "missing")
+    emptyM <- assertRight "missing root" =<< maxRustVersionInTree (root </> "missing")
     assertEq "missing root" Nothing emptyM
+
+testHarvestRegistryRoots :: IO ()
+testHarvestRegistryRoots =
+  withSystemTempDirectory "mndz-reg-harvest-" $ \root -> do
+    let kdl = root </> "kdl-6.7.1"
+        nested = kdl </> "examples" </> "fixture"
+    createDirectoryIfMissing True nested
+    TIO.writeFile
+      (kdl </> "Cargo.toml")
+      "[package]\nname = \"kdl\"\nrust-version = \"1.95\"\n"
+    TIO.writeFile
+      (nested </> "Cargo.toml")
+      "[package]\nname = \"ex\"\nrust-version = \"1.99\"\n"
+    m <- assertRight "registry harvest" =<< harvestRegistryPackageRoots root
+    assertEq "package root 1.95 not nested 1.99" (Just "1.95.0") m
 
 testParseRegistryPackages :: IO ()
 testParseRegistryPackages = do
@@ -974,6 +991,8 @@ testCargoBuilderSuccess =
           Nothing
           Nothing
           donorEbuild
+          Nothing
+          False
           "pkg"
           outDir
           outDir
@@ -1009,6 +1028,8 @@ testCargoBuilderSuccess =
           Nothing
           Nothing
           donorEbuild
+          Nothing
+          False
           "pkg"
           outDir
           outDir
@@ -1033,6 +1054,8 @@ testCargoBuilderCloneFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
       Nothing
       Nothing
       donorEbuild
+      Nothing
+      False
       "pkg"
       tmp
       tmp
@@ -1062,6 +1085,8 @@ testCargoBuilderMissingLock = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> 
       Nothing
       Nothing
       donorEbuild
+      Nothing
+      False
       "pkg"
       tmp
       tmp
@@ -1091,6 +1116,8 @@ testCargoBuilderPycargoFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> 
       Nothing
       Nothing
       donorEbuild
+      Nothing
+      False
       "pkg"
       tmp
       tmp
@@ -1121,6 +1148,8 @@ testCargoBuilderPackFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
       Nothing
       Nothing
       donorEbuild
+      Nothing
+      False
       "pkg"
       tmp
       tmp
@@ -2371,6 +2400,8 @@ testCargoMkCommandRunner =
           Nothing
           Nothing
           donorEbuild
+          Nothing
+          False
           "pkg"
           outDir
           outDir
@@ -2389,6 +2420,8 @@ testCargoMkCommandRunner =
         Nothing
         Nothing
         donorEbuild
+        Nothing
+        False
         "pkg"
         outDir
         outDir
@@ -2539,6 +2572,8 @@ testApplyEnvFakeEcoOps =
           Nothing
           Nothing
           donorEbuild
+          Nothing
+          False
           "pkg"
           outDir
           outDir

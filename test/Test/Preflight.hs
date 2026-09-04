@@ -565,6 +565,7 @@ testAssetsPfReuseOnlyGo = do
                 pdPlan = emptyDepsPlan,
                 pdLocalPVs = [],
                 pdContentFix = [pv],
+                pdForceFull = [],
                 pdHypoProvider = Nothing
               }
         ]
@@ -599,6 +600,7 @@ testAssetsPfCargo = do
                 pdPlan = emptyDepsPlan,
                 pdLocalPVs = [],
                 pdContentFix = [pv],
+                pdForceFull = [],
                 pdHypoProvider = Nothing
               }
         ]
@@ -660,6 +662,7 @@ testReuseCargoWithoutPycargo = do
                   pdPlan = emptyDepsPlan,
                   pdLocalPVs = [],
                   pdContentFix = [pv],
+                  pdForceFull = [],
                   pdHypoProvider = Nothing
                 }
           ]

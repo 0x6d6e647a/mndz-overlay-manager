@@ -14,7 +14,7 @@ import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (SomeException, catch)
 import Data.ByteString.Lazy qualified as BL
 import Data.List (sortBy)
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -30,10 +30,14 @@ import Network.HTTP.Client
   )
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
-import Overlay.Version (EbuildVersion (..), comparePV, renderPVNoRev)
+import Overlay.Version (EbuildVersion (..), comparePV, renderPVNoRev, samePV)
 import System.FilePath ((</>))
 import Update.Bun.Cache (parseEnginesBunFromPackageJson)
-import Update.Cargo.Msrv (parseRustVersionField)
+import Update.Cargo.Msrv
+  ( CargoTomlFetch (..),
+    cargoFloorPolicyKey,
+    probeDirectTagFloor,
+  )
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
   ( LaneTarget (..),
@@ -43,6 +47,7 @@ import Update.Go.Lanes
     filterCandidateVersions,
     planFromTargetsWithAtom,
     selectAllLaneTargets,
+    withCargoTagFloors,
   )
 import Update.Go.ModFetch
   ( GoModFetcher,
@@ -78,7 +83,7 @@ data DepsPlanOps = DepsPlanOps
     dpoFetchNpmEngines :: Text -> Text -> IO (Either Text Text),
     dpoFetchBunEngines :: Text -> Text -> Text -> Text -> IO (Either Text Text),
     -- | Fetch package Cargo.toml body at tag for rust-version probe.
-    dpoFetchCargoToml :: Text -> Text -> Text -> Text -> Maybe FilePath -> IO (Either Text Text),
+    dpoFetchCargoToml :: Text -> Text -> Text -> Text -> Maybe FilePath -> IO CargoTomlFetch,
     -- | Fetch @sbcl.version@ body at tag for SBCL floor probe.
     dpoFetchSbclVersion :: Text -> Text -> Text -> Text -> IO (Either Text Text),
     dpoWorkBudget :: WorkBudget,
@@ -313,28 +318,48 @@ planCargo ::
   IO (Either PlanError RuntimeLanePlan)
 planCargo ops progress src mLockSub mPkgSub locals =
   case src of
-    GitHub owner repo prefix ->
-      planWith
-        ops
-        progress
-        src
-        locals
-        ( discoverCeilingsCached
-            (dpoRustCeilingsCache ops)
-            (discoverRustUnionCeilingsWith (dpoPortageq ops))
-        )
-        ( \pv -> do
-            let pvText = renderPVNoRev pv
-            -- Prefer package subdir Cargo.toml; fall back to lock-root / repo root.
-            let tryPaths =
-                  nubMaybe
-                    [ mPkgSub,
-                      mLockSub,
-                      Nothing
-                    ]
-            probeRustVersion ops owner repo prefix pvText tryPaths
-        )
+    GitHub owner repo prefix -> do
+      snapsVar <- newMVar []
+      result <-
+        planWith
+          ops
+          progress
+          src
+          locals
+          ( discoverCeilingsCached
+              (dpoRustCeilingsCache ops)
+              (discoverRustUnionCeilingsWith (dpoPortageq ops))
+          )
+          ( \pv -> do
+              let pvText = renderPVNoRev pv
+              probed <-
+                probeDirectTagFloor mPkgSub mLockSub $ \mSub ->
+                  dpoFetchCargoToml ops owner repo prefix pvText mSub
+              case probed of
+                Left err -> pure (Left (PlanProbeFailed err))
+                Right mFloor -> do
+                  modifyMVar_ snapsVar $ \xs ->
+                    pure ((stripRev pv, mFloor) : xs)
+                  pure (Right (Just (fromMaybe "0.0.0" mFloor)))
+          )
+      case result of
+        Left err -> pure (Left err)
+        Right plan -> do
+          snaps <- readMVar snapsVar
+          let selected =
+                [ (pv, f)
+                | pv <- glpUniquePVs plan,
+                  Just f <- [lookupSnap pv snaps]
+                ]
+              policy = cargoFloorPolicyKey prefix mPkgSub mLockSub
+          pure (Right (withCargoTagFloors selected policy plan))
     _ -> pure (Left (PlanFailed "DepsAndAssets Cargo requires a GitHub update source"))
+
+lookupSnap :: EbuildVersion -> [(EbuildVersion, Maybe Text)] -> Maybe (Maybe Text)
+lookupSnap pv snaps =
+  case [f | (p, f) <- snaps, samePV p pv || p == pv] of
+    (f : _) -> Just f
+    [] -> Nothing
 
 ------------------------------------------------------------------------
 -- Sbcl
@@ -371,38 +396,6 @@ planSbcl ops progress src locals =
               Right body -> Right (parseSbclVersionFloor body)
         )
     _ -> pure (Left (PlanFailed "DepsAndAssets Sbcl requires a GitHub update source"))
-
--- | Probe rust-version from the first readable Cargo.toml among subdirs.
-probeRustVersion ::
-  DepsPlanOps ->
-  Text ->
-  Text ->
-  Text ->
-  Text ->
-  [Maybe FilePath] ->
-  IO (Either PlanError (Maybe Text))
-probeRustVersion ops owner repo prefix pv = go
-  where
-    go [] =
-      -- No declared rust-version: still eligible under any ceiling; apply path
-      -- recomputes max-deps + donor and hard-fails if still unknown.
-      pure (Right (Just "0.0.0"))
-    go (mSub : rest) = do
-      eres <- dpoFetchCargoToml ops owner repo prefix pv mSub
-      case eres of
-        Left _ -> go rest
-        Right body ->
-          case parseRustVersionField body of
-            Just ver -> pure (Right (Just ver))
-            Nothing -> go rest
-
-nubMaybe :: (Eq a) => [Maybe a] -> [Maybe a]
-nubMaybe = go []
-  where
-    go acc [] = reverse acc
-    go acc (x : xs)
-      | x `elem` acc = go acc xs
-      | otherwise = go (x : acc) xs
 
 ------------------------------------------------------------------------
 -- Shared spine
@@ -589,7 +582,7 @@ fetchCargoTomlAtTag ::
   Text ->
   Text ->
   Maybe FilePath ->
-  IO (Either Text Text)
+  IO CargoTomlFetch
 fetchCargoTomlAtTag mgr mToken owner repo prefix pv mSub = do
   let tag = versionTag prefix pv
       subPath = case mSub of
@@ -604,7 +597,35 @@ fetchCargoTomlAtTag mgr mToken owner repo prefix pv mSub = do
           <> T.unpack tag
           <> "/"
           <> subPath
-  fetchRawGithubFile mgr mToken url
+  fetchCargoTomlUrl mgr mToken url
+
+fetchCargoTomlUrl :: Manager -> Maybe Text -> String -> IO CargoTomlFetch
+fetchCargoTomlUrl mgr mToken url = do
+  req0 <- parseRequest url
+  let req =
+        req0
+          { method = "GET",
+            requestHeaders =
+              [ ("User-Agent", "mndz-overlay-manager"),
+                ("Accept", "text/plain")
+              ]
+                <> case mToken of
+                  Just t -> [("Authorization", "Bearer " <> TE.encodeUtf8 t)]
+                  Nothing -> []
+          }
+  eres <-
+    (Right <$> httpLbs req mgr)
+      `catch` \(e :: SomeException) -> pure (Left (T.pack (show e)))
+  pure $ case eres of
+    Left err -> CargoTomlError err
+    Right resp ->
+      let code = statusCode (responseStatus resp)
+       in if code >= 200 && code < 300
+            then CargoTomlBody (TE.decodeUtf8 (BL.toStrict (responseBody resp)))
+            else
+              if code == 404
+                then CargoTomlMissing
+                else CargoTomlError ("HTTP " <> T.pack (show code) <> " from " <> T.pack url)
 
 fetchSbclVersionAtTag ::
   Manager ->

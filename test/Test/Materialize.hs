@@ -53,6 +53,7 @@ import Update.Assets.Release
   )
 import Update.Bun.Cache (BunCacheOps (..))
 import Update.Cargo.Crates (CargoOps (..))
+import Update.Cargo.Msrv (CargoTomlFetch (..))
 import Update.Check (PackageEntry (..))
 import Update.Deps.Plan (DepsPlanOps (..))
 import Update.Git (GitOps (..))
@@ -93,7 +94,7 @@ integrationTests =
       testCase "bun reuse-path apply success" testBunReusePathSuccess,
       testCase "opencode multi-asset full path" testOpencodeMultiAssetFullPath,
       testCase "opencode multi-asset reuse path" testOpencodeMultiAssetReusePath,
-      testCase "opencode partial release does not reuse" testOpencodePartialReleaseFullPath,
+      testCase "opencode partial release hard-fails" testOpencodePartialReleaseFullPath,
       testCase "cargo full-path applyDepsAndAssets success" testCargoFullPathSuccess,
       testCase "cargo full-path staging crates then crates pack" testCargoFullPathStagingStatus,
       testCase "cargo reuse-path apply success" testCargoReusePathSuccess,
@@ -135,7 +136,7 @@ mkDepsPlanOps ::
   (GoModKey -> IO (Either T.Text T.Text)) ->
   (T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
   (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
-  (T.Text -> T.Text -> T.Text -> T.Text -> Maybe FilePath -> IO (Either T.Text T.Text)) ->
+  (T.Text -> T.Text -> T.Text -> T.Text -> Maybe FilePath -> IO CargoTomlFetch) ->
   Maybe FilePath ->
   IO DepsPlanOps
 mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
@@ -183,8 +184,8 @@ unusedCargo ::
   T.Text ->
   T.Text ->
   Maybe FilePath ->
-  IO (Either T.Text T.Text)
-unusedCargo _ _ _ _ _ = pure (Left "cargo toml unused")
+  IO CargoTomlFetch
+unusedCargo _ _ _ _ _ = pure (CargoTomlError "cargo toml unused")
 
 ------------------------------------------------------------------------
 -- Fake eco builders
@@ -1300,9 +1301,12 @@ testOpencodePartialReleaseFullPath =
         Nothing
     let env = env0 {aeFetchModelsDev = fakeModelsFetch modelsAssetBytes}
     outcomes <- applyPackagePhase1 env overlayRoot entry
-    expectSuccess "opencode partial → full materialize" outcomes
+    expectHardFail
+      "opencode partial → existing-release conflict"
+      "cannot be reused or fully published"
+      outcomes
     n <- readIORef installCalls
-    assertTrue "bun install ran when models missing" (n > 0)
+    assertEq "bun install did not run" 0 n
 
 ------------------------------------------------------------------------
 -- cargo
@@ -1323,15 +1327,15 @@ cargoTomls ::
   T.Text ->
   T.Text ->
   Maybe FilePath ->
-  IO (Either T.Text T.Text)
+  IO CargoTomlFetch
 cargoTomls _o _r _p pv mSub =
   pure $
     case (pv, mSub) of
       ("0.40.0", Nothing) ->
-        Right " [package]\nrust-version = \"1.80.0\"\n"
+        CargoTomlBody " [package]\nrust-version = \"1.80.0\"\n"
       ("0.50.0", Nothing) ->
-        Right " [package]\nrust-version = \"1.85.0\"\n"
-      _ -> Left "missing Cargo.toml"
+        CargoTomlBody " [package]\nrust-version = \"1.85.0\"\n"
+      _ -> CargoTomlMissing
 
 testCargoFullPathSuccess :: IO ()
 testCargoFullPathSuccess =
@@ -1534,8 +1538,8 @@ testCargoSoftSkip =
         ( \_o _r _p _pv mSub ->
             pure $
               case mSub of
-                Nothing -> Right " [package]\nrust-version = \"1.85.0\"\n"
-                _ -> Left "no sub"
+                Nothing -> CargoTomlBody " [package]\nrust-version = \"1.85.0\"\n"
+                _ -> CargoTomlMissing
         )
         (Just overlayRoot)
     env <-

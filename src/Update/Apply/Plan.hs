@@ -40,7 +40,7 @@ import CLI.Progress
     withMultiProgress,
   )
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Types (Ebuild (..))
@@ -48,13 +48,12 @@ import Overlay.Version
   ( EbuildVersion,
     comparePV,
     renderPVNoRev,
+    samePV,
   )
 import System.FilePath ((</>))
+import Update.Adequacy (requiredAssetBasenames)
 import Update.Assets.Layout
-  ( distfileKindForEcosystem,
-    distfileTarballName,
-    modelsDistfileName,
-    releaseTag,
+  ( releaseTag,
   )
 import Update.Assets.Release
   ( ReleaseAsset (..),
@@ -62,12 +61,15 @@ import Update.Assets.Release
     findAssetByName,
   )
 import Update.Check
-  ( PackageEntry (..),
+  ( ContentAssessment (..),
+    PackageEntry (..),
+    assessOverlayContent,
     checkPackage,
     contentFixPVs,
   )
 import Update.CheckCache
   ( CheckCacheHandle,
+    cachedCargoPlanUsable,
     computeFingerprint,
     lookupDeps,
     recordFetch,
@@ -83,6 +85,7 @@ import Update.DiskSpace
   ( MaterializeClass (..),
     UnitDiskPlan (..),
     estimateNeedBytes,
+    floorReuseTemp,
     lookupManifestBaselineForClass,
     materializeClassFull,
     readManifestMaybe,
@@ -95,6 +98,7 @@ import Update.Go.Lanes
   )
 import Update.Go.Plan (PlanProgress (..), localNonLivePVs)
 import Update.Hardcoded (lookupPolicy)
+import Update.Manifest.Dist (exactDistSize)
 import Update.OverlayWaves
   ( bunBinPackageKey,
     computeOverlayProviderFingerprint,
@@ -146,6 +150,8 @@ data PlannedWork
         pdPlan :: RuntimeLanePlan,
         pdLocalPVs :: [EbuildVersion],
         pdContentFix :: [EbuildVersion],
+        -- | PVs that must take the full path (no reuse-write floor).
+        pdForceFull :: [EbuildVersion],
         -- | Working plan used hypothetical provider-at-remote ceilings.
         pdHypoProvider :: Maybe (PackageKey, EbuildVersion)
       }
@@ -171,7 +177,7 @@ needsWorkDepsAssets = \case
 
 needsWorkCargo :: PackagePlanResult -> Bool
 needsWorkCargo = \case
-  PlanNeedsWork _ (PlannedDeps eco _ _ _ _ _) -> ecosystemIsCargo eco
+  PlanNeedsWork _ (PlannedDeps eco _ _ _ _ _ _) -> ecosystemIsCargo eco
   _ -> False
 
 ------------------------------------------------------------------------
@@ -314,10 +320,11 @@ planDeps env entry locals src eco = do
           (Just _, Nothing) -> pure Nothing
           _ -> lookupDeps cache key fp lookupProv
       planResult <- case mCached of
-        Just plan -> do
-          recordHit cache
-          pure (Right plan)
-        Nothing -> do
+        Just plan
+          | cachedCargoPlanUsable eco src plan -> do
+              recordHit cache
+              pure (Right plan)
+        _ -> do
           recordFetch cache
           planDepsPackageWithProgress depsOps progress eco src localPVs
       case planResult of
@@ -330,26 +337,37 @@ planDeps env entry locals src eco = do
           case mCached of
             Nothing -> storeDeps cache key fp mProvFp plan
             Just _ -> pure ()
-          contentFix <- contentFixPVs depsOps eco src locals plan
-          let onDiskNeed = planNeedsWork localPVs contentFix plan
-          refuse <- refuseUnselectedProvider env key eco src localPVs locals plan onDiskNeed
-          case refuse of
-            Just failMsg -> pure $ PlanHardFail key failMsg
-            Nothing ->
-              if not onDiskNeed
-                then pure $ PlanSoftSkip key "already matches runtime-lane plan"
-                else
-                  pure $
-                    PlanNeedsWork
-                      key
-                      PlannedDeps
-                        { pdEco = eco,
-                          pdSource = src,
-                          pdPlan = plan,
-                          pdLocalPVs = localPVs,
-                          pdContentFix = contentFix,
-                          pdHypoProvider = Nothing
-                        }
+          assessed <- assessOverlayContent eco key (pePN entry) locals plan
+          case assessed of
+            Left err -> pure $ PlanHardFail key err
+            Right (ca, _, _) -> do
+              let missing = missingTargets localPVs plan
+                  contentFix =
+                    [ pv
+                    | pv <- caNeedsWorkPVs ca,
+                      not (any (samePV pv) missing)
+                    ]
+                  forceFull = caForceFullPVs ca
+                  onDiskNeed = planNeedsWork localPVs contentFix plan
+              refuse <- refuseUnselectedProvider env key eco src localPVs locals plan onDiskNeed
+              case refuse of
+                Just failMsg -> pure $ PlanHardFail key failMsg
+                Nothing ->
+                  if not onDiskNeed
+                    then pure $ PlanSoftSkip key "already matches runtime-lane plan"
+                    else
+                      pure $
+                        PlanNeedsWork
+                          key
+                          PlannedDeps
+                            { pdEco = eco,
+                              pdSource = src,
+                              pdPlan = plan,
+                              pdLocalPVs = localPVs,
+                              pdContentFix = contentFix,
+                              pdForceFull = forceFull,
+                              pdHypoProvider = Nothing
+                            }
 
 -- | Selected overlay provider is needs-work (GitMv local PV < remote latest).
 selectedProviderNeedsWork ::
@@ -431,6 +449,7 @@ planDepsHypo env entry locals src eco localPVs =
                           pdPlan = hypoPlan,
                           pdLocalPVs = localPVs,
                           pdContentFix = contentFix,
+                          pdForceFull = [],
                           pdHypoProvider = Just (provider, remote)
                         }
         _ ->
@@ -475,6 +494,7 @@ planDepsOnDiskFallback env entry locals src eco localPVs = do
                   pdPlan = plan,
                   pdLocalPVs = localPVs,
                   pdContentFix = contentFix,
+                  pdForceFull = [],
                   pdHypoProvider = Nothing
                 }
 
@@ -649,7 +669,7 @@ classifyPackageUnits ::
 classifyPackageUnits releaseOps owner repo overlayRoot key pn work =
   case work of
     PlannedGitMv {} -> pure (ClassifyOk key [])
-    PlannedDeps eco _src plan localPVs contentFix _hypo -> do
+    PlannedDeps eco _src plan localPVs contentFix forceFull _hypo -> do
       let needPVs = missingTargets localPVs plan <> contentFix
           pkgDir = case splitPackageKey key of
             Just (cat, p) -> overlayRoot </> T.unpack cat </> T.unpack p
@@ -658,7 +678,7 @@ classifyPackageUnits releaseOps owner repo overlayRoot key pn work =
         then pure (ClassifyOk key []) -- prune-only: no heavy unit
         else do
           mMan <- readManifestMaybe pkgDir
-          classified <- mapM (classifyPv releaseOps owner repo eco key pn mMan) needPVs
+          classified <- mapM (classifyPv releaseOps owner repo eco key pn mMan forceFull) needPVs
           pure $ case sequence classified of
             Left err -> ClassifyHardFail key err
             Right units -> ClassifyOk key units
@@ -671,13 +691,15 @@ classifyPv ::
   PackageKey ->
   Text ->
   Maybe Text ->
+  [EbuildVersion] ->
   EbuildVersion ->
   IO (Either Text ClassifiedPvUnit)
-classifyPv releaseOps owner repo eco key pn mMan pv = do
+classifyPv releaseOps owner repo eco key pn mMan forceFull pv = do
   let pvNoRev = renderPVNoRev pv
       assetNames = map T.pack (requiredAssetBasenames key eco pn pvNoRev)
       tag = releaseTag pn pvNoRev
       fullCls = materializeClassFull eco
+      forced = any (samePV pv) forceFull
   eres <- roGetReleaseByTag releaseOps owner repo tag
   pure $ case eres of
     Left err -> Left ("release asset lookup failed: " <> err)
@@ -685,36 +707,44 @@ classifyPv releaseOps owner repo eco key pn mMan pv = do
       Right $ fullUnit key pn pv eco fullCls mMan
     Right (Just info) ->
       let assets = mapMaybe (findAssetByName info) assetNames
-       in if length assets /= length assetNames
-            then Right $ fullUnit key pn pv eco fullCls mMan
+          complete = length assets == length assetNames
+       in if not complete || forced
+            then Left (existingReleaseConflictMsg owner repo tag)
             else
-              let mSize = case assets of
-                    (a : _) -> raSize a
-                    [] -> Nothing
-               in case mSize of
-                    Just n
-                      | n > 0 ->
-                          Right
-                            ClassifiedPvUnit
-                              { cpuKey = key,
-                                cpuPN = pn,
-                                cpuPV = pv,
-                                cpuEco = eco,
-                                cpuClass = ReusePath,
-                                cpuTempBaseline = Just n
-                              }
-                    _ ->
-                      let mBase =
-                            mMan >>= (`lookupManifestBaselineForClass` ReusePath)
-                       in Right
-                            ClassifiedPvUnit
-                              { cpuKey = key,
-                                cpuPN = pn,
-                                cpuPV = pv,
-                                cpuEco = eco,
-                                cpuClass = ReusePath,
-                                cpuTempBaseline = mBase
-                              }
+              let baseline = reuseBaseline assets mMan assetNames
+               in Right
+                    ClassifiedPvUnit
+                      { cpuKey = key,
+                        cpuPN = pn,
+                        cpuPV = pv,
+                        cpuEco = eco,
+                        cpuClass = ReusePath,
+                        cpuTempBaseline = Just baseline
+                      }
+
+existingReleaseConflictMsg :: Text -> Text -> Text -> Text
+existingReleaseConflictMsg owner repo tag =
+  "existing release "
+    <> owner
+    <> "/"
+    <> repo
+    <> " "
+    <> tag
+    <> " cannot be reused or fully published; remove or repair that release \
+       \externally before retrying"
+
+-- | Sum per-basename API size, else exact Manifest size, else reuse floor.
+reuseBaseline :: [ReleaseAsset] -> Maybe Text -> [Text] -> Integer
+reuseBaseline assets mMan names =
+  sum (map one names)
+  where
+    one name =
+      case [s | a <- assets, raName a == name, Just s <- [raSize a], s > 0] of
+        (s : _) -> s
+        [] ->
+          case mMan of
+            Just man -> fromMaybe floorReuseTemp (exactDistSize man (T.unpack name))
+            Nothing -> floorReuseTemp
 
 fullUnit ::
   PackageKey ->
@@ -734,15 +764,6 @@ fullUnit key pn pv eco fullCls mMan =
           cpuClass = fullCls,
           cpuTempBaseline = mBase
         }
-
-requiredAssetBasenames :: PackageKey -> EcosystemSpec -> Text -> Text -> [FilePath]
-requiredAssetBasenames key eco pn pvNoRev =
-  let primary = distfileTarballName (distfileKindForEcosystem eco) pn pvNoRev
-      extras =
-        case key of
-          PackageKey "dev-util/opencode" -> [modelsDistfileName pn pvNoRev]
-          _ -> []
-   in primary : extras
 
 ------------------------------------------------------------------------
 -- Pure disk unit builders
