@@ -118,6 +118,7 @@ import Update.Bun.Cache (productionBunCacheOps)
 import Update.Cargo.Crates (productionCargoOps)
 import Update.Cargo.Msrv
   ( CargoTomlFetch (..),
+    TagFloorResult (..),
     combineMsrv,
     maxRustVersion,
     normalizeRustVersion,
@@ -125,6 +126,7 @@ import Update.Cargo.Msrv
     parseRustMinVerFromEbuild,
     parseRustVersionField,
     probeDirectTagFloor,
+    probePolicyTagFloor,
   )
 import Update.Check
   ( InventoryFile (..),
@@ -295,6 +297,7 @@ unitTests =
       testCase "Engines Minimum Parse" testEnginesMinimumParse,
       testCase "Cargo Msrv And Ceilings" testCargoMsrvAndCeilings,
       testCase "Cargo Toml Probe Order" testCargoTomlProbeOrder,
+      testCase "Cargo Policy Tag Floor Walker" testPolicyTagFloorWalker,
       testCase "Canonical Ebuild Revision" testCanonicalEbuildRevision,
       testCase "Go Lane Selection" testGoLaneSelection,
       testCase "Go Lane Collapse" testGoLaneCollapse,
@@ -615,6 +618,498 @@ testCargoTomlProbeOrder = do
           Nothing -> CargoTomlBody "[package]\nrust-version = \"1.91\"\n"
           _ -> CargoTomlMissing
   assertEq "fallback after missing" (Right (Just "1.91.0")) rOk
+
+fetchMap :: [(Maybe FilePath, T.Text)] -> Maybe FilePath -> IO CargoTomlFetch
+fetchMap xs k = pure $ maybe CargoTomlMissing CargoTomlBody (lookup k xs)
+
+runFloor ::
+  Maybe FilePath ->
+  Maybe FilePath ->
+  [(Maybe FilePath, T.Text)] ->
+  IO TagFloorResult
+runFloor pkg lock files =
+  probePolicyTagFloor pkg lock Nothing (fetchMap files)
+
+pkgToml :: T.Text -> T.Text -> T.Text
+pkgToml name ver =
+  "[package]\nname = \"" <> name <> "\"\nrust-version = \"" <> ver <> "\"\n"
+
+testPolicyTagFloorWalker :: IO ()
+testPolicyTagFloorWalker = do
+  -- 1.2 inheritance
+  inh <-
+    runFloor
+      (Just "cli")
+      Nothing
+      [ ( Just "cli",
+          "[package]\nname = \"cli\"\nrust-version.workspace = true\n"
+        ),
+        ( Nothing,
+          "[workspace]\nmembers = [\"cli\"]\n[workspace.package]\nrust-version = \"1.91\"\n"
+        )
+      ]
+  case inh of
+    TagFloorComplete (Just v) _ -> assertEq "resolved inheritance" "1.91.0" v
+    other -> assertFailure ("inheritance: " <> show other)
+  missingWs <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          "[package]\nname = \"p\"\nrust-version.workspace = true\n"
+        )
+      ]
+  case missingWs of
+    TagFloorIncomplete reasons _ ->
+      assertTrue "missing workspace doc" (any ("workspace" `T.isInfixOf`) reasons)
+    other -> assertFailure ("missing ws: " <> show other)
+  escapeWs <-
+    runFloor
+      (Just "cli")
+      Nothing
+      [ ( Just "cli",
+          "[package]\nname = \"cli\"\nworkspace = \"../..\"\nrust-version.workspace = true\n"
+        )
+      ]
+  case escapeWs of
+    TagFloorFailed err ->
+      assertTrue "workspace escape names path" ("escapes" `T.isInfixOf` err)
+    other -> assertFailure ("ws escape: " <> show other)
+  sameFile <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          "[package]\nname = \"p\"\nrust-version = \"1.91\"\n[workspace.package]\nrust-version = \"1.95\"\n"
+        )
+      ]
+  case sameFile of
+    TagFloorComplete (Just v) _ ->
+      assertEq "package field precedes workspace.package" "1.91.0" v
+    other -> assertFailure ("same-file: " <> show other)
+  -- 1.3 path closure
+  usage <-
+    runFloor
+      (Just "cli")
+      Nothing
+      [ ( Just "cli",
+          T.unlines
+            [ "[package]",
+              "name = \"usage\"",
+              "rust-version = \"1.91\"",
+              "[dependencies]",
+              "usage-rs = { path = \"../usage-rs\" }",
+              "lib = { path = \"../lib\" }",
+              "usage-derive = { path = \"../derive\", optional = true }",
+              "[features]",
+              "default = [\"derive\"]",
+              "derive = [\"dep:usage-derive\"]"
+            ]
+        ),
+        (Just "usage-rs", pkgToml "usage-rs" "1.91"),
+        (Just "lib", pkgToml "lib" "1.91"),
+        (Just "derive", pkgToml "usage-derive" "1.91"),
+        (Just "benches/shadows", pkgToml "shadows" "1.99"),
+        (Just "xtask", pkgToml "xtask" "1.99")
+      ]
+  case usage of
+    TagFloorComplete (Just v) prov -> do
+      assertEq "usage-style floor" "1.91.0" v
+      let paths = map fst prov
+      assertTrue "includes cli" (any (("cli" `T.isInfixOf`) . T.pack) paths)
+      assertTrue
+        "excludes benches"
+        (not (any (("benches" `T.isInfixOf`) . T.pack) paths))
+      assertTrue
+        "excludes xtask"
+        (not (any (("xtask" `T.isInfixOf`) . T.pack) paths))
+    other -> assertFailure ("usage: " <> show other)
+  optOn <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[dependencies]",
+              "extra = { path = \"extra\", optional = true }",
+              "[features]",
+              "default = [\"extra\"]",
+              "extra = [\"dep:extra\"]"
+            ]
+        ),
+        (Just "extra", pkgToml "extra" "1.92")
+      ]
+  case optOn of
+    TagFloorComplete (Just v) _ ->
+      assertEq "default-on optional raises" "1.92.0" v
+    other -> assertFailure ("opt-on: " <> show other)
+  wsDep <-
+    runFloor
+      (Just "cli")
+      Nothing
+      [ ( Just "cli",
+          T.unlines
+            [ "[package]",
+              "name = \"cli\"",
+              "rust-version = \"1.91\"",
+              "[dependencies]",
+              "lib = { workspace = true }"
+            ]
+        ),
+        ( Nothing,
+          T.unlines
+            [ "[workspace]",
+              "members = [\"cli\", \"lib\"]",
+              "[workspace.dependencies]",
+              "lib = { path = \"lib\" }"
+            ]
+        ),
+        (Just "lib", pkgToml "lib" "1.93")
+      ]
+  case wsDep of
+    TagFloorComplete (Just v) _ ->
+      assertEq "workspace.dependencies path" "1.93.0" v
+    other -> assertFailure ("ws dep: " <> show other)
+  nsFeat <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"mise\"",
+              "rust-version = \"1.85\"",
+              "[dependencies]",
+              "vfox = { path = \"crates/vfox\", default-features = false }",
+              "[features]",
+              "default = [\"native-tls\", \"vfox/vendored-lua\"]",
+              "native-tls = []"
+            ]
+        ),
+        ( Just "crates/vfox",
+          T.unlines
+            [ "[package]",
+              "name = \"vfox\"",
+              "rust-version = \"1.85\"",
+              "[features]",
+              "default = [\"vendored-lua\"]",
+              "vendored-lua = [\"mlua/vendored\"]"
+            ]
+        )
+      ]
+  case nsFeat of
+    TagFloorComplete (Just v) _ ->
+      assertEq "mise-style namespaced feature completes" "1.85.0" v
+    other -> assertFailure ("namespaced: " <> show other)
+  usageNs <-
+    runFloor
+      (Just "cli")
+      Nothing
+      [ ( Just "cli",
+          T.unlines
+            [ "[package]",
+              "name = \"usage-cli\"",
+              "rust-version = \"1.91\"",
+              "[dependencies]",
+              "usage-rs = { path = \"../usage-rs\", features = [\"completions\"] }"
+            ]
+        ),
+        ( Just "usage-rs",
+          T.unlines
+            [ "[package]",
+              "name = \"usage-rs\"",
+              "rust-version = \"1.91\"",
+              "[dependencies]",
+              "usage-argv = { path = \"../argv\" }",
+              "usage-derive = { path = \"../derive\", optional = true }",
+              "usage-test = { path = \"../test\", optional = true }",
+              "[features]",
+              "default = [\"spec\"]",
+              "spec = [\"usage-argv/spec\", \"dep:usage-derive\"]",
+              "completions = [\"spec\", \"usage-test?/completions\"]"
+            ]
+        ),
+        (Just "argv", pkgToml "usage-argv" "1.91"),
+        (Just "derive", pkgToml "usage-derive" "1.91"),
+        (Just "test", pkgToml "usage-test" "1.99")
+      ]
+  case usageNs of
+    TagFloorComplete (Just v) _ ->
+      assertEq "usage-argv/spec completes; weak test does not raise" "1.91.0" v
+    other -> assertFailure ("usage ns: " <> show other)
+  weakNs <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[dependencies]",
+              "extra = { path = \"extra\", optional = true }",
+              "[features]",
+              "default = [\"extra?/hot\"]"
+            ]
+        ),
+        (Just "extra", pkgToml "extra" "1.99")
+      ]
+  case weakNs of
+    TagFloorComplete (Just v) _ ->
+      assertEq "weak namespaced does not enable optional" "1.91.0" v
+    other -> assertFailure ("weak ns: " <> show other)
+  depQ <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[features]",
+              "default = [\"dep:foo?\"]"
+            ]
+        )
+      ]
+  case depQ of
+    TagFloorIncomplete reasons _ ->
+      assertTrue "dep:foo? unreadable" (any ("feature" `T.isInfixOf`) reasons)
+    other -> assertFailure ("dep:foo?: " <> show other)
+  devOnly <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[dev-dependencies]",
+              "devcrate = { path = \"devcrate\" }"
+            ]
+        ),
+        (Just "devcrate", pkgToml "devcrate" "1.99")
+      ]
+  case devOnly of
+    TagFloorComplete (Just v) _ ->
+      assertEq "dev-only excluded" "1.91.0" v
+    other -> assertFailure ("dev-only: " <> show other)
+  cycleR <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"a\"",
+              "rust-version = \"1.80\"",
+              "[dependencies]",
+              "b = { path = \"b\" }"
+            ]
+        ),
+        ( Just "b",
+          T.unlines
+            [ "[package]",
+              "name = \"b\"",
+              "rust-version = \"1.81\"",
+              "[dependencies]",
+              "a = { path = \"..\" }"
+            ]
+        )
+      ]
+  case cycleR of
+    TagFloorComplete (Just v) _ -> assertEq "cycle max" "1.81.0" v
+    other -> assertFailure ("cycle: " <> show other)
+  missingPath <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[dependencies]",
+              "gone = { path = \"gone\" }"
+            ]
+        )
+      ]
+  case missingPath of
+    TagFloorIncomplete reasons _ ->
+      assertTrue "in-tree missing" (any ("gone" `T.isInfixOf`) reasons)
+    other -> assertFailure ("missing path: " <> show other)
+  -- 1.4 targets
+  winOnly <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(windows)'.dependencies]",
+              "wincrate = { path = \"wincrate\" }"
+            ]
+        ),
+        (Just "wincrate", pkgToml "wincrate" "1.99")
+      ]
+  case winOnly of
+    TagFloorComplete (Just v) _ ->
+      assertEq "windows-only ignored" "1.91.0" v
+    other -> assertFailure ("windows: " <> show other)
+  watchedRaiseR <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(target_os = \"macos\")'.dependencies]",
+              "mac = { path = \"mac\" }"
+            ]
+        ),
+        (Just "mac", pkgToml "mac" "1.95")
+      ]
+  case watchedRaiseR of
+    TagFloorFailed err -> do
+      assertTrue "names watched path" ("mac" `T.isInfixOf` err)
+      assertTrue "names watched floor" ("1.95" `T.isInfixOf` err)
+      assertTrue "names active floor" ("1.91" `T.isInfixOf` err)
+    other -> assertFailure ("watched raise: " <> show other)
+  watchedEq <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(target_os = \"macos\")'.dependencies]",
+              "mac = { path = \"mac\" }"
+            ]
+        ),
+        (Just "mac", pkgToml "mac" "1.91")
+      ]
+  case watchedEq of
+    TagFloorComplete (Just v) _ ->
+      assertEq "watched equal succeeds" "1.91.0" v
+    other -> assertFailure ("watched eq: " <> show other)
+  unixInc <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(unix)'.dependencies]",
+              "unixc = { path = \"unixc\" }"
+            ]
+        ),
+        (Just "unixc", pkgToml "unixc" "1.93")
+      ]
+  case unixInc of
+    TagFloorComplete (Just v) _ ->
+      assertEq "unix included" "1.93.0" v
+    other -> assertFailure ("unix: " <> show other)
+  unparsed <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(weirdness)'.dependencies]",
+              "x = { path = \"x\" }"
+            ]
+        ),
+        (Just "x", pkgToml "x" "1.80")
+      ]
+  case unparsed of
+    TagFloorIncomplete reasons _ ->
+      assertTrue "unparsed cfg" (any ("cfg" `T.isInfixOf`) reasons)
+    other -> assertFailure ("unparsed: " <> show other)
+  -- 1.5 escape, virtual, patch
+  escapeDep <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[dependencies]",
+              "out = { path = \"../out\" }"
+            ]
+        )
+      ]
+  case escapeDep of
+    TagFloorFailed err ->
+      assertTrue "escape names path" ("escapes" `T.isInfixOf` err)
+    other -> assertFailure ("escape dep: " <> show other)
+  virt <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          "[workspace]\nmembers = [\"cli\"]\n"
+        )
+      ]
+  case virt of
+    TagFloorFailed err ->
+      assertTrue
+        "virtual asks for subdirectory"
+        ("subdirectory" `T.isInfixOf` err || "package" `T.isInfixOf` err)
+    other -> assertFailure ("virtual: " <> show other)
+  patchOk <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.80\"",
+              "[patch.crates-io]",
+              "foo = { path = \"vendor/foo\" }"
+            ]
+        ),
+        (Just "vendor/foo", pkgToml "foo" "1.88")
+      ]
+  case patchOk of
+    TagFloorComplete (Just v) _ ->
+      assertEq "in-tree patch followed" "1.88.0" v
+    other -> assertFailure ("patch: " <> show other)
+  patchEsc <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.80\"",
+              "[patch.crates-io]",
+              "foo = { path = \"../escape\" }"
+            ]
+        )
+      ]
+  case patchEsc of
+    TagFloorFailed err ->
+      assertTrue "patch escape" ("escapes" `T.isInfixOf` err)
+    other -> assertFailure ("patch escape: " <> show other)
 
 testCanonicalEbuildRevision :: IO ()
 testCanonicalEbuildRevision = do

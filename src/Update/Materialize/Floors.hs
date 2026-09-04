@@ -27,7 +27,11 @@ import Update.Apply.Plan
     planResultKey,
   )
 import Update.DiskSpace (MaterializeClass (..))
-import Update.Go.Lanes (LaneTarget (..), RuntimeLanePlan (..))
+import Update.Go.Lanes
+  ( CargoTagFloorSnapshot (..),
+    LaneTarget (..),
+    RuntimeLanePlan (..),
+  )
 import Update.Go.Version (compareGoVersions)
 import Update.Runtime.Ceilings (RuntimeEbuildMeta (..))
 import Update.Types
@@ -218,11 +222,11 @@ reqForPv plan pv =
         (r : _) -> r
         [] -> Nothing
     floors ->
-      case [f | (p, f) <- floors, p == pv] of
+      case [ctfsFloor s | s <- floors, ctfsPV s == pv] of
         (Just v : _) -> Just v
         (Nothing : _) -> Nothing
         [] ->
-          case [f | (p, f) <- floors, samePV p pv] of
+          case [ctfsFloor s | s <- floors, samePV (ctfsPV s) pv] of
             (Just v : _) -> Just v
             _ -> Nothing
 

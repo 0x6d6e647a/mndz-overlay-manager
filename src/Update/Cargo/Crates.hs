@@ -8,7 +8,7 @@ module Update.Cargo.Crates
     mkCargoOps,
     buildCargoCratesTarball,
     crateTarballPrefix,
-    maxRustVersionInTree,
+    harvestCloneFloor,
     harvestRegistryPackageRoots,
     -- Pack helpers (unit-tested)
     RegistryPackage (..),
@@ -37,9 +37,12 @@ import Update.Cargo.Lock
     parseRegistryPackages,
   )
 import Update.Cargo.Msrv
-  ( maxMaybeRustVersions,
+  ( TagFloorResult (..),
+    fetchCargoTomlFromDir,
+    maxMaybeRustVersions,
     parseDirectRustVersion,
     parseRustMinVerFromEbuild,
+    probePolicyTagFloor,
   )
 import Update.DiskSpace
   ( MaterializeClass (FullCargo),
@@ -64,7 +67,9 @@ data CargoResult = CargoResult
     -- | Combined MSRV written as RUST_MIN_VER.
     crMsrv :: Text,
     -- | Ebuild body after pycargoebuild inplace update (before manager SRC_URI patches).
-    crEbuildBody :: Text
+    crEbuildBody :: Text,
+    -- | @max(Hclone, Hregistry)@ after pack; 'Nothing' if both absent.
+    crHarvestFloor :: Maybe Text
   }
 
 data CargoOps = CargoOps
@@ -222,7 +227,7 @@ buildCargoCratesTarball
                                 )
                           else do
                             ebuildBody <- TIO.readFile ebuildPath
-                            cloneH <- maxRustVersionInTree lockRoot
+                            cloneH <- harvestCloneFloor cloneDir mPkgSub mLockSub
                             regH <-
                               harvestRegistryPackageRoots
                                 (stageDir </> "cargo_home" </> "gentoo")
@@ -235,26 +240,43 @@ buildCargoCratesTarball
                                 (Left err, _) -> Left err
                                 (_, Left err) -> Left err
                                 (Right mClone, Right mReg) ->
-                                  case maxMaybeRustVersions [tagFloor, mClone, mReg, mDonor] of
-                                    Nothing ->
-                                      Left
-                                        "could not determine RUST_MIN_VER (no direct tag \
-                                        \rust-version, clone/registry harvest, or same-PV \
-                                        \donor RUST_MIN_VER)"
-                                    Just msrv ->
-                                      Right
-                                        CargoResult
-                                          { crTarballPath = outPath,
-                                            crMsrv = msrv,
-                                            crEbuildBody = ebuildBody
-                                          }
+                                  let harvest = maxMaybeRustVersions [mClone, mReg]
+                                   in case maxMaybeRustVersions [tagFloor, mClone, mReg, mDonor] of
+                                        Nothing ->
+                                          Left
+                                            "could not determine RUST_MIN_VER (no direct tag \
+                                            \rust-version, clone/registry harvest, or same-PV \
+                                            \donor RUST_MIN_VER)"
+                                        Just msrv ->
+                                          Right
+                                            CargoResult
+                                              { crTarballPath = outPath,
+                                                crMsrv = msrv,
+                                                crEbuildBody = ebuildBody,
+                                                crHarvestFloor = harvest
+                                              }
 
--- | Max direct rust-version under a lock/workspace tree. Malformed manifests
--- hard-fail rather than being skipped.
-maxRustVersionInTree :: FilePath -> IO (Either Text (Maybe Text))
-maxRustVersionInTree root = do
-  tomls <- findCargoTomls root
-  maxDirectRustFromFiles tomls
+-- | Active-set clone harvest: same policy-package path closure as tag floor.
+harvestCloneFloor ::
+  FilePath ->
+  Maybe FilePath ->
+  Maybe FilePath ->
+  IO (Either Text (Maybe Text))
+harvestCloneFloor cloneDir mPkg mLock = do
+  result <-
+    probePolicyTagFloor
+      mPkg
+      mLock
+      (Just cloneDir)
+      (fetchCargoTomlFromDir cloneDir)
+  pure $ case result of
+    TagFloorComplete mFloor _ -> Right mFloor
+    TagFloorIncomplete reasons _ ->
+      Left
+        ( "incomplete clone Cargo.toml path closure: "
+            <> T.intercalate "; " reasons
+        )
+    TagFloorFailed err -> Left err
 
 -- | Direct rust-version from immediate extracted registry package roots only
 -- (@cargo_home/gentoo/{name}-{version}/Cargo.toml@). Nested examples are ignored.
@@ -289,39 +311,6 @@ maxDirectRustFromFiles paths = do
     readOne path = do
       body <- TIO.readFile path
       pure (parseDirectRustVersion body)
-
-findCargoTomls :: FilePath -> IO [FilePath]
-findCargoTomls root = do
-  exists <- doesDirectoryExist root
-  if not exists
-    then pure []
-    else go root
-  where
-    go dir = do
-      names <- listDirectory dir
-      let here =
-            [ dir </> n
-            | n <- names,
-              n == "Cargo.toml"
-            ]
-          skip =
-            [ "target",
-              ".git",
-              "node_modules",
-              "cargo_home"
-            ]
-      subs <-
-        concat
-          <$> mapM
-            ( \n -> do
-                let p = dir </> n
-                isDir <- doesDirectoryExist p
-                if isDir && n `notElem` skip
-                  then go p
-                  else pure []
-            )
-            names
-      pure (here <> subs)
 
 ------------------------------------------------------------------------
 -- pycargoebuild (fetch / license / ebuild; no archive write)

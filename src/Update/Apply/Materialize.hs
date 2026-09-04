@@ -101,6 +101,7 @@ import Update.Cargo.Crates
   )
 import Update.Cargo.Msrv
   ( parseRustMinVerFromEbuild,
+    rustMinVerTooLow,
   )
 import Update.Check
   ( ContentAssessment (..),
@@ -136,6 +137,7 @@ import Update.EbuildEdit
 import Update.Git (GitOps (..), relativeOverlayPath)
 import Update.Go.Lanes
   ( GapLine (..),
+    LaneTarget (..),
     PlannedEbuild (..),
     RuntimeLanePlan (..),
     buildGapLines,
@@ -1245,9 +1247,12 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
               CargoResult
                 { crTarballPath = p,
                   crMsrv = msrv,
-                  crEbuildBody = body
+                  crEbuildBody = body,
+                  crHarvestFloor = harvest
                 } ->
-                Right (p, Just msrv, Just body)
+                case harvestVsLaneCeiling plan plannedPv' tagFloor harvest of
+                  Left err -> Left err
+                  Right () -> Right (p, Just msrv, Just body)
     (Sbcl, GitHub owner repo prefix) -> do
       floorResult <-
         dpoFetchSbclVersion (aeDepsPlanOps env) owner repo prefix pvNoRev
@@ -1285,6 +1290,42 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
     (Bun, _) -> pure (Left "DepsAndAssets Bun requires a GitHub update source")
     (Cargo {}, _) -> pure (Left "DepsAndAssets Cargo requires a GitHub update source")
     (Sbcl, _) -> pure (Left "DepsAndAssets Sbcl requires a GitHub update source")
+
+-- | After pack, fail closed if harvest exceeds any selecting rust ceiling.
+harvestVsLaneCeiling ::
+  RuntimeLanePlan ->
+  EbuildVersion ->
+  Maybe Text ->
+  Maybe Text ->
+  Either Text ()
+harvestVsLaneCeiling plan pv tagFloor harvest =
+  case harvest of
+    Nothing -> Right ()
+    Just h ->
+      case bindingCeilings of
+        [] -> Right ()
+        (c : _) ->
+          Left
+            ( "Cargo harvest rust-version "
+                <> h
+                <> " exceeds rust ceiling "
+                <> renderPVNoRev c
+                <> " for "
+                <> renderPVNoRev pv
+                <> " (tag floor "
+                <> fromMaybe "absent" tagFloor
+                <> ")"
+            )
+  where
+    bindingCeilings =
+      [ c
+      | lt <- glpLanes plan,
+        Just lpv <- [ltPackagePV lt],
+        samePV lpv pv,
+        Just c <- [ltCeiling lt],
+        rustMinVerTooLow (renderPVNoRev c) hNeed
+      ]
+    hNeed = fromMaybe "0.0.0" harvest
 
 -- | Companion distfiles (e.g. models JSON) required beyond the primary tarball.
 materializeCompanionAssets ::

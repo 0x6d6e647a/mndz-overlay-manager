@@ -70,6 +70,7 @@ import Data.ByteString.Lazy qualified as LBS
 import Data.List (sort)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
@@ -106,7 +107,10 @@ import System.Posix.IO
 import System.Posix.Types (Fd)
 import Update.Cargo.Msrv (cargoFloorPolicyKey)
 import Update.Go.Lanes
-  ( LaneId (..),
+  ( CargoFloorCoverage (..),
+    CargoPathProvenance (..),
+    CargoTagFloorSnapshot (..),
+    LaneId (..),
     LaneTarget (..),
     PlannedEbuild (..),
     RuntimeLanePlan (..),
@@ -420,11 +424,27 @@ cargoPlanFields plan =
         "cargo_floor_policy" .= pol
       ]
 
-tagFloorToJSON :: (EbuildVersion, Maybe Text) -> Value
-tagFloorToJSON (pv, mFloor) =
+tagFloorToJSON :: CargoTagFloorSnapshot -> Value
+tagFloorToJSON snap =
+  object $
+    [ "pv" .= renderPV (ctfsPV snap),
+      "floor" .= ctfsFloor snap,
+      "reasons" .= ctfsReasons snap,
+      "provenance" .= map provenanceToJSON (ctfsProvenance snap)
+    ]
+      <> coveragePairs (ctfsCoverage snap)
+
+coveragePairs :: Maybe CargoFloorCoverage -> [Pair]
+coveragePairs = \case
+  Nothing -> []
+  Just CargoCoverageComplete -> ["coverage" .= ("complete" :: Text)]
+  Just CargoCoverageIncomplete -> ["coverage" .= ("incomplete" :: Text)]
+
+provenanceToJSON :: CargoPathProvenance -> Value
+provenanceToJSON p =
   object
-    [ "pv" .= renderPV pv,
-      "floor" .= mFloor
+    [ "path" .= cppPath p,
+      "floor" .= cppFloor p
     ]
 
 planFromJSON :: Value -> Parser RuntimeLanePlan
@@ -448,11 +468,39 @@ planFromJSON = withObject "RuntimeLanePlan" $ \o -> do
         glpFloorPolicy = mPolicy
       }
 
-tagFloorFromJSON :: Value -> Parser (EbuildVersion, Maybe Text)
+tagFloorFromJSON :: Value -> Parser CargoTagFloorSnapshot
 tagFloorFromJSON = withObject "direct_tag_floor" $ \o -> do
   pvTxt <- o .: "pv"
   mFloor <- o .:? "floor"
-  pure (parseEbuildVersion pvTxt, mFloor)
+  mCovTxt <- o .:? "coverage"
+  reasons <- o .:? "reasons" .!= []
+  mProv <- o .:? "provenance"
+  prov <- case mProv of
+    Nothing -> pure []
+    Just vs -> mapM provenanceFromJSON vs
+  cov <- case mCovTxt of
+    Nothing -> pure Nothing
+    Just ("complete" :: Text) -> pure (Just CargoCoverageComplete)
+    Just "incomplete" -> pure (Just CargoCoverageIncomplete)
+    Just other -> fail ("unknown coverage: " <> T.unpack other)
+  pure
+    CargoTagFloorSnapshot
+      { ctfsPV = parseEbuildVersion pvTxt,
+        ctfsFloor = mFloor,
+        ctfsCoverage = cov,
+        ctfsReasons = reasons,
+        ctfsProvenance = prov
+      }
+
+provenanceFromJSON :: Value -> Parser CargoPathProvenance
+provenanceFromJSON = withObject "cargo_path_provenance" $ \o -> do
+  path <- o .: "path"
+  mFloor <- o .:? "floor"
+  pure
+    CargoPathProvenance
+      { cppPath = path,
+        cppFloor = mFloor
+      }
 
 laneTargetToJSON :: LaneTarget -> Value
 laneTargetToJSON lt =
@@ -691,11 +739,12 @@ cachedCargoPlanUsable eco src plan =
     (Cargo mLock mPkg, GitHub _ _ prefix) ->
       glpFloorPolicy plan == Just (cargoFloorPolicyKey prefix mPkg mLock)
         && snapshotsCover (glpUniquePVs plan) (glpDirectTagFloors plan)
+        && all (isJust . ctfsCoverage) (glpDirectTagFloors plan)
     (Cargo {}, _) -> False
     _ -> True
   where
     snapshotsCover uniquePVs floors =
-      all (\pv -> any (\(p, _) -> samePV p pv) floors) uniquePVs
+      all (\pv -> any (\s -> samePV (ctfsPV s) pv) floors) uniquePVs
 
 lookupDeps ::
   CheckCacheHandle ->

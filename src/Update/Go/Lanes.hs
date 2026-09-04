@@ -25,6 +25,9 @@ module Update.Go.Lanes
     planFromTargets,
     planFromTargetsWithAtom,
     withCargoTagFloors,
+    CargoFloorCoverage (..),
+    CargoPathProvenance (..),
+    CargoTagFloorSnapshot (..),
     planNeedsWork,
     extrasToDelete,
     missingTargets,
@@ -158,9 +161,8 @@ data RuntimeLanePlan = RuntimeLanePlan
     glpUniquePVs :: [EbuildVersion],
     -- | Runtime package atom for labels (e.g. @dev-lang/go@).
     glpRuntimeAtom :: Text,
-    -- | Selected-PV direct tag floors (Cargo). @Nothing@ values are explicit
-    -- absence. Empty for non-Cargo plans.
-    glpDirectTagFloors :: [(EbuildVersion, Maybe Text)],
+    -- | Selected-PV tag-floor snapshots (Cargo). Empty for non-Cargo plans.
+    glpDirectTagFloors :: [CargoTagFloorSnapshot],
     -- | Cargo floor-policy key; 'Nothing' for non-Cargo plans and old cache
     -- entries that lack snapshots.
     glpFloorPolicy :: Maybe Text
@@ -278,9 +280,33 @@ planFromTargetsWithAtom atom targets =
           glpFloorPolicy = Nothing
         }
 
+-- | Coverage recorded with a selected Cargo tag-floor snapshot.
+data CargoFloorCoverage
+  = CargoCoverageComplete
+  | CargoCoverageIncomplete
+  deriving (Eq, Show)
+
+-- | One resolved path in a Cargo tag-floor walk.
+data CargoPathProvenance = CargoPathProvenance
+  { cppPath :: FilePath,
+    cppFloor :: Maybe Text
+  }
+  deriving (Eq, Show)
+
+-- | Selected-PV Cargo tag-floor snapshot persisted in the deps plan.
+data CargoTagFloorSnapshot = CargoTagFloorSnapshot
+  { ctfsPV :: EbuildVersion,
+    ctfsFloor :: Maybe Text,
+    -- | 'Nothing' means a v1 payload that omitted coverage.
+    ctfsCoverage :: Maybe CargoFloorCoverage,
+    ctfsReasons :: [Text],
+    ctfsProvenance :: [CargoPathProvenance]
+  }
+  deriving (Eq, Show)
+
 -- | Attach selected Cargo tag-floor snapshots and the policy key that produced them.
 withCargoTagFloors ::
-  [(EbuildVersion, Maybe Text)] ->
+  [CargoTagFloorSnapshot] ->
   Text ->
   RuntimeLanePlan ->
   RuntimeLanePlan

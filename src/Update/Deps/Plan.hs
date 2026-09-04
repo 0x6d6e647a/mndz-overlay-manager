@@ -10,11 +10,12 @@ module Update.Deps.Plan
 where
 
 import CLI.Jobs (WorkBudget, newWorkBudget, withWorkSlot)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (SomeException, catch)
 import Data.ByteString.Lazy qualified as BL
 import Data.List (sortBy)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -35,12 +36,16 @@ import System.FilePath ((</>))
 import Update.Bun.Cache (parseEnginesBunFromPackageJson)
 import Update.Cargo.Msrv
   ( CargoTomlFetch (..),
+    TagFloorResult (..),
     cargoFloorPolicyKey,
-    probeDirectTagFloor,
+    probePolicyTagFloor,
   )
 import Update.GitHub (listGitHubVersionsWith)
 import Update.Go.Lanes
-  ( LaneTarget (..),
+  ( CargoFloorCoverage (..),
+    CargoPathProvenance (..),
+    CargoTagFloorSnapshot (..),
+    LaneTarget (..),
     PlanError (..),
     RuntimeLanePlan (..),
     VersionCandidate (..),
@@ -320,6 +325,7 @@ planCargo ops progress src mLockSub mPkgSub locals =
   case src of
     GitHub owner repo prefix -> do
       snapsVar <- newMVar []
+      memoVar <- newMVar Map.empty
       result <-
         planWith
           ops
@@ -332,33 +338,61 @@ planCargo ops progress src mLockSub mPkgSub locals =
           )
           ( \pv -> do
               let pvText = renderPVNoRev pv
+                  fetchMemo = memoFetchCargo memoVar ops owner repo prefix pvText
               probed <-
-                probeDirectTagFloor mPkgSub mLockSub $ \mSub ->
-                  dpoFetchCargoToml ops owner repo prefix pvText mSub
+                probePolicyTagFloor mPkgSub mLockSub Nothing fetchMemo
               case probed of
-                Left err -> pure (Left (PlanProbeFailed err))
-                Right mFloor -> do
-                  modifyMVar_ snapsVar $ \xs ->
-                    pure ((stripRev pv, mFloor) : xs)
+                TagFloorFailed err -> pure (Left (PlanProbeFailed err))
+                TagFloorIncomplete _ _ ->
+                  -- Incomplete is not a parseable requirement; skip, do not persist.
+                  pure (Right Nothing)
+                TagFloorComplete mFloor prov -> do
+                  let snap =
+                        CargoTagFloorSnapshot
+                          { ctfsPV = stripRev pv,
+                            ctfsFloor = mFloor,
+                            ctfsCoverage = Just CargoCoverageComplete,
+                            ctfsReasons = [],
+                            ctfsProvenance =
+                              [ CargoPathProvenance p f
+                              | (p, f) <- prov
+                              ]
+                          }
+                  modifyMVar_ snapsVar $ \xs -> pure (snap : xs)
                   pure (Right (Just (fromMaybe "0.0.0" mFloor)))
           )
       case result of
         Left err -> pure (Left err)
         Right plan -> do
           snaps <- readMVar snapsVar
-          let selected =
-                [ (pv, f)
-                | pv <- glpUniquePVs plan,
-                  Just f <- [lookupSnap pv snaps]
-                ]
+          let selected = mapMaybe (`lookupSnap` snaps) (glpUniquePVs plan)
               policy = cargoFloorPolicyKey prefix mPkgSub mLockSub
           pure (Right (withCargoTagFloors selected policy plan))
     _ -> pure (Left (PlanFailed "DepsAndAssets Cargo requires a GitHub update source"))
 
-lookupSnap :: EbuildVersion -> [(EbuildVersion, Maybe Text)] -> Maybe (Maybe Text)
+memoFetchCargo ::
+  MVar (Map.Map (Text, Maybe FilePath) CargoTomlFetch) ->
+  DepsPlanOps ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  IO CargoTomlFetch
+memoFetchCargo memoVar ops owner repo prefix pvText mSub = do
+  let tag = versionTag prefix pvText
+      key = (tag, mSub)
+  modifyMVar memoVar $ \m ->
+    case Map.lookup key m of
+      Just v -> pure (m, v)
+      Nothing -> do
+        v <- dpoFetchCargoToml ops owner repo prefix pvText mSub
+        pure (Map.insert key v m, v)
+
+lookupSnap :: EbuildVersion -> [CargoTagFloorSnapshot] -> Maybe CargoTagFloorSnapshot
 lookupSnap pv snaps =
-  case [f | (p, f) <- snaps, samePV p pv || p == pv] of
-    (f : _) -> Just f
+  case [s | s <- snaps, samePV (ctfsPV s) pv || ctfsPV s == pv] of
+    (s : _) -> Just s
     [] -> Nothing
 
 ------------------------------------------------------------------------

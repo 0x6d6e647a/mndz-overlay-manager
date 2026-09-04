@@ -56,8 +56,8 @@ import Update.Cargo.Crates
     buildCargoCratesTarball,
     cargoChecksumJson,
     crateTarballPrefix,
+    harvestCloneFloor,
     harvestRegistryPackageRoots,
-    maxRustVersionInTree,
     mkCargoOps,
     packCratesTarball,
     packCratesTarballWith,
@@ -150,7 +150,7 @@ unitTests =
       testGroup
         "cargo pure"
         [ testCase "crateTarballPrefix" testCrateTarballPrefix,
-          testCase "maxRustVersionInTree" testMaxRustVersionInTree,
+          testCase "harvestCloneFloor skips unrelated members" testHarvestCloneFloor,
           testCase "harvestRegistryPackageRoots skips nested examples" testHarvestRegistryRoots,
           testCase "parseRegistryPackages fixtures" testParseRegistryPackages,
           testCase "cargoChecksumJson shape" testCargoChecksumJson
@@ -188,6 +188,8 @@ unitTests =
       testGroup
         "cargo builder"
         [ testCase "buildCargoCratesTarball success + progress" testCargoBuilderSuccess,
+          testCase "clone harvest ignores benches and xtask" testCargoCloneHarvestIgnoresBenches,
+          testCase "registry harvest raises build floor" testCargoRegistryHarvestRaisesFloor,
           testCase "buildCargoCratesTarball clone failure" testCargoBuilderCloneFail,
           testCase "buildCargoCratesTarball missing Cargo.lock" testCargoBuilderMissingLock,
           testCase "buildCargoCratesTarball pycargo failure" testCargoBuilderPycargoFail,
@@ -444,25 +446,38 @@ testSbclBuilderCloneFail =
           "x-deps.tar.xz"
     assertTrue "clone err" ("clone boom" `T.isInfixOf` err)
 
-testMaxRustVersionInTree :: IO ()
-testMaxRustVersionInTree =
-  withSystemTempDirectory "mndz-cargo-tree-" $ \root -> do
-    createDirectoryIfMissing True (root </> "sub")
+testHarvestCloneFloor :: IO ()
+testHarvestCloneFloor =
+  withSystemTempDirectory "mndz-cargo-clone-h-" $ \root -> do
+    createDirectoryIfMissing True (root </> "cli")
+    createDirectoryIfMissing True (root </> "lib")
+    createDirectoryIfMissing True (root </> "benches" </> "shadows")
+    createDirectoryIfMissing True (root </> "xtask")
     TIO.writeFile
       (root </> "Cargo.toml")
-      "[package]\nname = \"root\"\nrust-version = \"1.80\"\n"
+      "[workspace]\nmembers = [\"cli\", \"lib\", \"benches/shadows\", \"xtask\"]\n[workspace.package]\nrust-version = \"1.91\"\n"
     TIO.writeFile
-      (root </> "sub" </> "Cargo.toml")
-      "[package]\nname = \"sub\"\nrust-version = \"1.88.0\"\n"
-    -- skip noise dirs
-    createDirectoryIfMissing True (root </> "target")
+      (root </> "cli" </> "Cargo.toml")
+      "[package]\nname = \"usage\"\nrust-version.workspace = true\n[dependencies]\nlib = { path = \"../lib\" }\n"
     TIO.writeFile
-      (root </> "target" </> "Cargo.toml")
-      "[package]\nrust-version = \"9.9.9\"\n"
-    m <- assertRight "tree harvest" =<< maxRustVersionInTree root
-    assertEq "max across tree (skips target)" (Just "1.88.0") m
-    emptyM <- assertRight "missing root" =<< maxRustVersionInTree (root </> "missing")
-    assertEq "missing root" Nothing emptyM
+      (root </> "lib" </> "Cargo.toml")
+      "[package]\nname = \"lib\"\nrust-version = \"1.91\"\n"
+    TIO.writeFile
+      (root </> "benches" </> "shadows" </> "Cargo.toml")
+      "[package]\nname = \"shadows\"\nrust-version = \"1.99\"\n"
+    TIO.writeFile
+      (root </> "xtask" </> "Cargo.toml")
+      "[package]\nname = \"xtask\"\nrust-version = \"1.99\"\n"
+    m <-
+      assertRight "clone harvest"
+        =<< harvestCloneFloor root (Just "cli") Nothing
+    assertEq "path closure 1.91 not benches/xtask" (Just "1.91.0") m
+    miss <-
+      assertLeft "missing clone"
+        =<< harvestCloneFloor (root </> "missing") Nothing Nothing
+    assertTrue
+      "missing clone is incomplete"
+      ("not found" `T.isInfixOf` miss || "incomplete" `T.isInfixOf` miss)
 
 testHarvestRegistryRoots :: IO ()
 testHarvestRegistryRoots =
@@ -1034,6 +1049,98 @@ testCargoBuilderSuccess =
           outDir
           outDir
           "pkg-0.1.0-crates-noop.tar.xz"
+
+testCargoCloneHarvestIgnoresBenches :: IO ()
+testCargoCloneHarvestIgnoresBenches =
+  withSystemTempDirectory "mndz-cargo-hclone-" $ \outDir -> do
+    let ops =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> do
+                createDirectoryIfMissing True (dest </> "cli")
+                createDirectoryIfMissing True (dest </> "lib")
+                createDirectoryIfMissing True (dest </> "benches" </> "shadows")
+                createDirectoryIfMissing True (dest </> "xtask")
+                TIO.writeFile (dest </> "Cargo.lock") "# lock\n"
+                TIO.writeFile
+                  (dest </> "Cargo.toml")
+                  "[workspace]\nmembers = [\"cli\", \"lib\", \"benches/shadows\", \"xtask\"]\n"
+                TIO.writeFile
+                  (dest </> "cli" </> "Cargo.toml")
+                  "[package]\nname = \"usage\"\nrust-version = \"1.91\"\n[dependencies]\nlib = { path = \"../lib\" }\n"
+                TIO.writeFile
+                  (dest </> "lib" </> "Cargo.toml")
+                  "[package]\nname = \"lib\"\nrust-version = \"1.91\"\n"
+                TIO.writeFile
+                  (dest </> "benches" </> "shadows" </> "Cargo.toml")
+                  "[package]\nname = \"shadows\"\nrust-version = \"1.99\"\n"
+                TIO.writeFile
+                  (dest </> "xtask" </> "Cargo.toml")
+                  "[package]\nname = \"xtask\"\nrust-version = \"1.99\"\n"
+                pure (Right ())
+            }
+    res <-
+      assertRight "clone harvest"
+        =<< buildCargoCratesTarball
+          ops
+          noopCargoProgress
+          "jdx"
+          "usage"
+          "v"
+          "6.4.1"
+          Nothing
+          (Just "cli")
+          donorEbuild
+          (Just "1.91.0")
+          False
+          "usage"
+          outDir
+          outDir
+          "usage-6.4.1-crates.tar.xz"
+    assertEq "clone harvest 1.91" "1.91.0" (crMsrv res)
+    assertEq "harvest field" (Just "1.91.0") (crHarvestFloor res)
+
+testCargoRegistryHarvestRaisesFloor :: IO ()
+testCargoRegistryHarvestRaisesFloor =
+  withSystemTempDirectory "mndz-cargo-hreg-" $ \outDir -> do
+    let ops =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> do
+                createDirectoryIfMissing True dest
+                TIO.writeFile (dest </> "Cargo.lock") "# lock\n"
+                TIO.writeFile
+                  (dest </> "Cargo.toml")
+                  "[package]\nname = \"pkg\"\nrust-version = \"1.91\"\n"
+                pure (Right ()),
+              coPackCrates = \_onStage onArchive _lock _dist stage outPath -> do
+                let gentoo = stage </> "cargo_home" </> "gentoo" </> "kdl-6.7.1"
+                createDirectoryIfMissing True gentoo
+                TIO.writeFile
+                  (gentoo </> "Cargo.toml")
+                  "[package]\nname = \"kdl\"\nrust-version = \"1.95\"\n"
+                onArchive
+                writeFile outPath "crates-tarball"
+                pure (Right ())
+            }
+    res <-
+      assertRight "registry harvest"
+        =<< buildCargoCratesTarball
+          ops
+          noopCargoProgress
+          "o"
+          "r"
+          "v"
+          "0.1.0"
+          Nothing
+          Nothing
+          donorEbuild
+          (Just "1.91.0")
+          False
+          "pkg"
+          outDir
+          outDir
+          "pkg-0.1.0-crates.tar.xz"
+    assertEq "registry 1.95 raises write floor" "1.95.0" (crMsrv res)
+    assertEq "harvest is 1.95" (Just "1.95.0") (crHarvestFloor res)
 
 testCargoBuilderCloneFail :: IO ()
 testCargoBuilderCloneFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do

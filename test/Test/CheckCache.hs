@@ -21,6 +21,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
+import Update.Cargo.Msrv (cargoFloorPolicyKey)
 import Update.CheckCache
   ( CacheFingerprint (..),
     CacheStats (..),
@@ -40,7 +41,12 @@ import Update.CheckCache
     storeLatest,
     updateSourceId,
   )
-import Update.Go.Lanes (RuntimeLanePlan (..))
+import Update.Go.Lanes
+  ( CargoFloorCoverage (..),
+    CargoPathProvenance (..),
+    CargoTagFloorSnapshot (..),
+    RuntimeLanePlan (..),
+  )
 import Update.Types
   ( EcosystemSpec (..),
     PackageKey (..),
@@ -66,7 +72,10 @@ tests =
       testCase "GitMv latest ignores overlay provider field" testLatestNoProviderField,
       testCase "Missing overlay-provider field is a miss" testMissingOverlayProviderMiss,
       testCase "Old Cargo plan without snapshots is unusable" testOldCargoPlanUnusable,
-      testCase "Non-Cargo plan remains usable without snapshots" testNonCargoPlanUsableWithoutSnapshots
+      testCase "Non-Cargo plan remains usable without snapshots" testNonCargoPlanUsableWithoutSnapshots,
+      testCase "Cargo v2 snapshot round-trip and usability" testCargoV2SnapshotRoundTrip,
+      testCase "Cargo v1 policy version misses" testCargoV1PolicyMisses,
+      testCase "Cargo prefix/subdir/policy-version invalidation" testCargoPolicyKeyInvalidation
     ]
 
 testXdgDir :: IO ()
@@ -363,3 +372,101 @@ testNonCargoPlanUsableWithoutSnapshots =
         (GitHub "o" "r" "v")
         emptyDepsPlan
     )
+
+cargoV2Snapshot :: CargoTagFloorSnapshot
+cargoV2Snapshot =
+  CargoTagFloorSnapshot
+    { ctfsPV = parseEbuildVersion "0.50.0",
+      ctfsFloor = Just "1.91.0",
+      ctfsCoverage = Just CargoCoverageComplete,
+      ctfsReasons = [],
+      ctfsProvenance =
+        [ CargoPathProvenance
+            { cppPath = "cli/Cargo.toml",
+              cppFloor = Just "1.91.0"
+            }
+        ]
+    }
+
+cargoV2Plan :: RuntimeLanePlan
+cargoV2Plan =
+  emptyDepsPlan
+    { glpUniquePVs = [parseEbuildVersion "0.50.0"],
+      glpRuntimeAtom = "dev-lang/rust|rust-bin",
+      glpDirectTagFloors = [cargoV2Snapshot],
+      glpFloorPolicy = Just (cargoFloorPolicyKey "v" (Just "cli") Nothing)
+    }
+
+testCargoV2SnapshotRoundTrip :: IO ()
+testCargoV2SnapshotRoundTrip =
+  withSystemTempDirectory "om-cc-cargo-v2" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        cacheDir = tmp </> "check-cache"
+        src = GitHub "jdx" "usage" "v"
+        key = PackageKey "dev-util/usage"
+        eco = Cargo Nothing (Just "cli")
+    pkgDir <- do
+      let d = overlay </> "dev-util" </> "usage"
+      createDirectoryIfMissing True d
+      TIO.writeFile (d </> "usage-0.50.0.ebuild") "EAPI=8\n"
+      pure d
+    now <- getCurrentTime
+    (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
+    fp <- computeFingerprintFromDir src pkgDir "usage"
+    storeDeps h key fp Nothing cargoV2Plan
+    flushCheckCache h
+    hit <- lookupDeps h key fp Nothing
+    assertEq "v2 round-trip" (Just cargoV2Plan) hit
+    assertEq
+      "v2 usable"
+      True
+      (cachedCargoPlanUsable eco src cargoV2Plan)
+    let noCov =
+          cargoV2Plan
+            { glpDirectTagFloors =
+                [cargoV2Snapshot {ctfsCoverage = Nothing}]
+            }
+    assertEq
+      "missing coverage is a miss"
+      False
+      (cachedCargoPlanUsable eco src noCov)
+
+testCargoV1PolicyMisses :: IO ()
+testCargoV1PolicyMisses =
+  let v1 =
+        cargoV2Plan
+          { glpFloorPolicy = Just "1|prefix=v|pkg=cli|lock="
+          }
+   in assertEq
+        "v1 policy version misses"
+        False
+        ( cachedCargoPlanUsable
+            (Cargo Nothing (Just "cli"))
+            (GitHub "jdx" "usage" "v")
+            v1
+        )
+
+testCargoPolicyKeyInvalidation :: IO ()
+testCargoPolicyKeyInvalidation = do
+  let src = GitHub "jdx" "usage" "v"
+      plan = cargoV2Plan
+  assertEq
+    "matching key hits"
+    True
+    (cachedCargoPlanUsable (Cargo Nothing (Just "cli")) src plan)
+  assertEq
+    "prefix change misses"
+    False
+    ( cachedCargoPlanUsable
+        (Cargo Nothing (Just "cli"))
+        (GitHub "jdx" "usage" "")
+        plan
+    )
+  assertEq
+    "subdir change misses"
+    False
+    (cachedCargoPlanUsable (Cargo Nothing Nothing) src plan)
+  assertEq
+    "lock subdir change misses"
+    False
+    (cachedCargoPlanUsable (Cargo (Just "lock") (Just "cli")) src plan)

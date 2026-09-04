@@ -32,7 +32,9 @@ import Update.DiskSpace
     MaterializeClass (..),
   )
 import Update.Go.Lanes
-  ( LaneTarget (..),
+  ( CargoFloorCoverage (..),
+    CargoTagFloorSnapshot (..),
+    LaneTarget (..),
     RuntimeLanePlan (..),
     pattern LaneAmd64Plain,
   )
@@ -109,6 +111,8 @@ unitTests =
       testCase "missing ebuilds at floor is a resolve miss" testResolveMissingFloorMiss,
       testCase "floor 0 is unversioned; ~arch only without plain ebuild" testResolveFloorZero,
       testCase "full-path 1.24 + reuse 1.26 → Go floor 1.24" testFullPathFloorIgnoresReuseSibling,
+      testCase "Cargo declared tag floor feeds ensure" testCargoDeclaredTagFloorFeedsEnsure,
+      testCase "Cargo selection 0.0.0 is not an image floor" testCargoAbsenceNotImageFloor,
       testCase "render contains ::mndz and no official tarball URLs" testRenderMndzNoOfficial,
       testCase "uname map splits KEYWORDS from OpenRC Hub tag" testLookupRecipeArch,
       testCase "x86_64 recipe uses amd64-openrc FROM and ~amd64 keywords" testAmd64OpenrcRecipe,
@@ -359,6 +363,73 @@ testFullPathFloorIgnoresReuseSibling = do
   assertEq "no unused toolchains" Nothing (nfSbcl needed)
   assertEq "no qlot without SBCL" Nothing (nfQlot needed)
   assertEq "no node-gyp without bun or node" Nothing (nfNodeGyp needed)
+
+testCargoDeclaredTagFloorFeedsEnsure :: IO ()
+testCargoDeclaredTagFloorFeedsEnsure = do
+  let key = mkPackageKey "dev-util" "usage"
+      pv = parseEbuildVersion "6.4.1"
+      classify =
+        [ ClassifyOk
+            key
+            [ ClassifiedPvUnit
+                { cpuKey = key,
+                  cpuPN = "usage",
+                  cpuPV = pv,
+                  cpuEco = Cargo Nothing (Just "cli"),
+                  cpuClass = FullCargo,
+                  cpuTempBaseline = Nothing
+                }
+            ]
+        ]
+      plan =
+        [ PlanNeedsWork
+            key
+            PlannedDeps
+              { pdEco = Cargo Nothing (Just "cli"),
+                pdSource = GitHub "jdx" "usage" "v",
+                pdPlan = cargoPlan pv (Just "1.91.0") "1.91.0",
+                pdLocalPVs = [],
+                pdContentFix = [pv],
+                pdForceFull = [pv],
+                pdHypoProvider = Nothing
+              }
+        ]
+      needed = neededFloorsFromClassified classify plan Nothing Nothing (Just "13.0.0")
+  assertEq "declared tag floor" (Just "1.91.0") (nfRust needed)
+
+testCargoAbsenceNotImageFloor :: IO ()
+testCargoAbsenceNotImageFloor = do
+  let key = mkPackageKey "dev-util" "hk"
+      pv = parseEbuildVersion "0.50.0"
+      classify =
+        [ ClassifyOk
+            key
+            [ ClassifiedPvUnit
+                { cpuKey = key,
+                  cpuPN = "hk",
+                  cpuPV = pv,
+                  cpuEco = Cargo Nothing Nothing,
+                  cpuClass = FullCargo,
+                  cpuTempBaseline = Nothing
+                }
+            ]
+        ]
+      plan =
+        [ PlanNeedsWork
+            key
+            PlannedDeps
+              { pdEco = Cargo Nothing Nothing,
+                pdSource = GitHub "jdx" "hk" "v",
+                pdPlan = cargoPlan pv Nothing "0.0.0",
+                pdLocalPVs = [],
+                pdContentFix = [pv],
+                pdForceFull = [pv],
+                pdHypoProvider = Nothing
+              }
+        ]
+      needed = neededFloorsFromClassified classify plan Nothing Nothing (Just "13.0.0")
+  assertTrue "not 0.0.0" (nfRust needed /= Just "0.0.0")
+  assertEq "absence is unversioned rust" (Just "0") (nfRust needed)
 
 testRenderMndzNoOfficial :: IO ()
 testRenderMndzNoOfficial = do
@@ -641,6 +712,32 @@ bunPlan req =
       glpRuntimeAtom = "dev-lang/bun-bin",
       glpDirectTagFloors = [],
       glpFloorPolicy = Nothing
+    }
+
+cargoPlan :: EbuildVersion -> Maybe T.Text -> T.Text -> RuntimeLanePlan
+cargoPlan pv mFloor laneReq =
+  RuntimeLanePlan
+    { glpLanes =
+        [ LaneTarget
+            { ltLane = LaneAmd64Plain,
+              ltCeiling = Just (parseEbuildVersion "1.92.0"),
+              ltPackagePV = Just pv,
+              ltGoReq = Just laneReq
+            }
+        ],
+      glpEbuilds = [],
+      glpUniquePVs = [pv],
+      glpRuntimeAtom = "dev-lang/rust|rust-bin",
+      glpDirectTagFloors =
+        [ CargoTagFloorSnapshot
+            { ctfsPV = pv,
+              ctfsFloor = mFloor,
+              ctfsCoverage = Just CargoCoverageComplete,
+              ctfsReasons = [],
+              ctfsProvenance = []
+            }
+        ],
+      glpFloorPolicy = Just "2|prefix=v|pkg=|lock="
     }
 
 goPlan :: [(EbuildVersion, T.Text)] -> RuntimeLanePlan

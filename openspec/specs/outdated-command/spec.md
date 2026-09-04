@@ -58,7 +58,7 @@ For each package whose technique is `DepsAndAssets`, the `outdated` check SHALL 
 
 Split and converge mapping SHALL follow: when one local version maps to multiple new targets, emit one line per target with the same `FROM`; when multiple locals converge to one target, emit one line per local `FROM` to that `TO`. Versions SHALL use PV pretty form without a leading `v`.
 
-For Cargo, `RUST_MIN_VER` adequacy SHALL use the decision floor from `cargo-crates-assets`: the maximum of the planned direct tag-floor snapshot and the canonical highest-revision same-PV ebuild's valid `RUST_MIN_VER`. A valid written floor at or above that decision floor SHALL be adequate; a lower, missing, or malformed written floor SHALL need work. If neither decision-floor operand is usable, the PV SHALL be reported as needing work and marked for full-path materialization rather than treated as adequate.
+For Cargo, `RUST_MIN_VER` adequacy SHALL use the decision floor from `cargo-crates-assets`: the maximum of the planned tag-floor snapshot and the canonical highest-revision same-PV ebuild's valid `RUST_MIN_VER`. A valid written floor at or above that decision floor SHALL be adequate; a lower, missing, or malformed written floor SHALL need work. If neither decision-floor operand is usable, the PV SHALL be reported as needing work and marked for full-path materialization rather than treated as adequate. Incomplete Cargo tag-floor coverage SHALL NOT be reported as a `0.0.0` requirement; such a candidate SHALL NOT appear as a lane `TO` solely because discovery failed to complete.
 
 A gap line MAY include ` [assets reusable]` only when the PV is not forced full and a release lookup confirms that every required primary and companion asset is usable. If release completeness cannot be established because lookup dependencies are unavailable or lookup fails, `outdated` SHALL still report the needs-work line but SHALL conservatively omit the optional marker. A primary-only or otherwise partial release SHALL NOT receive that marker. The marker rule applies to missing-PV and same-PV content gaps alike.
 
@@ -84,7 +84,7 @@ A gap line MAY include ` [assets reusable]` only when the PV is not forced full 
 
 #### Scenario: Cargo ebuild matching the written floor is not flagged
 
-- **WHEN** `dev-util/usage` was written with `RUST_MIN_VER="1.95.0"`, its planned direct tag floor is `1.91.0`, and its canonical same-PV donor is the same written `1.95.0`
+- **WHEN** `dev-util/usage` was written with `RUST_MIN_VER="1.95.0"`, its planned tag floor is `1.91.0`, and its canonical same-PV donor is the same written `1.95.0`
 - **WHEN** `outdated` checks the same PV
 - **THEN** it does not print a `6.4.1 -> 6.4.1` content-only line
 
@@ -95,8 +95,13 @@ A gap line MAY include ` [assets reusable]` only when the PV is not forced full 
 
 #### Scenario: Missing direct Cargo floor is reported as full-path work
 
-- **WHEN** a present Cargo PV has neither a planned direct tag floor nor a valid floor in its canonical same-PV ebuild
+- **WHEN** a present Cargo PV has neither a planned tag floor nor a valid floor in its canonical same-PV ebuild
 - **THEN** `outdated` reports the lane gap and does not label it `[assets reusable]` even if release assets exist
+
+#### Scenario: Incomplete Cargo candidate is not a zero-floor gap
+
+- **WHEN** the newest upstream Cargo tag is incomplete and an older complete tag remains at or below the rust ceiling
+- **THEN** `outdated` does not treat the incomplete newest tag as requirement `0.0.0`
 
 #### Scenario: Missing companion distfile is flagged
 

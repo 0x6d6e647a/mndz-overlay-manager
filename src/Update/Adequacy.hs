@@ -36,7 +36,11 @@ import Update.EbuildEdit
     nodejsBdependAtom,
     sbclBdependAtom,
   )
-import Update.Go.Lanes (LaneTarget (..), RuntimeLanePlan (..))
+import Update.Go.Lanes
+  ( CargoTagFloorSnapshot (..),
+    LaneTarget (..),
+    RuntimeLanePlan (..),
+  )
 import Update.Manifest.Dist (manifestHasExactDist)
 import Update.Types (EcosystemSpec (..), PackageKey (..))
 
@@ -82,7 +86,7 @@ requiredAssetBasenames key eco pn pvNoRev =
 
 lookupDirectTagFloor :: RuntimeLanePlan -> EbuildVersion -> Maybe (Maybe Text)
 lookupDirectTagFloor plan pv =
-  case [f | (p, f) <- glpDirectTagFloors plan, samePV p pv] of
+  case [ctfsFloor s | s <- glpDirectTagFloors plan, samePV (ctfsPV s) pv] of
     (f : _) -> Just f
     [] -> Nothing
 

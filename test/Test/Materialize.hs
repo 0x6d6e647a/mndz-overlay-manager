@@ -6,7 +6,7 @@ module Test.Materialize (unitTests, integrationTests) where
 
 import CLI.Jobs (newWorkBudget)
 import CLI.Progress (MultiHandle (..))
-import Control.Concurrent.MVar (newMVar)
+import Control.Concurrent.MVar (modifyMVar_, newMVar)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (fromMaybe)
@@ -98,6 +98,7 @@ integrationTests =
       testCase "cargo full-path applyDepsAndAssets success" testCargoFullPathSuccess,
       testCase "cargo full-path staging crates then crates pack" testCargoFullPathStagingStatus,
       testCase "cargo reuse-path apply success" testCargoReusePathSuccess,
+      testCase "cargo harvest above ceiling hard-fails before write" testCargoHarvestAboveCeilingNoWrite,
       testCase "npm full-path materialize progress sequence" testNpmFullPathProgressSequence,
       testCase "go residual applyDepsAndAssets full path" testGoResidualApplyDepsAndAssets,
       testCase "plan fail hard-fails apply" testMaterializePlanFail,
@@ -1557,6 +1558,102 @@ testCargoSoftSkip =
         Nothing
     outcomes <- applyPackagePhase1 env overlayRoot entry
     expectSoftSkip "cargo skip" "already matches" outcomes
+
+testCargoHarvestAboveCeilingNoWrite :: IO ()
+testCargoHarvestAboveCeilingNoWrite =
+  withSystemTempDirectory "mndz-mat-cargo-hceil-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "hk"
+        pn = "hk" :: T.Text
+        local = parseEbuildVersion "0.40.0"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "hk",
+              pePN = pn,
+              peLocal = local,
+              pePath = pkgDir </> "hk-0.40.0.ebuild"
+            }
+    commitCalls <- newIORef (0 :: Int)
+    createDirectoryIfMissing True assetsRoot
+    seedCargoLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["0.50.0"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        ( \_o _r _p pv mSub ->
+            pure $
+              case (pv, mSub) of
+                ("0.50.0", Nothing) ->
+                  CargoTomlBody "[package]\nrust-version = \"1.91\"\n"
+                _ -> CargoTomlMissing
+        )
+        (Just overlayRoot)
+    modifyMVar_
+      (dpoRustCeilingsCache depsOps)
+      ( \_ ->
+          pure
+            ( Just
+                ( dualArchCeilings
+                    "dev-lang/rust|rust-bin"
+                    (Just "1.92.0")
+                    (Just "1.92.0")
+                )
+            )
+      )
+    let cargoOps =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> do
+                createDirectoryIfMissing True dest
+                TIO.writeFile (dest </> "Cargo.lock") "# lock\n"
+                TIO.writeFile
+                  (dest </> "Cargo.toml")
+                  "[package]\nname = \"hk\"\nrust-version = \"1.91\"\n"
+                pure (Right ()),
+              coPackCrates = \_onStage onArchive _lock _dist stage outPath -> do
+                let gentoo = stage </> "cargo_home" </> "gentoo" </> "kdl-6.7.1"
+                createDirectoryIfMissing True gentoo
+                TIO.writeFile
+                  (gentoo </> "Cargo.toml")
+                  "[package]\nname = \"kdl\"\nrust-version = \"1.95\"\n"
+                onArchive
+                BS.writeFile outPath cargoAssetBytes
+                pure (Right ())
+            }
+        gitOps =
+          cleanGitOps
+            { goAddAndCommit = \_ _ _ -> do
+                atomicModifyIORef' commitCalls (\n -> (n + 1, ()))
+                pure (Right ())
+            }
+    env <-
+      mkMatEnv
+        gitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir cratesKind cargoAssetBytes)
+        releaseMissing
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        cargoOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectHardFail "harvest vs ceiling" "harvest rust-version" outcomes
+    case outcomes of
+      [ApplyHardFail _ msg _ _] -> do
+        assertTrue "names harvest 1.95" ("1.95" `T.isInfixOf` msg)
+        assertTrue "names ceiling 1.92" ("1.92" `T.isInfixOf` msg)
+        assertTrue "names tag 1.91" ("1.91" `T.isInfixOf` msg)
+        assertTrue "names PV" ("0.50.0" `T.isInfixOf` msg)
+      _ -> pure ()
+    existsNew <- doesFileExist (pkgDir </> "hk-0.50.0.ebuild")
+    assertTrue "no overlay ebuild write" (not existsNew)
+    n <- readIORef commitCalls
+    assertEq "no git commit" 0 n
 
 ------------------------------------------------------------------------
 -- Go residual: exercise applyDepsAndAssets (not legacy materializePlan)

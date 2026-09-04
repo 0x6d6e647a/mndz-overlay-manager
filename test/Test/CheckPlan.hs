@@ -8,6 +8,7 @@ import CLI.Jobs (newWorkBudget)
 import CLI.Progress (noopMultiHandle)
 import Config.Types (CheckCacheTtl (..))
 import Control.Concurrent.MVar (modifyMVar_, newMVar)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -43,7 +44,9 @@ import Update.Deps.Plan
     toGoPlanOps,
   )
 import Update.Go.Lanes
-  ( PlanError (..),
+  ( CargoTagFloorSnapshot (..),
+    LaneTarget (..),
+    PlanError (..),
     RuntimeLanePlan (..),
     planErrorMessage,
   )
@@ -85,6 +88,10 @@ unitTests =
           testCase "Npm success" testPlanNpmSuccess,
           testCase "Bun success" testPlanBunSuccess,
           testCase "Cargo success" testPlanCargoSuccess,
+          testCase "Cargo namespaced features plan" testPlanCargoNamespacedFeatures,
+          testCase "Cargo incomplete newest skipped" testPlanCargoIncompleteSkipped,
+          testCase "Cargo complete absence uses 0.0.0" testPlanCargoCompleteAbsence,
+          testCase "Cargo parse failure fails package" testPlanCargoParseFails,
           testCase "Go wrong source" testPlanGoWrongSource,
           testCase "Npm wrong source" testPlanNpmWrongSource,
           testCase "Bun missing overlay" testPlanBunMissingOverlay,
@@ -116,6 +123,8 @@ integrationTests =
       testCase "contentFix Bun content-only reusable" testContentFixBunReusable,
       testCase "contentFix Cargo content-only reusable" testContentFixCargoReusable,
       testCase "Cargo written floor above tag is adequate" testCargoWrittenAboveTagAdequate,
+      testCase "Cargo usage path-closure adequacy" testUsagePathClosureAdequacy,
+      testCase "Cargo incomplete candidate is not a zero-floor gap" testIncompleteNotZeroFloorGap,
       testCase "checkPackageDeps Sbcl outdated floor" testCheckPackageDepsSbclOutdated,
       testCase "outdated ralph blocked on bun-bin" testOutdatedBlockedOn,
       testCase "outdated fail-closed when bun-bin latest missing" testOutdatedFailClosed,
@@ -509,6 +518,171 @@ testPlanCargoSuccess = do
         [parseEbuildVersion "0.40.0"]
   assertTrue "planned non-empty" (not (null (glpUniquePVs plan)))
   assertEq "rust atom" "dev-lang/rust|rust-bin" (glpRuntimeAtom plan)
+
+testPlanCargoNamespacedFeatures :: IO ()
+testPlanCargoNamespacedFeatures = do
+  ops <-
+    mkDepsPlanOps
+      (listFixed ["0.50.0"])
+      unusedGoMod
+      unusedNpm
+      unusedBun
+      ( \_o _r _p pv mSub ->
+          pure $
+            case (pv, mSub) of
+              ("0.50.0", Nothing) ->
+                CargoTomlBody $
+                  T.unlines
+                    [ "[package]",
+                      "name = \"mise\"",
+                      "rust-version = \"1.85\"",
+                      "[dependencies]",
+                      "vfox = { path = \"crates/vfox\", default-features = false }",
+                      "[features]",
+                      "default = [\"vfox/vendored-lua\"]"
+                    ]
+              ("0.50.0", Just "crates/vfox") ->
+                CargoTomlBody $
+                  T.unlines
+                    [ "[package]",
+                      "name = \"vfox\"",
+                      "rust-version = \"1.85\"",
+                      "[features]",
+                      "vendored-lua = [\"mlua/vendored\"]"
+                    ]
+              _ -> CargoTomlMissing
+      )
+      Nothing
+  plan <-
+    assertRight "cargo namespaced plan"
+      =<< planDepsPackageWithProgress
+        ops
+        noopPlanProgress
+        (Cargo Nothing Nothing)
+        (GitHub "jdx" "mise" "v")
+        [parseEbuildVersion "0.40.0"]
+  assertTrue
+    "mise-style features still plan"
+    (parseEbuildVersion "0.50.0" `elem` glpUniquePVs plan)
+
+testPlanCargoIncompleteSkipped :: IO ()
+testPlanCargoIncompleteSkipped = do
+  ops <-
+    mkDepsPlanOps
+      (listFixed ["0.50.0", "0.40.0"])
+      unusedGoMod
+      unusedNpm
+      unusedBun
+      ( \_o _r _p pv mSub ->
+          pure $
+            case (pv, mSub) of
+              ("0.50.0", Nothing) ->
+                CargoTomlBody
+                  "[package]\nname = \"p\"\nrust-version = \"1.80\"\n[dependencies]\ngone = { path = \"gone\" }\n"
+              ("0.40.0", Nothing) ->
+                CargoTomlBody "[package]\nname = \"p\"\nrust-version = \"1.85.0\"\n"
+              _ -> CargoTomlMissing
+      )
+      Nothing
+  plan <-
+    assertRight "cargo incomplete skip"
+      =<< planDepsPackageWithProgress
+        ops
+        noopPlanProgress
+        (Cargo Nothing Nothing)
+        (GitHub "jdx" "hk" "v")
+        [parseEbuildVersion "0.40.0"]
+  assertTrue
+    "older complete selected"
+    (parseEbuildVersion "0.40.0" `elem` glpUniquePVs plan)
+  assertTrue
+    "incomplete newest not selected"
+    (parseEbuildVersion "0.50.0" `notElem` glpUniquePVs plan)
+  assertTrue
+    "no 0.0.0 lane req"
+    (not (any (\lt -> ltGoReq lt == Just "0.0.0") (glpLanes plan)))
+
+testPlanCargoCompleteAbsence :: IO ()
+testPlanCargoCompleteAbsence = do
+  ops <-
+    mkDepsPlanOps
+      (listFixed ["0.50.0"])
+      unusedGoMod
+      unusedNpm
+      unusedBun
+      ( \_o _r _p pv mSub ->
+          pure $
+            case (pv, mSub) of
+              ("0.50.0", Nothing) ->
+                CargoTomlBody "[package]\nname = \"p\"\nversion = \"0.50.0\"\n"
+              _ -> CargoTomlMissing
+      )
+      Nothing
+  plan <-
+    assertRight "cargo complete absence"
+      =<< planDepsPackageWithProgress
+        ops
+        noopPlanProgress
+        (Cargo Nothing Nothing)
+        (GitHub "jdx" "hk" "v")
+        [parseEbuildVersion "0.40.0"]
+  assertTrue
+    "selects complete empty"
+    (parseEbuildVersion "0.50.0" `elem` glpUniquePVs plan)
+  assertTrue
+    "selection-only 0.0.0"
+    (any (\lt -> ltGoReq lt == Just "0.0.0") (glpLanes plan))
+  case glpDirectTagFloors plan of
+    (s : _) -> assertEq "stored absence" Nothing (ctfsFloor s)
+    [] -> assertFailure "expected snapshot for selected PV"
+
+testPlanCargoParseFails :: IO ()
+testPlanCargoParseFails = do
+  ops <-
+    mkDepsPlanOps
+      (listFixed ["0.50.0", "0.40.0"])
+      unusedGoMod
+      unusedNpm
+      unusedBun
+      ( \_o _r _p _pv mSub ->
+          pure $
+            case mSub of
+              Nothing -> CargoTomlBody "[[[ not toml"
+              _ -> CargoTomlMissing
+      )
+      Nothing
+  err <-
+    assertLeftPlan
+      =<< planDepsPackageWithProgress
+        ops
+        noopPlanProgress
+        (Cargo Nothing Nothing)
+        (GitHub "jdx" "hk" "v")
+        [parseEbuildVersion "0.40.0"]
+  case err of
+    PlanProbeFailed msg ->
+      assertTrue "malformed fails" ("malformed" `T.isInfixOf` msg)
+    other -> assertFailure $ "expected PlanProbeFailed, got " <> show other
+  opsHttp <-
+    mkDepsPlanOps
+      (listFixed ["0.50.0"])
+      unusedGoMod
+      unusedNpm
+      unusedBun
+      (\_o _r _p _pv _m -> pure (CargoTomlError "HTTP 500 from origin"))
+      Nothing
+  errHttp <-
+    assertLeftPlan
+      =<< planDepsPackageWithProgress
+        opsHttp
+        noopPlanProgress
+        (Cargo Nothing Nothing)
+        (GitHub "jdx" "hk" "v")
+        [parseEbuildVersion "0.40.0"]
+  case errHttp of
+    PlanProbeFailed msg ->
+      assertTrue "HTTP fails package" ("HTTP 500" `T.isInfixOf` msg)
+    other -> assertFailure $ "expected PlanProbeFailed, got " <> show other
 
 testPlanGoWrongSource :: IO ()
 testPlanGoWrongSource = do
@@ -1066,6 +1240,151 @@ testCargoWrittenAboveTagAdequate =
         src
         (Cargo Nothing (Just "cli"))
     assertOkStatus "usage 1.85 vs tag 1.80" (reportStatus report)
+
+-- | usage-style path closure: benches/xtask 1.99 must not raise T above 1.91.
+testUsagePathClosureAdequacy :: IO ()
+testUsagePathClosureAdequacy =
+  withSystemTempDirectory "mndz-cf-usage-closure-" $ \tmp -> do
+    let pkgDir = tmp </> "dev-util" </> "usage"
+        pn = "usage" :: T.Text
+        ver = "6.4.1" :: T.Text
+        ebuildPath = pkgDir </> "usage-6.4.1.ebuild"
+        body =
+          T.unlines
+            [ "EAPI=8",
+              "inherit cargo",
+              "RUST_MIN_VER=\"1.91.0\"",
+              "KEYWORDS=\"~amd64 ~arm64\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/usage-${PV}/usage-${PV}-crates.tar.xz\"",
+              "CRATES=\"\""
+            ]
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath body
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST usage-6.4.1-crates.tar.xz 1 SHA512 deadbeef\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["6.4.1"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        ( \_o _r _p _pv mSub ->
+            pure $
+              case mSub of
+                Just "cli" ->
+                  CargoTomlBody
+                    "[package]\nname = \"usage\"\nrust-version = \"1.91\"\n[dependencies]\nlib = { path = \"../lib\" }\n"
+                Just "lib" ->
+                  CargoTomlBody "[package]\nname = \"lib\"\nrust-version = \"1.91\"\n"
+                Just "benches/shadows" ->
+                  CargoTomlBody "[package]\nname = \"shadows\"\nrust-version = \"1.99\"\n"
+                Just "xtask" ->
+                  CargoTomlBody "[package]\nname = \"xtask\"\nrust-version = \"1.99\"\n"
+                _ -> CargoTomlMissing
+        )
+        Nothing
+    modifyMVar_
+      (dpoRustCeilingsCache ops)
+      ( \_ ->
+          pure
+            ( Just
+                ( dualArchCeilings
+                    "dev-lang/rust|rust-bin"
+                    (Just "1.99.0")
+                    (Just "1.99.0")
+                )
+            )
+      )
+    let e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "usage",
+              pePN = pn,
+              peLocal = parseEbuildVersion ver,
+              pePath = ebuildPath
+            }
+        locals = [Ebuild "dev-util" pn ver ebuildPath]
+        src = GitHub "jdx" "usage" "v"
+    cache <- disabledCache
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        unusedFetch
+        ops
+        cache
+        e
+        locals
+        src
+        (Cargo Nothing (Just "cli"))
+    assertOkStatus "usage path-closure 1.91" (reportStatus report)
+
+-- | Incomplete newest tag is not reported as a 0.0.0 TO.
+testIncompleteNotZeroFloorGap :: IO ()
+testIncompleteNotZeroFloorGap =
+  withSystemTempDirectory "mndz-cf-incomplete-" $ \tmp -> do
+    let pkgDir = tmp </> "dev-util" </> "hk"
+        pn = "hk" :: T.Text
+        ver = "0.40.0" :: T.Text
+        ebuildPath = pkgDir </> "hk-0.40.0.ebuild"
+        body =
+          T.unlines
+            [ "EAPI=8",
+              "inherit cargo",
+              "RUST_MIN_VER=\"1.85.0\"",
+              "KEYWORDS=\"~amd64 ~arm64\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/hk-${PV}/hk-${PV}-crates.tar.xz\"",
+              "CRATES=\"\""
+            ]
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath body
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST hk-0.40.0-crates.tar.xz 1 SHA512 deadbeef\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["0.50.0", "0.40.0"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        ( \_o _r _p pv mSub ->
+            pure $
+              case (pv, mSub) of
+                ("0.50.0", Nothing) ->
+                  CargoTomlBody
+                    "[package]\nname = \"hk\"\nrust-version = \"1.80\"\n[dependencies]\ngone = { path = \"gone\" }\n"
+                ("0.40.0", Nothing) ->
+                  CargoTomlBody "[package]\nname = \"hk\"\nrust-version = \"1.85.0\"\n"
+                _ -> CargoTomlMissing
+        )
+        Nothing
+    let e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "hk",
+              pePN = pn,
+              peLocal = parseEbuildVersion ver,
+              pePath = ebuildPath
+            }
+        locals = [Ebuild "dev-util" pn ver ebuildPath]
+        src = GitHub "jdx" "hk" "v"
+    cache <- disabledCache
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        unusedFetch
+        ops
+        cache
+        e
+        locals
+        src
+        (Cargo Nothing Nothing)
+    case reportStatus report of
+      Ok _ -> pure ()
+      Outdated lines_ ->
+        assertTrue
+          "incomplete newest is not a TO"
+          (not (any (\l -> olTo l == parseEbuildVersion "0.50.0") lines_))
+      other ->
+        assertFailure ("expected Ok or no 0.50.0 TO, got " <> show other)
 
 ------------------------------------------------------------------------
 -- Overlay wait-edge plan-delta / outdated blocked-on
