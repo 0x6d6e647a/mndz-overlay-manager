@@ -68,6 +68,10 @@ hardcodedPolicies =
         (Npm "@fission-ai/openspec")
         (DepsAndAssets NpmEco),
       policy
+        "dev-util/rulesync"
+        (Npm "rulesync")
+        (DepsAndAssets NpmEco),
+      policy
         "dev-util/ralph-tui"
         (GitHub "subsy" "ralph-tui" "v")
         (DepsAndAssets Bun),

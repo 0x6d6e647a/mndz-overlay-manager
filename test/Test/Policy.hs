@@ -434,6 +434,11 @@ testPolicyClassification = do
     other -> do
       hPutStrLn stderr $ "openspec technique: " <> show other
       exitFailure
+  case lookupPolicy (PackageKey "dev-util/rulesync") of
+    Just (PackagePolicy (Npm "rulesync") (DepsAndAssets NpmEco)) -> pure ()
+    other -> do
+      hPutStrLn stderr $ "rulesync technique: " <> show other
+      exitFailure
   case lookupPolicy (PackageKey "dev-util/ralph-tui") of
     Just (PackagePolicy _ (DepsAndAssets Bun)) -> pure ()
     other -> do
