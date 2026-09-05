@@ -87,6 +87,7 @@ import Update.Assets.Release
     ReleaseOps (..),
     lookupNamedAssets,
   )
+import Update.AtomClosure (keepPVsForProvider)
 import Update.Bun.Cache
   ( BunCacheProgress (..),
     buildBunDepsTarball,
@@ -706,31 +707,41 @@ pruneExtras ::
 pruneExtras env overlayRoot entry plan = do
   let pkgDir = takeDirectory (pePath entry)
       pn = pePN entry
+      key = peKey entry
   names <- listDirectory pkgDir
-  let extras =
-        [ pkgDir </> n
-        | n <- names,
-          Just (pkg, verStr) <- [parseEbuildFileName n],
-          T.pack pkg == pn,
-          let v = parseEbuildVersion (T.pack verStr),
-          not (isLivePackageVersion v),
-          not (any (samePV v) (glpUniquePVs plan))
-        ]
-  if null extras
-    then pure (Right [])
-    else do
-      mapM_ removeFile extras
-      rels <- mapM (relativeOverlayPath overlayRoot) extras
-      -- Manifest after deletions.
-      manResult <-
-        case [n | n <- names, ".ebuild" `T.isSuffixOf` T.pack n, n `notElem` map takeFileName extras] of
-          (keep : _) -> aeEbuildRunner env pkgDir keep
-          [] -> pure (Right ())
-      case manResult of
-        Left err -> pure (Left err)
-        Right () -> do
-          manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-          pure (Right (rels <> [manRel]))
+  keepResult <-
+    keepPVsForProvider
+      (aeAtomClosure env)
+      overlayRoot
+      key
+      (glpUniquePVs plan)
+  case keepResult of
+    Left err -> pure (Left err)
+    Right keep -> do
+      let extras =
+            [ pkgDir </> n
+            | n <- names,
+              Just (pkg, verStr) <- [parseEbuildFileName n],
+              T.pack pkg == pn,
+              let v = parseEbuildVersion (T.pack verStr),
+              not (isLivePackageVersion v),
+              not (any (samePV v) keep)
+            ]
+      if null extras
+        then pure (Right [])
+        else do
+          mapM_ removeFile extras
+          rels <- mapM (relativeOverlayPath overlayRoot) extras
+          -- Manifest after deletions.
+          manResult <-
+            case [n | n <- names, ".ebuild" `T.isSuffixOf` T.pack n, n `notElem` map takeFileName extras] of
+              (keepName : _) -> aeEbuildRunner env pkgDir keepName
+              [] -> pure (Right ())
+          case manResult of
+            Left err -> pure (Left err)
+            Right () -> do
+              manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+              pure (Right (rels <> [manRel]))
 
 -- | Full materialize path: 7 discrete multi-progress steps.
 fullPathMaterializeSteps :: Int

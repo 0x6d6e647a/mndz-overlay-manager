@@ -164,6 +164,22 @@ When `update` **will ensure** a materialize image in this run and the recipe wil
 - **AND** node-gyp’s signed overlay commit is not required to wait until ensure finishes
 - **AND** opencode is not presented as waiting on `dev-build/node-gyp`
 
+### Requirement: Overlay write waits for atom closure
+
+Before overlay mutation of a selected package (ebuild rewrite or GitMv rename, Manifest, egencache, signed commit), `update` apply SHALL enforce overlay-internal atom closure as specified by `overlay-atom-closure`: wait for an in-selection provider whose planned remaining PVs would satisfy an unsatisfied atom, otherwise hard-fail that package without overlay mutation. Language materialize and assets publish MAY overlap that provider. The wait SHALL occur before the overlay critical section and SHALL NOT be held inside it. Admission to phase-1 for ceiling wait-edges SHALL remain as specified by `overlay-apply-waves`; atom-closure wait SHALL NOT by itself withhold a package from phase-1 materialize.
+
+#### Scenario: hk materialize overlaps usage
+
+- **WHEN** untargeted `update` selects usage and hk, usage needs GitMv or DepsAndAssets work, and hk’s to-be-written ebuild is already satisfiable or will be after usage’s planned commit
+- **THEN** hk MAY start language materialize while usage applies
+- **AND** hk overlay mutation waits when current usage PVs would not satisfy the to-be-written ebuild
+
+#### Scenario: Unsatisfied targeted consumer does not pull the provider
+
+- **WHEN** `update dev-util/hk` would write an ebuild whose overlay-internal usage atom is unsatisfied and usage is not selected
+- **THEN** hk hard-fails without overlay mutation
+- **AND** usage is not added to the selection
+
 ### Requirement: Hypo-planned consumer overlay write asserts provider PV
 
 Before overlay mutation of a `DepsAndAssets` unit whose working plan used hypothetical overlay ceiling-provider ceilings, the program SHALL apply the provider-PV assert specified by `overlay-apply-waves`. Mismatch is a unit hard-fail without overlay mutation.
@@ -232,7 +248,7 @@ Before mutating an apply unit, the program SHALL check that the unit’s involve
 
 ### Requirement: Parallel work then serial signed commits
 
-Package check, md5-cache consistency gate, dirty verification, vendor construction, ebuild rename/rewrite, and `ebuild … manifest` work SHALL be allowed to run concurrently across **admitted** packages, except that assets-repository git commit, push, and GitHub release publish for a shared assets worktree SHALL be mutually excluded, and package-scoped `egencache` together with overlay git index mutations (`git add` and `git commit`) SHALL be mutually excluded via an overlay critical section. Admission of selected packages to that concurrent phase-1 work SHALL honor overlay wait-edges as specified by `overlay-apply-waves`: a consumer withheld on an overlay ceiling provider SHALL NOT start phase-1 while that provider still needs work in this run. The program SHALL create each unit’s signed overlay commit immediately after that unit’s successful overlay mutation, manifest, egencache, and verification (commit-on-unit-success), except the overlay ceiling-provider GitMv commit-after-ensure rule. The program SHALL NOT defer all overlay commits until after every selected package has finished apply work. Global ordering of overlay commits by `category/package` is NOT required under concurrent apply; each commit SHALL include only paths belonging to that unit (including that unit’s md5-cache paths). Each overlay and assets commit SHALL sign with GPG (`git commit` with signing enabled); the program SHALL NOT create unsigned commits as a fallback. The program SHALL NOT read or store the GPG passphrase. Immediately before each signed overlay or assets commit, the program SHALL apply GPG sign readiness for that commit’s worktree (agent cache check; ready-prompt and unlock when cold; terminal pinentry environment) as specified by the gpg-sign-readiness capability. Signing failure, including readiness or unlock failure, SHALL be a hard failure for that unit and SHALL NOT leave an unsigned commit recorded as success.
+Package check, md5-cache consistency gate, dirty verification, vendor construction, ebuild rename/rewrite, and `ebuild … manifest` work SHALL be allowed to run concurrently across **admitted** packages, except that assets-repository git commit, push, and GitHub release publish for a shared assets worktree SHALL be mutually excluded, and package-scoped `egencache` together with overlay git index mutations (`git add` and `git commit`) SHALL be mutually excluded via an overlay critical section. Admission of selected packages to that concurrent phase-1 work SHALL honor overlay wait-edges as specified by `overlay-apply-waves`: a consumer withheld on an overlay ceiling provider SHALL NOT start phase-1 while that provider still needs work in this run. Atom-closure wait specified by `overlay-atom-closure` SHALL NOT by itself withhold phase-1 materialize; it SHALL block overlay mutation only, and SHALL wait outside the overlay critical section. The program SHALL create each unit’s signed overlay commit immediately after that unit’s successful overlay mutation, manifest, egencache, and verification (commit-on-unit-success), except the overlay ceiling-provider GitMv commit-after-ensure rule. The program SHALL NOT defer all overlay commits until after every selected package has finished apply work. Global ordering of overlay commits by `category/package` is NOT required under concurrent apply; each commit SHALL include only paths belonging to that unit (including that unit’s md5-cache paths). Each overlay and assets commit SHALL sign with GPG (`git commit` with signing enabled); the program SHALL NOT create unsigned commits as a fallback. The program SHALL NOT read or store the GPG passphrase. Immediately before each signed overlay or assets commit, the program SHALL apply GPG sign readiness for that commit’s worktree (agent cache check; ready-prompt and unlock when cold; terminal pinentry environment) as specified by the gpg-sign-readiness capability. Signing failure, including readiness or unlock failure, SHALL be a hard failure for that unit and SHALL NOT leave an unsigned commit recorded as success.
 
 #### Scenario: No successful units create no overlay commits
 
@@ -279,6 +295,12 @@ Package check, md5-cache consistency gate, dirty verification, vendor constructi
 - **WHEN** bun-bin needs work and ralph-tui is withheld on bun-bin
 - **THEN** ralph-tui phase-1 (vendor construction, ebuild rewrite, manifest) does not run concurrently with bun-bin phase-1
 
+#### Scenario: Atom-closure wait does not hold the overlay lock
+
+- **WHEN** a consumer is waiting for a provider signed commit so its to-be-written ebuild will be atom-closed
+- **THEN** the consumer is not inside the overlay critical section while waiting
+- **AND** the provider can still obtain that critical section
+
 ### Requirement: Half-applied package warning
 
 When a unit hard-fails after the ebuild was renamed or rewritten but before a successful signed overlay commit (for example `ebuild manifest` failure, `egencache` failure, or signing failure after mutation), the program SHALL log an error and a warning that the package directory may be left dirty or half-applied so a later dirty check or md5-cache consistency gate can explain retry failures, and SHALL mention that cache reconciliation may require `gencache` or `gencache --force` when ebuild and cache disagree.
@@ -313,7 +335,7 @@ The `update` apply path SHALL require the overlay path to be inside a git work t
 
 ### Requirement: DepsAndAssets multi-lane apply
 
-For packages with technique `DepsAndAssets`, apply SHALL use the runtime-lane planner for the package’s ecosystem to obtain the planned set of PVs and KEYWORDS, materialize each PV that needs work (full or reuse path), commit each successful unit before the next, and perform exact-set prune of non-live ebuilds after all planned PVs succeed. Multi-PV ordering and failure isolation SHALL match multi-unit behavior (later unit failure does not roll back earlier committed units).
+For packages with technique `DepsAndAssets`, apply SHALL use the runtime-lane planner for the package’s ecosystem to obtain the planned set of PVs and KEYWORDS, materialize each PV that needs work (full or reuse path), commit each successful unit before the next, and perform prune of non-live ebuilds after all planned PVs succeed as specified by `runtime-lanes` and `overlay-atom-closure` (planned unique PVs union reverse-dep keep). Multi-PV ordering and failure isolation SHALL match multi-unit behavior (later unit failure does not roll back earlier committed units).
 
 When more than one planned PV needs work in the same package apply, the program SHALL order those units so that **missing** planned PVs (no local non-live ebuild at that PV) are materialized **before** pure **content-fix** units (a local non-live ebuild at that PV exists but ebuild content, KEYWORDS, runtime field, and/or Manifest dist entry is inadequate). Within each of those two groups, ordering SHALL be stable by PV comparison (numeric components ascending). A PV that is missing SHALL be classified as missing for this order even if content-fix checks would also apply. This order SHALL keep discovery-time donor ebuild paths usable for new-PV template reads that fall back to an existing local ebuild, so a content-fix revision bump does not delete that donor path before missing PVs run.
 
@@ -333,6 +355,11 @@ When more than one planned PV needs work in the same package apply, the program 
 - **WHEN** every planned PV that needs work already has a local non-live ebuild (content-fix only; no missing PVs)
 - **THEN** units run in stable ascending PV order among those content-fix units
 
+#### Scenario: Prune keeps a reverse-dep PV
+
+- **WHEN** a DepsAndAssets provider’s unique planned set is one PV and a remaining consumer ebuild requires another on-disk provider PV by exact pin
+- **THEN** after successful apply that extra PV remains
+
 ### Requirement: Reuse path does not take assets publish critical section
 
 When a planned PV is materialized via the reuse path (existing release asset), the program SHALL NOT hold the assets-repo git critical section solely for that PV’s materialization. Full-path publish for other packages or other PVs SHALL continue to serialize assets git/push/release as specified by `assets-publish`.
@@ -344,12 +371,17 @@ When a planned PV is materialized via the reuse path (existing release asset), t
 
 ### Requirement: GitMvAndManifest leaves other versions
 
-`GitMvAndManifest` apply behavior for non-selected ebuild versions in the package directory SHALL leave other non-selected versions in place. Exact-set pruning applies only to `DepsAndAssets` runtime-lane apply.
+`GitMvAndManifest` apply behavior for non-selected ebuild versions in the package directory SHALL leave other non-selected versions in place. Exact-set pruning applies only to `DepsAndAssets` runtime-lane apply, as extended by `overlay-atom-closure` reverse-dep keep. GitMv rename of the newest ebuild SHALL honor the rename-away guard specified by `overlay-atom-closure`.
 
 #### Scenario: Binary update does not delete siblings
 
 - **WHEN** a `GitMvAndManifest` package directory has two ebuild versions and newest is renamed to a new remote PV
 - **THEN** the non-selected older ebuild is left in place by that technique
+
+#### Scenario: Rename-away of a required exact pin fails
+
+- **WHEN** GitMv would rename the only matching provider PV away from an exact pin still required by a remaining consumer ebuild
+- **THEN** the GitMv unit hard-fails without renaming
 
 ### Requirement: Assets publish failure does not cancel sibling packages
 

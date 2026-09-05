@@ -2,6 +2,7 @@ module Main (main) where
 
 import Test.Apply qualified as Apply
 import Test.Assets qualified as Assets
+import Test.AtomClosure qualified as AtomClosure
 import Test.CLI qualified as CLI
 import Test.CheckCache qualified as CheckCache
 import Test.CheckPlan qualified as CheckPlan
@@ -51,6 +52,7 @@ main =
           "Unit"
           [ Overlay.tests,
             OverlayWaves.tests,
+            AtomClosure.unitTests,
             Config.tests,
             CheckCache.tests,
             Distfiles.tests,

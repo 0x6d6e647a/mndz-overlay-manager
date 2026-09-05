@@ -18,6 +18,17 @@ module Update.Apply.TestSupport
     reusePathMaterializeSteps,
     materializeStepTotalUpper,
     reviseMaterializeStepTotal,
+    parseConsumerNeeds,
+    prettyOverlayAtom,
+    atomMatchesPV,
+    keepProviderPVs,
+    extrasBeyondKeep,
+    renameAwayUnsatisfied,
+    waitCycleWithEdge,
+    prettyWaitCycle,
+    OverlayAtom (..),
+    VersionOp (..),
+    DepNeed (..),
   )
 where
 
@@ -37,3 +48,16 @@ import Update.Apply.Materialize
     reviseMaterializeStepTotal,
   )
 import Update.Apply.OverlayWrite (overlayAfterAssets)
+import Update.AtomClosure
+  ( DepNeed (..),
+    OverlayAtom (..),
+    VersionOp (..),
+    atomMatchesPV,
+    extrasBeyondKeep,
+    keepProviderPVs,
+    parseConsumerNeeds,
+    prettyOverlayAtom,
+    prettyWaitCycle,
+    renameAwayUnsatisfied,
+    waitCycleWithEdge,
+  )

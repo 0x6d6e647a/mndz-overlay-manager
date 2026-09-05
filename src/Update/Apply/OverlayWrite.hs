@@ -23,6 +23,7 @@ import Update.Apply.Errors
     applyUnitHardFail,
   )
 import Update.Assets.Hash (FileDigests (..))
+import Update.AtomClosure (ensureAtomClosedForWrite)
 import Update.Check (PackageEntry (..))
 import Update.EbuildEdit
   ( ebuildFileNameWithRev,
@@ -128,48 +129,59 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
           case contentFixed of
             Left err -> pure $ ApplyHardFail key err False orphan
             Right fixed -> do
-              let newName = ebuildFileNameWithRev pn targetVer
-                  newPath = pkgDir </> newName
-              TIO.writeFile newPath fixed
-              removedTemplate <-
-                if templatePath /= newPath && takeFileName templatePath /= newName
-                  then do
-                    let templateIsTarget =
-                          case parseEbuildFileName (takeFileName templatePath) of
-                            Just (_, verStr) ->
-                              case comparePV (parseEbuildVersion (T.pack verStr)) targetVer of
-                                Just EQ -> True
-                                _ -> False
-                            Nothing -> False
-                    if templateIsTarget
-                      then removeFile templatePath >> pure True
-                      else pure False
-                  else pure False
-              manResult <- ebuildRun pkgDir newName
-              case manResult of
-                Left err -> pure $ ApplyHardFail key err True orphan
+              closed <-
+                ensureAtomClosedForWrite
+                  (aeAtomClosure env)
+                  (aeMulti env)
+                  overlayRoot
+                  key
+                  fixed
+              case closed of
+                Left err ->
+                  pure $ applyUnitHardFail key (ApplyAtomClosure err) False orphan
                 Right () -> do
-                  manText <- TIO.readFile (pkgDir </> "Manifest")
-                  case verifyManifestDigests manText distDigests of
+                  let newName = ebuildFileNameWithRev pn targetVer
+                      newPath = pkgDir </> newName
+                  TIO.writeFile newPath fixed
+                  removedTemplate <-
+                    if templatePath /= newPath && takeFileName templatePath /= newName
+                      then do
+                        let templateIsTarget =
+                              case parseEbuildFileName (takeFileName templatePath) of
+                                Just (_, verStr) ->
+                                  case comparePV (parseEbuildVersion (T.pack verStr)) targetVer of
+                                    Just EQ -> True
+                                    _ -> False
+                                Nothing -> False
+                        if templateIsTarget
+                          then removeFile templatePath >> pure True
+                          else pure False
+                      else pure False
+                  manResult <- ebuildRun pkgDir newName
+                  case manResult of
                     Left err -> pure $ ApplyHardFail key err True orphan
                     Right () -> do
-                      newRel <- relativeOverlayPath overlayRoot newPath
-                      manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-                      let unitPaths =
-                            nubOrd $
-                              [newRel, manRel]
-                                <> [ebuildRel | removedTemplate || templatePath /= newPath]
-                          msg = unitCommitMessage key (renderPV targetVer)
-                      committed <-
-                        egencacheAndSignedCommit
-                          env
-                          overlayRoot
-                          key
-                          unitPaths
-                          msg
-                      pure $ case committed of
-                        Right paths -> ApplySuccess key lines_ paths
-                        Left err -> ApplyHardFail key err True orphan
+                      manText <- TIO.readFile (pkgDir </> "Manifest")
+                      case verifyManifestDigests manText distDigests of
+                        Left err -> pure $ ApplyHardFail key err True orphan
+                        Right () -> do
+                          newRel <- relativeOverlayPath overlayRoot newPath
+                          manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+                          let unitPaths =
+                                nubOrd $
+                                  [newRel, manRel]
+                                    <> [ebuildRel | removedTemplate || templatePath /= newPath]
+                              msg = unitCommitMessage key (renderPV targetVer)
+                          committed <-
+                            egencacheAndSignedCommit
+                              env
+                              overlayRoot
+                              key
+                              unitPaths
+                              msg
+                          pure $ case committed of
+                            Right paths -> ApplySuccess key lines_ paths
+                            Left err -> ApplyHardFail key err True orphan
 
 findTemplate :: FilePath -> Text -> EbuildVersion -> FilePath -> IO FilePath
 findTemplate pkgDir pn targetVer fallback = do

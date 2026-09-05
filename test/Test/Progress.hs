@@ -296,7 +296,8 @@ unitTests =
       testCase "Full-path waiting on ensure is not hard-fail" testWaitingOnEnsureNotHardFail,
       testCase "Ralph stays waiting on bun-bin through Manifest and commit" testRalphWaitsThroughManifestAndCommit,
       testCase "qlot Manifest is visible; Autolith is not waiting on qlot" testQlotManifestVisibleAutolithNotWaiting,
-      testCase "node-gyp Manifest is visible; opencode is not waiting on node-gyp" testNodeGypManifestVisibleOpencodeNotWaiting
+      testCase "node-gyp Manifest is visible; opencode is not waiting on node-gyp" testNodeGypManifestVisibleOpencodeNotWaiting,
+      testCase "hk waiting on usage at overlay write; mise not waiting" testHkWaitingOnUsageMiseNot
     ]
 
 -- | Soft-skip handle drives ApplyEnv / PlanOps apply path.
@@ -595,6 +596,54 @@ testNodeGypManifestVisibleOpencodeNotWaiting = do
     (not ("waiting on dev-build/node-gyp" `T.isInfixOf` frame))
   assertTrue "image wait in frame" (waitingOnMaterializeImage `T.isInfixOf` frame)
   assertTrue "not fail glyph" (not ("✗" `T.isInfixOf` frame))
+
+-- | Atom-closure overlay-write wait names usage; already-closed mise is not
+-- waiting; Graph 1 ralph-on-bun-bin chrome is unchanged.
+testHkWaitingOnUsageMiseNot :: IO ()
+testHkWaitingOnUsageMiseNot = do
+  stateRef <-
+    newIORef
+      MultiState
+        { msLabel = "Updating packages",
+          msTotal = 4,
+          msSucceeded = 0,
+          msJobs = Map.empty,
+          msTick = 0
+        }
+  let mh = multiHandle stateRef
+      bun = mkPackageKey "dev-lang" "bun-bin"
+      ralph = mkPackageKey "dev-util" "ralph-tui"
+      hk = mkPackageKey "dev-util" "hk"
+      mise = mkPackageKey "dev-util" "mise"
+      usageKey = mkPackageKey "dev-util" "usage"
+  mhStart mh bun
+  mhWait mh ralph "waiting on dev-lang/bun-bin"
+  mhStart mh usageKey
+  mhStart mh mise
+  mhWait mh hk "waiting on dev-util/usage"
+  s0 <- readIORef stateRef
+  case Map.lookup hk (msJobs s0) of
+    Just (JobWaiting reason) ->
+      assertEq "hk waiting names usage" "waiting on dev-util/usage" reason
+    other -> do
+      hPutStrLn stderr ("expected hk JobWaiting, got: " <> show other)
+      exitFailure
+  case Map.lookup mise (msJobs s0) of
+    Just (JobActive _) -> pure ()
+    other -> do
+      hPutStrLn stderr ("expected mise in-flight, got: " <> show other)
+      exitFailure
+  case Map.lookup ralph (msJobs s0) of
+    Just (JobWaiting reason) ->
+      assertEq "ralph Graph 1 wait unchanged" "waiting on dev-lang/bun-bin" reason
+    other -> do
+      hPutStrLn stderr ("expected ralph JobWaiting, got: " <> show other)
+      exitFailure
+  let frame = T.pack (renderMulti ColorOff s0)
+  assertTrue "hk wait in frame" ("waiting on dev-util/usage" `T.isInfixOf` frame)
+  assertTrue "ralph wait in frame" ("waiting on dev-lang/bun-bin" `T.isInfixOf` frame)
+  assertTrue "single panel" ("Updating packages" `T.isInfixOf` frame)
+  assertTrue "not fail glyph for waiting" (not ("✗" `T.isInfixOf` frame))
 
 -- | Soft-skip-only package outcomes call mhSkip, not mhFail.
 testApplyProgressSoftSkipHandle :: IO ()

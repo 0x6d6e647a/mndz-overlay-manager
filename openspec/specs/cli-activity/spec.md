@@ -237,6 +237,21 @@ When activity indicators are enabled, `update` mutate SHALL use a **single** mul
 - **THEN** that package’s row uses waiting presentation rather than in-flight container materialize
 - **AND** GitMv packages may appear in-flight in the same panel
 
+### Requirement: Atom-closure overlay-write wait is visible
+
+When activity indicators are enabled and a package is waiting for an overlay-internal atom-closure provider before overlay mutation, as specified by `overlay-atom-closure`, the apply multi-progress row for that package SHALL use waiting presentation naming the provider. That wait SHALL NOT occupy a package job slot. The program SHALL NOT open a second apply panel solely for this wait. Ceiling wait-edge withhold presentation specified for `overlay-apply-waves` SHALL remain unchanged: a Cargo package waiting only on atom closure MAY already be in-flight for language materialize, then show waiting when blocked on overlay write.
+
+#### Scenario: hk waits on usage at overlay write
+
+- **WHEN** indicators are enabled, untargeted `update` is applying usage and hk, and hk overlay mutation is waiting because current usage PVs would not satisfy hk’s to-be-written ebuild
+- **THEN** the hk row uses waiting presentation naming `dev-util/usage`
+- **AND** there is not a second apply panel solely for that wait
+
+#### Scenario: Atom-closure wait is not Graph 1 withhold of mise
+
+- **WHEN** mise’s to-be-written ebuild is already atom-closed against on-disk usage
+- **THEN** mise is not shown as waiting on `dev-util/usage` solely because usage is also in the selection
+
 ### Requirement: bun-bin Manifest wait and post-ensure commit are visible
 
 When activity indicators are enabled and `update` will `docker build` a recipe that emerges overlay bun-bin, the program SHALL show bun-bin file work (`ebuild … manifest` / egencache) so that wait is not indistinguishable from a hung ensure. When bun-bin’s signed overlay commit is delayed until ensure finishes, the sequential commit progress (or bun-bin’s apply row) SHALL indicate that commit after the ensure attempt. Full-path packages waiting on ensure SHALL keep waiting presentation as already specified.

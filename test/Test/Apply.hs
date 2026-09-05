@@ -87,7 +87,11 @@ import Test.Tasty.HUnit (testCase)
 import Update.Apply
   ( ApplyEnv (..),
     EbuildRunner,
+    MutateEnsure (..),
+    PackagePlanResult (..),
+    PlannedWork (..),
     applyOverlay,
+    applyOverlayFromPlan,
     applyPackagePhase1Tracked,
     foldExitHardFail,
   )
@@ -313,7 +317,14 @@ integrationTests =
       testCase "Overlay Commit Lock" testOverlayCommitLock,
       testCase "Apply Overlay Jobs1 Soft Hard Mix" testApplyOverlayJobs1SoftHardMix,
       testCase "Apply Overlay Jobs Concurrent" testApplyOverlayJobsConcurrent,
-      testCase "Git Mv Residual Soft Hard Dirty" testGitMvResidualSoftHardDirty
+      testCase "Git Mv Residual Soft Hard Dirty" testGitMvResidualSoftHardDirty,
+      testCase "Atom-closure: usage commits before hk overlay write" testAtomClosureWaitUsageBeforeHk,
+      testCase "Atom-closure: targeted hk refuses without applying usage" testAtomClosureRefuseNoExpand,
+      testCase "Atom-closure: unversioned usage does not wait" testAtomClosureUnversionedNoWait,
+      testCase "Atom-closure: provider hard-fail fails waiting hk" testAtomClosureProviderFail,
+      testCase "Atom-closure: wait cycle hard-fails both" testAtomClosureWaitCycle,
+      testCase "Atom-closure: GitMv rename-away exact pin fails" testAtomClosureRenameAwayPin,
+      testCase "Atom-closure: GitMv rename-away >= succeeds" testAtomClosureRenameAwayGe
     ]
 
 testNewEbuildFileName :: IO ()
@@ -2041,3 +2052,434 @@ testGitMvResidualSoftHardDirty =
       other -> do
         hPutStrLn stderr ("exists: expected hard fail, got " <> show other)
         exitFailure
+
+------------------------------------------------------------------------
+-- Overlay atom-closure (wait / refuse / cycle / GitMv rename-away)
+------------------------------------------------------------------------
+
+emptyMutate :: MutateEnsure
+emptyMutate =
+  MutateEnsure
+    { meFullPathKeys = [],
+      meImageEnsure = \_ -> pure (Right ()),
+      meDelayCommit = Nothing,
+      meGateEnsureOnFiles = [],
+      meRunEnsure = False
+    }
+
+hkKeyA :: PackageKey
+hkKeyA = mkPackageKey "dev-util" "hk"
+
+usageKeyA :: PackageKey
+usageKeyA = mkPackageKey "dev-util" "usage"
+
+bunKeyA :: PackageKey
+bunKeyA = mkPackageKey "dev-lang" "bun-bin"
+
+seedPkgEbuild ::
+  FilePath ->
+  T.Text ->
+  T.Text ->
+  T.Text ->
+  T.Text ->
+  IO FilePath
+seedPkgEbuild overlayRoot cat pn ver body = do
+  let pkgDir = overlayRoot </> T.unpack cat </> T.unpack pn
+      name = T.unpack pn <> "-" <> T.unpack ver <> ".ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile (pkgDir </> name) body
+  TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+  writeMatchingCachesForPackage overlayRoot cat pn pkgDir
+  pure (pkgDir </> name)
+
+entryOf :: PackageKey -> T.Text -> T.Text -> FilePath -> PackageEntry
+entryOf key pn ver path =
+  PackageEntry
+    { peKey = key,
+      pePN = pn,
+      peLocal = parseEbuildVersion ver,
+      pePath = path
+    }
+
+fakeManifestRun :: FilePath -> FilePath -> IO (Either T.Text ())
+fakeManifestRun pkgDir name = do
+  TIO.writeFile (pkgDir </> "Manifest") ("DIST " <> T.pack name <> " 1\n")
+  pure (Right ())
+
+planOpsUnused :: PlanOps
+planOpsUnused =
+  PlanOps
+    { poPortageq = \_ -> pure (Left "unused"),
+      poListVersions = \_ -> pure (Left "unused"),
+      poFetchGoMod = \_ -> pure (Left "unused"),
+      poWorkBudget = error "unused",
+      poCeilingsCache = error "unused"
+    }
+
+mkClosureEnv ::
+  GitOps ->
+  MultiHandle ->
+  Int ->
+  MVar () ->
+  IO ApplyEnv
+mkClosureEnv gitOps mh jobs overlayLock = do
+  assetsLock <- newMVar ()
+  budget <- newWorkBudget jobs
+  ceilingsCache <- newMVar Nothing
+  env0 <-
+    mkTestApplyEnv
+      gitOps
+      planOpsUnused {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+      fakeManifestRun
+      unusedReleaseOps
+      unusedVendorOps
+      Nothing
+      assetsLock
+      overlayLock
+  pure env0 {aeJobs = jobs, aeMulti = mh, aeFetcher = \_ -> pure (Left "unused")}
+
+runClosureApply ::
+  ApplyEnv ->
+  FilePath ->
+  [PackageEntry] ->
+  [PackagePlanResult] ->
+  IO [ApplyOutcome]
+runClosureApply env overlayRoot entries plans = do
+  cfg <- mkDisabledProgressConfig
+  applyOverlayFromPlan
+    cfg
+    env
+    overlayRoot
+    entries
+    plans
+    (\_ _ _ -> pure [])
+    emptyMutate
+
+testAtomClosureWaitUsageBeforeHk :: IO ()
+testAtomClosureWaitUsageBeforeHk =
+  withSystemTempDirectory "mndz-atom-wait-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    usagePath <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "usage"
+        "6.6.1"
+        "EAPI=8\n"
+    hkPath <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "hk"
+        "1.0.0"
+        "EAPI=8\nRDEPEND=\"=dev-util/usage-6.8.0\"\n"
+    commits <- newIORef ([] :: [T.Text])
+    overlayLock <- newMVar ()
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ msg -> do
+                atomicModifyIORef' commits (\xs -> (msg : xs, ()))
+                pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
+    let entries =
+          [ entryOf usageKeyA "usage" "6.6.1" usagePath,
+            entryOf hkKeyA "hk" "1.0.0" hkPath
+          ]
+        plans =
+          [ PlanNeedsWork hkKeyA (PlannedGitMv (parseEbuildVersion "1.1.0")),
+            PlanNeedsWork usageKeyA (PlannedGitMv (parseEbuildVersion "6.8.0"))
+          ]
+    raced <-
+      race
+        (threadDelay 15_000_000)
+        (runClosureApply env overlayRoot entries plans)
+    case raced of
+      Left () -> do
+        hPutStrLn stderr "atom-closure wait deadlock under jobs=1"
+        exitFailure
+      Right outcomes -> do
+        msgs <- reverse <$> readIORef commits
+        assertTrue
+          "usage committed"
+          (any ("dev-util/usage: 6.8.0" `T.isInfixOf`) msgs)
+        assertTrue
+          "hk committed"
+          (any ("dev-util/hk: 1.1.0" `T.isInfixOf`) msgs)
+        let idx p = [i | (i, m) <- zip [0 :: Int ..] msgs, p `T.isInfixOf` m]
+        case (idx "dev-util/usage: 6.8.0", idx "dev-util/hk: 1.1.0") of
+          (u : _, h : _) ->
+            assertTrue "usage commit before hk overlay commit" (u < h)
+          _ -> do
+            hPutStrLn stderr ("commit order missing: " <> show msgs)
+            exitFailure
+        assertTrue "no hard fail" (not (foldExitHardFail outcomes))
+        usageNew <-
+          doesFileExist (overlayRoot </> "dev-util" </> "usage" </> "usage-6.8.0.ebuild")
+        hkNew <-
+          doesFileExist (overlayRoot </> "dev-util" </> "hk" </> "hk-1.1.0.ebuild")
+        assertTrue "usage renamed" usageNew
+        assertTrue "hk renamed" hkNew
+
+testAtomClosureRefuseNoExpand :: IO ()
+testAtomClosureRefuseNoExpand =
+  withSystemTempDirectory "mndz-atom-refuse-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    usagePath <-
+      seedPkgEbuild overlayRoot "dev-util" "usage" "6.6.1" "EAPI=8\n"
+    hkPath <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "hk"
+        "1.0.0"
+        "EAPI=8\nRDEPEND=\"=dev-util/usage-6.8.0\"\n"
+    overlayLock <- newMVar ()
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
+    let entries = [entryOf hkKeyA "hk" "1.0.0" hkPath]
+        plans = [PlanNeedsWork hkKeyA (PlannedGitMv (parseEbuildVersion "1.1.0"))]
+    outcomes <- runClosureApply env overlayRoot entries plans
+    case [m | ApplyHardFail k m _ _ <- outcomes, k == hkKeyA] of
+      (msg : _) -> do
+        assertTrue "names usage" ("dev-util/usage" `T.isInfixOf` msg)
+        assertTrue "names atom" ("=dev-util/usage-6.8.0" `T.isInfixOf` msg)
+      [] -> do
+        hPutStrLn stderr ("expected hk refuse, got " <> show outcomes)
+        exitFailure
+    usageStill <- doesFileExist usagePath
+    hkOld <- doesFileExist hkPath
+    usageNew <-
+      doesFileExist (overlayRoot </> "dev-util" </> "usage" </> "usage-6.8.0.ebuild")
+    hkNew <-
+      doesFileExist (overlayRoot </> "dev-util" </> "hk" </> "hk-1.1.0.ebuild")
+    assertTrue "usage not applied" (usageStill && not usageNew)
+    assertTrue "hk not mutated" (hkOld && not hkNew)
+
+testAtomClosureUnversionedNoWait :: IO ()
+testAtomClosureUnversionedNoWait =
+  withSystemTempDirectory "mndz-atom-nowait-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    usagePath <-
+      seedPkgEbuild overlayRoot "dev-util" "usage" "6.6.1" "EAPI=8\n"
+    hkPath <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "hk"
+        "1.0.0"
+        "EAPI=8\nRDEPEND=\"dev-util/usage\"\n"
+    waits <- newIORef ([] :: [(PackageKey, T.Text)])
+    overlayLock <- newMVar ()
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+        mh =
+          noopMultiHandle
+            { mhWait = \k reason ->
+                atomicModifyIORef' waits (\xs -> ((k, reason) : xs, ()))
+            }
+    env <- mkClosureEnv gitOps mh 2 overlayLock
+    let entries =
+          [ entryOf usageKeyA "usage" "6.6.1" usagePath,
+            entryOf hkKeyA "hk" "1.0.0" hkPath
+          ]
+        plans =
+          [ PlanNeedsWork hkKeyA (PlannedGitMv (parseEbuildVersion "1.1.0")),
+            PlanNeedsWork usageKeyA (PlannedGitMv (parseEbuildVersion "6.8.0"))
+          ]
+    outcomes <- runClosureApply env overlayRoot entries plans
+    waited <- readIORef waits
+    assertTrue
+      "hk did not wait on usage"
+      (not (any (\(k, _) -> k == hkKeyA) waited))
+    assertTrue "no hard fail" (not (foldExitHardFail outcomes))
+    hkNew <-
+      doesFileExist (overlayRoot </> "dev-util" </> "hk" </> "hk-1.1.0.ebuild")
+    assertTrue "hk overlay-wrote" hkNew
+
+testAtomClosureProviderFail :: IO ()
+testAtomClosureProviderFail =
+  withSystemTempDirectory "mndz-atom-pfail-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    usagePath <-
+      seedPkgEbuild overlayRoot "dev-util" "usage" "6.6.1" "EAPI=8\n"
+    hkPath <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "hk"
+        "1.0.0"
+        "EAPI=8\nRDEPEND=\"=dev-util/usage-6.8.0\"\n"
+    overlayLock <- newMVar ()
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ paths ->
+                pure $
+                  Right (any (\p -> "usage" `T.isInfixOf` T.pack p) paths),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
+    let entries =
+          [ entryOf usageKeyA "usage" "6.6.1" usagePath,
+            entryOf hkKeyA "hk" "1.0.0" hkPath
+          ]
+        plans =
+          [ PlanNeedsWork hkKeyA (PlannedGitMv (parseEbuildVersion "1.1.0")),
+            PlanNeedsWork usageKeyA (PlannedGitMv (parseEbuildVersion "6.8.0"))
+          ]
+    raced <-
+      race
+        (threadDelay 15_000_000)
+        (runClosureApply env overlayRoot entries plans)
+    case raced of
+      Left () -> do
+        hPutStrLn stderr "provider-fail wait deadlock"
+        exitFailure
+      Right outcomes -> do
+        case [m | ApplyHardFail k m _ _ <- outcomes, k == hkKeyA] of
+          (msg : _) ->
+            assertTrue "hk names usage" ("dev-util/usage" `T.isInfixOf` msg)
+          [] -> do
+            hPutStrLn stderr ("expected hk hard-fail, got " <> show outcomes)
+            exitFailure
+        hkNew <-
+          doesFileExist (overlayRoot </> "dev-util" </> "hk" </> "hk-1.1.0.ebuild")
+        assertTrue "hk not overlay-mutated" (not hkNew)
+
+testAtomClosureWaitCycle :: IO ()
+testAtomClosureWaitCycle =
+  withSystemTempDirectory "mndz-atom-cycle-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    usagePath <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "usage"
+        "6.6.1"
+        "EAPI=8\nRDEPEND=\"=dev-util/hk-1.1.0\"\n"
+    hkPath <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "hk"
+        "1.0.0"
+        "EAPI=8\nRDEPEND=\"=dev-util/usage-6.8.0\"\n"
+    overlayLock <- newMVar ()
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    env <- mkClosureEnv gitOps noopMultiHandle 2 overlayLock
+    let entries =
+          [ entryOf usageKeyA "usage" "6.6.1" usagePath,
+            entryOf hkKeyA "hk" "1.0.0" hkPath
+          ]
+        plans =
+          [ PlanNeedsWork hkKeyA (PlannedGitMv (parseEbuildVersion "1.1.0")),
+            PlanNeedsWork usageKeyA (PlannedGitMv (parseEbuildVersion "6.8.0"))
+          ]
+    raced <-
+      race
+        (threadDelay 15_000_000)
+        (runClosureApply env overlayRoot entries plans)
+    case raced of
+      Left () -> do
+        hPutStrLn stderr "cycle wait deadlock"
+        exitFailure
+      Right outcomes -> do
+        let hards = [m | ApplyHardFail k m _ _ <- outcomes, k `elem` [hkKeyA, usageKeyA]]
+        assertTrue "both involved hard-fail" (length hards >= 2)
+        assertTrue
+          "names cycle"
+          (any ("cycle" `T.isInfixOf`) hards)
+        hkNew <-
+          doesFileExist (overlayRoot </> "dev-util" </> "hk" </> "hk-1.1.0.ebuild")
+        usageNew <-
+          doesFileExist (overlayRoot </> "dev-util" </> "usage" </> "usage-6.8.0.ebuild")
+        assertTrue "neither mutated" (not hkNew && not usageNew)
+
+testAtomClosureRenameAwayPin :: IO ()
+testAtomClosureRenameAwayPin =
+  withSystemTempDirectory "mndz-atom-renpin-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    bunPath <-
+      seedPkgEbuild overlayRoot "dev-lang" "bun-bin" "1.1.0" "EAPI=8\n"
+    _ <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "ralph-tui"
+        "1.0.0"
+        "EAPI=8\nBDEPEND=\"=dev-lang/bun-bin-1.1.0\"\n"
+    overlayLock <- newMVar ()
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
+    let entries = [entryOf bunKeyA "bun-bin" "1.1.0" bunPath]
+        plans = [PlanNeedsWork bunKeyA (PlannedGitMv (parseEbuildVersion "1.2.0"))]
+    outcomes <- runClosureApply env overlayRoot entries plans
+    case [m | ApplyHardFail k m _ _ <- outcomes, k == bunKeyA] of
+      (msg : _) ->
+        assertTrue "rename-away names atom" ("=dev-lang/bun-bin-1.1.0" `T.isInfixOf` msg)
+      [] -> do
+        hPutStrLn stderr ("expected bun-bin rename-away fail, got " <> show outcomes)
+        exitFailure
+    oldStill <- doesFileExist bunPath
+    newExists <-
+      doesFileExist (overlayRoot </> "dev-lang" </> "bun-bin" </> "bun-bin-1.2.0.ebuild")
+    assertTrue "old PV remains" oldStill
+    assertTrue "not renamed" (not newExists)
+
+testAtomClosureRenameAwayGe :: IO ()
+testAtomClosureRenameAwayGe =
+  withSystemTempDirectory "mndz-atom-renge-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    bunPath <-
+      seedPkgEbuild overlayRoot "dev-lang" "bun-bin" "1.1.0" "EAPI=8\n"
+    _ <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "ralph-tui"
+        "1.0.0"
+        "EAPI=8\nBDEPEND=\">=dev-lang/bun-bin-1.1.0\"\n"
+    overlayLock <- newMVar ()
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
+    let entries = [entryOf bunKeyA "bun-bin" "1.1.0" bunPath]
+        plans = [PlanNeedsWork bunKeyA (PlannedGitMv (parseEbuildVersion "1.2.0"))]
+    outcomes <- runClosureApply env overlayRoot entries plans
+    assertTrue "no hard fail" (not (foldExitHardFail outcomes))
+    newExists <-
+      doesFileExist (overlayRoot </> "dev-lang" </> "bun-bin" </> "bun-bin-1.2.0.ebuild")
+    assertTrue "renamed" newExists

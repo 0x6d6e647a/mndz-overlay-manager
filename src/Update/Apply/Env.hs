@@ -16,6 +16,7 @@ import Data.Text qualified as T
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import Update.Assets.Release (ReleaseOps)
+import Update.AtomClosure (AtomClosureSession)
 import Update.Bun.Cache (BunCacheOps)
 import Update.Cargo.Crates (CargoOps)
 import Update.CheckCache (CheckCacheHandle)
@@ -98,5 +99,8 @@ data ApplyEnv = ApplyEnv
     -- | When @Just@, full-path materialize opens a per-unit Docker session
     -- (image\/user\/run-id plus the inner @docker@ CLI runner). @Nothing@
     -- keeps injected @ae*Ops@ (tests).
-    aeMaterializeDocker :: Maybe (MaterializeDockerCfg, CommandRunner)
+    aeMaterializeDocker :: Maybe (MaterializeDockerCfg, CommandRunner),
+    -- | Overlay-internal atom-closure wait/refuse session for this apply
+    -- run. @Nothing@ checks current disk only (no wait).
+    aeAtomClosure :: Maybe AtomClosureSession
   }

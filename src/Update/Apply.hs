@@ -42,6 +42,7 @@ import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Update.Apply.Env
@@ -63,8 +64,18 @@ import Update.Apply.Materialize
     fetchModelsDevApiJson,
   )
 import Update.Apply.Plan
+import Update.AtomClosure
+  ( AtomClosureSession,
+    AtomClosureTerminal (..),
+    listNonLiveProviderPVs,
+    mkAtomClosureSession,
+    plannedRemainingFromWork,
+    recordAtomClosureTerminal,
+    wireAtomClosureSlots,
+  )
 import Update.Check (PackageEntry (..))
 import Update.Git (GitOps (..))
+import Update.Go.Lanes (RuntimeLanePlan (..))
 import Update.Hardcoded (lookupPolicy)
 import Update.Materialize (waitingOnMaterializeImage)
 import Update.OverlayWaves
@@ -86,6 +97,11 @@ import Update.Types
 
 foldExitHardFail :: [ApplyOutcome] -> Bool
 foldExitHardFail = any outcomeIsHardFail
+
+terminalFromApplyOutcomes :: [ApplyOutcome] -> AtomClosureTerminal
+terminalFromApplyOutcomes os
+  | any outcomeIsHardFail os = TerminalOverlayFail
+  | otherwise = TerminalOverlayOk
 
 -- | Legacy entry: plan+mutate per package (used by older tests).
 applyOverlay ::
@@ -199,6 +215,13 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare mutate = d
           panelTotal = length admittedWork + length withheldPairs
           (readyWork, ensureWork) =
             partitionEnsure (meFullPathKeys mutate) admittedWork
+      session <-
+        mkApplyAtomClosureSession
+          overlayRoot
+          byEntry
+          planByKey
+          (map planResultKey planResults)
+      let envSess = env {aeAtomClosure = Just session}
       nested <-
         if panelTotal <= 0 && not (meRunEnsure mutate)
           then pure []
@@ -207,7 +230,7 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare mutate = d
               mhWait mh consumer ("waiting on " <> packageKeyText provider)
             for_ ensureWork $ \(e, _) ->
               mhWait mh (peKey e) waitingOnMaterializeImage
-            let env' = env {aeMulti = mh}
+            let env' = envSess {aeMulti = mh}
             if panelTotal <= 0
               then do
                 -- Ensure-only (no admitted/withheld rows): still run t0 ensure.
@@ -240,6 +263,41 @@ partitionEnsure fullKeys items =
         [it | it@(e, _) <- items, isFull e]
       )
 
+mkApplyAtomClosureSession ::
+  FilePath ->
+  Map PackageKey PackageEntry ->
+  Map PackageKey PackagePlanResult ->
+  [PackageKey] ->
+  IO AtomClosureSession
+mkApplyAtomClosureSession overlayRoot byEntry planByKey selectedKeys = do
+  remainingPairs <- mapM remainingOne selectedKeys
+  let remaining = Map.fromList remainingPairs
+      selected = Set.fromList selectedKeys
+      prefilled =
+        Map.fromList $
+          mapMaybe prefill (Map.elems planByKey)
+  mkAtomClosureSession remaining selected prefilled
+  where
+    prefill = \case
+      PlanSoftSkip k _ -> Just (k, TerminalOverlayOk)
+      PlanHardFail k _ -> Just (k, TerminalOverlayFail)
+      PlanNeedsWork {} -> Nothing
+    remainingOne k = do
+      pvs <-
+        case Map.lookup k planByKey of
+          Just (PlanNeedsWork _ work)
+            | Just e <- Map.lookup k byEntry ->
+                plannedRemainingFromWork
+                  overlayRoot
+                  k
+                  (peLocal e)
+                  (workShape work)
+          _ -> listNonLiveProviderPVs overlayRoot k
+      pure (k, pvs)
+    workShape = \case
+      PlannedGitMv remote -> Right remote
+      PlannedDeps _ _ plan _ _ _ _ -> Left (glpUniquePVs plan)
+
 runAdmitPool ::
   ApplyEnv ->
   FilePath ->
@@ -254,6 +312,9 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
   let jobs = max 1 (aeJobs env)
       mh = aeMulti env
       panelCount = length readyWork + length ensureWork + Map.size withheld0
+      -- Extra workers beyond --jobs so an overlay-write wait can yield its
+      -- occupancy slot while another package still has a thread to run.
+      nWorkers = max jobs panelCount
       delayKey = meDelayCommit mutate
       gateKeys = meGateEnsureOnFiles mutate
       isGitMvWork = \case
@@ -276,6 +337,10 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
     then pure []
     else do
       sem <- newQSem jobs
+      case aeAtomClosure env of
+        Just session ->
+          wireAtomClosureSlots session (signalQSem sem) (waitQSem sem)
+        Nothing -> pure ()
       chan <- newChan
       remaining <- newIORef panelCount
       outcomesRef <- newIORef ([] :: [ApplyOutcome])
@@ -290,7 +355,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
       let finishOne = do
             n <- atomicModifyIORef' remaining (\x -> let x' = x - 1 in (x', x'))
             when (n == 0) $
-              replicateM_ jobs (writeChan chan Nothing)
+              replicateM_ nWorkers (writeChan chan Nothing)
           recordOutcomes os =
             atomicModifyIORef' outcomesRef (\acc -> (acc <> os, ()))
           cascade provider consumers = do
@@ -298,6 +363,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
             for_ consumers $ \c -> do
               mhFail mh c msg
               recordOutcomes [ApplyHardFail c msg False False]
+              recordAtomClosureTerminal (aeAtomClosure env) c TerminalOverlayFail
               finishOne
           admitResults provider consumers results = do
             let byPlan = Map.fromList [(planResultKey r, r) | r <- results]
@@ -309,14 +375,20 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                 Just (PlanSoftSkip _ reason) -> do
                   mhSkip mh c (shortApplyReason reason)
                   recordOutcomes [ApplySoftSkip c reason]
+                  recordAtomClosureTerminal (aeAtomClosure env) c TerminalOverlayOk
                   finishOne
                 Just (PlanHardFail _ msg) -> do
                   mhFail mh c (shortApplyReason msg)
                   recordOutcomes [ApplyHardFail c msg False False]
+                  recordAtomClosureTerminal (aeAtomClosure env) c TerminalOverlayFail
                   finishOne
                 _ -> cascade provider [c]
           handleDone key outs = do
             recordOutcomes outs
+            recordAtomClosureTerminal
+              (aeAtomClosure env)
+              key
+              (terminalFromApplyOutcomes outs)
             waiting <-
               Map.keys . Map.filter (== key) <$> readIORef withheldRef
             if null waiting
@@ -336,6 +408,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
               let k = peKey e
               mhFail mh k (shortApplyReason err)
               recordOutcomes [ApplyHardFail k err False False]
+              recordAtomClosureTerminal (aeAtomClosure env) k TerminalOverlayFail
               finishOne
           delayedGitMv key work =
             delayKey == Just key && isGitMvWork work
@@ -419,7 +492,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                   Right () ->
                     for_ ensureWork $ \item -> writeChan chan (Just item)
       withAsync runEnsure $ \ea -> do
-        mapConcurrently_ (const worker) [1 .. jobs]
+        mapConcurrently_ (const worker) [1 .. nWorkers]
         wait ea
       readIORef outcomesRef
 
@@ -562,6 +635,10 @@ applyPackagePhase1Tracked env overlayRoot entry = do
       mh = aeMulti env
   mhStart mh key
   outcomes <- applyPackagePhase1 env overlayRoot entry
+  recordAtomClosureTerminal
+    (aeAtomClosure env)
+    key
+    (terminalFromApplyOutcomes outcomes)
   case outcomes of
     [] -> mhSuccess mh key
     _ ->

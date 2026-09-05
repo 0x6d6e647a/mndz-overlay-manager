@@ -45,6 +45,8 @@ data ApplyUnitError
     ApplyOverlayFailClosed PackageKey
   | -- | Withheld consumer fails because the overlay provider hard-failed.
     ApplyOverlayProviderCascade PackageKey
+  | -- | Overlay-internal atom-closure refuse, parse fail, cycle, or rename-away.
+    ApplyAtomClosure Text
   deriving (Eq, Show)
 
 applyUnitErrorMessage :: ApplyUnitError -> Text
@@ -69,6 +71,7 @@ applyUnitErrorMessage = \case
   ApplyOverlayRefuse provider -> overlayRefuseMessage provider
   ApplyOverlayFailClosed provider -> overlayFailClosedMessage provider
   ApplyOverlayProviderCascade provider -> overlayProviderCascadeMessage provider
+  ApplyAtomClosure msg -> msg
 
 -- | Build 'ApplyHardFail' with stable operator wording for a known unit error.
 -- Remaining args are half-applied (overlay mutated) and assets-published flags.

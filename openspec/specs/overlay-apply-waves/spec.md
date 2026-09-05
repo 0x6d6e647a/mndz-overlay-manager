@@ -6,7 +6,7 @@ Define overlay-internal apply wait-edges from update technique so `update` withh
 
 ### Requirement: Overlay wait-edges follow technique ceiling source
 
-For `DepsAndAssets` packages whose runtime-lane ceiling source is a package in the configured overlay, that overlay package SHALL be the overlay wait-edge **provider** and the `DepsAndAssets` package SHALL be the **consumer**. Today that mapping is: ecosystem `Bun` waits on `dev-lang/bun-bin`. Ecosystems whose ceilings come from the gentoo repository (Go, Npm, Cargo, Sbcl) SHALL NOT create overlay wait-edges. The program SHALL NOT parse ebuild `DEPEND`, `RDEPEND`, or `BDEPEND` to discover these edges, and SHALL NOT require a second per-package edge map. Adding a package whose technique is `DepsAndAssets Bun` SHALL create the bun-bin wait-edge without a separate edge-table edit.
+For `DepsAndAssets` packages whose runtime-lane ceiling source is a package in the configured overlay, that overlay package SHALL be the overlay wait-edge **provider** and the `DepsAndAssets` package SHALL be the **consumer**. Today that mapping is: ecosystem `Bun` waits on `dev-lang/bun-bin`. Ecosystems whose ceilings come from the gentoo repository (Go, Npm, Cargo, Sbcl) SHALL NOT create overlay wait-edges. The program SHALL NOT parse ebuild `DEPEND`, `RDEPEND`, or `BDEPEND` to discover these **ceiling wait-edges**, and SHALL NOT require a second per-package edge map for them. Parsing `DEPEND*` for overlay-internal atom closure is specified by `overlay-atom-closure` and SHALL NOT create overlay wait-edges. Adding a package whose technique is `DepsAndAssets Bun` SHALL create the bun-bin wait-edge without a separate edge-table edit.
 
 #### Scenario: ralph waits on bun-bin
 
@@ -22,6 +22,11 @@ For `DepsAndAssets` packages whose runtime-lane ceiling source is a package in t
 
 - **WHEN** a newly configured overlay package uses `DepsAndAssets Bun`
 - **THEN** that package waits on `dev-lang/bun-bin` without a separate edge-table entry
+
+#### Scenario: Atom-closure parse does not create a Cargo wait-edge
+
+- **WHEN** `dev-util/hk` ebuild `RDEPEND` contains `dev-util/usage`
+- **THEN** hk has no overlay wait-edge on usage solely because of that atom
 
 ### Requirement: Selected provider needs-work uses hypothetical ceilings as the working plan
 

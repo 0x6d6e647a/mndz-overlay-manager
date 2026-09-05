@@ -105,6 +105,7 @@ integrationTests =
       testCase "missing assets-path hard-fails" testMaterializeMissingAssetsPath,
       testCase "missing github token hard-fails" testMaterializeMissingToken,
       testCase "prune extras on full success" testMaterializePruneExtras,
+      testCase "prune keeps exact-pin reverse-dep PV" testMaterializePruneKeepsExactPin,
       testCase "sidecar SHA512 mismatch hard-fails reuse" testMaterializeSidecarMismatch
     ]
 
@@ -1902,6 +1903,60 @@ testMaterializePruneExtras =
     assertEq "no hard fail" 0 (length fails)
     extraExists <- doesFileExist (pkgDir </> extraName)
     assertTrue "extra ebuild pruned" (not extraExists)
+
+-- | Remaining consumer exact pin keeps an unplanned provider PV.
+testMaterializePruneKeepsExactPin :: IO ()
+testMaterializePruneKeepsExactPin =
+  withSystemTempDirectory "mndz-mat-prune-pin-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "openspec"
+        hkDir = overlayRoot </> "dev-util" </> "hk"
+        pn = "openspec" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "openspec",
+              pePN = pn,
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = pkgDir </> "openspec-1.0.0.ebuild"
+            }
+        extraName = "openspec-0.5.0.ebuild"
+    createDirectoryIfMissing True assetsRoot
+    createDirectoryIfMissing True hkDir
+    seedNpmLocalOk overlayRoot pkgDir pn
+    TIO.writeFile
+      (pkgDir </> extraName)
+      (npmEbuildBody kwTilde ">=net-libs/nodejs-18.0.0[npm]")
+    TIO.writeFile
+      (hkDir </> "hk-1.0.0.ebuild")
+      "EAPI=8\nRDEPEND=\"=dev-util/openspec-0.5.0\"\n"
+    writeMatchingCachesForPackage overlayRoot "dev-util" pn pkgDir
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["2.0.0", "1.0.0"])
+        unusedGoMod
+        npmEngines
+        unusedBun
+        unusedCargo
+        (Just overlayRoot)
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir depsKind npmAssetBytes)
+        releaseMissing
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    let fails = [o | o@ApplyHardFail {} <- outcomes]
+    assertEq "no hard fail" 0 (length fails)
+    extraExists <- doesFileExist (pkgDir </> extraName)
+    assertTrue "exact-pin extra retained" extraExists
 
 -- | Reuse path: assets-repo sidecar disagrees with downloaded release asset.
 testMaterializeSidecarMismatch :: IO ()

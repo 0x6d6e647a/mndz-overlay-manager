@@ -15,6 +15,7 @@ where
 import CLI.Progress (MultiHandle (..))
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Overlay.Version (EbuildVersion, comparePV, prettyVersion, renderPV, renderPVNoRev)
 import System.Directory (doesFileExist, renameFile)
 import System.FilePath (takeDirectory, takeFileName, (</>))
@@ -27,6 +28,10 @@ import Update.Apply.Env (ApplyEnv (..))
 import Update.Apply.Errors
   ( ApplyUnitError (..),
     applyUnitHardFail,
+  )
+import Update.AtomClosure
+  ( ensureAtomClosedForWrite,
+    guardGitMvRenameAway,
   )
 import Update.Check (PackageEntry (..))
 import Update.CheckCache
@@ -239,44 +244,71 @@ gitMvFiles env key local remote oldPath pkgDir pn overlayRoot = do
                     False
                     False
             else do
-              renamed <-
-                if takeFileName oldPath == newName
-                  then pure False
-                  else do
-                    renameFile oldPath newPath
-                    pure True
-              mhStatus mh key regeneratingManifestStatus
-              manResult <- ebuildRun pkgDir newName
-              case manResult of
+              renameAway <-
+                guardGitMvRenameAway
+                  (aeAtomClosure env)
+                  overlayRoot
+                  key
+                  local
+                  remote
+              case renameAway of
                 Left err ->
-                  pure $ Left $ ApplyHardFail key err renamed False
+                  pure $
+                    Left $
+                      applyUnitHardFail key (ApplyAtomClosure err) False False
                 Right () -> do
-                  newRel <- relativeOverlayPath overlayRoot newPath
-                  manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-                  let unitPaths =
-                        if renamed
-                          then [ebuildRel, newRel, manRel]
-                          else [newRel, manRel]
-                      lines_ =
-                        [ SuccessLine
-                            { slFrom = local,
-                              slTo = remote,
-                              slLabel = Nothing,
-                              slAssetsReused = False
-                            }
-                        ]
-                      msg = unitCommitMessage key (renderPV remote)
-                  ePaths <-
-                    egencacheUnitPaths env overlayRoot key unitPaths
-                  case ePaths of
+                  toWrite <- TIO.readFile oldPath
+                  closed <-
+                    ensureAtomClosedForWrite
+                      (aeAtomClosure env)
+                      mh
+                      overlayRoot
+                      key
+                      toWrite
+                  case closed of
                     Left err ->
-                      pure $ Left $ ApplyHardFail key err True False
-                    Right paths ->
                       pure $
-                        Right
-                          PendingGitMvCommit
-                            { pgcKey = key,
-                              pgcLines = lines_,
-                              pgcPaths = paths,
-                              pgcMessage = msg
-                            }
+                        Left $
+                          applyUnitHardFail key (ApplyAtomClosure err) False False
+                    Right () -> do
+                      renamed <-
+                        if takeFileName oldPath == newName
+                          then pure False
+                          else do
+                            renameFile oldPath newPath
+                            pure True
+                      mhStatus mh key regeneratingManifestStatus
+                      manResult <- ebuildRun pkgDir newName
+                      case manResult of
+                        Left err ->
+                          pure $ Left $ ApplyHardFail key err renamed False
+                        Right () -> do
+                          newRel <- relativeOverlayPath overlayRoot newPath
+                          manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+                          let unitPaths =
+                                if renamed
+                                  then [ebuildRel, newRel, manRel]
+                                  else [newRel, manRel]
+                              lines_ =
+                                [ SuccessLine
+                                    { slFrom = local,
+                                      slTo = remote,
+                                      slLabel = Nothing,
+                                      slAssetsReused = False
+                                    }
+                                ]
+                              msg = unitCommitMessage key (renderPV remote)
+                          ePaths <-
+                            egencacheUnitPaths env overlayRoot key unitPaths
+                          case ePaths of
+                            Left err ->
+                              pure $ Left $ ApplyHardFail key err True False
+                            Right paths ->
+                              pure $
+                                Right
+                                  PendingGitMvCommit
+                                    { pgcKey = key,
+                                      pgcLines = lines_,
+                                      pgcPaths = paths,
+                                      pgcMessage = msg
+                                    }

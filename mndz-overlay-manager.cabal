@@ -129,6 +129,7 @@ library
     -- Implementation details not imported by app/ or test/.
     other-modules:
         Update.Adequacy
+      , Update.AtomClosure
       , Update.Apply.Commit
       , Update.Apply.Env
       , Update.Apply.GitMv
@@ -228,6 +229,7 @@ test-suite mndz-overlay-manager-test
     other-modules:
         Test.Apply
         Test.Assert
+        Test.AtomClosure
         Test.Assets
         Test.CheckCache
         Test.CheckPlan

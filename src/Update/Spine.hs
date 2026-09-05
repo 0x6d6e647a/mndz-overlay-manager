@@ -459,7 +459,8 @@ runUpdatePhases deps entries allEbuilds selected = do
                               aeDepsPlanOps = usdDepsPlanOps deps,
                               aeTempRun = tempRun,
                               aeCheckCache = cache,
-                              aeMaterializeDocker = mMatDocker
+                              aeMaterializeDocker = mMatDocker,
+                              aeAtomClosure = Nothing
                             }
                         overlapReady =
                           [ r
