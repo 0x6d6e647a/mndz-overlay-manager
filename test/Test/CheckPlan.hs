@@ -55,7 +55,8 @@ import Update.Go.Plan (noopPlanProgress)
 import Update.OverlayWaves (bunBinPackageKey)
 import Update.Runtime.Ceilings (RuntimeCeilings (..))
 import Update.Types
-  ( EcosystemSpec (..),
+  ( CargoSource (..),
+    EcosystemSpec (..),
     OutdatedLine (..),
     PackageKey (..),
     UpdateReport (..),
@@ -513,7 +514,7 @@ testPlanCargoSuccess = do
       =<< planDepsPackageWithProgress
         ops
         noopPlanProgress
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
         (GitHub "jdx" "hk" "v")
         [parseEbuildVersion "0.40.0"]
   assertTrue "planned non-empty" (not (null (glpUniquePVs plan)))
@@ -558,7 +559,7 @@ testPlanCargoNamespacedFeatures = do
       =<< planDepsPackageWithProgress
         ops
         noopPlanProgress
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
         (GitHub "jdx" "mise" "v")
         [parseEbuildVersion "0.40.0"]
   assertTrue
@@ -589,7 +590,7 @@ testPlanCargoIncompleteSkipped = do
       =<< planDepsPackageWithProgress
         ops
         noopPlanProgress
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
         (GitHub "jdx" "hk" "v")
         [parseEbuildVersion "0.40.0"]
   assertTrue
@@ -623,7 +624,7 @@ testPlanCargoCompleteAbsence = do
       =<< planDepsPackageWithProgress
         ops
         noopPlanProgress
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
         (GitHub "jdx" "hk" "v")
         [parseEbuildVersion "0.40.0"]
   assertTrue
@@ -656,7 +657,7 @@ testPlanCargoParseFails = do
       =<< planDepsPackageWithProgress
         ops
         noopPlanProgress
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
         (GitHub "jdx" "hk" "v")
         [parseEbuildVersion "0.40.0"]
   case err of
@@ -676,7 +677,7 @@ testPlanCargoParseFails = do
       =<< planDepsPackageWithProgress
         opsHttp
         noopPlanProgress
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
         (GitHub "jdx" "hk" "v")
         [parseEbuildVersion "0.40.0"]
   case errHttp of
@@ -741,7 +742,7 @@ testPlanCargoWrongSource = do
       =<< planDepsPackageWithProgress
         ops
         noopPlanProgress
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
         (Http "https://example.com" Nothing)
         [parseEbuildVersion "1.0.0"]
   assertTrue
@@ -1169,7 +1170,7 @@ testContentFixCargoReusable =
         e
         locals
         src
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
     assertContentOnlyReusable "cargo content-fix" (reportStatus report)
     TIO.writeFile ebuildPath bodyOk
     reportOk <-
@@ -1181,7 +1182,7 @@ testContentFixCargoReusable =
         e
         locals
         src
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
     assertOkStatus "cargo content ok" (reportStatus reportOk)
 
 -- | usage-style: written 1.95 vs tag 1.91 is adequate (too-low-only).
@@ -1238,7 +1239,7 @@ testCargoWrittenAboveTagAdequate =
         e
         locals
         src
-        (Cargo Nothing (Just "cli"))
+        (Cargo Nothing (Just "cli") CargoGitTag)
     assertOkStatus "usage 1.85 vs tag 1.80" (reportStatus report)
 
 -- | usage-style path closure: benches/xtask 1.99 must not raise T above 1.91.
@@ -1315,7 +1316,7 @@ testUsagePathClosureAdequacy =
         e
         locals
         src
-        (Cargo Nothing (Just "cli"))
+        (Cargo Nothing (Just "cli") CargoGitTag)
     assertOkStatus "usage path-closure 1.91" (reportStatus report)
 
 -- | Incomplete newest tag is not reported as a 0.0.0 TO.
@@ -1376,7 +1377,7 @@ testIncompleteNotZeroFloorGap =
         e
         locals
         src
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
     case reportStatus report of
       Ok _ -> pure ()
       Outdated lines_ ->

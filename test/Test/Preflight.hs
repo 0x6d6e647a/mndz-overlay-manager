@@ -248,6 +248,7 @@ import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.TextUtil (stripSurroundingQuotes)
 import Update.Types
   ( ApplyOutcome (..),
+    CargoSource (..),
     EcosystemSpec (..),
     OutdatedLine (..),
     PackageKey (..),
@@ -441,7 +442,7 @@ cargoFullPathClassify =
               { cpuKey = key,
                 cpuPN = "mise",
                 cpuPV = pv,
-                cpuEco = Cargo Nothing Nothing,
+                cpuEco = Cargo Nothing Nothing CargoGitTag,
                 cpuClass = FullCargo,
                 cpuTempBaseline = Just (5 * 1024 * 1024)
               }
@@ -458,7 +459,7 @@ cargoReuseOnlyClassify =
               { cpuKey = key,
                 cpuPN = "mise",
                 cpuPV = pv,
-                cpuEco = Cargo Nothing Nothing,
+                cpuEco = Cargo Nothing Nothing CargoGitTag,
                 cpuClass = ReusePath,
                 cpuTempBaseline = Just (5 * 1024 * 1024)
               }
@@ -595,7 +596,7 @@ testAssetsPfCargo = do
         [ PlanNeedsWork
             key
             PlannedDeps
-              { pdEco = Cargo Nothing Nothing,
+              { pdEco = Cargo Nothing Nothing CargoGitTag,
                 pdSource = GitHub "o" "r" "v",
                 pdPlan = emptyDepsPlan,
                 pdLocalPVs = [],
@@ -611,7 +612,7 @@ testAssetsPfCargo = do
                 { cpuKey = key,
                   cpuPN = "mise",
                   cpuPV = pv,
-                  cpuEco = Cargo Nothing Nothing,
+                  cpuEco = Cargo Nothing Nothing CargoGitTag,
                   cpuClass = ReusePath,
                   cpuTempBaseline = Just (5 * 1024 * 1024)
                 }
@@ -657,7 +658,7 @@ testReuseCargoWithoutPycargo = do
        in [ PlanNeedsWork
               key
               PlannedDeps
-                { pdEco = Cargo Nothing Nothing,
+                { pdEco = Cargo Nothing Nothing CargoGitTag,
                   pdSource = GitHub "o" "r" "v",
                   pdPlan = emptyDepsPlan,
                   pdLocalPVs = [],

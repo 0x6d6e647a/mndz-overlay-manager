@@ -6,21 +6,23 @@ module Test.Ecosystems (unitTests, integrationTests) where
 
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (void)
+import Control.Monad (forM_, void, when)
 import Data.ByteString qualified as BS
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory
-  ( createDirectoryIfMissing,
+  ( copyFile,
+    createDirectoryIfMissing,
     createFileLink,
     doesDirectoryExist,
     doesFileExist,
     getSymbolicLinkTarget,
     pathIsSymbolicLink,
+    removePathForcibly,
   )
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, (</>))
@@ -56,6 +58,8 @@ import Update.Cargo.Crates
     buildCargoCratesTarball,
     cargoChecksumJson,
     crateTarballPrefix,
+    cratesIoDownloadEndpoint,
+    fetchAndUnpackCrate,
     harvestCloneFloor,
     harvestRegistryPackageRoots,
     mkCargoOps,
@@ -128,7 +132,7 @@ import Update.Sbcl.Deps
     stripUnusedFffTrees,
   )
 import Update.TempWorkspace (UnitDirs (..))
-import Update.Types (PackageKey (..))
+import Update.Types (CargoSource (..), PackageKey (..))
 
 unitTests :: TestTree
 unitTests =
@@ -197,7 +201,11 @@ unitTests =
           testCase "packCratesTarball tiny fixture" testPackCratesTarballFixture,
           testCase "packCratesTarball missing crate" testPackCratesTarballMissingCrate,
           testCase "packCratesTarball records XZ_OPT and -J / .xz temp" testPackCratesTarballXzArgv,
-          testCase "crate staging progress then crates pack" testCargoStagingProgress
+          testCase "crate staging progress then crates pack" testCargoStagingProgress,
+          testCase "CratesIo lane op sequence" testCargoCratesIoLaneOps,
+          testCase "GitTag lane op sequence unchanged" testCargoGitTagLaneOps,
+          testCase "fetchAndUnpackCrate edges" testFetchUnpackCrateEdges,
+          testCase "CratesIo fixture lock pack" testCargoCratesIoFixtureLockPack
         ],
       testGroup
         "xz pack helpers"
@@ -968,6 +976,8 @@ fakeCargoSuccessOps =
           (dest </> "Cargo.toml")
           "[package]\nname = \"pkg\"\nrust-version = \"1.85.0\"\n"
         pure (Right ()),
+      coFetchUnpackCrate = \_pn _pv _dist _src ->
+        pure (Left "should not fetch published crate"),
       coPycargoebuild = \ebuildPath _lockRoot _outPath _dist -> do
         -- Simulate inplace ebuild update; pack step writes the tarball.
         TIO.writeFile ebuildPath (donorEbuild <> "\n# pycargoebuild\n")
@@ -1005,6 +1015,7 @@ testCargoBuilderSuccess =
           "0.1.0"
           Nothing
           Nothing
+          CargoGitTag
           donorEbuild
           Nothing
           False
@@ -1042,6 +1053,7 @@ testCargoBuilderSuccess =
           "0.1.0"
           Nothing
           Nothing
+          CargoGitTag
           donorEbuild
           Nothing
           False
@@ -1089,6 +1101,7 @@ testCargoCloneHarvestIgnoresBenches =
           "6.4.1"
           Nothing
           (Just "cli")
+          CargoGitTag
           donorEbuild
           (Just "1.91.0")
           False
@@ -1132,6 +1145,7 @@ testCargoRegistryHarvestRaisesFloor =
           "0.1.0"
           Nothing
           Nothing
+          CargoGitTag
           donorEbuild
           (Just "1.91.0")
           False
@@ -1160,6 +1174,7 @@ testCargoBuilderCloneFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
       "0.1.0"
       Nothing
       Nothing
+      CargoGitTag
       donorEbuild
       Nothing
       False
@@ -1191,6 +1206,7 @@ testCargoBuilderMissingLock = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> 
       "0.1.0"
       Nothing
       Nothing
+      CargoGitTag
       donorEbuild
       Nothing
       False
@@ -1222,6 +1238,7 @@ testCargoBuilderPycargoFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> 
       "0.1.0"
       Nothing
       Nothing
+      CargoGitTag
       donorEbuild
       Nothing
       False
@@ -1254,6 +1271,7 @@ testCargoBuilderPackFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
       "0.1.0"
       Nothing
       Nothing
+      CargoGitTag
       donorEbuild
       Nothing
       False
@@ -2506,6 +2524,7 @@ testCargoMkCommandRunner =
           "0.1.0"
           Nothing
           Nothing
+          CargoGitTag
           donorEbuild
           Nothing
           False
@@ -2526,6 +2545,7 @@ testCargoMkCommandRunner =
         "0.1.0"
         Nothing
         Nothing
+        CargoGitTag
         donorEbuild
         Nothing
         False
@@ -2678,6 +2698,7 @@ testApplyEnvFakeEcoOps =
           "0.1.0"
           Nothing
           Nothing
+          CargoGitTag
           donorEbuild
           Nothing
           False
@@ -2688,3 +2709,347 @@ testApplyEnvFakeEcoOps =
     assertTrue "npm via env" =<< doesFileExist npmPath
     assertTrue "bun via env" =<< doesFileExist bunPath
     assertTrue "cargo via env" =<< doesFileExist (crTarballPath cargoRes)
+
+------------------------------------------------------------------------
+-- CratesIo provenance lane (fetch-and-unpack + op sequence)
+------------------------------------------------------------------------
+
+-- | CratesIo units run fetch+unpack -> pycargoebuild -> pack and never clone.
+-- Registry harvest covers the packed vendor crates when the unpacked published
+-- crate declares no rust-version.
+testCargoCratesIoLaneOps :: IO ()
+testCargoCratesIoLaneOps =
+  withSystemTempDirectory "mndz-cargo-cratesio-" $ \outDir -> do
+    events <- newIORef ([] :: [T.Text])
+    cloneCalls <- newIORef (0 :: Int)
+    let logEv e = atomicModifyIORef' events (\es -> (e : es, ()))
+        progress =
+          CargoProgress
+            { cgpOnCloneStart = logEv "source-start",
+              cgpOnCloneDone = logEv "source-done",
+              cgpOnPycargoStart = logEv "pycargo-start",
+              cgpOnPycargoDone = logEv "pycargo-done",
+              cgpOnStageCrate = \_ _ -> pure (),
+              cgpOnPackStart = logEv "pack-start",
+              cgpOnPackDone = logEv "pack-done"
+            }
+        ops =
+          CargoOps
+            { coClone = \_ _ _ -> do
+                atomicModifyIORef' cloneCalls (\n -> (n + 1, ()))
+                pure (Left "should not clone for CratesIo"),
+              coFetchUnpackCrate = \pn pv _dist src -> do
+                logEv "fetch"
+                let dir = src </> T.unpack (pn <> "-" <> pv)
+                createDirectoryIfMissing True dir
+                -- Published crate: [package] only, no rust-version, ships lock.
+                TIO.writeFile (dir </> "Cargo.toml") "[package]\nname = \"biodiff\"\n"
+                TIO.writeFile
+                  (dir </> "Cargo.lock")
+                  ( T.unlines
+                      [ "version = 4",
+                        "[[package]]",
+                        "name = \"hexagex\"",
+                        "version = \"0.2.3\"",
+                        "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+                        "checksum = \"aa\""
+                      ]
+                  )
+                pure (Right ()),
+              coPycargoebuild = \ebuildPath _lockRoot _outPath _dist -> do
+                logEv "pycargo"
+                body <- TIO.readFile ebuildPath
+                TIO.writeFile ebuildPath (body <> "\n# pycargo\n")
+                pure (Right ()),
+              coPackCrates = \_onStage onArchive _lock _dist stage outPath -> do
+                logEv "pack"
+                -- Staged registry crate declares rust-version 1.80.
+                let gentoo = stage </> "cargo_home" </> "gentoo" </> "hexagex-0.2.3"
+                createDirectoryIfMissing True gentoo
+                TIO.writeFile
+                  (gentoo </> "Cargo.toml")
+                  "[package]\nname = \"hexagex\"\nrust-version = \"1.80\"\n"
+                onArchive
+                writeFile outPath "crates-tarball"
+                pure (Right ())
+            }
+    res <-
+      assertRight "cratesio lane"
+        =<< buildCargoCratesTarball
+          ops
+          progress
+          "8051enthusiast"
+          "biodiff"
+          "v"
+          "1.2.1"
+          Nothing
+          Nothing
+          CargoCratesIo
+          donorEbuild
+          Nothing
+          False
+          "biodiff"
+          outDir
+          outDir
+          "biodiff-1.2.1-crates.tar.xz"
+    evs <- reverse <$> readIORef events
+    assertEq
+      "cratesio op sequence"
+      [ "source-start",
+        "fetch",
+        "source-done",
+        "pycargo-start",
+        "pycargo",
+        "pycargo-done",
+        "pack",
+        "pack-start",
+        "pack-done"
+      ]
+      evs
+    n <- readIORef cloneCalls
+    assertEq "clone never runs for CratesIo" 0 n
+    -- Registry harvest raises the floor; written RUST_MIN_VER is 1.80.0.
+    assertEq "registry harvest floor" "1.80.0" (crMsrv res)
+    assertEq "harvest field" (Just "1.80.0") (crHarvestFloor res)
+
+-- | GitTag units keep the clone flow byte-for-byte: clone -> pycargo -> pack,
+-- and never call the crate fetch op.
+testCargoGitTagLaneOps :: IO ()
+testCargoGitTagLaneOps =
+  withSystemTempDirectory "mndz-cargo-gittag-" $ \outDir -> do
+    events <- newIORef ([] :: [T.Text])
+    fetchCalls <- newIORef (0 :: Int)
+    let logEv e = atomicModifyIORef' events (\es -> (e : es, ()))
+        progress =
+          CargoProgress
+            { cgpOnCloneStart = logEv "clone-start",
+              cgpOnCloneDone = logEv "clone-done",
+              cgpOnPycargoStart = logEv "pycargo-start",
+              cgpOnPycargoDone = logEv "pycargo-done",
+              cgpOnStageCrate = \_ _ -> pure (),
+              cgpOnPackStart = logEv "pack-start",
+              cgpOnPackDone = logEv "pack-done"
+            }
+        ops =
+          fakeCargoSuccessOps
+            { coFetchUnpackCrate = \_ _ _ _ -> do
+                atomicModifyIORef' fetchCalls (\n -> (n + 1, ()))
+                pure (Left "should not fetch published crate")
+            }
+    _ <-
+      assertRight "gittag lane"
+        =<< buildCargoCratesTarball
+          ops
+          progress
+          "jdx"
+          "mise"
+          "v"
+          "2026.7.5"
+          Nothing
+          Nothing
+          CargoGitTag
+          donorEbuild
+          Nothing
+          False
+          "mise"
+          outDir
+          outDir
+          "mise-2026.7.5-crates.tar.xz"
+    evs <- reverse <$> readIORef events
+    assertEq
+      "gittag op sequence"
+      [ "clone-start",
+        "clone-done",
+        "pycargo-start",
+        "pycargo-done",
+        "pack-start",
+        "pack-done"
+      ]
+      evs
+    n <- readIORef fetchCalls
+    assertEq "fetch never runs for GitTag" 0 n
+
+-- | Scripted in-container fetch: parse @--dir@ / @--out@ from the aria2c argv
+-- and serve a prebuilt @.crate@ file at that destination.
+serveCrateFrom :: FilePath -> (ProcessRequest -> IO ProcessResult)
+serveCrateFrom crateFile req = case execCmd req of
+  Just ("aria2c", args) -> do
+    assertTrue
+      "no custom user-agent flag"
+      (not (any ("--user-agent" `isPrefixOf`) args))
+    case parseAria2Out args of
+      Just dest -> copyFile crateFile dest
+      Nothing -> fail "aria2c script: missing --dir/--out"
+    pure (okResult "")
+  Just ("tar", _) -> productionCommandRunner req
+  _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+
+parseAria2Out :: [String] -> Maybe FilePath
+parseAria2Out args =
+  case ( [v | (k, v) <- zip args (drop 1 args), k == "--dir"],
+         [v | (k, v) <- zip args (drop 1 args), k == "--out"]
+       ) of
+    (dir : _, out : _) -> Just (dir </> out)
+    _ -> Nothing
+
+buildTestCrate ::
+  FilePath ->
+  -- | Crate root directory name.
+  FilePath ->
+  -- | @[package].name@ (or Nothing to omit Cargo.toml entirely).
+  Maybe T.Text ->
+  Bool ->
+  -- | Path of the produced @.crate@ file.
+  IO FilePath
+buildTestCrate tmp dirName mCrateName withLock = do
+  -- Isolated build tree: repeated dirName values in one tmp must not reuse a
+  -- directory that a previous build populated (e.g. with a Cargo.lock).
+  let workRoot = tmp </> (dirName ++ "-build")
+      root = workRoot </> dirName
+  -- Fresh build tree: repeated dirName values in one tmp must not inherit
+  -- files (e.g. Cargo.lock) from a previous build.
+  removePathForcibly workRoot
+  createDirectoryIfMissing True root
+  case mCrateName of
+    Just name ->
+      TIO.writeFile (root </> "Cargo.toml") ("[package]\nname = \"" <> name <> "\"\n")
+    Nothing -> pure ()
+  when withLock $
+    TIO.writeFile (root </> "Cargo.lock") "version = 4\n"
+  let cratePath = tmp </> (dirName ++ ".crate")
+  void $
+    productionCommandRunner
+      ProcessRequest
+        { prMode = ExecCmd "tar" ["-czf", cratePath, "-C", workRoot, dirName],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  pure cratePath
+
+-- | In-container fetch-and-unpack edges: success posture (default User-Agent,
+-- canonical endpoint, lock present), fetch failure naming endpoint + PV,
+-- published-name divergence from PN, and missing Cargo.lock.
+testFetchUnpackCrateEdges :: IO ()
+testFetchUnpackCrateEdges =
+  withSystemTempDirectory "mndz-fetch-unpack-" $ \tmp -> do
+    let distDir = tmp </> "distdir"
+        srcDir = tmp </> "src"
+        crateName = "biodiff" :: T.Text
+        pv = "1.2.0" :: T.Text
+        endpoint = cratesIoDownloadEndpoint crateName pv
+    goodCrate <- buildTestCrate tmp "biodiff-1.2.0" (Just "biodiff") True
+    assertRight "fetch unpack success"
+      =<< fetchAndUnpackCrate (serveCrateFrom goodCrate) crateName pv distDir (tmp </> "src1")
+    lockThere <- doesFileExist (tmp </> "src1" </> "biodiff-1.2.0" </> "Cargo.lock")
+    assertTrue "lock unpacked" lockThere
+    -- Fetch failure names the endpoint and PV.
+    let failRun req = case execCmd req of
+          Just ("aria2c", _) -> pure (failResult "no such host")
+          _ -> pure (failResult "unexpected post-fetch call")
+    fetchErr <- fetchAndUnpackCrate failRun crateName pv (tmp </> "d2") (tmp </> "src2")
+    case fetchErr of
+      Left err -> do
+        assertTrue
+          "fetch failure names endpoint"
+          (endpoint `T.isInfixOf` err)
+        assertTrue "fetch failure names PV" ("1.2.0" `T.isInfixOf` err)
+      Right () -> fail "expected fetch failure"
+    -- Published-name divergence hard-fails naming both.
+    divergentCrate <- buildTestCrate tmp "biodiff-1.2.0" (Just "notbiodiff") True
+    divRes <-
+      fetchAndUnpackCrate
+        (serveCrateFrom divergentCrate)
+        crateName
+        pv
+        (tmp </> "d3")
+        (tmp </> "src3")
+    case divRes of
+      Left err -> do
+        assertTrue "names published name" ("notbiodiff" `T.isInfixOf` err)
+        assertTrue "names overlay pn" (crateName `T.isInfixOf` err)
+      Right () -> fail "expected name divergence failure"
+    -- Missing Cargo.lock hard-fails.
+    locklessCrate <- buildTestCrate tmp "biodiff-1.2.0" (Just "biodiff") False
+    locklessRes <-
+      fetchAndUnpackCrate
+        (serveCrateFrom locklessCrate)
+        crateName
+        pv
+        (tmp </> "d4")
+        (tmp </> "src4")
+    case locklessRes of
+      Left err -> assertTrue "missing lock named" ("Cargo.lock" `T.isInfixOf` err)
+      Right () -> fail "expected missing Cargo.lock failure"
+
+-- | Pack from a published-crate-style lock: hexagex-0.2.3 and
+-- biodiff-wfa2-sys-2.3.4-cf3eb92 entries packed as registry crates, the -sys
+-- crate bundling the WFA2-lib C sources.
+testCargoCratesIoFixtureLockPack :: IO ()
+testCargoCratesIoFixtureLockPack =
+  withSystemTempDirectory "mndz-cargo-pack-io-" $ \tmp -> do
+    let lockRoot = tmp </> "crate"
+        distDir = tmp </> "distdir"
+        stageDir = tmp </> "stage"
+        outPath = tmp </> "biodiff-1.2.0-crates.tar.xz"
+    createDirectoryIfMissing True distDir
+    createDirectoryIfMissing True lockRoot
+    forM_ [("hexagex", "0.2.3" :: T.Text), ("biodiff-wfa2-sys", "2.3.4-cf3eb92")] $
+      \(name, ver) -> do
+        let dirName = T.unpack (name <> "-" <> ver)
+            crateDir = tmp </> dirName
+        createDirectoryIfMissing True crateDir
+        TIO.writeFile (crateDir </> "Cargo.toml") ("[package]\nname = \"" <> name <> "\"\n")
+        when (name == "biodiff-wfa2-sys") $ do
+          createDirectoryIfMissing True (crateDir </> "WFA2-lib")
+          TIO.writeFile
+            (crateDir </> "WFA2-lib" </> "CMakeLists.txt")
+            "cmake_minimum_required(VERSION 3.15)\n"
+        void $
+          productionCommandRunner
+            ProcessRequest
+              { prMode =
+                  ExecCmd
+                    "tar"
+                    ["-czf", distDir </> (dirName ++ ".crate"), "-C", tmp, dirName],
+                prCwd = Nothing,
+                prEnv = Nothing,
+                prStdin = ""
+              }
+    TIO.writeFile
+      (lockRoot </> "Cargo.lock")
+      ( T.unlines
+          [ "version = 4",
+            "[[package]]",
+            "name = \"hexagex\"",
+            "version = \"0.2.3\"",
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            "checksum = \"h1\"",
+            "[[package]]",
+            "name = \"biodiff-wfa2-sys\"",
+            "version = \"2.3.4-cf3eb92\"",
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            "checksum = \"w1\""
+          ]
+      )
+    assertRight "pack fixture cratesio"
+      =<< packCratesTarball productionCommandRunner lockRoot distDir stageDir outPath
+    res <-
+      productionCommandRunner
+        ProcessRequest
+          { prMode = ExecCmd "tar" ["-tf", outPath],
+            prCwd = Nothing,
+            prEnv = Nothing,
+            prStdin = ""
+          }
+    assertEq "tar list exit" ExitSuccess (prExitCode res)
+    let listing = T.pack (prStdout res)
+    assertTrue
+      "hexagex member"
+      ("cargo_home/gentoo/hexagex-0.2.3/" `T.isInfixOf` listing)
+    assertTrue
+      "wfa2-sys member with suffix version"
+      ("cargo_home/gentoo/biodiff-wfa2-sys-2.3.4-cf3eb92/" `T.isInfixOf` listing)
+    assertTrue
+      "bundled WFA2-lib C sources"
+      ("biodiff-wfa2-sys-2.3.4-cf3eb92/WFA2-lib/CMakeLists.txt" `T.isInfixOf` listing)

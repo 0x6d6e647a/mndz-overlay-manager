@@ -8,6 +8,8 @@ module Update.Cargo.Crates
     mkCargoOps,
     buildCargoCratesTarball,
     crateTarballPrefix,
+    cratesIoDownloadEndpoint,
+    fetchAndUnpackCrate,
     harvestCloneFloor,
     harvestRegistryPackageRoots,
     -- Pack helpers (unit-tested)
@@ -34,6 +36,7 @@ import Update.Cargo.Lock
   ( RegistryPackage (..),
     crateDirName,
     crateFilename,
+    cratePackageName,
     parseRegistryPackages,
   )
 import Update.Cargo.Msrv
@@ -57,10 +60,16 @@ import Update.Process
     ProcessResult (..),
     productionCommandRunner,
   )
+import Update.Types (CargoSource (..))
 
 -- | Internal tarball path prefix expected by cargo.eclass.
 crateTarballPrefix :: Text
 crateTarballPrefix = "cargo_home/gentoo"
+
+-- | Canonical crates.io download endpoint for a published crate.
+cratesIoDownloadEndpoint :: Text -> Text -> Text
+cratesIoDownloadEndpoint crate pv =
+  "https://crates.io/api/v1/crates/" <> crate <> "/" <> pv <> "/download"
 
 data CargoResult = CargoResult
   { crTarballPath :: FilePath,
@@ -68,12 +77,27 @@ data CargoResult = CargoResult
     crMsrv :: Text,
     -- | Ebuild body after pycargoebuild inplace update (before manager SRC_URI patches).
     crEbuildBody :: Text,
-    -- | @max(Hclone, Hregistry)@ after pack; 'Nothing' if both absent.
+    -- | @max(Hsource, Hregistry)@ after pack; 'Nothing' if both absent.
     crHarvestFloor :: Maybe Text
   }
 
 data CargoOps = CargoOps
   { coClone :: Text -> Text -> FilePath -> IO (Either Text ()),
+    -- | Fetch the published @crate@ @.crate@ at @pv@ from the canonical crates.io
+    -- endpoint with in-container @aria2c@ (default User-Agent) into @distDir@,
+    -- then unpack it under @srcDir@ as @{crate}-{pv}\/@. Hard-fails on fetch
+    -- failure (naming endpoint and PV), package-name divergence from @pn@, or
+    -- a missing unpacked @Cargo.lock@.
+    coFetchUnpackCrate ::
+      -- \| Overlay package name (also the expected published crate name).
+      Text ->
+      -- \| PV without revision.
+      Text ->
+      -- \| Unit distdir for the fetched @.crate@.
+      FilePath ->
+      -- \| Unit work source area receiving @{crate}-{pv}\/@.
+      FilePath ->
+      IO (Either Text ()),
     -- | Run pycargoebuild: ebuild path, lock root / pkg dir, tarball out path, temp distdir.
     coPycargoebuild :: FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ()),
     -- | Pack registry crates: staging callback @k N@, archive-start, lock
@@ -104,6 +128,7 @@ mkCargoOps :: CommandRunner -> CargoOps
 mkCargoOps run =
   CargoOps
     { coClone = gitCloneTag run,
+      coFetchUnpackCrate = fetchAndUnpackCrate run,
       coPycargoebuild = runPycargoebuild run,
       coPackCrates = packCratesTarballWith run
     }
@@ -111,9 +136,12 @@ mkCargoOps run =
 productionCargoOps :: CargoOps
 productionCargoOps = mkCargoOps productionCommandRunner
 
--- | Clone @tag@, run pycargoebuild with no-write crate tarball, pack crates, return
--- tarball + MSRV + ebuild body.
--- Clone, distdir, and stage live under unit @workDir@; tarball under @outDir@.
+-- | Clone-or-fetch @tag@/@published crate@, run pycargoebuild with no-write
+-- crate tarball, pack crates, return tarball + MSRV + ebuild body.
+-- Source, distdir, and stage live under unit @workDir@; tarball under @outDir@.
+-- Provenance selects how @workDir/src@ is populated: 'CargoGitTag' clones the
+-- GitHub tag (byte-for-byte legacy flow); 'CargoCratesIo' fetches and unpacks
+-- the published crates.io @.crate@ for @pn@ at the target PV.
 buildCargoCratesTarball ::
   CargoOps ->
   CargoProgress ->
@@ -123,6 +151,7 @@ buildCargoCratesTarball ::
   Text ->
   Maybe FilePath ->
   Maybe FilePath ->
+  CargoSource ->
   -- | Donor ebuild content (from overlay template).
   Text ->
   -- | Planned direct tag floor (authoritative; not re-fetched).
@@ -131,7 +160,7 @@ buildCargoCratesTarball ::
   Bool ->
   -- | Overlay package name (for ebuild filename in work dir).
   Text ->
-  -- | Unit @work/@ (clone, distdir, stage, donor ebuild).
+  -- | Unit @work/@ (source tree, distdir, stage, donor ebuild).
   FilePath ->
   -- | Unit @out/@ (staged tarball).
   FilePath ->
@@ -146,6 +175,7 @@ buildCargoCratesTarball
   pv
   mLockSub
   mPkgSub
+  cargoSrc
   donorContent
   tagFloor
   useDonorFloor
@@ -158,30 +188,50 @@ buildCargoCratesTarball
     let tag = versionTag prefix pv
         url = githubCloneUrl owner repo
         outPath = outDir </> tarballName
-        cloneDir = workDir </> "src"
+        srcDir = workDir </> "src"
         distDir = workDir </> "distdir"
         stageDir = workDir </> "stage"
         ebuildName = T.unpack pn <> "-" <> T.unpack pv <> ".ebuild"
         ebuildPath = workDir </> ebuildName
     createDirectoryIfMissing True distDir
-    cgpOnCloneStart progress
-    cloned <- coClone ops url tag cloneDir
-    case cloned of
+    populated <- case cargoSrc of
+      CargoGitTag -> do
+        cgpOnCloneStart progress
+        cloned <- coClone ops url tag srcDir
+        case cloned of
+          Left err -> pure (Left err)
+          Right () -> do
+            cgpOnCloneDone progress
+            pure (Right ())
+      CargoCratesIo -> do
+        cgpOnCloneStart progress
+        fetched <- coFetchUnpackCrate ops pn pv distDir srcDir
+        case fetched of
+          Left err -> pure (Left err)
+          Right () -> do
+            cgpOnCloneDone progress
+            pure (Right ())
+    case populated of
       Left err -> pure (Left err)
       Right () -> do
-        cgpOnCloneDone progress
-        spaceOk <- checkPostCloneForClass FullCargo cloneDir
+        -- The source root is the clone (GitTag) or the unpacked crate tree
+        -- (CratesIo); the unpack itself lands as srcDir/<p>/ in both cases.
+        spaceOk <- checkPostCloneForClass FullCargo srcDir
         case spaceOk of
           Left err -> pure (Left err)
           Right () -> do
-            let lockRoot = case mLockSub of
-                  Nothing -> cloneDir
-                  Just sub -> cloneDir </> sub
+            let unpackedCrateRoot = srcDir </> (T.unpack pn <> "-" <> T.unpack pv)
+                lockRoot = case (cargoSrc, mLockSub) of
+                  (CargoCratesIo, _) -> unpackedCrateRoot
+                  (CargoGitTag, Just sub) -> srcDir </> sub
+                  (CargoGitTag, Nothing) -> srcDir
                 -- pycargoebuild rejects workspace roots; run in the package member
                 -- when set (e.g. usage's cli/). Cargo.lock is still resolved upward.
-                pycargoDir = case mPkgSub of
-                  Just sub -> cloneDir </> sub
-                  Nothing -> lockRoot
+                -- CratesIo: the published crate root is the package.
+                pycargoDir = case (cargoSrc, mPkgSub) of
+                  (CargoGitTag, Just sub) -> srcDir </> sub
+                  (CargoCratesIo, _) -> unpackedCrateRoot
+                  (CargoGitTag, Nothing) -> lockRoot
             hasLock <- doesFileExist (lockRoot </> "Cargo.lock")
             if not hasLock
               then
@@ -227,7 +277,12 @@ buildCargoCratesTarball
                                 )
                           else do
                             ebuildBody <- TIO.readFile ebuildPath
-                            cloneH <- harvestCloneFloor cloneDir mPkgSub mLockSub
+                            srcH <- case cargoSrc of
+                              -- GitTag: active-set clone harvest (policy closure).
+                              CargoGitTag -> harvestCloneFloor srcDir mPkgSub mLockSub
+                              -- CratesIo: published crate manifests declare no
+                              -- in-tree path deps; walk the unpacked crate root.
+                              CargoCratesIo -> harvestCloneFloor unpackedCrateRoot Nothing Nothing
                             regH <-
                               harvestRegistryPackageRoots
                                 (stageDir </> "cargo_home" </> "gentoo")
@@ -236,16 +291,16 @@ buildCargoCratesTarball
                                     then parseRustMinVerFromEbuild donorContent
                                     else Nothing
                             pure $
-                              case (cloneH, regH) of
+                              case (srcH, regH) of
                                 (Left err, _) -> Left err
                                 (_, Left err) -> Left err
-                                (Right mClone, Right mReg) ->
-                                  let harvest = maxMaybeRustVersions [mClone, mReg]
-                                   in case maxMaybeRustVersions [tagFloor, mClone, mReg, mDonor] of
+                                (Right mSrcH, Right mReg) ->
+                                  let harvest = maxMaybeRustVersions [mSrcH, mReg]
+                                   in case maxMaybeRustVersions [tagFloor, mSrcH, mReg, mDonor] of
                                         Nothing ->
                                           Left
                                             "could not determine RUST_MIN_VER (no direct tag \
-                                            \rust-version, clone/registry harvest, or same-PV \
+                                            \rust-version, source/registry harvest, or same-PV \
                                             \donor RUST_MIN_VER)"
                                         Just msrv ->
                                           Right
@@ -514,3 +569,137 @@ gitCloneTag run url tag dest = do
     if prExitCode res == ExitSuccess
       then Right ()
       else Left ("git clone failed: " <> T.pack (prStderr res))
+
+------------------------------------------------------------------------
+-- CratesIo fetch-and-unpack (published crate provenance)
+------------------------------------------------------------------------
+
+-- | Fetch the published @crate@ @.crate@ at @pv@ from the canonical crates.io
+-- download endpoint with @aria2c@ (its default User-Agent, matching
+-- pycargoebuild's in-container fetch posture) into @distDir@, then unpack the
+-- tarball under @srcDir@. Hard-fails on fetch failure (naming the endpoint and
+-- PV), when the unpacked tree does not contain the expected @{crate}-{pv}\/@
+-- directory, when the published manifest's package name diverges from the
+-- overlay package name @pn@ (naming both), or when the unpacked crate lacks
+-- @Cargo.lock@.
+fetchAndUnpackCrate ::
+  CommandRunner ->
+  Text ->
+  Text ->
+  FilePath ->
+  FilePath ->
+  IO (Either Text ())
+fetchAndUnpackCrate run pn pv distDir srcDir = do
+  createDirectoryIfMissing True distDir
+  createDirectoryIfMissing True srcDir
+  let endpoint = cratesIoDownloadEndpoint pn pv
+      crateFile = T.unpack pn <> "-" <> T.unpack pv <> ".crate"
+      cratePath = distDir </> crateFile
+      expectedDirName = T.unpack pn <> "-" <> T.unpack pv
+      crateDir = srcDir </> expectedDirName
+  fetchRes <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "aria2c"
+              [ "--dir",
+                distDir,
+                "--out",
+                crateFile,
+                "--allow-overwrite=true",
+                T.unpack endpoint
+              ],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  case prExitCode fetchRes of
+    ExitFailure _ ->
+      pure $
+        Left
+          ( "crates.io fetch failed for published crate "
+              <> pn
+              <> "-"
+              <> pv
+              <> " from "
+              <> endpoint
+              <> ": "
+              <> T.strip (T.pack (prStderr fetchRes))
+          )
+    ExitSuccess -> do
+      unpacked <-
+        run
+          ProcessRequest
+            { prMode = ExecCmd "tar" ["-xzf", cratePath, "-C", srcDir],
+              prCwd = Nothing,
+              prEnv = Nothing,
+              prStdin = ""
+            }
+      case prExitCode unpacked of
+        ExitFailure _ ->
+          pure $
+            Left
+              ( "crates.io crate unpack failed for "
+                  <> pn
+                  <> "-"
+                  <> pv
+                  <> ": "
+                  <> T.strip (T.pack (prStderr unpacked))
+              )
+        ExitSuccess -> do
+          dirOk <- doesDirectoryExist crateDir
+          if not dirOk
+            then
+              pure $
+                Left
+                  ( "crates.io crate unpack did not produce "
+                      <> pn
+                      <> "-"
+                      <> pv
+                      <> "/ under "
+                      <> T.pack srcDir
+                      <> " (expected published crate directory "
+                      <> T.pack expectedDirName
+                      <> ")"
+                  )
+            else do
+              mBody <- readOptionalFile (crateDir </> "Cargo.toml")
+              case mBody >>= cratePackageName of
+                Nothing ->
+                  pure $
+                    Left
+                      ( "published crate "
+                          <> pn
+                          <> "-"
+                          <> pv
+                          <> " has no [package].name in Cargo.toml"
+                      )
+                Just name
+                  | name /= pn ->
+                      pure $
+                        Left
+                          ( "published crate package name "
+                              <> name
+                              <> " differs from overlay package name "
+                              <> pn
+                              <> " (crates.io provenance requires them to match)"
+                          )
+                  | otherwise -> do
+                      hasLock <- doesFileExist (crateDir </> "Cargo.lock")
+                      if not hasLock
+                        then
+                          pure $
+                            Left
+                              ( "published crate "
+                                  <> pn
+                                  <> "-"
+                                  <> pv
+                                  <> " has no Cargo.lock; pack requires the \
+                                     \published crate's lockfile"
+                              )
+                        else pure (Right ())
+  where
+    readOptionalFile path = do
+      exists <- doesFileExist path
+      if exists then Just <$> TIO.readFile path else pure Nothing

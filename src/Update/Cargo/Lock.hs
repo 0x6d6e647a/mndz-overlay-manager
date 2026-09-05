@@ -7,6 +7,7 @@ module Update.Cargo.Lock
     parseRegistryPackages,
     crateFilename,
     crateDirName,
+    cratePackageName,
   )
 where
 
@@ -103,3 +104,11 @@ parseSimpleFields block = go (T.lines block) []
 
 lookupField :: Text -> [(Text, Text)] -> Maybe Text
 lookupField = lookup
+
+-- | Top-level @[package].name@ from a Cargo.toml body ('Nothing' when absent).
+-- Used on published crates.io crates, whose manifest is cargo-generated.
+cratePackageName :: Text -> Maybe Text
+cratePackageName body =
+  case dropWhile (/= "[package]") (T.lines body) of
+    (_hdr : rest) -> lookupField "name" (parseSimpleFields (T.unlines rest))
+    [] -> Nothing

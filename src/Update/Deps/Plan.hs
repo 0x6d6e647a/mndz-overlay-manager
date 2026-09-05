@@ -157,7 +157,7 @@ planDepsPackageWithProgress ops progress eco src locals =
     Go mSub -> planGo ops progress src mSub locals
     NpmEco -> planNpm ops progress src locals
     Bun -> planBun ops progress src locals Nothing
-    Cargo mLock mPkg -> planCargo ops progress src mLock mPkg locals
+    Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals
     Sbcl -> planSbcl ops progress src locals
 
 -- | Plan against caller-supplied ceilings (hypothetical overlay bun-bin).
@@ -175,7 +175,7 @@ planDepsPackageWithCeilings ops progress eco src locals ceilings =
     Bun -> planBun ops progress src locals (Just ceilings)
     Go mSub -> planGo ops progress src mSub locals
     NpmEco -> planNpm ops progress src locals
-    Cargo mLock mPkg -> planCargo ops progress src mLock mPkg locals
+    Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals
     Sbcl -> planSbcl ops progress src locals
 
 ------------------------------------------------------------------------

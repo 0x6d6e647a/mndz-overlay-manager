@@ -26,7 +26,7 @@ import Data.ByteString.Lazy qualified as LBS
 import Data.Containers.ListUtils (nubOrd)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sortOn)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -130,6 +130,7 @@ import Update.DiskSpace
   )
 import Update.EbuildEdit
   ( bunBdependAtom,
+    cargoProvenanceMismatch,
     goBdependAtom,
     nodejsBdependAtom,
     sbclBdependAtom,
@@ -191,6 +192,7 @@ import Update.TempWorkspace
   )
 import Update.Types
   ( ApplyOutcome (..),
+    CargoSource (..),
     EcosystemSpec (..),
     PackageKey (..),
     SuccessLine (..),
@@ -309,39 +311,73 @@ applyDepsAndAssetsFromPlan
     let key = peKey entry
         pkgDir = takeDirectory (pePath entry)
         pn = pePN entry
-    if not (planNeedsWork localPVs contentFix plan)
-      then pure [ApplySoftSkip key "already matches runtime-lane plan"]
-      else do
-        asserted <- assertHypoProviderPv overlayRoot key mHypo
-        case asserted of
-          Left msg ->
-            pure [ApplyHardFail key msg False False]
-          Right () -> do
-            cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
-            case cacheGate of
-              Left unitErr -> pure [applyUnitHardFail key unitErr False False]
+    coherence <- cargoProvenanceGate eco entry
+    case coherence of
+      Just msg -> pure [ApplyHardFail key msg False False]
+      Nothing ->
+        if not (planNeedsWork localPVs contentFix plan)
+          then pure [ApplySoftSkip key "already matches runtime-lane plan"]
+          else do
+            asserted <- assertHypoProviderPv overlayRoot key mHypo
+            case asserted of
+              Left msg ->
+                pure [ApplyHardFail key msg False False]
               Right () -> do
-                outcomes <-
-                  materializeDepsPlan
-                    env
-                    overlayRoot
-                    entry
-                    src
-                    eco
-                    plan
-                    localPVs
-                    contentFix
-                    forceFull
-                    planDone
-                when (any isApplySuccess outcomes) $ do
-                  fp' <- computeFingerprintFromDir src pkgDir pn
-                  mProvFp' <-
-                    computeOverlayProviderFingerprint overlayRoot (DepsAndAssets eco)
-                  storeDeps (aeCheckCache env) key fp' mProvFp' plan
-                pure outcomes
+                cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
+                case cacheGate of
+                  Left unitErr -> pure [applyUnitHardFail key unitErr False False]
+                  Right () -> do
+                    outcomes <-
+                      materializeDepsPlan
+                        env
+                        overlayRoot
+                        entry
+                        src
+                        eco
+                        plan
+                        localPVs
+                        contentFix
+                        forceFull
+                        planDone
+                    when (any isApplySuccess outcomes) $ do
+                      fp' <- computeFingerprintFromDir src pkgDir pn
+                      mProvFp' <-
+                        computeOverlayProviderFingerprint overlayRoot (DepsAndAssets eco)
+                      storeDeps (aeCheckCache env) key fp' mProvFp' plan
+                    pure outcomes
     where
       isApplySuccess ApplySuccess {} = True
       isApplySuccess _ = False
+
+-- | Provenance coherence gate (apply-time, before any mutation): every present
+-- non-live ebuild of the package must agree with the policy Cargo provenance
+-- on the primary source-line form; a mismatch names expected vs observed.
+cargoProvenanceGate :: EcosystemSpec -> PackageEntry -> IO (Maybe Text)
+cargoProvenanceGate eco entry = case eco of
+  Cargo {cargoSource = cargoSrc} -> do
+    let pkgDir = takeDirectory (pePath entry)
+    locals <- listLocalEbuilds (peKey entry) (pePN entry) pkgDir
+    let nonLive =
+          [ eb
+          | eb <- locals,
+            not (isLivePackageVersion (parseEbuildVersion (ebuildVersion eb)))
+          ]
+    errs <- mapM (checkOne cargoSrc) nonLive
+    pure (listToMaybe (catMaybes errs))
+  _ -> pure Nothing
+  where
+    checkOne cargoSrc eb = do
+      exists <- doesFileExist (ebuildPath eb)
+      if not exists
+        then pure Nothing
+        else do
+          content <- TIO.readFile (ebuildPath eb)
+          pure
+            ( cargoProvenanceMismatch
+                cargoSrc
+                (T.pack (takeFileName (ebuildPath eb)))
+                content
+            )
 
 -- | Overlay write of a hypo-planned consumer requires the provider PV to match.
 assertHypoProviderPv ::
@@ -1210,7 +1246,7 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
           pure $ case built of
             Left err -> Left err
             Right p -> Right (p, Just bunReq, Nothing)
-    (Cargo mLock mPkg, GitHub owner repo prefix) -> do
+    (Cargo mLock mPkg mCargoSrc, GitHub owner repo prefix) -> do
       let plannedPv = parseEbuildVersion pvNoRev
       donorPath <-
         findTemplate
@@ -1227,7 +1263,7 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
                 ApplyMissingDonorTemplate key (renderPV plannedPv) donorPath
         else do
           donorContent <- TIO.readFile donorPath
-          let progress = cargoCratesProgress stepsDoneRef mh key
+          let progress = cargoCratesProgress stepsDoneRef mh key mCargoSrc
               plannedPv' = parseEbuildVersion pvNoRev
               tagFloor = fromMaybe Nothing (lookupDirectTagFloor plan plannedPv')
               samePv =
@@ -1245,6 +1281,7 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
               pvNoRev
               mLock
               mPkg
+              mCargoSrc
               donorContent
               tagFloor
               samePv
@@ -1436,25 +1473,28 @@ bunCacheProgress stepsDoneRef mh key =
       bcpOnCompressDone = markMaterializeStep stepsDoneRef mh key "compressing tarball"
     }
 
-cargoCratesProgress :: IORef Int -> MultiHandle -> PackageKey -> CargoProgress
-cargoCratesProgress stepsDoneRef mh key =
-  CargoProgress
-    { cgpOnCloneStart = mhStatus mh key "cloning upstream",
-      cgpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
-      cgpOnPycargoStart = mhStatus mh key "pycargoebuild",
-      cgpOnPycargoDone = markMaterializeStep stepsDoneRef mh key "pycargoebuild",
-      cgpOnStageCrate = \k n ->
-        mhStatus
-          mh
-          key
-          ( "staging crates "
-              <> T.pack (show k)
-              <> "/"
-              <> T.pack (show n)
-          ),
-      cgpOnPackStart = mhStatus mh key "crates pack",
-      cgpOnPackDone = markMaterializeStep stepsDoneRef mh key "crates pack"
-    }
+cargoCratesProgress :: IORef Int -> MultiHandle -> PackageKey -> CargoSource -> CargoProgress
+cargoCratesProgress stepsDoneRef mh key cargoSrc =
+  let cloneLabel = case cargoSrc of
+        CargoGitTag -> "cloning upstream"
+        CargoCratesIo -> "fetching published crate"
+   in CargoProgress
+        { cgpOnCloneStart = mhStatus mh key cloneLabel,
+          cgpOnCloneDone = markMaterializeStep stepsDoneRef mh key cloneLabel,
+          cgpOnPycargoStart = mhStatus mh key "pycargoebuild",
+          cgpOnPycargoDone = markMaterializeStep stepsDoneRef mh key "pycargoebuild",
+          cgpOnStageCrate = \k n ->
+            mhStatus
+              mh
+              key
+              ( "staging crates "
+                  <> T.pack (show k)
+                  <> "/"
+                  <> T.pack (show n)
+              ),
+          cgpOnPackStart = mhStatus mh key "crates pack",
+          cgpOnPackDone = markMaterializeStep stepsDoneRef mh key "crates pack"
+        }
 
 -- | Open a per-unit Docker session when configured; otherwise keep injected ops.
 withFullPathMaterializeSession ::

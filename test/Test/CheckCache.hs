@@ -48,7 +48,8 @@ import Update.Go.Lanes
     RuntimeLanePlan (..),
   )
 import Update.Types
-  ( EcosystemSpec (..),
+  ( CargoSource (..),
+    EcosystemSpec (..),
     PackageKey (..),
     UpdateSource (..),
   )
@@ -357,7 +358,7 @@ testOldCargoPlanUnusable =
     "old cargo without snapshots"
     False
     ( cachedCargoPlanUsable
-        (Cargo Nothing Nothing)
+        (Cargo Nothing Nothing CargoGitTag)
         (GitHub "o" "r" "v")
         emptyDepsPlan
     )
@@ -404,7 +405,7 @@ testCargoV2SnapshotRoundTrip =
         cacheDir = tmp </> "check-cache"
         src = GitHub "jdx" "usage" "v"
         key = PackageKey "dev-util/usage"
-        eco = Cargo Nothing (Just "cli")
+        eco = Cargo Nothing (Just "cli") CargoGitTag
     pkgDir <- do
       let d = overlay </> "dev-util" </> "usage"
       createDirectoryIfMissing True d
@@ -441,7 +442,7 @@ testCargoV1PolicyMisses =
         "v1 policy version misses"
         False
         ( cachedCargoPlanUsable
-            (Cargo Nothing (Just "cli"))
+            (Cargo Nothing (Just "cli") CargoGitTag)
             (GitHub "jdx" "usage" "v")
             v1
         )
@@ -453,20 +454,20 @@ testCargoPolicyKeyInvalidation = do
   assertEq
     "matching key hits"
     True
-    (cachedCargoPlanUsable (Cargo Nothing (Just "cli")) src plan)
+    (cachedCargoPlanUsable (Cargo Nothing (Just "cli") CargoGitTag) src plan)
   assertEq
     "prefix change misses"
     False
     ( cachedCargoPlanUsable
-        (Cargo Nothing (Just "cli"))
+        (Cargo Nothing (Just "cli") CargoGitTag)
         (GitHub "jdx" "usage" "")
         plan
     )
   assertEq
     "subdir change misses"
     False
-    (cachedCargoPlanUsable (Cargo Nothing Nothing) src plan)
+    (cachedCargoPlanUsable (Cargo Nothing Nothing CargoGitTag) src plan)
   assertEq
     "lock subdir change misses"
     False
-    (cachedCargoPlanUsable (Cargo (Just "lock") (Just "cli")) src plan)
+    (cachedCargoPlanUsable (Cargo (Just "lock") (Just "cli") CargoGitTag) src plan)

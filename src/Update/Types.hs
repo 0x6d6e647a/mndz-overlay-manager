@@ -11,6 +11,7 @@ module Update.Types
     UpdateReport (..),
     Fetcher,
     EcosystemSpec (..),
+    CargoSource (..),
     UpdateTechnique (..),
     PackagePolicy (..),
     SuccessLine (..),
@@ -116,10 +117,21 @@ data EcosystemSpec
     -- 'Nothing' means repository root for that role.
     Cargo
       { cargoLockSubdir :: Maybe FilePath,
-        cargoPackageSubdir :: Maybe FilePath
+        cargoPackageSubdir :: Maybe FilePath,
+        -- | Where the buildable source tree comes from at apply time.
+        cargoSource :: CargoSource
       }
   | -- | Autolith-style SBCL deps tarball (@.qlot/@ + vendored fff) and @sbcl.version@ floor.
     Sbcl
+  deriving (Eq, Show)
+
+-- | Materialize provenance for a Cargo package. Version detection and
+-- tag-floor probing stay GitHub-based for both provenances.
+data CargoSource
+  = -- | Clone the GitHub tag (hk, mise, usage).
+    CargoGitTag
+  | -- | Fetch and unpack the published crates.io @.crate@ for the target PV.
+    CargoCratesIo
   deriving (Eq, Show)
 
 -- | How (or whether) to apply a version bump in the overlay.

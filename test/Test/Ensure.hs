@@ -95,7 +95,8 @@ import Update.Process.Docker
   )
 import Update.Runtime.Ceilings (RuntimeEbuildMeta (..))
 import Update.Types
-  ( EcosystemSpec (..),
+  ( CargoSource (..),
+    EcosystemSpec (..),
     UpdateSource (..),
     mkPackageKey,
   )
@@ -375,7 +376,7 @@ testCargoDeclaredTagFloorFeedsEnsure = do
                 { cpuKey = key,
                   cpuPN = "usage",
                   cpuPV = pv,
-                  cpuEco = Cargo Nothing (Just "cli"),
+                  cpuEco = Cargo Nothing (Just "cli") CargoGitTag,
                   cpuClass = FullCargo,
                   cpuTempBaseline = Nothing
                 }
@@ -385,7 +386,7 @@ testCargoDeclaredTagFloorFeedsEnsure = do
         [ PlanNeedsWork
             key
             PlannedDeps
-              { pdEco = Cargo Nothing (Just "cli"),
+              { pdEco = Cargo Nothing (Just "cli") CargoGitTag,
                 pdSource = GitHub "jdx" "usage" "v",
                 pdPlan = cargoPlan pv (Just "1.91.0") "1.91.0",
                 pdLocalPVs = [],
@@ -408,7 +409,7 @@ testCargoAbsenceNotImageFloor = do
                 { cpuKey = key,
                   cpuPN = "hk",
                   cpuPV = pv,
-                  cpuEco = Cargo Nothing Nothing,
+                  cpuEco = Cargo Nothing Nothing CargoGitTag,
                   cpuClass = FullCargo,
                   cpuTempBaseline = Nothing
                 }
@@ -418,7 +419,7 @@ testCargoAbsenceNotImageFloor = do
         [ PlanNeedsWork
             key
             PlannedDeps
-              { pdEco = Cargo Nothing Nothing,
+              { pdEco = Cargo Nothing Nothing CargoGitTag,
                 pdSource = GitHub "jdx" "hk" "v",
                 pdPlan = cargoPlan pv Nothing "0.0.0",
                 pdLocalPVs = [],

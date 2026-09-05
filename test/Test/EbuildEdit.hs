@@ -124,17 +124,22 @@ import Update.Cargo.Msrv
 import Update.Check (PackageEntry (..), groupNewest)
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
-  ( assetsSrcUriParameterized,
+  ( CargoSourceForm (..),
+    assetsSrcUriParameterized,
+    cargoProvenanceMismatch,
     ebuildHasDevLangGoBdepend,
+    ebuildNeedsCargoBodyFix,
     ebuildNeedsCargoContentFix,
     ebuildNeedsContentFix,
     ensureCargoAssetsSrcUri,
+    ensureCargoAssetsSrcUriFor,
     ensureGoBdepend,
     ensureNodejsBdepend,
     ensureRustMinVer,
     ensureSbclAtom,
     goBdependAtom,
     goBdependMatches,
+    hasCleanCratesIoSourceLine,
     keywordsMatch,
     manifestHasVendorDist,
     nextRevisionVersion,
@@ -257,6 +262,7 @@ import Update.SshAgent
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types
   ( ApplyOutcome (..),
+    CargoSource (..),
     EcosystemSpec (..),
     OutdatedLine (..),
     PackageKey (..),
@@ -281,6 +287,8 @@ tests =
       testCase "Nodejs Bdepend Use Replace" testNodejsBdependUseReplace,
       testCase "Vendor Go Version Gate" testVendorGoVersionGate,
       testCase "Cargo Content Fix" testCargoContentFix,
+      testCase "Cargo CratesIo SrcUri" testCargoCratesIoSrcUri,
+      testCase "Cargo Provenance Coherence" testCargoProvenanceCoherence,
       testCase "Go Keywords Assembly" testGoKeywordsAssembly,
       testCase "Set Keywords" testSetKeywords
     ]
@@ -693,7 +701,7 @@ testCargoContentFix = do
   assertTrue "RUST_MIN_VER" ("RUST_MIN_VER=\"1.88.0\"" `T.isInfixOf` msrvEd)
   assertTrue
     "list-era needs fix"
-    (ebuildNeedsCargoContentFix ["~amd64"] listEra (Just "1.88.0"))
+    (ebuildNeedsCargoContentFix CargoGitTag ["~amd64"] listEra (Just "1.88.0"))
   let good =
         T.unlines
           [ "inherit cargo",
@@ -705,7 +713,7 @@ testCargoContentFix = do
           ]
   assertTrue
     "tarball form ok"
-    (not (ebuildNeedsCargoContentFix ["~amd64"] good (Just "1.88.0")))
+    (not (ebuildNeedsCargoContentFix CargoGitTag ["~amd64"] good (Just "1.88.0")))
 
 testGoKeywordsAssembly :: IO ()
 testGoKeywordsAssembly = do
@@ -779,3 +787,126 @@ testSetKeywords = do
           ]
       inserted = setKeywords ["~amd64"] noKw
   assertTrue "inserted tilde" (keywordsMatch ["~amd64"] inserted)
+
+testCargoCratesIoSrcUri :: IO ()
+testCargoCratesIoSrcUri = do
+  -- pycargoebuild emits a GitHub archive line (from the manifest repository
+  -- field); the manager overrides the primary source line for CratesIo.
+  let pycargoBody =
+        T.unlines
+          [ "EAPI=8",
+            "inherit cargo",
+            "DESCRIPTION=\"biodiff\"",
+            "SRC_URI=\"https://github.com/8051Enthusiast/biodiff/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" ${CARGO_CRATE_URIS}\""
+          ]
+      fixed = ensureCargoAssetsSrcUriFor CargoCratesIo "biodiff" pycargoBody
+  assertTrue
+    "crates.io primary source line"
+    ( "SRC_URI=\"https://crates.io/api/v1/crates/biodiff/${PV}/download -> biodiff-${PV}.crate\""
+        `T.isInfixOf` fixed
+    )
+  assertTrue
+    "assets crates line present"
+    ( "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/biodiff-${PV}/biodiff-${PV}-crates.tar.xz\""
+        `T.isInfixOf` fixed
+    )
+  assertTrue
+    "github archive gone"
+    (not ("github.com/8051Enthusiast/biodiff/archive" `T.isInfixOf` fixed))
+  assertTrue
+    "no CARGO_CRATE_URIS"
+    (not ("CARGO_CRATE_URIS" `T.isInfixOf` fixed))
+  assertTrue
+    "clean crates.io source detected"
+    (hasCleanCratesIoSourceLine fixed)
+  -- Idempotent: already-clean parameterized form only parameterizes.
+  let clean =
+        T.unlines
+          [ "KEYWORDS=\"~amd64\"",
+            "SRC_URI=\"https://crates.io/api/v1/crates/biodiff/${PV}/download -> biodiff-${PV}.crate\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/biodiff-${PV}/biodiff-${PV}-crates.tar.xz\""
+          ]
+  assertEq
+    "clean form unchanged"
+    clean
+    (ensureCargoAssetsSrcUriFor CargoCratesIo "biodiff" clean)
+  -- Body fix: CratesIo accepts the crates.io form; github form needs work.
+  assertTrue
+    "crates.io form ok"
+    (not (ebuildNeedsCargoBodyFix CargoCratesIo ["~amd64"] clean))
+  assertTrue
+    "github form needs fix under CratesIo"
+    ( ebuildNeedsCargoBodyFix
+        CargoCratesIo
+        ["~amd64"]
+        ( T.unlines
+            [ "SRC_URI=\"https://github.com/8051Enthusiast/biodiff/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/biodiff-${PV}/biodiff-${PV}-crates.tar.xz\""
+            ]
+        )
+    )
+  -- GitTag rewrite byte-identical to the pre-provenance function.
+  let gitTagBody =
+        T.unlines
+          [ "SRC_URI=\"https://github.com/jdx/mise/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" ${CARGO_CRATE_URIS}\""
+          ]
+  assertEq
+    "git tag rewrite unchanged"
+    (ensureCargoAssetsSrcUri "mise" gitTagBody)
+    (ensureCargoAssetsSrcUriFor CargoGitTag "mise" gitTagBody)
+  assertTrue
+    "git tag body fix unchanged"
+    ( ebuildNeedsCargoBodyFix
+        CargoGitTag
+        ["~amd64"]
+        gitTagBody
+    )
+
+testCargoProvenanceCoherence :: IO ()
+testCargoProvenanceCoherence = do
+  let cratesIo =
+        T.unlines
+          [ "SRC_URI=\"https://crates.io/api/v1/crates/biodiff/${PV}/download -> biodiff-${PV}.crate\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/biodiff-${PV}/biodiff-${PV}-crates.tar.xz\""
+          ]
+      githubForm =
+        T.unlines
+          [ "SRC_URI=\"https://github.com/8051Enthusiast/biodiff/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/biodiff-${PV}/biodiff-${PV}-crates.tar.xz\""
+          ]
+  -- Coherent CratesIo ebuild admitted.
+  assertEq
+    "coherent crates-io admits"
+    Nothing
+    (cargoProvenanceMismatch CargoCratesIo "biodiff-1.2.0" cratesIo)
+  -- Coherent GitTag ebuild admitted.
+  assertEq
+    "coherent github admits"
+    Nothing
+    (cargoProvenanceMismatch CargoGitTag "hk-1.50.0" githubForm)
+  -- CratesIo policy + GitHub archive line hard-fails naming both forms.
+  case cargoProvenanceMismatch CargoCratesIo "biodiff-1.2.0" githubForm of
+    Nothing -> fail "expected crates-io mismatch"
+    Just err -> do
+      assertTrue "names policy" ("CargoCratesIo" `T.isInfixOf` err)
+      assertTrue "names expected form" ("crates.io/api/v1/crates" `T.isInfixOf` err)
+      assertTrue "names observed form" ("GitHub archive" `T.isInfixOf` err)
+      assertTrue "names ebuild" ("biodiff-1.2.0" `T.isInfixOf` err)
+  -- GitTag policy + crates.io line hard-fails (reverse direction).
+  case cargoProvenanceMismatch CargoGitTag "hk-1.50.0" cratesIo of
+    Nothing -> fail "expected git-tag mismatch"
+    Just err -> do
+      assertTrue "names policy" ("CargoGitTag" `T.isInfixOf` err)
+      assertTrue "names expected form" ("github.com" `T.isInfixOf` err)
+      assertTrue "names observed form" ("crates.io download" `T.isInfixOf` err)
+  -- Unrecognized primary form is left alone (no false positive).
+  assertEq
+    "other form no false positive"
+    Nothing
+    ( cargoProvenanceMismatch
+        CargoCratesIo
+        "biodiff-1.2.0"
+        "SRC_URI=\"https://example.com/something.tar.gz\"\n"
+    )

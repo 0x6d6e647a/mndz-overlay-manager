@@ -736,7 +736,7 @@ lookupLatest h key fp = do
 cachedCargoPlanUsable :: EcosystemSpec -> UpdateSource -> RuntimeLanePlan -> Bool
 cachedCargoPlanUsable eco src plan =
   case (eco, src) of
-    (Cargo mLock mPkg, GitHub _ _ prefix) ->
+    (Cargo mLock mPkg _, GitHub _ _ prefix) ->
       glpFloorPolicy plan == Just (cargoFloorPolicyKey prefix mPkg mLock)
         && snapshotsCover (glpUniquePVs plan) (glpDirectTagFloors plan)
         && all (isJust . ctfsCoverage) (glpDirectTagFloors plan)

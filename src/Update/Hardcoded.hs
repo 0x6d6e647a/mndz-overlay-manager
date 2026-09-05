@@ -10,7 +10,8 @@ where
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Update.Types
-  ( EcosystemSpec (..),
+  ( CargoSource (..),
+    EcosystemSpec (..),
     PackageKey (..),
     PackagePolicy (..),
     UpdateSource (..),
@@ -82,15 +83,19 @@ hardcodedPolicies =
       policy
         "dev-util/hk"
         (GitHub "jdx" "hk" "v")
-        (DepsAndAssets (Cargo Nothing Nothing)),
+        (DepsAndAssets (Cargo Nothing Nothing CargoGitTag)),
       policy
         "dev-util/mise"
         (GitHub "jdx" "mise" "v")
-        (DepsAndAssets (Cargo Nothing Nothing)),
+        (DepsAndAssets (Cargo Nothing Nothing CargoGitTag)),
       policy
         "dev-util/usage"
         (GitHub "jdx" "usage" "v")
-        (DepsAndAssets (Cargo Nothing (Just "cli"))),
+        (DepsAndAssets (Cargo Nothing (Just "cli") CargoGitTag)),
+      policy
+        "dev-util/biodiff"
+        (GitHub "8051enthusiast" "biodiff" "v")
+        (DepsAndAssets (Cargo Nothing Nothing CargoCratesIo)),
       policy
         "dev-util/autolith"
         (GitHub "luciusmagn" "autolith" "v")

@@ -282,6 +282,7 @@ import Update.SshAgent
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types
   ( ApplyOutcome (..),
+    CargoSource (..),
     EcosystemSpec (..),
     OutdatedLine (..),
     PackageKey (..),
@@ -358,20 +359,30 @@ testPolicyClassification = do
       hPutStrLn stderr $ "opencode-bin should be absent: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/mise") of
-    Just (PackagePolicy (GitHub "jdx" "mise" "v") (DepsAndAssets (Cargo Nothing Nothing))) ->
+    Just (PackagePolicy (GitHub "jdx" "mise" "v") (DepsAndAssets (Cargo Nothing Nothing CargoGitTag))) ->
       pure ()
     other -> do
       hPutStrLn stderr $ "mise technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/hk") of
-    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing Nothing))) -> pure ()
+    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing Nothing CargoGitTag))) -> pure ()
     other -> do
       hPutStrLn stderr $ "hk technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/usage") of
-    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing (Just "cli")))) -> pure ()
+    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing (Just "cli") CargoGitTag))) -> pure ()
     other -> do
       hPutStrLn stderr $ "usage technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/biodiff") of
+    Just
+      ( PackagePolicy
+          (GitHub "8051enthusiast" "biodiff" "v")
+          (DepsAndAssets (Cargo Nothing Nothing CargoCratesIo))
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "biodiff technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/autolith") of
     Just
@@ -1038,7 +1049,7 @@ testTypesHelperPredicates = do
   assertTrue "deps npm needs assets" (techniqueNeedsAssets (DepsAndAssets NpmEco))
   assertTrue
     "deps cargo needs assets"
-    (techniqueNeedsAssets (DepsAndAssets (Cargo Nothing Nothing)))
+    (techniqueNeedsAssets (DepsAndAssets (Cargo Nothing Nothing CargoGitTag)))
   assertTrue "deps sbcl needs assets" (techniqueNeedsAssets (DepsAndAssets Sbcl))
   assertTrue "git-mv no assets" (not (techniqueNeedsAssets GitMvAndManifest))
   assertTrue "unsupported no assets" (not (techniqueNeedsAssets (Unsupported "why")))
@@ -1049,13 +1060,13 @@ testTypesHelperPredicates = do
   assertTrue "npm not go" (not (ecosystemIsGo NpmEco))
   assertTrue "is bun" (ecosystemIsBun Bun)
   assertTrue "bun not cargo" (not (ecosystemIsCargo Bun))
-  assertTrue "is cargo" (ecosystemIsCargo (Cargo (Just "lock") (Just "pkg")))
-  assertTrue "cargo not bun" (not (ecosystemIsBun (Cargo Nothing Nothing)))
+  assertTrue "is cargo" (ecosystemIsCargo (Cargo (Just "lock") (Just "pkg") CargoGitTag))
+  assertTrue "cargo not bun" (not (ecosystemIsBun (Cargo Nothing Nothing CargoGitTag)))
   assertTrue "npm not bun" (not (ecosystemIsBun NpmEco))
   assertTrue "go not cargo" (not (ecosystemIsCargo (Go Nothing)))
   assertTrue "is sbcl" (ecosystemIsSbcl Sbcl)
   assertTrue "sbcl not cargo" (not (ecosystemIsCargo Sbcl))
-  assertTrue "cargo not sbcl" (not (ecosystemIsSbcl (Cargo Nothing Nothing)))
+  assertTrue "cargo not sbcl" (not (ecosystemIsSbcl (Cargo Nothing Nothing CargoGitTag)))
   -- splitPackageKey success + Nothing arms
   assertEq
     "split ok"

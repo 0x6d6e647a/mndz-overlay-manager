@@ -32,7 +32,8 @@ import Update.Runtime.Ceilings
     computeCeilings,
   )
 import Update.Types
-  ( EcosystemSpec (..),
+  ( CargoSource (..),
+    EcosystemSpec (..),
     PackageKey (..),
     UpdateTechnique (..),
     mkPackageKey,
@@ -81,7 +82,7 @@ testTechniqueEdges = do
   assertEq
     "Cargo"
     Nothing
-    (overlayCeilingProvider (DepsAndAssets (Cargo Nothing Nothing)))
+    (overlayCeilingProvider (DepsAndAssets (Cargo Nothing Nothing CargoGitTag)))
   assertEq
     "Sbcl"
     Nothing

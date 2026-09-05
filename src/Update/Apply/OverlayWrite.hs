@@ -29,7 +29,7 @@ import Update.EbuildEdit
   ( ebuildFileNameWithRev,
     ebuildHasDevLangGoBdepend,
     ensureBunBdepend,
-    ensureCargoAssetsSrcUri,
+    ensureCargoAssetsSrcUriFor,
     ensureEmptyCrates,
     ensureGoBdepend,
     ensureNodejsBdepend,
@@ -48,6 +48,7 @@ import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
     SuccessLine,
+    cargoSource,
   )
 
 overlayAfterAssets ::
@@ -99,7 +100,8 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
           let content = fromMaybe templateContent mEbuildBody
               withAssets = case eco of
                 Cargo {} ->
-                  ensureEmptyCrates (ensureCargoAssetsSrcUri pn content)
+                  ensureEmptyCrates
+                    (ensureCargoAssetsSrcUriFor (cargoSource eco) pn content)
                 _ -> parameterizeAssetsSrcUri pn content
               withKw = setKeywords keywords withAssets
           contentFixed <- case (eco, mReqVer) of

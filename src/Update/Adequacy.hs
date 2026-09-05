@@ -183,7 +183,7 @@ ebuildBodyNeedsWork eco facts content =
         Sbcl ->
           ebuildNeedsContentFixAtom kws content (sbclBdependAtom <$> ppfRuntimeReq facts)
         Cargo {} ->
-          ebuildNeedsCargoBodyFix kws content
+          ebuildNeedsCargoBodyFix (cargoSource eco) kws content
 
 manifestNeedsWork :: PackageKey -> EcosystemSpec -> Text -> PlannedPvFacts -> Bool
 manifestNeedsWork key eco pn facts =

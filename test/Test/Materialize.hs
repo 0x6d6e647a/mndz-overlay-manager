@@ -248,6 +248,8 @@ fakeCargoSuccessOps =
           (dest </> "Cargo.toml")
           "[package]\nname = \"pkg\"\nrust-version = \"1.85.0\"\n"
         pure (Right ()),
+      coFetchUnpackCrate = \_pn _pv _dist _src ->
+        pure (Left "should not fetch published crate"),
       coPycargoebuild = \ebuildPath _lockRoot _outPath _dist -> do
         body <- TIO.readFile ebuildPath
         TIO.writeFile ebuildPath (body <> "\n# pycargoebuild\n")

@@ -12,6 +12,8 @@ module Update.EbuildEdit
     ebuildNeedsContentFixAtom,
     ebuildNeedsCargoContentFix,
     ebuildNeedsCargoBodyFix,
+    cargoProvenanceMismatch,
+    CargoSourceForm (..),
     goBdependAtom,
     nodejsBdependAtom,
     bunBdependAtom,
@@ -24,6 +26,9 @@ module Update.EbuildEdit
     ensureSbclAtom,
     ensureRustMinVer,
     ensureCargoAssetsSrcUri,
+    ensureCargoAssetsSrcUriFor,
+    hasCleanCratesIoSourceLine,
+    cargoCratesIoSrcUriLine,
     ensureEmptyCrates,
     cargoCratesSrcUriLine,
     sbclBdependAtom,
@@ -46,6 +51,7 @@ import Update.Cargo.Msrv
   )
 import Update.Manifest.Dist (exactDistSHA512, manifestHasExactDist)
 import Update.TextUtil (stripSurroundingQuotes)
+import Update.Types (CargoSource (..))
 
 assetsMarker :: Text
 assetsMarker = "mndz-overlay-assets/releases/download/"
@@ -177,8 +183,17 @@ ebuildNeedsContentFixAtom keywords content mAtom =
       Nothing -> False
 
 -- | Cargo body fix excluding RUST_MIN_VER (SRC_URI, KEYWORDS, CRATES, list-era).
-ebuildNeedsCargoBodyFix :: [Text] -> Text -> Bool
-ebuildNeedsCargoBodyFix keywords content =
+-- CratesIo provenance additionally requires the canonical crates.io primary
+-- source line; GitTag requirements are unchanged.
+ebuildNeedsCargoBodyFix :: CargoSource -> [Text] -> Text -> Bool
+ebuildNeedsCargoBodyFix CargoCratesIo keywords content =
+  not (assetsSrcUriParameterized content)
+    || not (keywordsMatch keywords content)
+    || not (hasCratesAssetsSrcUri content)
+    || not (hasCleanCratesIoSourceLine content)
+    || hasListEraCargoDepsFor CargoCratesIo content
+    || cratesFieldNonEmpty content
+ebuildNeedsCargoBodyFix CargoGitTag keywords content =
   not (assetsSrcUriParameterized content)
     || not (keywordsMatch keywords content)
     || not (hasCratesAssetsSrcUri content)
@@ -186,9 +201,9 @@ ebuildNeedsCargoBodyFix keywords content =
     || cratesFieldNonEmpty content
 
 -- | Cargo content fix: body plus too-low-only RUST_MIN_VER vs the decision floor.
-ebuildNeedsCargoContentFix :: [Text] -> Text -> Maybe Text -> Bool
-ebuildNeedsCargoContentFix keywords content mRequiredMsrv =
-  ebuildNeedsCargoBodyFix keywords content
+ebuildNeedsCargoContentFix :: CargoSource -> [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsCargoContentFix cargoSrc keywords content mRequiredMsrv =
+  ebuildNeedsCargoBodyFix cargoSrc keywords content
     || case mRequiredMsrv of
       Just ver ->
         case parseRustMinVerFromEbuild content of
@@ -202,10 +217,17 @@ hasCratesAssetsSrcUri content =
     && "-crates.tar.xz" `T.isInfixOf` content
 
 -- | List-era crate deps via @CARGO_CRATE_URIS@ or crates.io crate dist URLs.
+-- For CratesIo provenance the canonical crates.io download line is manager-owned,
+-- so only @CARGO_CRATE_URIS@ is list-era.
 hasListEraCargoDeps :: Text -> Bool
 hasListEraCargoDeps content =
   "CARGO_CRATE_URIS" `T.isInfixOf` content
     || "crates.io/api/v1/crates" `T.isInfixOf` content
+
+hasListEraCargoDepsFor :: CargoSource -> Text -> Bool
+hasListEraCargoDepsFor CargoGitTag = hasListEraCargoDeps
+hasListEraCargoDepsFor CargoCratesIo = \content ->
+  "CARGO_CRATE_URIS" `T.isInfixOf` content
 
 -- | True when @CRATES=@ is present and not empty (quoted empty is OK).
 cratesFieldNonEmpty :: Text -> Bool
@@ -231,6 +253,104 @@ cargoCratesSrcUriLine pn =
     <> "-${PV}/"
     <> pn
     <> "-${PV}-crates.tar.xz\""
+
+-- | Canonical crates.io primary source distfile line (CratesIo provenance).
+cargoCratesIoSrcUriLine :: Text -> Text
+cargoCratesIoSrcUriLine pn =
+  "SRC_URI=\"https://crates.io/api/v1/crates/"
+    <> pn
+    <> "/${PV}/download -> "
+    <> pn
+    <> "-${PV}.crate\""
+
+-- | True when some @SRC_URI=@ line is the clean crates.io download form.
+hasCleanCratesIoSourceLine :: Text -> Bool
+hasCleanCratesIoSourceLine content =
+  any
+    ( \ln ->
+        let s = T.stripStart ln
+         in "SRC_URI=\"" `T.isPrefixOf` s
+              && "crates.io/api/v1/crates/" `T.isInfixOf` s
+              && "/download" `T.isInfixOf` s
+    )
+    (T.lines content)
+
+-- | Ensure the provenance-appropriate SRC_URI form (GitTag: github archive;
+-- CratesIo: canonical crates.io download distfile) plus the assets crates line.
+ensureCargoAssetsSrcUriFor :: CargoSource -> Text -> Text -> Text
+ensureCargoAssetsSrcUriFor cargoSrc pn content = case cargoSrc of
+  CargoGitTag -> ensureCargoAssetsSrcUri pn content
+  CargoCratesIo ->
+    -- Already in clean single-line crates.io + crates form: only parameterize.
+    if hasCratesAssetsSrcUri content
+      && hasCleanCratesIoSourceLine content
+      && not (hasListEraCargoDepsFor CargoCratesIo content)
+      then parameterizeAssetsSrcUri pn content
+      else
+        let (pre, _oldBlock, post) = splitSrcUriAssignment (T.lines content)
+            sourceLine = cargoCratesIoSrcUriLine pn
+            cratesLine = cargoCratesSrcUriLine pn
+            rebuilt = T.unlines (pre <> [sourceLine, cratesLine] <> post)
+         in parameterizeAssetsSrcUri pn rebuilt
+
+------------------------------------------------------------------------
+-- Provenance coherence (policy provenance <-> ebuild source-line form)
+------------------------------------------------------------------------
+
+-- | Observed primary source-line form of an ebuild.
+data CargoSourceForm
+  = -- | @github.com/…/archive/@ primary source line.
+    SourceFormGithubArchive
+  | -- | canonical @crates.io/api/v1/crates/…/download@ primary source line.
+    SourceFormCratesIo
+  | -- | Neither manager-written form (left alone to avoid false positives).
+    SourceFormOther
+  deriving (Eq, Show)
+
+-- | Primary source-line form of an ebuild body: crates.io download beats
+-- github archive when both appear; assets release URLs are never primary.
+ebuildCargoSourceForm :: Text -> CargoSourceForm
+ebuildCargoSourceForm content
+  | hasCleanCratesIoSourceLine content = SourceFormCratesIo
+  | hasCleanGithubSourceLine content = SourceFormGithubArchive
+  | otherwise = SourceFormOther
+
+-- | Provenance coherence error for one ebuild body: 'Nothing' when the
+-- observed primary source form agrees with the policy provenance (or is
+-- unrecognizable); @Just@ names the expected and observed forms otherwise.
+cargoProvenanceMismatch :: CargoSource -> Text -> Text -> Maybe Text
+cargoProvenanceMismatch cargoSrc name content =
+  let observed = ebuildCargoSourceForm content
+      expected = case cargoSrc of
+        CargoGitTag -> SourceFormGithubArchive
+        CargoCratesIo -> SourceFormCratesIo
+   in if observed == expected || observed == SourceFormOther
+        then Nothing
+        else
+          Just $
+            "cargo provenance mismatch for "
+              <> name
+              <> ": policy provenance "
+              <> cargoSourceName cargoSrc
+              <> " requires primary source line "
+              <> expectedForm
+              <> " but observed "
+              <> observedForm
+  where
+    expectedForm = case cargoSrc of
+      CargoGitTag ->
+        "the upstream GitHub source archive (github.com/.../archive/)"
+      CargoCratesIo ->
+        "the canonical crates.io download distfile \
+        \(crates.io/api/v1/crates/<crate>/<pv>/download)"
+    observedForm = case ebuildCargoSourceForm content of
+      SourceFormGithubArchive -> "a GitHub archive source line"
+      SourceFormCratesIo -> "a crates.io download source line"
+      SourceFormOther -> "an unrecognized primary source line"
+
+cargoSourceName :: CargoSource -> Text
+cargoSourceName CargoGitTag = "CargoGitTag"
+cargoSourceName CargoCratesIo = "CargoCratesIo"
 
 -- | Ensure assets crates SRC_URI form; strip list-era crate URI patterns.
 --

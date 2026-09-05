@@ -1,8 +1,4 @@
-## Purpose
-
-Cargo ecosystem under `DepsAndAssets`: pycargoebuild crate-tarball materialize, manager-owned crates tarball pack, distfile naming, MSRV probe, SRC_URI/`RUST_MIN_VER` ownership, policy for hk/mise/usage, preflight tools, and reuse vs full path.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Cargo ecosystem under DepsAndAssets
 
@@ -48,15 +44,6 @@ For `DepsAndAssets Cargo` with provenance `CargoGitTag`, full-path materializati
 
 - **WHEN** full-path cargo materialize runs without `rustc` on the host PATH
 - **THEN** packing is not failed solely due to missing host `rustc`
-
-### Requirement: Cargo distfile and release naming
-
-For Cargo packages, the program SHALL name the dependency distfile `{pn}-{pv}-crates.tar.xz` using the overlay package name PN and version PV without revision. Release tags SHALL remain `{pn}-{pv}`. The program SHALL pass this basename to pycargoebuild via `--crate-tarball-path` (for tarball mode / empty CRATES metadata) and SHALL write that same basename when packing after pycargoebuild, rather than relying on Cargo.toml package name defaults when they could differ from PN.
-
-#### Scenario: mise crates name
-
-- **WHEN** publishing assets for package `mise` at PV `2026.7.5`
-- **THEN** the distfile basename is `mise-2026.7.5-crates.tar.xz` and the release tag is `mise-2026.7.5`
 
 ### Requirement: MSRV probe and RUST_MIN_VER
 
@@ -252,32 +239,6 @@ After pycargoebuild inplace update on full path (or on content repair), the prog
 - **THEN** the primary source line is `https://crates.io/api/v1/crates/biodiff/${PV}/download -> biodiff-${PV}.crate`
 - **AND** the secondary line references `biodiff-${PV}-crates.tar.xz` under the mndz-overlay-assets release for `biodiff-${PV}`
 
-### Requirement: Cargo reuse path skips pycargoebuild
-
-When a planned Cargo PV needs work, has a derivable reuse-write floor, is not forced full, and an assets release provides every required asset basename including `{pn}-{pv}-crates.tar.xz`, the program SHALL reuse those assets when downloaded bytes pass expected Manifest/trusted-hash verification. Reuse SHALL NOT run pycargoebuild, manager crate packing, or release publication. It MAY rewrite KEYWORDS, `RUST_MIN_VER`, and SRC_URI for plan adequacy, SHALL ensure steady-state tarball shape has empty `CRATES`, then SHALL run `ebuild ... manifest` and verify as for other `DepsAndAssets` ecosystems.
-
-If the release tag exists but any required asset is missing, or if the PV is forced full because no reuse-write floor is derivable, the package SHALL hard-fail before mutation because full publication cannot update, replace, or delete an existing release tag. Absence of the release tag SHALL permit the full path.
-
-#### Scenario: Clean reuse no pycargoebuild
-
-- **WHEN** all required release assets for `usage-3.5.4` exist, their bytes verify, and its reuse-write floor is derivable
-- **THEN** apply does not invoke pycargoebuild for that unit
-
-#### Scenario: Clean reuse no manager crate pack
-
-- **WHEN** all required release assets for `usage-3.5.4` exist, their bytes verify, and its reuse-write floor is derivable
-- **THEN** apply does not run manager crate packing for that unit
-
-#### Scenario: Reuse clears list-era CRATES
-
-- **WHEN** reuse applies for a PV whose canonical template still has a non-empty `CRATES` list
-- **THEN** the written ebuild has empty `CRATES` suitable for crate-tarball packaging
-
-#### Scenario: Existing release cannot satisfy forced-full Cargo unit
-
-- **WHEN** all required assets exist but the Cargo PV is forced full because it has no derivable reuse-write floor
-- **THEN** the package hard-fails with release-tag guidance and does not run pycargoebuild or mutate local/remote assets
-
 ### Requirement: Manager-owned crates tarball pack
 
 For full-path Cargo materialize after successful pycargoebuild with `--no-write-crate-tarball`, the program SHALL create `{pn}-{pv}-crates.tar.xz` by: (1) parsing the provenance-appropriate `Cargo.lock` — provenance `CargoGitTag`: the clone’s lock at the policy lock root; provenance `CargoCratesIo`: the unpacked published crate’s `Cargo.lock` — for registry packages that declare a checksum; (2) for each such package, extracting the corresponding `{name}-{version}.crate` from the temporary distdir into a stage tree under `cargo_home/gentoo/{name}-{version}/` and writing `.cargo-checksum.json` with `package` set to the lockfile checksum and `files` an empty object; (3) creating the archive with system `tar` such that member paths are prefixed with `cargo_home/gentoo/…`, packing with the hermetic tar/xz rules specified by `hermetic-asset-materialize` (`XZ_OPT=-T1 -9e`, numeric owner `0/0`); (4) writing the final file atomically (temp then rename) such that the path presented to `tar` for compression **always selects xz** (the program SHALL NOT use a temporary basename whose suffix causes `tar -a` / auto-compress to skip compression—for example a bare `.tmp` suffix on an otherwise `.tar.xz` product name—unless xz is forced by an explicit xz filter flag equivalent to `-J` / `--xz`); (5) after a successful archive write and rename to the final `{pn}-{pv}-crates.tar.xz` path, verifying that the final file is an xz-compressed stream (hard-fail with an error distinct from pycargoebuild failure if the body is plain tar or otherwise not xz). Pack SHALL hard-fail if a lock-listed registry crate file is missing from the distdir or if archive creation fails, with an error distinct from pycargoebuild failure. Git/path packages that are not registry crates with checksums SHALL NOT be required in the tarball (GIT_CRATES remain pycargoebuild’s ebuild concern).
@@ -318,49 +279,6 @@ For full-path Cargo materialize after successful pycargoebuild with `--no-write-
 - **WHEN** pack succeeds
 - **THEN** the final `{pn}-{pv}-crates.tar.xz` path exists as a complete file (no partial final basename left from a failed mid-write)
 
-### Requirement: Cargo preflight tools
-
-When any classified **full-path** unit uses `DepsAndAssets Cargo`, preflight SHALL require `docker` and a usable materialize image as specified by `hermetic-asset-materialize`. The image SHALL provide `pycargoebuild` and at least one fetcher among `wget` and `aria2c`. Preflight SHALL NOT require host `pycargoebuild`, `wget`, `aria2c`, `xz`, or `rustc` solely because a cargo package needs work. Reuse-only cargo units SHALL NOT fail preflight solely because those host tools or `docker` are missing.
-
-#### Scenario: Missing pycargoebuild
-
-- **WHEN** `update` selects `dev-util/mise`, a cargo unit is classified full path, and `docker` is not available
-- **THEN** preflight fails before apply (image provides `pycargoebuild`; host binary is not a substitute)
-
-#### Scenario: Missing both wget and aria2c
-
-- **WHEN** a cargo unit is classified full path and the materialize image is unusable
-- **THEN** preflight fails before package mutation (fetchers live in the image, not on the host PATH)
-
-#### Scenario: aria2 alone does not satisfy fetcher preflight
-
-- **WHEN** a cargo unit is classified full path and only a host binary named `aria2` (without `c`) exists
-- **THEN** that host binary does not satisfy full-path cargo preflight; `docker` and the image are required
-
-#### Scenario: Reuse-only cargo skips host pycargoebuild
-
-- **WHEN** a cargo package needs work and every cargo unit is classified reuse
-- **THEN** preflight does not fail solely because host `pycargoebuild` or a fetcher is missing
-
-### Requirement: Soft advisory when cargo full path will use wget
-
-The host wget/aria2 speed advisory specified previously for host-PATH `pycargoebuild` SHALL NOT be emitted solely because `aria2c` is absent from the **host** `PATH`. The materialize image SHOULD provide `aria2c`; image-internal fetcher choice is not an operator host preflight.
-
-#### Scenario: Full-path cargo with wget only warns once
-
-- **WHEN** `update` will full-path materialize a cargo package and `aria2c` is not on the **host** `PATH`
-- **THEN** the program does not emit `pycargoebuild is using wget; install aria2 for faster crate fetches` solely for that host PATH
-
-#### Scenario: aria2c present no advisory
-
-- **WHEN** `update` will full-path materialize a cargo package and `aria2c` is on the host `PATH`
-- **THEN** the program does not emit the wget/aria2 speed advisory solely for that package set
-
-#### Scenario: Reuse-only cargo no advisory
-
-- **WHEN** a cargo package needs work but every cargo unit is classified reuse (no full-path cargo materialize)
-- **THEN** the program does not emit the wget/aria2 speed advisory solely for missing host `aria2c`
-
 ### Requirement: Hardcoded cargo packages enabled
 
 The hardcoded policy map SHALL set `DepsAndAssets` with ecosystem `Cargo` for `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` with their existing GitHub sources (`jdx` / respective repos / tag prefix `v`) and provenance `CargoGitTag`, and for `dev-util/biodiff` with GitHub source `8051enthusiast`/`biodiff` (tag prefix `v`) and provenance `CargoCratesIo`. Those packages SHALL NOT remain `Unsupported` solely for cargo CRATES regeneration. Policy for `usage` SHALL use package subdirectory `cli` when required for package metadata.
@@ -379,6 +297,8 @@ The hardcoded policy map SHALL set `DepsAndAssets` with ecosystem `Cargo` for `d
 
 - **WHEN** policy is resolved for `dev-util/biodiff`
 - **THEN** the technique is `DepsAndAssets Cargo` with provenance `CargoCratesIo` and the source is GitHub `8051enthusiast`/`biodiff` with tag prefix `v`
+
+## ADDED Requirements
 
 ### Requirement: CratesIo materialize from the published crate
 
