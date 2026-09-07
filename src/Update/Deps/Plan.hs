@@ -4,7 +4,8 @@ module Update.Deps.Plan
   ( DepsPlanOps (..),
     productionDepsPlanOps,
     planDepsPackageWithProgress,
-    planDepsPackageWithCeilings,
+    planDepsPackageWithProgressFor,
+    planDepsPackageWithCeilingsFor,
     toGoPlanOps,
   )
 where
@@ -37,6 +38,7 @@ import Update.Bun.Cache (parseEnginesBunFromPackageJson)
 import Update.Cargo.Msrv
   ( CargoTomlFetch (..),
     TagFloorResult (..),
+    applyRustToolchainFloor,
     cargoFloorPolicyKey,
     probePolicyTagFloor,
   )
@@ -50,7 +52,8 @@ import Update.Go.Lanes
     RuntimeLanePlan (..),
     VersionCandidate (..),
     filterCandidateVersions,
-    planFromTargetsWithAtom,
+    planFromTargetsWithAtomFor,
+    restrictCeilings,
     selectAllLaneTargets,
     withCargoTagFloors,
   )
@@ -89,6 +92,8 @@ data DepsPlanOps = DepsPlanOps
     dpoFetchBunEngines :: Text -> Text -> Text -> Text -> IO (Either Text Text),
     -- | Fetch package Cargo.toml body at tag for rust-version probe.
     dpoFetchCargoToml :: Text -> Text -> Text -> Text -> Maybe FilePath -> IO CargoTomlFetch,
+    -- | Fetch rust-toolchain.toml at tag (lock subdir then repository root).
+    dpoFetchRustToolchain :: Text -> Text -> Text -> Text -> Maybe FilePath -> IO CargoTomlFetch,
     -- | Fetch @sbcl.version@ body at tag for SBCL floor probe.
     dpoFetchSbclVersion :: Text -> Text -> Text -> Text -> IO (Either Text Text),
     dpoWorkBudget :: WorkBudget,
@@ -134,6 +139,7 @@ productionDepsPlanOps mToken jobs mOverlay = do
         dpoFetchNpmEngines = fetchNpmEnginesNode mgr,
         dpoFetchBunEngines = fetchBunEnginesAtTag mgr mToken,
         dpoFetchCargoToml = fetchCargoTomlAtTag mgr mToken,
+        dpoFetchRustToolchain = fetchRustToolchainAtTag mgr mToken,
         dpoFetchSbclVersion = fetchSbclVersionAtTag mgr mToken,
         dpoWorkBudget = budget,
         dpoGoCeilingsCache = goCache,
@@ -153,30 +159,44 @@ planDepsPackageWithProgress ::
   [EbuildVersion] ->
   IO (Either PlanError RuntimeLanePlan)
 planDepsPackageWithProgress ops progress eco src locals =
-  case eco of
-    Go mSub -> planGo ops progress src mSub locals
-    NpmEco -> planNpm ops progress src locals
-    Bun -> planBun ops progress src locals Nothing
-    Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals
-    Sbcl -> planSbcl ops progress src locals
+  planDepsPackageWithProgressFor ops progress eco src locals []
 
--- | Plan against caller-supplied ceilings (hypothetical overlay bun-bin).
+-- | Like 'planDepsPackageWithProgress' with a policy runtime-lane arch allowlist.
+planDepsPackageWithProgressFor ::
+  DepsPlanOps ->
+  PlanProgress ->
+  EcosystemSpec ->
+  UpdateSource ->
+  [EbuildVersion] ->
+  [Text] ->
+  IO (Either PlanError RuntimeLanePlan)
+planDepsPackageWithProgressFor ops progress eco src locals allowlist =
+  case eco of
+    Go mSub -> planGo ops progress src mSub locals allowlist
+    NpmEco -> planNpm ops progress src locals allowlist
+    Bun -> planBun ops progress src locals Nothing allowlist
+    Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals allowlist
+    Sbcl -> planSbcl ops progress src locals allowlist
+
+-- | Plan against caller-supplied ceilings (hypothetical overlay bun-bin)
+-- with a policy runtime-lane arch allowlist.
 -- Does not read or write the process-lifetime bun ceiling cache.
-planDepsPackageWithCeilings ::
+planDepsPackageWithCeilingsFor ::
   DepsPlanOps ->
   PlanProgress ->
   EcosystemSpec ->
   UpdateSource ->
   [EbuildVersion] ->
   RuntimeCeilings ->
+  [Text] ->
   IO (Either PlanError RuntimeLanePlan)
-planDepsPackageWithCeilings ops progress eco src locals ceilings =
+planDepsPackageWithCeilingsFor ops progress eco src locals ceilings allowlist =
   case eco of
-    Bun -> planBun ops progress src locals (Just ceilings)
-    Go mSub -> planGo ops progress src mSub locals
-    NpmEco -> planNpm ops progress src locals
-    Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals
-    Sbcl -> planSbcl ops progress src locals
+    Bun -> planBun ops progress src locals (Just ceilings) allowlist
+    Go mSub -> planGo ops progress src mSub locals allowlist
+    NpmEco -> planNpm ops progress src locals allowlist
+    Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals allowlist
+    Sbcl -> planSbcl ops progress src locals allowlist
 
 ------------------------------------------------------------------------
 -- Go
@@ -188,8 +208,9 @@ planGo ::
   UpdateSource ->
   Maybe FilePath ->
   [EbuildVersion] ->
+  [Text] ->
   IO (Either PlanError RuntimeLanePlan)
-planGo ops progress src mSub locals =
+planGo ops progress src mSub locals allowlist =
   case src of
     GitHub owner repo prefix ->
       planWith
@@ -197,6 +218,7 @@ planGo ops progress src mSub locals =
         progress
         src
         locals
+        allowlist
         (discoverCeilingsCached (dpoGoCeilingsCache ops) (discoverGoCeilingsWith (dpoPortageq ops)))
         ( \pv -> do
             let tag = versionTag prefix (renderPVNoRev pv)
@@ -223,8 +245,9 @@ planNpm ::
   PlanProgress ->
   UpdateSource ->
   [EbuildVersion] ->
+  [Text] ->
   IO (Either PlanError RuntimeLanePlan)
-planNpm ops progress src locals =
+planNpm ops progress src locals allowlist =
   case src of
     Npm npmPkg ->
       planWith
@@ -232,6 +255,7 @@ planNpm ops progress src locals =
         progress
         src
         locals
+        allowlist
         ( discoverCeilingsCached
             (dpoNodeCeilingsCache ops)
             (discoverNodejsCeilingsWith (dpoPortageq ops))
@@ -255,8 +279,9 @@ planBun ::
   [EbuildVersion] ->
   -- | Override ceilings (hypothetical plan-delta). @Nothing@ discovers from overlay.
   Maybe RuntimeCeilings ->
+  [Text] ->
   IO (Either PlanError RuntimeLanePlan)
-planBun ops progress src locals mCeilings =
+planBun ops progress src locals mCeilings allowlist =
   case src of
     GitHub owner repo prefix ->
       case mCeilings of
@@ -266,6 +291,7 @@ planBun ops progress src locals mCeilings =
             progress
             src
             locals
+            allowlist
             (pure (Right ceilings))
             (bunProbe ops owner repo prefix)
         Nothing ->
@@ -283,6 +309,7 @@ planBun ops progress src locals mCeilings =
                 progress
                 src
                 locals
+                allowlist
                 ( discoverCeilingsCached
                     (dpoBunCeilingsCache ops)
                     (discoverBunBinCeilings overlayRoot)
@@ -320,8 +347,9 @@ planCargo ::
   Maybe FilePath ->
   Maybe FilePath ->
   [EbuildVersion] ->
+  [Text] ->
   IO (Either PlanError RuntimeLanePlan)
-planCargo ops progress src mLockSub mPkgSub locals =
+planCargo ops progress src mLockSub mPkgSub locals allowlist =
   case src of
     GitHub owner repo prefix -> do
       snapsVar <- newMVar []
@@ -332,6 +360,7 @@ planCargo ops progress src mLockSub mPkgSub locals =
           progress
           src
           locals
+          allowlist
           ( discoverCeilingsCached
               (dpoRustCeilingsCache ops)
               (discoverRustUnionCeilingsWith (dpoPortageq ops))
@@ -347,19 +376,27 @@ planCargo ops progress src mLockSub mPkgSub locals =
                   -- Incomplete is not a parseable requirement; skip, do not persist.
                   pure (Right Nothing)
                 TagFloorComplete mFloor prov -> do
-                  let snap =
-                        CargoTagFloorSnapshot
-                          { ctfsPV = stripRev pv,
-                            ctfsFloor = mFloor,
-                            ctfsCoverage = Just CargoCoverageComplete,
-                            ctfsReasons = [],
-                            ctfsProvenance =
-                              [ CargoPathProvenance p f
-                              | (p, f) <- prov
-                              ]
-                          }
-                  modifyMVar_ snapsVar $ \xs -> pure (snap : xs)
-                  pure (Right (Just (fromMaybe "0.0.0" mFloor)))
+                  applied <-
+                    applyRustToolchainFloor
+                      mLockSub
+                      (memoFetchToolchain memoVar ops owner repo prefix pvText)
+                      mFloor
+                  case applied of
+                    Left err -> pure (Left (PlanProbeFailed err))
+                    Right mFloor' -> do
+                      let snap =
+                            CargoTagFloorSnapshot
+                              { ctfsPV = stripRev pv,
+                                ctfsFloor = mFloor',
+                                ctfsCoverage = Just CargoCoverageComplete,
+                                ctfsReasons = [],
+                                ctfsProvenance =
+                                  [ CargoPathProvenance p f
+                                  | (p, f) <- prov
+                                  ]
+                              }
+                      modifyMVar_ snapsVar $ \xs -> pure (snap : xs)
+                      pure (Right (Just (fromMaybe "0.0.0" mFloor')))
           )
       case result of
         Left err -> pure (Left err)
@@ -389,6 +426,25 @@ memoFetchCargo memoVar ops owner repo prefix pvText mSub = do
         v <- dpoFetchCargoToml ops owner repo prefix pvText mSub
         pure (Map.insert key v m, v)
 
+memoFetchToolchain ::
+  MVar (Map.Map (Text, Maybe FilePath) CargoTomlFetch) ->
+  DepsPlanOps ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  IO CargoTomlFetch
+memoFetchToolchain memoVar ops owner repo prefix pvText mSub = do
+  let tag = versionTag prefix pvText
+      key = (tag <> "#rust-toolchain", mSub)
+  modifyMVar memoVar $ \m ->
+    case Map.lookup key m of
+      Just v -> pure (m, v)
+      Nothing -> do
+        v <- dpoFetchRustToolchain ops owner repo prefix pvText mSub
+        pure (Map.insert key v m, v)
+
 lookupSnap :: EbuildVersion -> [CargoTagFloorSnapshot] -> Maybe CargoTagFloorSnapshot
 lookupSnap pv snaps =
   case [s | s <- snaps, samePV (ctfsPV s) pv || ctfsPV s == pv] of
@@ -404,8 +460,9 @@ planSbcl ::
   PlanProgress ->
   UpdateSource ->
   [EbuildVersion] ->
+  [Text] ->
   IO (Either PlanError RuntimeLanePlan)
-planSbcl ops progress src locals =
+planSbcl ops progress src locals allowlist =
   case src of
     GitHub owner repo prefix ->
       planWith
@@ -413,6 +470,7 @@ planSbcl ops progress src locals =
         progress
         src
         locals
+        allowlist
         ( discoverCeilingsCached
             (dpoSbclCeilingsCache ops)
             (discoverSbclCeilingsWith (dpoPortageq ops))
@@ -440,10 +498,11 @@ planWith ::
   PlanProgress ->
   UpdateSource ->
   [EbuildVersion] ->
+  [Text] ->
   IO (Either Text RuntimeCeilings) ->
   (EbuildVersion -> IO (Either PlanError (Maybe Text))) ->
   IO (Either PlanError RuntimeLanePlan)
-planWith ops progress src locals discoverCeilings fetchReq = do
+planWith ops progress src locals allowlist discoverCeilings fetchReq = do
   ppOnCeilingsStart progress
   ceilingsResult <- discoverCeilings
   case ceilingsResult of
@@ -462,19 +521,21 @@ planWith ops progress src locals discoverCeilings fetchReq = do
             Left err -> pure (Left err)
             Right candidatePVs -> do
               let ordered = sortNewestFirst candidatePVs
+                  restricted = restrictCeilings allowlist ceilings
               candResult <-
                 buildCandidates
                   ops
                   progress
-                  ceilings
+                  restricted
                   ordered
                   fetchReq
               case candResult of
                 Left err -> pure (Left err)
                 Right candidates -> do
-                  let targets = selectAllLaneTargets ceilings candidates
+                  let targets = selectAllLaneTargets restricted candidates
                       plan =
-                        planFromTargetsWithAtom
+                        planFromTargetsWithAtomFor
+                          allowlist
                           (rcAtom ceilings)
                           targets
                   if null (glpUniquePVs plan)
@@ -622,6 +683,31 @@ fetchCargoTomlAtTag mgr mToken owner repo prefix pv mSub = do
       subPath = case mSub of
         Nothing -> "Cargo.toml"
         Just sub -> sub </> "Cargo.toml"
+      url =
+        "https://raw.githubusercontent.com/"
+          <> T.unpack owner
+          <> "/"
+          <> T.unpack repo
+          <> "/"
+          <> T.unpack tag
+          <> "/"
+          <> subPath
+  fetchCargoTomlUrl mgr mToken url
+
+fetchRustToolchainAtTag ::
+  Manager ->
+  Maybe Text ->
+  Text ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  IO CargoTomlFetch
+fetchRustToolchainAtTag mgr mToken owner repo prefix pv mSub = do
+  let tag = versionTag prefix pv
+      subPath = case mSub of
+        Nothing -> "rust-toolchain.toml"
+        Just sub -> sub </> "rust-toolchain.toml"
       url =
         "https://raw.githubusercontent.com/"
           <> T.unpack owner

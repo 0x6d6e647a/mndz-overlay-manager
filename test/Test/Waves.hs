@@ -250,6 +250,7 @@ mkWavePlanOps listVers fetchBun overlay = do
         dpoFetchNpmEngines = \_ _ -> pure (Left "npm unused"),
         dpoFetchBunEngines = fetchBun,
         dpoFetchCargoToml = \_ _ _ _ _ -> pure (CargoTomlError "cargo unused"),
+        dpoFetchRustToolchain = \_ _ _ _ _ -> pure CargoTomlMissing,
         dpoFetchSbclVersion = \_ _ _ _ -> pure (Left "sbcl unused"),
         dpoWorkBudget = budget,
         dpoGoCeilingsCache = goCache,

@@ -4,11 +4,13 @@ module Update.Hardcoded
   ( hardcodedPolicies,
     lookupPolicy,
     lookupHardcoded,
+    lookupLaneArches,
   )
 where
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Text (Text)
 import Update.Types
   ( CargoSource (..),
     EcosystemSpec (..),
@@ -96,15 +98,25 @@ hardcodedPolicies =
         "dev-util/biodiff"
         (GitHub "8051enthusiast" "biodiff" "v")
         (DepsAndAssets (Cargo Nothing Nothing CargoCratesIo)),
+      policyArches
+        "dev-util/codex"
+        (GitHub "openai" "codex" "rust-v")
+        (DepsAndAssets (Cargo (Just "codex-rs") (Just "codex-rs/cli") CargoGitTag))
+        ["amd64"],
       policy
         "dev-util/autolith"
         (GitHub "luciusmagn" "autolith" "v")
         (DepsAndAssets Sbcl)
     ]
   where
-    policy key src tech =
+    policy key src tech = policyArches key src tech []
+    policyArches key src tech arches =
       ( PackageKey key,
-        PackagePolicy {policySource = src, policyTechnique = tech}
+        PackagePolicy
+          { policySource = src,
+            policyTechnique = tech,
+            policyLaneArches = arches
+          }
       )
 
 lookupPolicy :: PackageKey -> Maybe PackagePolicy
@@ -113,3 +125,7 @@ lookupPolicy = (`Map.lookup` hardcodedPolicies)
 -- | Source-only lookup (for outdated checks).
 lookupHardcoded :: PackageKey -> Maybe UpdateSource
 lookupHardcoded key = policySource <$> lookupPolicy key
+
+-- | Runtime-lane arch allowlist; empty means every discovered runtime arch.
+lookupLaneArches :: PackageKey -> [Text]
+lookupLaneArches key = maybe [] policyLaneArches (lookupPolicy key)

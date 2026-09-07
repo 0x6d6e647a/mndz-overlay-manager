@@ -133,6 +133,7 @@ import Update.EbuildEdit
     ebuildNeedsContentFix,
     ensureCargoAssetsSrcUri,
     ensureCargoAssetsSrcUriFor,
+    ensureEmptyCrates,
     ensureGoBdepend,
     ensureNodejsBdepend,
     ensureRustMinVer,
@@ -148,6 +149,7 @@ import Update.EbuildEdit
     parseManifestVendorSHA512,
     sbclBdependMatches,
     setKeywords,
+    stripWindowsOnlyGitCrates,
     writeVersionForPlannedPV,
   )
 import Update.Engines (parseEnginesMinimum)
@@ -287,6 +289,8 @@ tests =
       testCase "Nodejs Bdepend Use Replace" testNodejsBdependUseReplace,
       testCase "Vendor Go Version Gate" testVendorGoVersionGate,
       testCase "Cargo Content Fix" testCargoContentFix,
+      testCase "Cargo Empty Crates SrcUri" testCargoEmptyCratesSrcUri,
+      testCase "Cargo GitCrates Windows Omit" testCargoGitCratesWindowsOmit,
       testCase "Cargo CratesIo SrcUri" testCargoCratesIoSrcUri,
       testCase "Cargo Provenance Coherence" testCargoProvenanceCoherence,
       testCase "Go Keywords Assembly" testGoKeywordsAssembly,
@@ -714,6 +718,134 @@ testCargoContentFix = do
   assertTrue
     "tarball form ok"
     (not (ebuildNeedsCargoContentFix CargoGitTag ["~amd64"] good (Just "1.88.0")))
+
+testCargoEmptyCratesSrcUri :: IO ()
+testCargoEmptyCratesSrcUri = do
+  let extras =
+        T.unlines
+          [ "inherit cargo",
+            "KEYWORDS=\"-* ~amd64\"",
+            "CRATES=\"\"",
+            "GIT_CRATES=\"",
+            "\tcrossterm;https://github.com/crossterm-rs/crossterm;abc",
+            "\"",
+            "SRC_URI=\"https://github.com/openai/codex/archive/refs/tags/rust-v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" ${CARGO_CRATE_URIS}\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/codex-${PV}/codex-${PV}-crates.tar.xz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/rusty-v8-150.4.0/rusty-v8-150.4.0-with-submodules.tar.xz\"",
+            "SRC_URI+=\" https://commondatastorage.googleapis.com/chromium-browser-clang/Linux_x64/clang-llvmorg-23-init-1234-gdeadbeef-1.tar.xz\"",
+            "SRC_URI+=\" https://commondatastorage.googleapis.com/chromium-browser-clang/Linux_x64/rust-toolchain-abc.tar.xz\""
+          ]
+      fixed = ensureCargoAssetsSrcUri "codex" extras
+  assertTrue "keeps CARGO_CRATE_URIS" ("CARGO_CRATE_URIS" `T.isInfixOf` fixed)
+  assertTrue "keeps GIT_CRATES" ("GIT_CRATES" `T.isInfixOf` fixed)
+  assertTrue "keeps rusty_v8" ("rusty-v8-150.4.0-with-submodules.tar.xz" `T.isInfixOf` fixed)
+  assertTrue "keeps clang" ("chromium-browser-clang" `T.isInfixOf` fixed)
+  assertTrue "keeps rust-toolchain distfile" ("rust-toolchain-abc" `T.isInfixOf` fixed)
+  assertTrue "keeps crates tarball" ("codex-${PV}-crates.tar.xz" `T.isInfixOf` fixed)
+  assertTrue "keeps github archive" ("openai/codex/archive" `T.isInfixOf` fixed)
+  assertTrue
+    "not collapsed to two lines only"
+    (length (filter ("SRC_URI" `T.isInfixOf`) (T.lines fixed)) >= 4)
+  -- List-era (non-empty CRATES) still rewrites to archive + crates tarball.
+  let listEra =
+        T.unlines
+          [ "CRATES=\"foo-1 bar-2\"",
+            "SRC_URI=\"",
+            "\thttps://github.com/jdx/hk/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz",
+            "\t${CARGO_CRATE_URIS}",
+            "\""
+          ]
+      listFixed = ensureCargoAssetsSrcUri "hk" listEra
+  assertTrue "list-era drops CARGO_CRATE_URIS" (not ("CARGO_CRATE_URIS" `T.isInfixOf` listFixed))
+  assertTrue "list-era has crates" ("hk-${PV}-crates.tar.xz" `T.isInfixOf` listFixed)
+  assertTrue "list-era keeps github" ("github.com/jdx/hk/archive" `T.isInfixOf` listFixed)
+  -- pycargoebuild empty CRATES is a multiline CRATES="\\n" block. That is not
+  -- list-era: keep GIT_CRATES URIs, the archive -> rename, and rusty_v8 tag.
+  let pycargoEmpty =
+        T.unlines
+          [ "CRATES=\"",
+            "\"",
+            "SRC_URI=\"",
+            "\thttps://github.com/openai/codex/archive/refs/tags/rust-v${PV}.tar.gz",
+            "\t\t-> ${P}.tar.gz",
+            "\thttps://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/${PN}-${PV}/${PN}-${PV}-crates.tar.xz",
+            "\thttps://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/rusty-v8-${RUSTY_V8_VER}/rusty-v8-${RUSTY_V8_VER}-with-submodules.tar.xz",
+            "\thttps://commondatastorage.googleapis.com/chromium-browser-clang/Linux_x64/clang.tar.xz",
+            "\t${CARGO_CRATE_URIS}",
+            "\""
+          ]
+      emptied = ensureEmptyCrates pycargoEmpty
+      fixedPycargo = ensureCargoAssetsSrcUri "codex" emptied
+  assertTrue
+    "pycargo empty keeps CARGO_CRATE_URIS"
+    ("CARGO_CRATE_URIS" `T.isInfixOf` fixedPycargo)
+  assertTrue
+    "pycargo empty keeps archive rename"
+    ("-> ${P}.tar.gz" `T.isInfixOf` fixedPycargo)
+  assertTrue
+    "pycargo empty does not glue rename onto crates"
+    (not ("crates.tar.xz->" `T.isInfixOf` T.filter (/= ' ') fixedPycargo))
+  assertTrue
+    "pycargo empty keeps rusty_v8 release tag"
+    ("/rusty-v8-${RUSTY_V8_VER}/" `T.isInfixOf` fixedPycargo)
+  assertTrue
+    "pycargo empty does not retag rusty_v8 as codex PV"
+    (not ("/codex-${PV}/rusty-v8-" `T.isInfixOf` fixedPycargo))
+
+testCargoGitCratesWindowsOmit :: IO ()
+testCargoGitCratesWindowsOmit = do
+  let lock =
+        T.unlines
+          [ "[[package]]",
+            "name = \"crossterm\"",
+            "version = \"0.28.0\"",
+            "source = \"git+https://github.com/crossterm-rs/crossterm?rev=abc\"",
+            "",
+            "[[package]]",
+            "name = \"mxc\"",
+            "version = \"0.1.0\"",
+            "source = \"git+https://github.com/microsoft/mxc?rev=def\"",
+            "",
+            "[[package]]",
+            "name = \"nucleo\"",
+            "version = \"0.5.0\"",
+            "source = \"git+https://github.com/helix-editor/nucleo?rev=aaa\""
+          ]
+      toml =
+        T.unlines
+          [ "[package]",
+            "name = \"codex-cli\"",
+            "[dependencies]",
+            "crossterm = { git = \"https://github.com/crossterm-rs/crossterm\" }",
+            "nucleo = { git = \"https://github.com/helix-editor/nucleo\" }",
+            "[target.'cfg(windows)'.dependencies]",
+            "mxc = { git = \"https://github.com/microsoft/mxc\" }"
+          ]
+      ebuild =
+        T.unlines
+          [ "GIT_CRATES=\"",
+            "\tcrossterm;https://github.com/crossterm-rs/crossterm;abc",
+            "\tmxc;https://github.com/microsoft/mxc;def",
+            "\tnucleo;https://github.com/helix-editor/nucleo;aaa",
+            "\""
+          ]
+      fixed = stripWindowsOnlyGitCrates lock [toml] ebuild
+  assertTrue "drops mxc" (not ("microsoft/mxc" `T.isInfixOf` fixed))
+  assertTrue "keeps crossterm" ("crossterm-rs/crossterm" `T.isInfixOf` fixed)
+  assertTrue "keeps nucleo" ("helix-editor/nucleo" `T.isInfixOf` fixed)
+  let assoc =
+        T.unlines
+          [ "declare -A GIT_CRATES=(",
+            "\t[crossterm]='https://github.com/crossterm-rs/crossterm;abc;crossterm-%commit%'",
+            "\t[mxc]='https://github.com/microsoft/mxc;def;mxc-%commit%'",
+            "\t[nucleo]='https://github.com/helix-editor/nucleo;aaa;nucleo-%commit%'",
+            ")"
+          ]
+      assocFixed = stripWindowsOnlyGitCrates lock [toml] assoc
+  assertTrue "assoc drops mxc" (not ("microsoft/mxc" `T.isInfixOf` assocFixed))
+  assertTrue "assoc keeps crossterm" ("crossterm-rs/crossterm" `T.isInfixOf` assocFixed)
+  assertTrue "assoc keeps nucleo" ("helix-editor/nucleo" `T.isInfixOf` assocFixed)
 
 testGoKeywordsAssembly :: IO ()
 testGoKeywordsAssembly = do

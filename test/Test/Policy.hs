@@ -348,7 +348,7 @@ testHardcodedGrok = do
 testPolicyClassification :: IO ()
 testPolicyClassification = do
   case lookupPolicy (PackageKey "dev-util/opencode") of
-    Just (PackagePolicy (GitHub "anomalyco" "opencode" "v") (DepsAndAssets Bun)) ->
+    Just (PackagePolicy (GitHub "anomalyco" "opencode" "v") (DepsAndAssets Bun) []) ->
       pure ()
     other -> do
       hPutStrLn stderr $ "opencode technique: " <> show other
@@ -359,18 +359,18 @@ testPolicyClassification = do
       hPutStrLn stderr $ "opencode-bin should be absent: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/mise") of
-    Just (PackagePolicy (GitHub "jdx" "mise" "v") (DepsAndAssets (Cargo Nothing Nothing CargoGitTag))) ->
+    Just (PackagePolicy (GitHub "jdx" "mise" "v") (DepsAndAssets (Cargo Nothing Nothing CargoGitTag)) []) ->
       pure ()
     other -> do
       hPutStrLn stderr $ "mise technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/hk") of
-    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing Nothing CargoGitTag))) -> pure ()
+    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing Nothing CargoGitTag)) []) -> pure ()
     other -> do
       hPutStrLn stderr $ "hk technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/usage") of
-    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing (Just "cli") CargoGitTag))) -> pure ()
+    Just (PackagePolicy _ (DepsAndAssets (Cargo Nothing (Just "cli") CargoGitTag)) []) -> pure ()
     other -> do
       hPutStrLn stderr $ "usage technique: " <> show other
       exitFailure
@@ -379,16 +379,29 @@ testPolicyClassification = do
       ( PackagePolicy
           (GitHub "8051enthusiast" "biodiff" "v")
           (DepsAndAssets (Cargo Nothing Nothing CargoCratesIo))
+          []
         ) ->
         pure ()
     other -> do
       hPutStrLn stderr $ "biodiff technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/codex") of
+    Just
+      ( PackagePolicy
+          (GitHub "openai" "codex" "rust-v")
+          (DepsAndAssets (Cargo (Just "codex-rs") (Just "codex-rs/cli") CargoGitTag))
+          ["amd64"]
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "codex technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/autolith") of
     Just
       ( PackagePolicy
           (GitHub "luciusmagn" "autolith" "v")
           (DepsAndAssets Sbcl)
+          []
         ) ->
         pure ()
     other -> do
@@ -399,6 +412,7 @@ testPolicyClassification = do
       ( PackagePolicy
           (GitHub "fukamachi" "qlot" "")
           GitMvAndManifest
+          []
         ) ->
         pure ()
     other -> do
@@ -409,6 +423,7 @@ testPolicyClassification = do
       ( PackagePolicy
           (Npm "node-gyp")
           (DepsAndAssets NpmEco)
+          []
         ) ->
         pure ()
     other -> do
@@ -416,17 +431,17 @@ testPolicyClassification = do
       exitFailure
   assertEq "unmapped" Nothing (lookupPolicy (PackageKey "dev-lang/haskell"))
   case lookupPolicy (PackageKey "dev-lang/bun-bin") of
-    Just (PackagePolicy (GitHub "oven-sh" "bun" "bun-v") GitMvAndManifest) -> pure ()
+    Just (PackagePolicy (GitHub "oven-sh" "bun" "bun-v") GitMvAndManifest []) -> pure ()
     other -> do
       hPutStrLn stderr $ "bun policy: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-db/dolt") of
-    Just (PackagePolicy _ (DepsAndAssets (Go (Just "go")))) -> pure ()
+    Just (PackagePolicy _ (DepsAndAssets (Go (Just "go"))) []) -> pure ()
     other -> do
       hPutStrLn stderr $ "dolt technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/beads") of
-    Just (PackagePolicy _ (DepsAndAssets (Go Nothing))) -> pure ()
+    Just (PackagePolicy _ (DepsAndAssets (Go Nothing)) []) -> pure ()
     other -> do
       hPutStrLn stderr $ "beads technique: " <> show other
       exitFailure
@@ -435,23 +450,24 @@ testPolicyClassification = do
       ( PackagePolicy
           (GitHub "dgraph-io" "badger" "v")
           (DepsAndAssets (Go Nothing))
+          []
         ) ->
         pure ()
     other -> do
       hPutStrLn stderr $ "badger technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/openspec") of
-    Just (PackagePolicy (Npm "@fission-ai/openspec") (DepsAndAssets NpmEco)) -> pure ()
+    Just (PackagePolicy (Npm "@fission-ai/openspec") (DepsAndAssets NpmEco) []) -> pure ()
     other -> do
       hPutStrLn stderr $ "openspec technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/rulesync") of
-    Just (PackagePolicy (Npm "rulesync") (DepsAndAssets NpmEco)) -> pure ()
+    Just (PackagePolicy (Npm "rulesync") (DepsAndAssets NpmEco) []) -> pure ()
     other -> do
       hPutStrLn stderr $ "rulesync technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/ralph-tui") of
-    Just (PackagePolicy _ (DepsAndAssets Bun)) -> pure ()
+    Just (PackagePolicy _ (DepsAndAssets Bun) []) -> pure ()
     other -> do
       hPutStrLn stderr $ "ralph-tui technique: " <> show other
       exitFailure

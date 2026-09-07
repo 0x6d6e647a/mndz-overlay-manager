@@ -78,8 +78,8 @@ import Update.CheckCache
   )
 import Update.Deps.Plan
   ( DepsPlanOps (..),
-    planDepsPackageWithCeilings,
-    planDepsPackageWithProgress,
+    planDepsPackageWithCeilingsFor,
+    planDepsPackageWithProgressFor,
   )
 import Update.DiskSpace
   ( MaterializeClass (..),
@@ -97,7 +97,7 @@ import Update.Go.Lanes
     planNeedsWork,
   )
 import Update.Go.Plan (PlanProgress (..), localNonLivePVs)
-import Update.Hardcoded (lookupPolicy)
+import Update.Hardcoded (lookupLaneArches, lookupPolicy)
 import Update.Manifest.Dist (exactDistSize)
 import Update.OverlayWaves
   ( bunBinPackageKey,
@@ -326,7 +326,13 @@ planDeps env entry locals src eco = do
               pure (Right plan)
         _ -> do
           recordFetch cache
-          planDepsPackageWithProgress depsOps progress eco src localPVs
+          planDepsPackageWithProgressFor
+            depsOps
+            progress
+            eco
+            src
+            localPVs
+            (lookupLaneArches key)
       case planResult of
         Left err ->
           pure $
@@ -420,13 +426,14 @@ planDepsHypo env entry locals src eco localPVs =
           recordFetch (peCheckCache env)
           let hypoCeil = hypotheticalCeilings metas remote
           hypoResult <-
-            planDepsPackageWithCeilings
+            planDepsPackageWithCeilingsFor
               depsOps
               progress
               eco
               src
               localPVs
               hypoCeil
+              (lookupLaneArches key)
           case hypoResult of
             Left err ->
               pure $
@@ -472,7 +479,14 @@ planDepsOnDiskFallback env entry locals src eco localPVs = do
       depsOps = peDepsPlanOps env
       progress = planProgress (peMulti env) key eco
   recordFetch (peCheckCache env)
-  planResult <- planDepsPackageWithProgress depsOps progress eco src localPVs
+  planResult <-
+    planDepsPackageWithProgressFor
+      depsOps
+      progress
+      eco
+      src
+      localPVs
+      (lookupLaneArches key)
   case planResult of
     Left err ->
       pure $
@@ -538,13 +552,14 @@ refuseUnselectedProvider env key eco src localPVs locals onDiskPlan onDiskNeed =
                     Right metas -> do
                       let hypoCeil = hypotheticalCeilings metas remote
                       hypoResult <-
-                        planDepsPackageWithCeilings
+                        planDepsPackageWithCeilingsFor
                           (peDepsPlanOps env)
                           (planProgress (peMulti env) key eco)
                           eco
                           src
                           localPVs
                           hypoCeil
+                          (lookupLaneArches key)
                       case hypoResult of
                         Left _ ->
                           pure $ Just (overlayFailClosedMessage provider)

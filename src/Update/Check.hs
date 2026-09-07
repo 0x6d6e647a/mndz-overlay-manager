@@ -60,8 +60,8 @@ import Update.CheckCache
   )
 import Update.Deps.Plan
   ( DepsPlanOps (..),
-    planDepsPackageWithCeilings,
-    planDepsPackageWithProgress,
+    planDepsPackageWithCeilingsFor,
+    planDepsPackageWithProgressFor,
   )
 import Update.EbuildSelection
   ( InventoryFile (..),
@@ -83,7 +83,7 @@ import Update.Go.Plan
   ( PlanProgress (..),
     localNonLivePVs,
   )
-import Update.Hardcoded (lookupPolicy)
+import Update.Hardcoded (lookupLaneArches, lookupPolicy)
 import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
 import Update.OverlayWaves
@@ -190,7 +190,7 @@ checkOne mh fetch depsOps cache byPkg entry = do
   mhStart mh key
   let locals = Map.findWithDefault [] key byPkg
   report <- case lookupPolicy key of
-    Just (PackagePolicy src (DepsAndAssets eco)) ->
+    Just (PackagePolicy src (DepsAndAssets eco) _) ->
       checkPackageDeps mh fetch depsOps cache entry locals src eco
     _ -> do
       mhStatus mh key "fetching"
@@ -293,7 +293,13 @@ checkPackageDeps mh fetch depsOps cache entry locals src eco = do
     _ -> do
       recordFetch cache
       planResult <-
-        planDepsPackageWithProgress depsOps progress eco src localPVs
+        planDepsPackageWithProgressFor
+          depsOps
+          progress
+          eco
+          src
+          localPVs
+          (lookupLaneArches key)
       case planResult of
         Left err ->
           pure
@@ -427,13 +433,14 @@ applyOverlayBlockIndication mh fetch depsOps cache eco src entry locals localPVs
                 Right metas -> do
                   let hypoCeil = hypotheticalCeilings metas remote
                   hypoResult <-
-                    planDepsPackageWithCeilings
+                    planDepsPackageWithCeilingsFor
                       depsOps
                       (depsPlanProgress mh (peKey entry) eco)
                       eco
                       src
                       localPVs
                       hypoCeil
+                      (lookupLaneArches (peKey entry))
                   case hypoResult of
                     Left _ ->
                       pure

@@ -10,6 +10,7 @@ module Update.Go.Lanes
     pattern LaneArm64Tilde,
     allLaneIds,
     lanesFromCeilings,
+    restrictCeilings,
     laneLabel,
     laneLabelWith,
     laneCeilingLane,
@@ -20,10 +21,13 @@ module Update.Go.Lanes
     VersionCandidate (..),
     selectLaneTarget,
     selectAllLaneTargets,
+    selectAllLaneTargetsFor,
     collapsePlannedEbuilds,
     assembleKeywords,
+    assembleKeywordsFor,
     planFromTargets,
     planFromTargetsWithAtom,
+    planFromTargetsWithAtomFor,
     withCargoTagFloors,
     CargoFloorCoverage (..),
     CargoPathProvenance (..),
@@ -44,6 +48,7 @@ where
 import Data.Containers.ListUtils (nubOrd)
 import Data.List (sort, sortBy)
 import Data.List.NonEmpty qualified as NE
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, samePV)
@@ -124,6 +129,12 @@ lanesFromCeilings ceilings =
   case allCeilingLanes ceilings of
     [] -> allLaneIds
     cls -> map (\(CeilingLane a t) -> LaneId a t) cls
+
+-- | Drop arches outside a policy allowlist. Empty allowlist is a no-op.
+restrictCeilings :: [Arch] -> RuntimeCeilings -> RuntimeCeilings
+restrictCeilings [] c = c
+restrictCeilings allowed c =
+  c {rcByArch = Map.filterWithKey (\arch _ -> arch `elem` allowed) (rcByArch c)}
 
 laneLabel :: LaneId -> Text
 laneLabel = laneLabelWith "dev-lang/go"
@@ -231,24 +242,38 @@ selectLaneTarget ceilings candidates lid =
         }
 
 selectAllLaneTargets :: RuntimeCeilings -> [VersionCandidate] -> [LaneTarget]
-selectAllLaneTargets ceilings candidates =
-  map (selectLaneTarget ceilings candidates) (lanesFromCeilings ceilings)
+selectAllLaneTargets = selectAllLaneTargetsFor []
+
+-- | Like 'selectAllLaneTargets' after 'restrictCeilings'.
+selectAllLaneTargetsFor :: [Arch] -> RuntimeCeilings -> [VersionCandidate] -> [LaneTarget]
+selectAllLaneTargetsFor allowlist ceilings candidates =
+  let restricted = restrictCeilings allowlist ceilings
+   in map (selectLaneTarget restricted candidates) (lanesFromCeilings restricted)
 
 -- | KEYWORDS tokens from lane membership: any plain or tilde lane for an arch
 -- emits @~arch@ (never bare). Plain vs tilde lanes still select PVs and arch set;
 -- overlay packages are testing-only (GURU-aligned tilde-only policy).
 assembleKeywords :: [LaneId] -> [Text]
-assembleKeywords lanes =
-  [ "~" <> arch
-  | arch <- arches,
-    any (\l -> liArch l == arch) lanes
-  ]
+assembleKeywords = assembleKeywordsFor []
+
+-- | Like 'assembleKeywords', prepending @-*@ when an allowlist is set.
+assembleKeywordsFor :: [Arch] -> [LaneId] -> [Text]
+assembleKeywordsFor allowlist lanes =
+  let toks =
+        [ "~" <> arch
+        | arch <- arches,
+          any (\l -> liArch l == arch) lanes
+        ]
+   in if null allowlist then toks else "-*" : toks
   where
     arches = sort (nubOrd (map liArch lanes))
 
 -- | Collapse lane targets to unique planned ebuilds with KEYWORDS.
 collapsePlannedEbuilds :: [LaneTarget] -> [PlannedEbuild]
-collapsePlannedEbuilds targets =
+collapsePlannedEbuilds = collapsePlannedEbuildsFor []
+
+collapsePlannedEbuildsFor :: [Arch] -> [LaneTarget] -> [PlannedEbuild]
+collapsePlannedEbuildsFor allowlist targets =
   let withPV =
         [ (ltPackagePV t, ltLane t)
         | t <- targets,
@@ -261,7 +286,7 @@ collapsePlannedEbuilds targets =
       let lanes = [lid | (Just p, lid) <- withPV, samePV p pv || p == pv]
        in PlannedEbuild
             { pePV = pv,
-              peKeywords = assembleKeywords lanes,
+              peKeywords = assembleKeywordsFor allowlist lanes,
               peLanes = lanes
             }
 
@@ -269,8 +294,12 @@ planFromTargets :: [LaneTarget] -> RuntimeLanePlan
 planFromTargets = planFromTargetsWithAtom "dev-lang/go"
 
 planFromTargetsWithAtom :: Text -> [LaneTarget] -> RuntimeLanePlan
-planFromTargetsWithAtom atom targets =
-  let ebuilds = collapsePlannedEbuilds targets
+planFromTargetsWithAtom = planFromTargetsWithAtomFor []
+
+-- | Like 'planFromTargetsWithAtom' with a policy arch allowlist.
+planFromTargetsWithAtomFor :: [Arch] -> Text -> [LaneTarget] -> RuntimeLanePlan
+planFromTargetsWithAtomFor allowlist atom targets =
+  let ebuilds = collapsePlannedEbuildsFor allowlist targets
    in RuntimeLanePlan
         { glpLanes = targets,
           glpEbuilds = ebuilds,

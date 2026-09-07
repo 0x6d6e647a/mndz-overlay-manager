@@ -98,10 +98,14 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
         Right False -> do
           templateContent <- TIO.readFile templatePath
           let content = fromMaybe templateContent mEbuildBody
+              -- Empty CRATES first so list-era detection does not treat
+              -- pycargoebuild's multiline CRATES="\\n" as a crate list.
               withAssets = case eco of
                 Cargo {} ->
-                  ensureEmptyCrates
-                    (ensureCargoAssetsSrcUriFor (cargoSource eco) pn content)
+                  ensureCargoAssetsSrcUriFor
+                    (cargoSource eco)
+                    pn
+                    (ensureEmptyCrates content)
                 _ -> parameterizeAssetsSrcUri pn content
               withKw = setKeywords keywords withAssets
           contentFixed <- case (eco, mReqVer) of

@@ -15,6 +15,7 @@ module Update.Apply.Materialize
     materializeStepTotalUpper,
     reviseMaterializeStepTotal,
     fetchModelsDevApiJson,
+    harvestVsLaneCeiling,
   )
 where
 
@@ -119,7 +120,7 @@ import Update.CheckCache
   )
 import Update.Deps.Plan
   ( DepsPlanOps (..),
-    planDepsPackageWithProgress,
+    planDepsPackageWithProgressFor,
   )
 import Update.DiskSpace
   ( checkTempNeedAtAdmit,
@@ -160,6 +161,7 @@ import Update.Go.Vendor
     mkVendorOps,
     versionTag,
   )
+import Update.Hardcoded (lookupLaneArches)
 import Update.Npm.Cache
   ( NpmCacheProgress (..),
     buildNpmDepsTarball,
@@ -232,12 +234,13 @@ applyDepsAndAssets env overlayRoot entry src eco = do
           pure (Right plan)
     _ -> do
       recordFetch cache
-      planDepsPackageWithProgress
+      planDepsPackageWithProgressFor
         (aeDepsPlanOps env)
         progress
         eco
         src
         localPVs
+        (lookupLaneArches key)
   case planResult of
     Left err ->
       pure

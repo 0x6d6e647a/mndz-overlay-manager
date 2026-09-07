@@ -15,6 +15,10 @@ module Update.Cargo.Crates
     -- Pack helpers (unit-tested)
     RegistryPackage (..),
     parseRegistryPackages,
+    parseV8RegistryPin,
+    rustyV8SnapshotBasename,
+    rustyV8ReleaseTag,
+    harvestRustyV8Snapshot,
     cargoChecksumJson,
     packCratesTarball,
     packCratesTarballWith,
@@ -38,10 +42,13 @@ import Update.Cargo.Lock
     crateFilename,
     cratePackageName,
     parseRegistryPackages,
+    parseV8RegistryPin,
   )
 import Update.Cargo.Msrv
   ( TagFloorResult (..),
+    applyRustToolchainFloor,
     fetchCargoTomlFromDir,
+    fetchRustToolchainFromDir,
     maxMaybeRustVersions,
     parseDirectRustVersion,
     parseRustMinVerFromEbuild,
@@ -51,6 +58,7 @@ import Update.DiskSpace
   ( MaterializeClass (FullCargo),
     checkPostCloneForClass,
   )
+import Update.EbuildEdit (stripWindowsOnlyGitCrates)
 import Update.Go.Vendor (githubCloneUrl, versionTag)
 import Update.Pack.XzTar (packTarXzAtomic)
 import Update.Process
@@ -65,6 +73,15 @@ import Update.Types (CargoSource (..))
 -- | Internal tarball path prefix expected by cargo.eclass.
 crateTarballPrefix :: Text
 crateTarballPrefix = "cargo_home/gentoo"
+
+-- | rusty_v8+submodules snapshot basename keyed by crates.io @v8@ version.
+rustyV8SnapshotBasename :: Text -> FilePath
+rustyV8SnapshotBasename ver =
+  T.unpack ("rusty-v8-" <> ver <> "-with-submodules.tar.xz")
+
+-- | Assets release tag for a rusty_v8 snapshot (crate version, not overlay PV).
+rustyV8ReleaseTag :: Text -> Text
+rustyV8ReleaseTag ver = "rusty-v8-" <> ver
 
 -- | Canonical crates.io download endpoint for a published crate.
 cratesIoDownloadEndpoint :: Text -> Text -> Text
@@ -276,7 +293,11 @@ buildCargoCratesTarball
                                     <> T.pack outPath
                                 )
                           else do
-                            ebuildBody <- TIO.readFile ebuildPath
+                            ebuildBody0 <- TIO.readFile ebuildPath
+                            lockBody <- TIO.readFile (lockRoot </> "Cargo.lock")
+                            tomlBodies <- collectCargoTomlBodies lockRoot
+                            let ebuildBody =
+                                  stripWindowsOnlyGitCrates lockBody tomlBodies ebuildBody0
                             srcH <- case cargoSrc of
                               -- GitTag: active-set clone harvest (policy closure).
                               CargoGitTag -> harvestCloneFloor srcDir mPkgSub mLockSub
@@ -311,6 +332,31 @@ buildCargoCratesTarball
                                                 crHarvestFloor = harvest
                                               }
 
+collectCargoTomlBodies :: FilePath -> IO [Text]
+collectCargoTomlBodies root = do
+  paths <- findCargoTomls root
+  mapM TIO.readFile paths
+
+findCargoTomls :: FilePath -> IO [FilePath]
+findCargoTomls = go
+  where
+    go dir = do
+      names <- listDirectory dir
+      concat
+        <$> mapM
+          ( \n -> do
+              let p = dir </> n
+              isDir <- doesDirectoryExist p
+              if isDir
+                then
+                  if n == ".git" || n == "target" || n == "vendor"
+                    then pure []
+                    else go p
+                else
+                  pure [p | n == "Cargo.toml"]
+          )
+          names
+
 -- | Active-set clone harvest: same policy-package path closure as tag floor.
 harvestCloneFloor ::
   FilePath ->
@@ -324,14 +370,16 @@ harvestCloneFloor cloneDir mPkg mLock = do
       mLock
       (Just cloneDir)
       (fetchCargoTomlFromDir cloneDir)
-  pure $ case result of
-    TagFloorComplete mFloor _ -> Right mFloor
+  case result of
     TagFloorIncomplete reasons _ ->
-      Left
-        ( "incomplete clone Cargo.toml path closure: "
-            <> T.intercalate "; " reasons
-        )
-    TagFloorFailed err -> Left err
+      pure $
+        Left
+          ( "incomplete clone Cargo.toml path closure: "
+              <> T.intercalate "; " reasons
+          )
+    TagFloorFailed err -> pure (Left err)
+    TagFloorComplete mFloor _ ->
+      applyRustToolchainFloor mLock (fetchRustToolchainFromDir cloneDir) mFloor
 
 -- | Direct rust-version from immediate extracted registry package roots only
 -- (@cargo_home/gentoo/{name}-{version}/Cargo.toml@). Nested examples are ignored.
@@ -569,6 +617,35 @@ gitCloneTag run url tag dest = do
     if prExitCode res == ExitSuccess
       then Right ()
       else Left ("git clone failed: " <> T.pack (prStderr res))
+
+-- | Reuse a verified rusty_v8 snapshot or clone @denoland/rusty_v8@ @v${ver}@
+-- with recursive submodules and pack a hermetic tar/xz.
+harvestRustyV8Snapshot ::
+  (Text -> Text -> FilePath -> IO (Either Text ())) ->
+  (FilePath -> FilePath -> IO (Either Text ())) ->
+  Maybe FilePath ->
+  Text ->
+  FilePath ->
+  FilePath ->
+  IO (Either Text FilePath)
+harvestRustyV8Snapshot cloneFn packFn mReuse ver workDir outDir =
+  let outPath = outDir </> rustyV8SnapshotBasename ver
+      tag = "v" <> ver
+      src = workDir </> "rusty_v8"
+      url = "https://github.com/denoland/rusty_v8" :: Text
+   in case mReuse of
+        Just p -> pure (Right p)
+        Nothing -> do
+          createDirectoryIfMissing True workDir
+          createDirectoryIfMissing True outDir
+          cloned <- cloneFn url tag src
+          case cloned of
+            Left err -> pure (Left err)
+            Right () -> do
+              packed <- packFn src outPath
+              pure $ case packed of
+                Left err -> Left err
+                Right () -> Right outPath
 
 ------------------------------------------------------------------------
 -- CratesIo fetch-and-unpack (published crate provenance)

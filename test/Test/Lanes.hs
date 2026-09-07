@@ -94,6 +94,7 @@ import Update.Apply.TestSupport
     contentFixNeeded,
     fullPathMaterializeSteps,
     goPublishAndOverlay,
+    harvestVsLaneCeiling,
     markSuccessLinesReused,
     materializePlan,
     materializeStepTotalUpper,
@@ -168,6 +169,7 @@ import Update.Go.Lanes
     RuntimeLanePlan (..),
     VersionCandidate (..),
     assembleKeywords,
+    assembleKeywordsFor,
     buildGapLines,
     collapsePlannedEbuilds,
     extrasToDelete,
@@ -179,8 +181,10 @@ import Update.Go.Lanes
     missingTargets,
     planErrorMessage,
     planFromTargets,
+    planFromTargetsWithAtomFor,
     planNeedsWork,
     selectAllLaneTargets,
+    selectAllLaneTargetsFor,
     zeroPlannedPVsError,
     pattern LaneAmd64Plain,
     pattern LaneAmd64Tilde,
@@ -301,6 +305,7 @@ unitTests =
       testCase "Canonical Ebuild Revision" testCanonicalEbuildRevision,
       testCase "Go Lane Selection" testGoLaneSelection,
       testCase "Go Lane Collapse" testGoLaneCollapse,
+      testCase "Lane Arch Allowlist" testLaneArchAllowlist,
       testCase "Go Gap Lines" testGoGapLines,
       testCase "Go Strip And Parse List" testGoStripAndParseList,
       testCase "Go Mod Cache Concurrent Distinct Keys" testGoModCacheConcurrentDistinctKeys,
@@ -1040,6 +1045,25 @@ testPolicyTagFloorWalker = do
     TagFloorIncomplete reasons _ ->
       assertTrue "unparsed cfg" (any ("cfg" `T.isInfixOf`) reasons)
     other -> assertFailure ("unparsed: " <> show other)
+  androidNot <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(not(target_os = \"android\"))'.dependencies]",
+              "tui = { path = \"tui\" }"
+            ]
+        ),
+        (Just "tui", pkgToml "tui" "1.93")
+      ]
+  case androidNot of
+    TagFloorComplete (Just v) _ ->
+      assertEq "not-android is active linux" "1.93.0" v
+    other -> assertFailure ("not-android: " <> show other)
   -- 1.5 escape, virtual, patch
   escapeDep <-
     runFloor
@@ -1133,6 +1157,73 @@ testCanonicalEbuildRevision = do
   case selectHighestNonLive [mk "1.0.0" "a.ebuild", mk "foo" "raw.ebuild"] of
     Left _ -> pure ()
     other -> assertFailure ("incomparable should fail, got " <> show other)
+
+testLaneArchAllowlist :: IO ()
+testLaneArchAllowlist = do
+  let rustCeilings = dualArchGoCeilings (Just "1.80.0") (Just "1.85.0")
+      -- amd64 ceilings stay high; arm64 is lower so a mid harvest would bind
+      -- only if arm64 lanes participated.
+      rustArmLower =
+        let base = dualArchGoCeilings (Just "1.90.0") (Just "1.90.0")
+            arm =
+              ArchCeilings
+                (Just (parseEbuildVersion "1.80.0"))
+                (Just (parseEbuildVersion "1.81.0"))
+         in base {rcByArch = Map.insert "arm64" arm (rcByArch base)}
+      candidates =
+        [ VersionCandidate (parseEbuildVersion "0.153.3") (Just "1.95.0"),
+          VersionCandidate (parseEbuildVersion "0.50.0") (Just "1.80.0")
+        ]
+      lowCandidates =
+        [ VersionCandidate (parseEbuildVersion "0.50.0") (Just "1.80.0")
+        ]
+  -- Codex: amd64-only, KEYWORDS -* ~amd64, no arm64 lanes.
+  let codexTargets = selectAllLaneTargetsFor ["amd64"] rustCeilings lowCandidates
+      codexPlan = planFromTargetsWithAtomFor ["amd64"] "dev-lang/rust|rust-bin" codexTargets
+  assertEq "codex unique" 1 (length (glpUniquePVs codexPlan))
+  assertTrue
+    "no arm64 lane"
+    (not (any (\t -> liArch (ltLane t) == "arm64") (glpLanes codexPlan)))
+  case glpEbuilds codexPlan of
+    [pe] -> assertEq "codex keywords" ["-*", "~amd64"] (peKeywords pe)
+    other -> assertFailure ("codex ebuilds: " <> show other)
+  assertEq
+    "assemble allowlist"
+    ["-*", "~amd64"]
+    (assembleKeywordsFor ["amd64"] [LaneAmd64Plain, LaneAmd64Tilde])
+  -- Harvest 1.85 vs amd64 1.90 succeeds; arm64 1.81 is not a selecting lane.
+  let harvestPlan =
+        planFromTargetsWithAtomFor
+          ["amd64"]
+          "dev-lang/rust|rust-bin"
+          (selectAllLaneTargetsFor ["amd64"] rustArmLower lowCandidates)
+  case harvestVsLaneCeiling harvestPlan (parseEbuildVersion "0.50.0") (Just "1.80.0") (Just "1.85.0") of
+    Right () -> pure ()
+    Left err -> assertFailure ("codex harvest should ignore arm64 ceiling: " <> T.unpack err)
+  -- Same harvest against an unfiltered plan (arm64 1.81 binds) hard-fails.
+  let fullPlan =
+        planFromTargetsWithAtomFor
+          []
+          "dev-lang/rust|rust-bin"
+          (selectAllLaneTargets rustArmLower lowCandidates)
+  case harvestVsLaneCeiling fullPlan (parseEbuildVersion "0.50.0") (Just "1.80.0") (Just "1.85.0") of
+    Left err ->
+      assertTrue "names arm64 ceiling" ("1.81" `T.isInfixOf` err || "1.80" `T.isInfixOf` err)
+    Right () -> assertFailure "expected harvest vs arm64 ceiling to fail"
+  -- hk: every rust arch, no -* from the allowlist requirement.
+  let hkTargets = selectAllLaneTargets rustCeilings lowCandidates
+      hkPlan = planFromTargetsWithAtomFor [] "dev-lang/rust|rust-bin" hkTargets
+  assertTrue
+    "hk has arm64"
+    (any (\t -> liArch (ltLane t) == "arm64") (glpLanes hkPlan))
+  case glpEbuilds hkPlan of
+    [pe] -> do
+      assertTrue "hk has ~amd64" ("~amd64" `elem` peKeywords pe)
+      assertTrue "hk has ~arm64" ("~arm64" `elem` peKeywords pe)
+      assertTrue "hk no -*" ("-*" `notElem` peKeywords pe)
+    other -> assertFailure ("hk ebuilds: " <> show other)
+  -- silence unused
+  assertEq "candidates kept" 2 (length candidates)
 
 testGoLaneSelection :: IO ()
 testGoLaneSelection = do

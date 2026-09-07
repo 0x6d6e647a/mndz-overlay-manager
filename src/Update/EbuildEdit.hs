@@ -27,6 +27,7 @@ module Update.EbuildEdit
     ensureRustMinVer,
     ensureCargoAssetsSrcUri,
     ensureCargoAssetsSrcUriFor,
+    stripWindowsOnlyGitCrates,
     hasCleanCratesIoSourceLine,
     cargoCratesIoSrcUriLine,
     ensureEmptyCrates,
@@ -40,14 +41,16 @@ module Update.EbuildEdit
 where
 
 import Data.Char (isAlpha, isDigit)
-import Data.Maybe (mapMaybe)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), renderPV, samePV)
+import Update.Cargo.Lock (parseGitPackageNames)
 import Update.Cargo.Msrv
   ( normalizeRustVersion,
     parseRustMinVerFromEbuild,
     rustMinVerTooLow,
+    windowsOnlyDepNames,
   )
 import Update.Manifest.Dist (exactDistSHA512, manifestHasExactDist)
 import Update.TextUtil (stripSurroundingQuotes)
@@ -84,15 +87,24 @@ parameterizeAssetsSrcUri pn content =
       T.intercalate assetsMarker (prefix : map (fixSeg pn) rest)
   where
     fixSeg pkgName seg =
-      let (_tagPart, rest0) = T.breakOn "/" seg
+      let (tagPart, rest0) = T.breakOn "/" seg
        in case T.uncons rest0 of
             Just ('/', afterSlash) ->
               let (filePart, rest1) =
                     T.break (\c -> c == ' ' || c == '"' || c == '\n') afterSlash
-                  newTag = pkgName <> "-${PV}"
+                  -- Only rewrite this package's release tag. rusty_v8 is keyed
+                  -- by crate version (rusty-v8-150.4.0), not {pn}-${PV}.
+                  newTag =
+                    if packageAssetsTag pkgName tagPart
+                      then pkgName <> "-${PV}"
+                      else tagPart
                   newFile = rewriteFile pkgName filePart
                in newTag <> "/" <> newFile <> rest1
             _ -> seg
+
+    packageAssetsTag pkgName tag =
+      "${PV}" `T.isInfixOf` tag
+        || (pkgName <> "-") `T.isPrefixOf` tag
 
     rewriteFile pkgName filePart
       | not (T.isPrefixOf (pkgName <> "-") filePart) = filePart
@@ -217,33 +229,54 @@ hasCratesAssetsSrcUri content =
     && "-crates.tar.xz" `T.isInfixOf` content
 
 -- | List-era crate deps via @CARGO_CRATE_URIS@ or crates.io crate dist URLs.
+-- @${CARGO_CRATE_URIS}@ is list-era registry URIs only when @CRATES@ is
+-- non-empty. Empty @CRATES@ plus @CARGO_CRATE_URIS@ is the git-crates form.
 -- For CratesIo provenance the canonical crates.io download line is manager-owned,
--- so only @CARGO_CRATE_URIS@ is list-era.
+-- so only @CARGO_CRATE_URIS@ is list-era (still gated on non-empty @CRATES@).
 hasListEraCargoDeps :: Text -> Bool
 hasListEraCargoDeps content =
-  "CARGO_CRATE_URIS" `T.isInfixOf` content
+  (cratesFieldNonEmpty content && "CARGO_CRATE_URIS" `T.isInfixOf` content)
     || "crates.io/api/v1/crates" `T.isInfixOf` content
 
 hasListEraCargoDepsFor :: CargoSource -> Text -> Bool
 hasListEraCargoDepsFor CargoGitTag = hasListEraCargoDeps
 hasListEraCargoDepsFor CargoCratesIo = \content ->
-  "CARGO_CRATE_URIS" `T.isInfixOf` content
+  cratesFieldNonEmpty content && "CARGO_CRATE_URIS" `T.isInfixOf` content
 
 -- | True when @CRATES=@ is present and not empty (quoted empty is OK).
+-- Multiline @CRATES="\\n"@ (pycargoebuild empty list) is empty, not list-era.
 cratesFieldNonEmpty :: Text -> Bool
-cratesFieldNonEmpty content =
-  case mapMaybe lineCrates (T.lines content) of
-    (val : _) ->
-      let stripped = T.strip val
-       in not (T.null stripped) && stripped /= "\"\"" && stripped /= "''"
-    [] -> False
+cratesFieldNonEmpty = not . T.null . T.strip . cratesAssignmentInner
+
+-- | Inner text of the first @CRATES=@ assignment, surrounding quotes stripped.
+cratesAssignmentInner :: Text -> Text
+cratesAssignmentInner content =
+  case break isCratesLine (T.lines content) of
+    (_, []) -> ""
+    (_, first : rest0) ->
+      if isCompleteCratesLine first
+        then stripSurroundingQuotes (T.strip (cratesRhs first))
+        else
+          let (mid, rest1) = break lineClosesQuote rest0
+              closeLn = case rest1 of
+                (c : _) -> c
+                [] -> ""
+              firstRest = dropOpeningQuote (cratesRhs first)
+              closeBody = T.dropWhileEnd (== '"') (T.stripEnd closeLn)
+           in T.strip (T.unlines (firstRest : mid) <> closeBody)
   where
-    mapMaybe f = foldr (\x acc -> case f x of Just y -> y : acc; Nothing -> acc) []
-    lineCrates ln =
-      let s = T.stripStart ln
-       in if "CRATES=" `T.isPrefixOf` s
-            then Just (T.drop (T.length ("CRATES=" :: Text)) s)
-            else Nothing
+    isCratesLine ln = "CRATES=" `T.isPrefixOf` T.stripStart ln
+    cratesRhs ln = T.drop (T.length ("CRATES=" :: Text)) (T.stripStart ln)
+    isCompleteCratesLine ln =
+      let s = T.strip ln
+          afterEq = T.drop 1 (T.dropWhile (/= '=') s)
+       in T.length afterEq >= 2 && T.head afterEq == '"' && T.count "\"" afterEq >= 2
+    lineClosesQuote ln =
+      let t = T.stripEnd ln
+       in not (T.null t) && T.last t == '"'
+    dropOpeningQuote rhs =
+      let t = T.stripStart rhs
+       in if not (T.null t) && T.head t == '"' then T.drop 1 t else t
 
 -- | Assets crates SRC_URI line (parameterized).
 cargoCratesSrcUriLine :: Text -> Text
@@ -366,19 +399,61 @@ cargoSourceName CargoCratesIo = "CargoCratesIo"
 ensureCargoAssetsSrcUri :: Text -> Text -> Text
 ensureCargoAssetsSrcUri pn content
   -- Already in clean single-line source + crates form: only parameterize.
+  -- Extra companion SRC_URI+= lines (V8 snapshot, GCS clang, git-crate URIs)
+  -- are part of the assignment block; skip rewrite when the primary+crates
+  -- pair is already present and this is not list-era.
   | hasCratesAssetsSrcUri content
       && hasCleanGithubSourceLine content
       && not (hasListEraCargoDeps content) =
       parameterizeAssetsSrcUri pn content
   | otherwise =
-      let (pre, _oldBlock, post) = splitSrcUriAssignment (T.lines content)
+      let (pre, oldBlock, post) = splitSrcUriAssignment (T.lines content)
           mSource = extractGithubSourceArchiveUri content
           sourceLine = case mSource of
             Just uri -> "SRC_URI=\"" <> uri <> "\""
             Nothing -> "SRC_URI=\"\""
           cratesLine = cargoCratesSrcUriLine pn
-          rebuilt = T.unlines (pre <> [sourceLine, cratesLine] <> post)
+          extras = extraCargoSrcUriLines pn (hasListEraCargoDeps content) oldBlock
+          rebuilt = T.unlines (pre <> [sourceLine, cratesLine] <> extras <> post)
        in parameterizeAssetsSrcUri pn rebuilt
+
+-- | Companion @SRC_URI+=@ lines that are neither the GitHub/crates.io primary
+-- source nor the assets crates tarball. List-era drops @CARGO_CRATE_URIS@;
+-- empty-@CRATES@ git-crate form keeps it.
+extraCargoSrcUriLines :: Text -> Bool -> [Text] -> [Text]
+extraCargoSrcUriLines pn dropCrateUris block =
+  [ "SRC_URI+=\" " <> T.strip body <> "\""
+  | ln <- block,
+    Just body <- [srcUriLineBody ln],
+    not (T.null (T.strip body)),
+    keepCompanion pn dropCrateUris (T.strip body)
+  ]
+
+srcUriLineBody :: Text -> Maybe Text
+srcUriLineBody ln =
+  let s = T.strip ln
+      stripped
+        | "SRC_URI+=\"" `T.isPrefixOf` s =
+            T.drop (T.length ("SRC_URI+=\"" :: Text)) s
+        | "SRC_URI=\"" `T.isPrefixOf` s =
+            T.drop (T.length ("SRC_URI=\"" :: Text)) s
+        | otherwise = s
+      unquoted = T.dropWhileEnd (== '"') (T.strip stripped)
+   in if T.null unquoted then Nothing else Just unquoted
+
+keepCompanion :: Text -> Bool -> Text -> Bool
+keepCompanion pn dropCrateUris body
+  | "->" `T.isPrefixOf` T.strip body = False
+  | "/archive/" `T.isInfixOf` body && "github.com/" `T.isInfixOf` body = False
+  | "mndz-overlay-assets" `T.isInfixOf` body
+      && (pn <> "-${PV}-crates.tar.xz") `T.isInfixOf` body =
+      False
+  | "mndz-overlay-assets" `T.isInfixOf` body
+      && "-crates.tar.xz" `T.isInfixOf` body =
+      False
+  | dropCrateUris && "CARGO_CRATE_URIS" `T.isInfixOf` body = False
+  | "crates.io/api/v1/crates" `T.isInfixOf` body = False
+  | otherwise = True
 
 hasCleanGithubSourceLine :: Text -> Bool
 hasCleanGithubSourceLine content =
@@ -441,10 +516,21 @@ splitSrcUriAssignment lns =
 -- | Prefer the GitHub source archive URI (including @-> ${P}.tar.gz@ rename) from ebuild text.
 extractGithubSourceArchiveUri :: Text -> Maybe Text
 extractGithubSourceArchiveUri content =
-  case mapMaybe cleanLine (T.lines content) of
-    (u : _) -> Just u
-    [] -> Nothing
+  go (T.lines content)
   where
+    go [] = Nothing
+    go (ln : rest) =
+      case cleanLine ln of
+        Nothing -> go rest
+        Just u ->
+          Just $
+            if "->" `T.isInfixOf` u
+              then u
+              else case rest of
+                (n : _)
+                  | "->" `T.isPrefixOf` T.strip n ->
+                      T.strip (u <> " " <> T.strip n)
+                _ -> u
     cleanLine ln
       | "mndz-overlay-assets" `T.isInfixOf` ln = Nothing
       | "crates.io" `T.isInfixOf` ln = Nothing
@@ -465,6 +551,82 @@ extractGithubSourceArchiveUri content =
                   else t2
               t4 = T.dropWhileEnd (\c -> c == '"' || c == '\r') (T.strip t3)
            in if T.null t4 then Nothing else Just t4
+
+-- | Drop @GIT_CRATES@ entries whose crate is a git remote reached only through
+-- windows-only (or wasm-only) target tables of the supplied Cargo.toml bodies.
+stripWindowsOnlyGitCrates :: Text -> [Text] -> Text -> Text
+stripWindowsOnlyGitCrates lockBody tomlBodies ebuild =
+  let winNames =
+        nubOrd $
+          concat
+            [ names
+            | body <- tomlBodies,
+              Right names <- [windowsOnlyDepNames body]
+            ]
+      gitNames = parseGitPackageNames lockBody
+      dropNames = [n | n <- gitNames, n `elem` winNames]
+   in if null dropNames
+        then ebuild
+        else filterGitCratesNames dropNames ebuild
+
+filterGitCratesNames :: [Text] -> Text -> Text
+filterGitCratesNames dropNames content =
+  let lns = T.lines content
+      (pre, post) = break isGitCratesStart lns
+   in case post of
+        [] -> content
+        (first : rest0)
+          | isAssocArrayStart first ->
+              let (mid, rest1) = break isAssocArrayEnd rest0
+               in case rest1 of
+                    (closeLn : rest2) ->
+                      let kept = filterGitCratesBlock dropNames (first : mid <> [closeLn])
+                       in T.unlines (pre <> kept <> rest2)
+                    [] -> content
+          | isCompleteAssignment first ->
+              T.unlines (pre <> [rewriteGitCratesLine dropNames first] <> rest0)
+          | otherwise ->
+              let (mid, rest1) = break lineClosesQuote rest0
+               in case rest1 of
+                    (closeLn : rest2) ->
+                      let kept = filterGitCratesBlock dropNames (first : mid <> [closeLn])
+                       in T.unlines (pre <> kept <> rest2)
+                    [] -> content
+  where
+    isGitCratesStart ln =
+      let s = T.stripStart ln
+       in "GIT_CRATES=" `T.isPrefixOf` s
+            || "declare -A GIT_CRATES=" `T.isPrefixOf` s
+    isAssocArrayStart ln =
+      "declare -A GIT_CRATES=" `T.isPrefixOf` T.stripStart ln
+        || "GIT_CRATES=(" `T.isPrefixOf` T.stripStart ln
+    isAssocArrayEnd ln = T.strip ln == ")"
+    isCompleteAssignment ln =
+      let s = T.strip ln
+          afterEq = T.drop 1 (T.dropWhile (/= '=') s)
+       in T.length afterEq >= 2 && T.head afterEq == '"' && T.count "\"" afterEq >= 2
+    lineClosesQuote ln =
+      let t = T.stripEnd ln
+       in not (T.null t) && T.last t == '"'
+
+rewriteGitCratesLine :: [Text] -> Text -> Text
+rewriteGitCratesLine dropNames ln =
+  T.unlines (filterGitCratesBlock dropNames [ln])
+
+filterGitCratesBlock :: [Text] -> [Text] -> [Text]
+filterGitCratesBlock dropNames block =
+  [ ln
+  | ln <- block,
+    let stripped = T.strip ln
+     in not (any (`gitCratesEntryName` stripped) dropNames)
+  ]
+
+gitCratesEntryName :: Text -> Text -> Bool
+gitCratesEntryName name ln =
+  let t = T.dropWhile (\c -> c == '\t' || c == ' ') ln
+   in (name <> ";") `T.isPrefixOf` t
+        || ("[" <> name <> "]=") `T.isPrefixOf` t
+        || ("[" <> name <> "] =") `T.isPrefixOf` t
 
 -- | Force @CRATES=""@ (tarball packaging). Replaces multi-line CRATES blocks.
 ensureEmptyCrates :: Text -> Text

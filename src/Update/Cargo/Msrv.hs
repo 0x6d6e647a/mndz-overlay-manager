@@ -18,6 +18,10 @@ module Update.Cargo.Msrv
     TagFloorResult (..),
     probePolicyTagFloor,
     fetchCargoTomlFromDir,
+    windowsOnlyDepNames,
+    parseRustToolchainChannel,
+    applyRustToolchainFloor,
+    fetchRustToolchainFromDir,
   )
 where
 
@@ -61,7 +65,7 @@ import Update.TextUtil (stripSurroundingQuotes)
 
 -- | Floor-policy/parser version stored with Cargo deps-plan snapshots.
 cargoFloorPolicyVersion :: Text
-cargoFloorPolicyVersion = "2"
+cargoFloorPolicyVersion = "3"
 
 -- | Cache-validity key for the tag probe that produced Cargo floor snapshots.
 cargoFloorPolicyKey :: Text -> Maybe FilePath -> Maybe FilePath -> Text
@@ -1267,13 +1271,79 @@ atomHolds name mVal fam =
     ("target_os", Just "dragonfly") -> Just (fam == FamBsd)
     ("target_os", Just "windows") -> Just (fam == FamWindows)
     ("target_os", Just "win32") -> Just (fam == FamWindows)
+    -- Known predicate, OS we do not model (android, ios, fuchsia, …):
+    -- does not hold for linux/macos/bsd/windows/wasm. Codex tui uses
+    -- cfg(not(target_os = "android")); treating that as unparsed made the
+    -- whole tag-floor walk incomplete and skipped rust-toolchain.toml.
+    ("target_os", Just _) -> Just False
     ("target_family", Just "unix") ->
       Just (fam `elem` [FamLinux, FamMacos, FamBsd])
     ("target_family", Just "windows") -> Just (fam == FamWindows)
     ("target_family", Just "wasm") -> Just (fam == FamWasm)
+    ("target_family", Just _) -> Just False
     ("target_arch", Just "wasm32") -> Just (fam == FamWasm)
     ("target_arch", Just "wasm64") -> Just (fam == FamWasm)
     _ -> Nothing
+
+-- | Dependency names listed only in windows-only (or wasm-only) target tables.
+-- | Dotted @channel@ from @rust-toolchain.toml@. @stable@/@nightly@ and
+-- missing channel are explicit absence (@Right Nothing@). Unparseable TOML
+-- is @Left@.
+parseRustToolchainChannel :: Text -> Either Text (Maybe Text)
+parseRustToolchainChannel content =
+  case parse content of
+    Left _ -> Left "malformed rust-toolchain.toml"
+    Right tab' -> channelFromTable (forgetTableAnns tab')
+
+channelFromTable :: Table -> Either Text (Maybe Text)
+channelFromTable tab =
+  case tableLookup "toolchain" tab of
+    Nothing -> Right Nothing
+    Just (Table t) ->
+      case tableLookup "channel" t of
+        Nothing -> Right Nothing
+        Just (Text raw) ->
+          let stripped = T.strip raw
+              unv = fromMaybe stripped (T.stripPrefix "v" stripped)
+           in Right (normalizeRustVersion unv)
+        Just _ -> Left "malformed rust-toolchain.toml channel"
+    Just _ -> Left "malformed rust-toolchain.toml"
+
+-- | When the active set supplied no rust-version, read lock-root then
+-- repository-root @rust-toolchain.toml@ via @fetch@.
+applyRustToolchainFloor ::
+  Maybe FilePath ->
+  (Maybe FilePath -> IO CargoTomlFetch) ->
+  Maybe Text ->
+  IO (Either Text (Maybe Text))
+applyRustToolchainFloor mLock fetch mFloor =
+  case mFloor of
+    Just ver -> pure (Right (Just ver))
+    Nothing -> go (nubOrd [mLock, Nothing])
+  where
+    go [] = pure (Right Nothing)
+    go (p : ps) = do
+      eres <- fetch p
+      case eres of
+        CargoTomlMissing -> go ps
+        CargoTomlError err -> pure (Left err)
+        CargoTomlBody body ->
+          case parseRustToolchainChannel body of
+            Left err -> pure (Left err)
+            Right (Just ver) -> pure (Right (Just ver))
+            Right Nothing ->
+              -- File exists but channel is not a dotted version.
+              pure (Right Nothing)
+
+windowsOnlyDepNames :: Text -> Either Text [Text]
+windowsOnlyDepNames content =
+  case parse content of
+    Left _ -> Left "malformed Cargo.toml"
+    Right tab' ->
+      case collectClassifiedDeps (forgetTableAnns tab') of
+        Left err -> Left err
+        Right classified ->
+          Right (nubOrd [dsName spec | (TIgnore, spec) <- classified])
 
 ------------------------------------------------------------------------
 -- Filesystem fetch (clone harvest)
@@ -1281,10 +1351,17 @@ atomHolds name mVal fam =
 
 -- | Read @Cargo.toml@ under a clone/workspace root.
 fetchCargoTomlFromDir :: FilePath -> Maybe FilePath -> IO CargoTomlFetch
-fetchCargoTomlFromDir root mSub = do
+fetchCargoTomlFromDir root = fetchNamedFromDir root "Cargo.toml"
+
+-- | Read @rust-toolchain.toml@ under a clone/workspace root.
+fetchRustToolchainFromDir :: FilePath -> Maybe FilePath -> IO CargoTomlFetch
+fetchRustToolchainFromDir root = fetchNamedFromDir root "rust-toolchain.toml"
+
+fetchNamedFromDir :: FilePath -> FilePath -> Maybe FilePath -> IO CargoTomlFetch
+fetchNamedFromDir root name mSub = do
   let path = case mSub of
-        Nothing -> root </> "Cargo.toml"
-        Just sub -> root </> sub </> "Cargo.toml"
+        Nothing -> root </> name
+        Just sub -> root </> sub </> name
   exists <- doesFileExist path
   if not exists
     then pure CargoTomlMissing

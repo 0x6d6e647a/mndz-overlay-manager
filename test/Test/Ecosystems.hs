@@ -25,7 +25,7 @@ import System.Directory
     removePathForcibly,
   )
 import System.Exit (ExitCode (..))
-import System.FilePath (isAbsolute, (</>))
+import System.FilePath (isAbsolute, takeDirectory, (</>))
 import System.IO.Error (userError)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
@@ -35,7 +35,7 @@ import Test.Support
     unusedVendorOps,
   )
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase)
+import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Apply (ApplyEnv (..), mkEbuildRunner)
 import Update.Bun.Cache
   ( BunCacheOps (..),
@@ -62,10 +62,14 @@ import Update.Cargo.Crates
     fetchAndUnpackCrate,
     harvestCloneFloor,
     harvestRegistryPackageRoots,
+    harvestRustyV8Snapshot,
     mkCargoOps,
     packCratesTarball,
     packCratesTarballWith,
     parseRegistryPackages,
+    parseV8RegistryPin,
+    rustyV8ReleaseTag,
+    rustyV8SnapshotBasename,
   )
 import Update.Git (GitOps (..))
 import Update.Go.Plan (PlanOps (..))
@@ -155,8 +159,11 @@ unitTests =
         "cargo pure"
         [ testCase "crateTarballPrefix" testCrateTarballPrefix,
           testCase "harvestCloneFloor skips unrelated members" testHarvestCloneFloor,
+          testCase "harvestCloneFloor rust-toolchain.toml channel" testHarvestCloneFloorToolchain,
           testCase "harvestRegistryPackageRoots skips nested examples" testHarvestRegistryRoots,
           testCase "parseRegistryPackages fixtures" testParseRegistryPackages,
+          testCase "parseV8RegistryPin and pack excludes git" testV8PinAndGitExcluded,
+          testCase "harvestRustyV8Snapshot reuse vs clone" testHarvestRustyV8Snapshot,
           testCase "cargoChecksumJson shape" testCargoChecksumJson
         ],
       testGroup
@@ -486,6 +493,102 @@ testHarvestCloneFloor =
     assertTrue
       "missing clone is incomplete"
       ("not found" `T.isInfixOf` miss || "incomplete" `T.isInfixOf` miss)
+
+testHarvestCloneFloorToolchain :: IO ()
+testHarvestCloneFloorToolchain =
+  withSystemTempDirectory "mndz-cargo-toolchain-" $ \root -> do
+    let ws = root </> "codex-rs"
+    createDirectoryIfMissing True (ws </> "cli")
+    TIO.writeFile
+      (ws </> "cli" </> "Cargo.toml")
+      "[package]\nname = \"codex-cli\"\nversion = \"0.153.3\"\n"
+    TIO.writeFile
+      (ws </> "Cargo.toml")
+      "[workspace]\nmembers = [\"cli\"]\n"
+    TIO.writeFile
+      (ws </> "rust-toolchain.toml")
+      "[toolchain]\nchannel = \"1.95.0\"\n"
+    dotted <-
+      assertRight "dotted channel"
+        =<< harvestCloneFloor ws (Just "cli") Nothing
+    assertEq "channel 1.95.0" (Just "1.95.0") dotted
+    let stableRoot = root </> "stable"
+    createDirectoryIfMissing True stableRoot
+    TIO.writeFile
+      (stableRoot </> "Cargo.toml")
+      "[package]\nname = \"p\"\nversion = \"1.0.0\"\n"
+    TIO.writeFile
+      (stableRoot </> "rust-toolchain.toml")
+      "[toolchain]\nchannel = \"stable\"\n"
+    stable <-
+      assertRight "stable channel"
+        =<< harvestCloneFloor stableRoot Nothing Nothing
+    assertEq "stable does not invent a floor" Nothing stable
+
+testV8PinAndGitExcluded :: IO ()
+testV8PinAndGitExcluded = do
+  let hkLock =
+        T.unlines
+          [ "[[package]]",
+            "name = \"serde\"",
+            "version = \"1.0.200\"",
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            "checksum = \"abc123\""
+          ]
+      codexLock =
+        T.unlines
+          [ "[[package]]",
+            "name = \"v8\"",
+            "version = \"150.4.0\"",
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            "checksum = \"v8sum\"",
+            "",
+            "[[package]]",
+            "name = \"mxc\"",
+            "version = \"0.1.0\"",
+            "source = \"git+https://github.com/microsoft/mxc?rev=def\""
+          ]
+  assertEq "hk has no v8 pin" Nothing (parseV8RegistryPin hkLock)
+  assertEq "codex v8 pin" (Just "150.4.0") (parseV8RegistryPin codexLock)
+  case parseRegistryPackages codexLock of
+    Left err -> assertFailure ("parse lock: " <> T.unpack err)
+    Right pkgs -> do
+      assertTrue "includes registry v8" (any (\p -> rpName p == "v8" && rpVersion p == "150.4.0") pkgs)
+      assertTrue "excludes git mxc" (not (any (\p -> rpName p == "mxc") pkgs))
+  assertEq "snapshot basename" "rusty-v8-150.4.0-with-submodules.tar.xz" (rustyV8SnapshotBasename "150.4.0")
+  assertEq "release tag" "rusty-v8-150.4.0" (rustyV8ReleaseTag "150.4.0")
+
+testHarvestRustyV8Snapshot :: IO ()
+testHarvestRustyV8Snapshot =
+  withSystemTempDirectory "mndz-rusty-v8-" $ \tmp -> do
+    cloneCalls <- newIORef (0 :: Int)
+    let work = tmp </> "work"
+        out = tmp </> "out"
+        reusePath = tmp </> "reuse.tar.xz"
+        cloneFn _url _tag dest = do
+          atomicModifyIORef' cloneCalls (\n -> (n + 1, ()))
+          createDirectoryIfMissing True dest
+          TIO.writeFile (dest </> "README.md") "rusty_v8\n"
+          pure (Right ())
+        packFn _src dest = do
+          createDirectoryIfMissing True (takeDirectory dest)
+          TIO.writeFile dest "snapshot\n"
+          pure (Right ())
+    TIO.writeFile reusePath "existing\n"
+    reused <-
+      assertRight "reuse"
+        =<< harvestRustyV8Snapshot cloneFn packFn (Just reusePath) "150.4.0" work out
+    assertEq "reuse path" reusePath reused
+    n0 <- readIORef cloneCalls
+    assertEq "reuse does not clone" 0 n0
+    harvested <-
+      assertRight "harvest"
+        =<< harvestRustyV8Snapshot cloneFn packFn Nothing "150.5.0" work out
+    n1 <- readIORef cloneCalls
+    assertEq "missing pin clones" 1 n1
+    assertTrue
+      "harvested basename"
+      ("rusty-v8-150.5.0-with-submodules.tar.xz" `T.isSuffixOf` T.pack harvested)
 
 testHarvestRegistryRoots :: IO ()
 testHarvestRegistryRoots =

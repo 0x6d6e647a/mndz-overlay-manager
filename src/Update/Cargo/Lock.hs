@@ -5,6 +5,8 @@
 module Update.Cargo.Lock
   ( RegistryPackage (..),
     parseRegistryPackages,
+    parseGitPackageNames,
+    parseV8RegistryPin,
     crateFilename,
     crateDirName,
     cratePackageName,
@@ -71,6 +73,27 @@ isRegistrySource :: Text -> Bool
 isRegistrySource src =
   "registry+" `T.isPrefixOf` src
     || src == "registry+https://github.com/rust-lang/crates.io-index"
+
+-- | Package names whose lock @source@ is a git remote.
+parseGitPackageNames :: Text -> [Text]
+parseGitPackageNames body =
+  [ name
+  | block <- packageBlocks body,
+    let fields = parseSimpleFields block,
+    Just name <- [lookupField "name" fields],
+    Just src <- [lookupField "source" fields],
+    "git+" `T.isPrefixOf` src
+  ]
+
+-- | crates.io @v8@ pin from a provenance lock; 'Nothing' when absent.
+parseV8RegistryPin :: Text -> Maybe Text
+parseV8RegistryPin body =
+  case parseRegistryPackages body of
+    Left _ -> Nothing
+    Right pkgs ->
+      case [rpVersion p | p <- pkgs, rpName p == "v8"] of
+        (ver : _) -> Just ver
+        [] -> Nothing
 
 -- | Collect top-level @key = value@ pairs until a nested table or array-of-tables.
 -- Nested multi-line arrays (dependencies = [ ... ]) are skipped as a unit.

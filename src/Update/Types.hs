@@ -169,7 +169,10 @@ ecosystemIsSbcl _ = False
 -- | Hardcoded per-package source and apply technique.
 data PackagePolicy = PackagePolicy
   { policySource :: UpdateSource,
-    policyTechnique :: UpdateTechnique
+    policyTechnique :: UpdateTechnique,
+    -- | Runtime-lane arches that may participate. Empty means every arch
+    -- discovered on the runtime package (current default).
+    policyLaneArches :: [Text]
   }
   deriving (Eq, Show)
 

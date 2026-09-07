@@ -157,6 +157,7 @@ mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
         dpoFetchNpmEngines = fetchNpm,
         dpoFetchBunEngines = fetchBun,
         dpoFetchCargoToml = fetchCargo,
+        dpoFetchRustToolchain = \_ _ _ _ _ -> pure CargoTomlMissing,
         dpoFetchSbclVersion = \_ _ _ _ -> pure (Left "sbcl.version unused"),
         dpoWorkBudget = budget,
         dpoGoCeilingsCache = goCache,
