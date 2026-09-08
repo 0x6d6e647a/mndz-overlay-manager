@@ -29,7 +29,7 @@ import Update.Cargo.Msrv
     rustMinVerTooLow,
   )
 import Update.EbuildEdit
-  ( bunBdependAtom,
+  ( bunBdependAtomFor,
     ebuildNeedsCargoBodyFix,
     ebuildNeedsContentFix,
     ebuildNeedsContentFixAtom,
@@ -148,7 +148,7 @@ assessPresent ::
   PresentPvOutcome
 assessPresent key eco pn facts content =
   let manBad = manifestNeedsWork key eco pn facts
-      bodyBad = ebuildBodyNeedsWork eco facts content
+      bodyBad = ebuildBodyNeedsWork key eco facts content
    in case eco of
         Cargo {} ->
           case cargoFloorOutcome (ppfTagFloor facts) content of
@@ -170,8 +170,8 @@ cargoFloorOutcome mTag content =
         (Just tag, Just written) ->
           if rustMinVerTooLow written tag then NeedsRewrite else Adequate
 
-ebuildBodyNeedsWork :: EcosystemSpec -> PlannedPvFacts -> Text -> Bool
-ebuildBodyNeedsWork eco facts content =
+ebuildBodyNeedsWork :: PackageKey -> EcosystemSpec -> PlannedPvFacts -> Text -> Bool
+ebuildBodyNeedsWork key eco facts content =
   let kws = ppfKeywords facts
    in case eco of
         Go _ ->
@@ -179,7 +179,7 @@ ebuildBodyNeedsWork eco facts content =
         NpmEco ->
           ebuildNeedsContentFixAtom kws content (nodejsBdependAtom <$> ppfRuntimeReq facts)
         Bun ->
-          ebuildNeedsContentFixAtom kws content (bunBdependAtom <$> ppfRuntimeReq facts)
+          ebuildNeedsContentFixAtom kws content (bunBdependAtomFor key <$> ppfRuntimeReq facts)
         Sbcl ->
           ebuildNeedsContentFixAtom kws content (sbclBdependAtom <$> ppfRuntimeReq facts)
         Cargo {} ->

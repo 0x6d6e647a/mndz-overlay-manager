@@ -41,12 +41,14 @@ import Update.Bun.Cache
   ( BunCacheOps (..),
     BunCacheProgress (..),
     BunPackagingMode (..),
+    BunProbe (..),
     buildBunDepsTarball,
     bunPackagingModeFor,
     bunVersionTooOldMessage,
     collectInstallTreeEntries,
     hostMeetsBunRequirement,
     mkBunCacheOps,
+    parseBunProbeFromPackageJson,
     parseEnginesBunFromPackageJson,
     rewriteBunCacheSymlinks,
   )
@@ -150,6 +152,7 @@ unitTests =
       testGroup
         "bun pure"
         [ testCase "parseEnginesBunFromPackageJson" testParseEnginesBun,
+          testCase "parseBunProbeFromPackageJson min vs exact" testParseBunProbe,
           testCase "hostMeetsBunRequirement" testHostMeetsBunRequirement,
           testCase "bunVersionTooOldMessage" testBunVersionTooOldMessage,
           testCase "bunPackagingModeFor opencode vs others" testBunPackagingModeFor,
@@ -191,6 +194,7 @@ unitTests =
           testCase "buildBunDepsTarball InstallTree packs node_modules" testBunBuilderInstallTree,
           testCase "buildBunDepsTarball InstallTree empty tree fails" testBunBuilderInstallTreeEmpty,
           testCase "buildBunDepsTarball host too old" testBunBuilderHostTooOld,
+          testCase "buildBunDepsTarball gates on minimum not exact pin" testBunBuilderGatesOnMinimum,
           testCase "buildBunDepsTarball missing lock" testBunBuilderMissingLock,
           testCase "buildBunDepsTarball install failure" testBunBuilderInstallFail,
           testCase "BunCache rewrite unscoped and scoped alias symlinks" testBunCacheRewriteSymlinks,
@@ -296,8 +300,8 @@ testParseEnginesBun = do
     Nothing
     (parseEnginesBunFromPackageJson "not-json")
   assertEq
-    "caret engines.bun is a minimum"
-    (Just "1.2.3")
+    "caret engines.bun is unparseable"
+    Nothing
     (parseEnginesBunFromPackageJson "{\"engines\":{\"bun\":\"^1.2.3\"}}")
   assertEq
     "star engines falls through without packageManager"
@@ -308,6 +312,23 @@ testParseEnginesBun = do
     (Just "1.3.14")
     ( parseEnginesBunFromPackageJson
         "{\"engines\":{\"bun\":\"*\"},\"packageManager\":\"bun@1.3.14\"}"
+    )
+
+testParseBunProbe :: IO ()
+testParseBunProbe = do
+  assertEq
+    "ralph-style >= is minimum only"
+    (Just (BunProbe "1.3.6" Nothing))
+    (parseBunProbeFromPackageJson "{\"engines\":{\"bun\":\">=1.3.6\"}}")
+  assertEq
+    "opencode packageManager is min and exact"
+    (Just (BunProbe "1.3.14" (Just "1.3.14")))
+    (parseBunProbeFromPackageJson "{\"packageManager\":\"bun@1.3.14\"}")
+  assertEq
+    "engines floor plus packageManager exact"
+    (Just (BunProbe "1.2.0" (Just "1.3.14")))
+    ( parseBunProbeFromPackageJson
+        "{\"engines\":{\"bun\":\">=1.2.0\"},\"packageManager\":\"bun@1.3.14\"}"
     )
 
 testHostMeetsBunRequirement :: IO ()
@@ -1008,6 +1029,29 @@ testBunBuilderHostTooOld = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   assertTrue "names required" ("1.2.3" `T.isInfixOf` err)
   n <- readIORef cloneCalls
   assertEq "clone not called" 0 n
+
+-- | Image gate uses the probed minimum, not a higher compile-pin exact.
+testBunBuilderGatesOnMinimum :: IO ()
+testBunBuilderGatesOnMinimum = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
+  let ops =
+        fakeBunSuccessOps
+          { bcoHostBunVersion = pure (Right "1.2.5")
+          }
+  path <-
+    assertRight "min 1.2.0 is met by 1.2.5 (exact pin 1.3.14 is unused)"
+      =<< buildBunDepsTarball
+        ops
+        noopBunProgress
+        BunCache
+        "o"
+        "r"
+        "v"
+        "0.1.0"
+        "1.2.0"
+        tmp
+        tmp
+        "x.tar.xz"
+  assertTrue "wrote tarball" (not (null path))
 
 testBunBuilderMissingLock :: IO ()
 testBunBuilderMissingLock = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do

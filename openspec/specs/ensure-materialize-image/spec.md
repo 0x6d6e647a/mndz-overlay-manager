@@ -29,16 +29,21 @@ When `update` has classified at least one DepsAndAssets unit as **full path** an
 
 When ensure will `docker build` a recipe that `emerge`s `dev-lang/bun-bin::mndz`, the program SHALL NOT start that `docker build` until the overlay bun-bin package directory on disk has:
 
-1. a non-live ebuild whose version equals the PV in that recipe’s bun-bin atom, and
+1. a non-live ebuild whose version equals the PV in that recipe’s bun-bin atom and whose `SLOT` is `0` (the unversioned `/usr/bin/bun` provider), and
 2. a package `Manifest` with DIST checksum entries for the distfile names that ebuild’s `SRC_URI` will fetch for the host architecture, and
 3. package-scoped Portage `egencache` metadata for that ebuild as specified by `md5-cache`.
 
-Independent GitMv packages that the image does not emerge (`dev-util/grok-build-bin`, `dev-lang/deno-bin`) SHALL NOT be required to finish before that `docker build`. Overlay bind SHALL remain the configured overlay worktree (read-only at build); the program SHALL NOT require the bun-bin signed overlay commit to exist before `docker build`.
+The recipe bun-bin atom SHALL be slot-qualified `:0` (latest unversioned bun). The image SHALL NOT be required to emerge bun-bin pin slots (`SLOT="${PV}"` other than `0`) solely so `bun install` can run. Independent GitMv packages that the image does not emerge (`dev-util/grok-build-bin`, `dev-lang/deno-bin`) SHALL NOT be required to finish before that `docker build`. Overlay bind SHALL remain the configured overlay worktree (read-only at build); the program SHALL NOT require the bun-bin signed overlay commit to exist before `docker build`.
 
 #### Scenario: Docker waits on bun-bin Manifest
 
-- **WHEN** ensure will emerge `>=dev-lang/bun-bin-1.4.0::mndz` and overlay bun-bin has been renamed to `bun-bin-1.4.0.ebuild` but Manifest DIST lines are still `bun-bin-1.3.14-*`
+- **WHEN** ensure will emerge `>=dev-lang/bun-bin-1.4.0:0::mndz` and overlay bun-bin latest `SLOT="0"` ebuild has been added as `bun-bin-1.4.0.ebuild` but Manifest DIST lines are still `bun-bin-1.3.14-*`
 - **THEN** `docker build` does not start until `ebuild … manifest` (and package `egencache`) for that ebuild have succeeded
+
+#### Scenario: Pin slot is not required in the image
+
+- **WHEN** overlay bun-bin has pin `1.3.14:1.3.14` and latest `1.4.2:0` and ensure will emerge overlay bun-bin for a full-path opencode unit
+- **THEN** the recipe emerges the `:0` latest atom and does not require emerging the pin slot for `bun install`
 
 #### Scenario: grok-build-bin does not gate docker
 
@@ -48,8 +53,8 @@ Independent GitMv packages that the image does not emerge (`dev-util/grok-build-
 
 #### Scenario: Commit is not required before docker
 
-- **WHEN** bun-bin `ebuild … manifest` and package `egencache` have succeeded for PV `1.4.0` and the signed overlay commit has not yet been created
-- **THEN** ensure MAY `docker build` emerging `dev-lang/bun-bin-1.4.0::mndz` from the worktree bind
+- **WHEN** bun-bin `ebuild … manifest` and package `egencache` have succeeded for latest `SLOT="0"` PV `1.4.0` and the signed overlay commit has not yet been created
+- **THEN** ensure MAY `docker build` emerging `dev-lang/bun-bin-1.4.0:0::mndz` from the worktree bind
 
 ### Requirement: Overlay qlot is emergeable before docker build
 
@@ -286,7 +291,7 @@ The program SHALL treat the sidecar as not satisfying a prepare when the recorde
 
 ### Requirement: Bun in the image is overlay bun-bin only
 
-When ensure must provide Bun, the image SHALL install `dev-lang/bun-bin::mndz` from the configured overlay (bind-mounted or otherwise visible to the build without copying the overlay git tree into an image layer as the package source). Portage in the build SHALL write distfiles and binpkgs to image cache locations, not into the overlay work tree. When that overlay atom is not plain-visible on the host architecture, the build SHALL write package-level `package.accept_keywords` of the form `>=dev-lang/bun-bin-<pv>::mndz ~<keywords-token>` and SHALL NOT set whole-image `ACCEPT_KEYWORDS` to `~arch` solely to install bun-bin. The PV in that atom SHALL be the bun floor for this prepare (hypothetical remote when bun-bin is selected and needs work).
+When ensure must provide Bun, the image SHALL install `dev-lang/bun-bin::mndz` from the configured overlay (bind-mounted or otherwise visible to the build without copying the overlay git tree into an image layer as the package source). Portage in the build SHALL write distfiles and binpkgs to image cache locations, not into the overlay work tree. When that overlay atom is not plain-visible on the host architecture, the build SHALL write package-level `package.accept_keywords` of the form `>=dev-lang/bun-bin-<pv>:0::mndz ~<keywords-token>` and SHALL NOT set whole-image `ACCEPT_KEYWORDS` to `~arch` solely to install bun-bin. The PV in that atom SHALL be the bun floor for this prepare (hypothetical remote when bun-bin is selected and needs work), slot-qualified `:0`.
 
 #### Scenario: Ralph uses overlay bun-bin in the image
 
@@ -297,7 +302,7 @@ When ensure must provide Bun, the image SHALL install `dev-lang/bun-bin::mndz` f
 #### Scenario: bun-bin accept_keywords names repo and version
 
 - **WHEN** the host machine is `x86_64` and ensure installs overlay bun-bin at PV `1.2.21` that is testing-keyworded
-- **THEN** the recipe contains `>=dev-lang/bun-bin-1.2.21::mndz ~amd64`
+- **THEN** the recipe contains `>=dev-lang/bun-bin-1.2.21:0::mndz ~amd64`
 
 ### Requirement: Qlot in the image is overlay qlot only
 

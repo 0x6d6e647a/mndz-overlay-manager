@@ -9,6 +9,10 @@ module Update.Bun.Cache
     buildBunDepsTarball,
     bunPackagingModeFor,
     collectInstallTreeEntries,
+    BunProbe (..),
+    isBunCompilePinPackage,
+    minimumBunProbe,
+    parseBunProbeFromPackageJson,
     parseEnginesBunFromPackageJson,
     parsePackageManagerBun,
     hostBunVersion,
@@ -18,6 +22,7 @@ module Update.Bun.Cache
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Exception (IOException, try)
 import Control.Monad (foldM, forM)
 import Data.Aeson (Value, eitherDecode, withObject, (.:?))
@@ -57,7 +62,6 @@ import Update.DiskSpace
   ( MaterializeClass (FullNpmBun),
     checkPostCloneForClass,
   )
-import Update.Engines (parseEnginesMinimum)
 import Update.Go.Vendor (githubCloneUrl, versionTag)
 import Update.Go.Version
   ( compareGoVersions,
@@ -88,6 +92,22 @@ data BunPackagingMode
 bunPackagingModeFor :: PackageKey -> BunPackagingMode
 bunPackagingModeFor (PackageKey "dev-util/opencode") = InstallTree
 bunPackagingModeFor _ = BunCache
+
+-- | InstallTree / @build.ts --compile@ packages (today opencode).
+isBunCompilePinPackage :: PackageKey -> Bool
+isBunCompilePinPackage key = bunPackagingModeFor key == InstallTree
+
+-- | Probed Bun minimum (ceilings, image gate, floor atoms) and optional
+-- compile-pin exact version.
+data BunProbe = BunProbe
+  { bunProbeMinimum :: Text,
+    bunProbeExactPin :: Maybe Text
+  }
+  deriving (Eq, Show)
+
+-- | Minimum-only probe (no compile-pin exact).
+minimumBunProbe :: Text -> BunProbe
+minimumBunProbe ver = BunProbe {bunProbeMinimum = ver, bunProbeExactPin = Nothing}
 
 -- | Injectable process steps for bun cache / install-tree construction.
 data BunCacheOps = BunCacheOps
@@ -173,9 +193,13 @@ bunVersionTooOldMessage host required =
 -- | Bun minimum from @package.json@: parseable @engines.bun@ wins; else
 -- @packageManager@ form @bun@X.Y.Z@ (optional build metadata ignored).
 parseEnginesBunFromPackageJson :: Text -> Maybe Text
-parseEnginesBunFromPackageJson body =
+parseEnginesBunFromPackageJson = fmap bunProbeMinimum . parseBunProbeFromPackageJson
+
+-- | Minimum plus compile-pin exact from @package.json@.
+parseBunProbeFromPackageJson :: Text -> Maybe BunProbe
+parseBunProbeFromPackageJson body =
   case eitherDecode (BL.fromStrict (TE.encodeUtf8 body)) of
-    Right val -> parseMaybe parseBunRequirement val
+    Right val -> parseMaybe parseBunProbe val
     Left _ -> Nothing
 
 -- | Parse @packageManager@ value @bun@X.Y.Z@ (optional leading @v@; strip
@@ -198,23 +222,68 @@ parsePackageManagerBun raw =
                 Just _ -> Just core
                 Nothing -> Nothing
 
-parseBunRequirement :: Value -> Parser Text
-parseBunRequirement =
+parseBunProbe :: Value -> Parser BunProbe
+parseBunProbe =
   withObject "package.json" $ \o -> do
     mEngines <- o .:? "engines"
-    mFromEngines <- case mEngines of
+    mBunField <- case mEngines of
       Nothing -> pure Nothing
-      Just eng -> do
-        mBun <- withObject "engines" (.:? "bun") eng
-        pure (parseEnginesMinimum =<< mBun)
-    case mFromEngines of
-      Just v -> pure v
-      Nothing -> do
-        mPm <- o .:? "packageManager"
-        case mPm of
-          Just t
-            | Just v <- parsePackageManagerBun t -> pure v
-          _ -> fail "no parseable engines.bun or packageManager bun@X.Y.Z"
+      Just eng -> withObject "engines" (.:? "bun") eng
+    let mMin = parseBunEnginesMinimum =<< mBunField
+        mBare = parseBareBunVersion =<< mBunField
+    mPm <- o .:? "packageManager"
+    let mPmVer = parsePackageManagerBun =<< mPm
+        mMinimum = mMin <|> mPmVer
+        mExact = mPmVer <|> mBare
+    case mMinimum of
+      Just v ->
+        pure
+          BunProbe
+            { bunProbeMinimum = v,
+              bunProbeExactPin = mExact
+            }
+      Nothing -> fail "no parseable engines.bun or packageManager bun@X.Y.Z"
+
+-- | Bun @engines.bun@ minimum: bare @X.Y.Z@, optional leading @v@, or
+-- @>=X.Y.Z@. Complex ranges (@^@, @||@, @<@, @*@) are unparseable.
+parseBunEnginesMinimum :: Text -> Maybe Text
+parseBunEnginesMinimum raw =
+  let t0 = T.strip raw
+   in if T.null t0
+        then Nothing
+        else
+          let t1
+                | ">=" `T.isPrefixOf` t0 = T.strip (T.drop 2 t0)
+                | otherwise = t0
+              t2 = stripLeadingV t1
+           in if isBunVersionToken t2 then Just t2 else Nothing
+
+-- | Bare @X.Y.Z@ (optional leading @v@) with no range operator.
+parseBareBunVersion :: Text -> Maybe Text
+parseBareBunVersion raw =
+  let t0 = T.strip raw
+   in if T.null t0
+        || any (`T.isInfixOf` t0) [">=", "^", "<", "*", "||", "~"]
+        || " " `T.isInfixOf` t0
+        then Nothing
+        else
+          let t1 = stripLeadingV t0
+           in if isBunVersionToken t1 then Just t1 else Nothing
+
+stripLeadingV :: Text -> Text
+stripLeadingV t1 =
+  if "v" `T.isPrefixOf` t1
+    && T.length t1 > 1
+    && isDigit (T.index t1 1)
+    then T.drop 1 t1
+    else t1
+
+isBunVersionToken :: Text -> Bool
+isBunVersionToken t =
+  let parts = T.splitOn "." t
+   in not (null parts)
+        && all (\p -> not (T.null p) && T.all isDigit p) parts
+        && length parts <= 4
 
 -- | Clone tag → require bun.lock → bun install → pack per 'BunPackagingMode'.
 -- Clone and bun-cache live under unit @workDir@; tarball under @outDir@.

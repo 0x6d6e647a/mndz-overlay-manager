@@ -16,13 +16,19 @@ module Update.EbuildEdit
     CargoSourceForm (..),
     goBdependAtom,
     nodejsBdependAtom,
-    bunBdependAtom,
+    bunCompilePinBdependAtom,
+    bunFloorBdependAtom,
+    bunBdependAtomFor,
+    bunAtomVersion,
     ebuildHasDevLangGoBdepend,
     goBdependMatches,
     nodejsBdependMatches,
     ensureGoBdepend,
     ensureNodejsBdepend,
     ensureBunBdepend,
+    ensureBunBdependFor,
+    parseEbuildSlot,
+    setSlotField,
     ensureSbclAtom,
     ensureRustMinVer,
     ensureCargoAssetsSrcUri,
@@ -45,6 +51,7 @@ import Data.Containers.ListUtils (nubOrd)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), renderPV, samePV)
+import Update.Bun.Cache (isBunCompilePinPackage)
 import Update.Cargo.Lock (parseGitPackageNames)
 import Update.Cargo.Msrv
   ( normalizeRustVersion,
@@ -54,7 +61,7 @@ import Update.Cargo.Msrv
   )
 import Update.Manifest.Dist (exactDistSHA512, manifestHasExactDist)
 import Update.TextUtil (stripSurroundingQuotes)
-import Update.Types (CargoSource (..))
+import Update.Types (CargoSource (..), PackageKey)
 
 assetsMarker :: Text
 assetsMarker = "mndz-overlay-assets/releases/download/"
@@ -688,9 +695,27 @@ goBdependAtom goVer = ">=dev-lang/go-" <> goVer <> ":="
 nodejsBdependAtom :: Text -> Text
 nodejsBdependAtom ver = ">=net-libs/nodejs-" <> ver <> "[npm]"
 
--- | Portage atom for engines.bun minimum.
-bunBdependAtom :: Text -> Text
-bunBdependAtom ver = ">=dev-lang/bun-bin-" <> ver
+-- | Floor consumer atom: @>=dev-lang/bun-bin-\<min\>:0@.
+bunFloorBdependAtom :: Text -> Text
+bunFloorBdependAtom ver = ">=dev-lang/bun-bin-" <> ver <> ":0"
+
+-- | Compile-pin atom: @=dev-lang/bun-bin-\<exact\>@.
+bunCompilePinBdependAtom :: Text -> Text
+bunCompilePinBdependAtom ver = "=dev-lang/bun-bin-" <> ver
+
+-- | BDEPEND atom for a Bun package key at the given version (min or exact).
+bunBdependAtomFor :: PackageKey -> Text -> Text
+bunBdependAtomFor key ver
+  | isBunCompilePinPackage key = bunCompilePinBdependAtom ver
+  | otherwise = bunFloorBdependAtom ver
+
+-- | Version token from a bun-bin BDEPEND atom (@>=…:0@ or @=…@).
+bunAtomVersion :: Text -> Maybe Text
+bunAtomVersion raw =
+  let t0 = T.dropWhile (\c -> c == '>' || c == '=' || c == '<' || c == '~') (T.strip raw)
+      rest = T.drop (T.length ("dev-lang/bun-bin-" :: Text)) t0
+      ver = T.takeWhile (\c -> isDigit c || c == '.') rest
+   in if T.null ver then Nothing else Just ver
 
 -- | Portage atom for SBCL floor with subslot and source USE (seed template form).
 sbclBdependAtom :: Text -> Text
@@ -732,13 +757,25 @@ ensureNodejsBdepend ver =
     (nodejsBdependAtom ver)
     ver
 
--- | Ensure @>=dev-lang/bun-bin-<ver>@ in BDEPEND.
+-- | Ensure floor @>=dev-lang/bun-bin-\<ver\>:0@ in BDEPEND (and any existing atoms).
 ensureBunBdepend :: Text -> Text -> Either Text Text
-ensureBunBdepend ver =
+ensureBunBdepend = ensureBunBdependForFloor
+
+ensureBunBdependForFloor :: Text -> Text -> Either Text Text
+ensureBunBdependForFloor ver =
   ensureBdependAtom
     "bun-bin"
     "dev-lang/bun-bin"
-    (bunBdependAtom ver)
+    (bunFloorBdependAtom ver)
+    ver
+
+-- | Ensure the packaging-mode bun-bin atom for @key@.
+ensureBunBdependFor :: PackageKey -> Text -> Text -> Either Text Text
+ensureBunBdependFor key ver =
+  ensureBdependAtom
+    "bun-bin"
+    "dev-lang/bun-bin"
+    (bunBdependAtomFor key ver)
     ver
 
 -- | Ensure @>=dev-lisp/sbcl-<floor>:=[source]@ (RDEPEND/BDEPEND body).
@@ -893,6 +930,42 @@ keywordsMatch expected content =
    in length expected == length actual
         && all (`elem` actual) expected
         && all (`elem` expected) actual
+
+-- | SLOT assignment value; omitted SLOT is treated as @0@.
+parseEbuildSlot :: Text -> Text
+parseEbuildSlot content =
+  case mapMaybe lineSlot (T.lines content) of
+    (s : _) -> s
+    [] -> "0"
+  where
+    mapMaybe f = foldr (\x acc -> case f x of Just y -> y : acc; Nothing -> acc) []
+    lineSlot ln =
+      let stripped = T.stripStart ln
+       in if "SLOT=" `T.isPrefixOf` stripped
+            then
+              Just
+                ( stripSurroundingQuotes
+                    (T.strip (T.takeWhile (/= '#') (T.drop (T.length ("SLOT=" :: Text)) stripped)))
+                )
+            else Nothing
+
+-- | Set or replace a one-line @SLOT=\"…\"@ assignment.
+setSlotField :: Text -> Text -> Text
+setSlotField slot content =
+  let line = "SLOT=\"" <> slot <> "\""
+      lns = T.lines content
+      (pre, post) = break isSlotLine lns
+   in case post of
+        [] ->
+          case findLastInheritIdx lns of
+            Nothing -> T.unlines (lns <> ["", line])
+            Just idx ->
+              let (before, after) = splitAt (idx + 1) lns
+                  (blanks, rest) = span T.null after
+               in T.unlines (before <> blanks <> [line] <> rest)
+        (_old : rest) -> T.unlines (pre <> [line] <> rest)
+  where
+    isSlotLine ln = "SLOT=" `T.isPrefixOf` T.stripStart ln
 
 -- | Set or replace KEYWORDS to the given space-joined tokens (quoted).
 -- Replaces a multi-line @KEYWORDS=\"…\"@ block when present.

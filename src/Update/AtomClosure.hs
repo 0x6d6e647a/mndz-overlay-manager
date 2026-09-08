@@ -8,6 +8,9 @@ module Update.AtomClosure
   ( OverlayAtom (..),
     VersionOp (..),
     DepNeed (..),
+    ProviderVer (..),
+    GitMvRenamePlan (..),
+    asSlotZero,
     AtomClosureSession (..),
     AtomClosureTerminal (..),
     parseConsumerNeeds,
@@ -50,6 +53,7 @@ import Control.Concurrent.MVar
     tryPutMVar,
     tryReadMVar,
   )
+import Control.Exception (IOException, try)
 import Control.Monad (foldM, join, unless, void)
 import Data.Char (isAlphaNum)
 import Data.Containers.ListUtils (nubOrd)
@@ -73,6 +77,7 @@ import Overlay.Version
   )
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath ((</>))
+import Update.EbuildEdit (parseEbuildSlot)
 import Update.Go.Plan (isLivePackageVersion)
 import Update.Types
   ( PackageKey (..),
@@ -101,6 +106,25 @@ data OverlayAtom = OverlayAtom
     oaVersion :: Maybe EbuildVersion
   }
   deriving (Eq, Show)
+
+-- | Retained provider ebuild PV plus whether @SLOT@ is @0@ (or omitted).
+data ProviderVer = ProviderVer
+  { pvVersion :: EbuildVersion,
+    pvSlotZero :: Bool
+  }
+  deriving (Eq, Show)
+
+-- | GitMv mutation after the rename-away guard.
+data GitMvRenamePlan
+  = GitMvRenameNewest
+  | GitMvAddKeepPin
+  deriving (Eq, Show)
+
+asSlotZero :: [EbuildVersion] -> [ProviderVer]
+asSlotZero = map (`ProviderVer` True)
+
+bunBinKey :: PackageKey
+bunBinKey = mkPackageKey "dev-lang" "bun-bin"
 
 -- | Required overlay-internal constraint after USE over-approx and
 -- non-overlay @||@ filtering.
@@ -215,24 +239,34 @@ atomMatchesPV atom pv =
     (OpEq, Just want) -> samePV pv want
     (OpApprox, Just want) -> samePV pv want
 
-pvsSatisfyNeed :: (PackageKey -> [EbuildVersion]) -> DepNeed -> Bool
+-- | bun-bin floor / omitted-slot atoms match SLOT=0 only; exact @=@ matches any SLOT.
+atomMatchesProvider :: OverlayAtom -> ProviderVer -> Bool
+atomMatchesProvider atom pv =
+  atomMatchesPV atom (pvVersion pv) && bunSlotOk
+  where
+    bunSlotOk
+      | oaKey atom /= bunBinKey = True
+      | oaOp atom == OpEq = True
+      | otherwise = pvSlotZero pv
+
+pvsSatisfyNeed :: (PackageKey -> [ProviderVer]) -> DepNeed -> Bool
 pvsSatisfyNeed pvsOf = \case
-  NeedAtom atom -> any (atomMatchesPV atom) (pvsOf (oaKey atom))
+  NeedAtom atom -> any (atomMatchesProvider atom) (pvsOf (oaKey atom))
   NeedOr atoms ->
-    any (\atom -> any (atomMatchesPV atom) (pvsOf (oaKey atom))) atoms
+    any (\atom -> any (atomMatchesProvider atom) (pvsOf (oaKey atom))) atoms
 
 -- | Planned unique PVs that exist on disk, plus extras still required by
 -- remaining consumer needs. Never invents a PV that is not on disk.
 keepProviderPVs ::
   PackageKey ->
   [EbuildVersion] ->
-  [EbuildVersion] ->
-  (PackageKey -> [EbuildVersion]) ->
+  [ProviderVer] ->
+  (PackageKey -> [ProviderVer]) ->
   [DepNeed] ->
   [EbuildVersion]
 keepProviderPVs provider unique disk pvsOf needs =
-  let uniqueOnDisk = [p | p <- disk, any (samePV p) unique]
-      extras = [p | p <- disk, not (any (samePV p) unique)]
+  let uniqueOnDisk = [p | p <- disk, any (samePV (pvVersion p)) unique]
+      extras = [p | p <- disk, not (any (samePV (pvVersion p)) unique)]
       relevant = filter (needMentions provider) needs
       pvsWith pPvs k
         | k == provider = pPvs
@@ -244,10 +278,11 @@ keepProviderPVs provider unique disk pvsOf needs =
         | closed (kept ++ [e]) = go (kept ++ [e]) es
         | otherwise = go kept es
       skipRest _ = []
+      versions = map pvVersion
    in -- If unique already closes, drop extras. Otherwise add extras that help.
       if closed uniqueOnDisk
-        then uniqueOnDisk
-        else go uniqueOnDisk extras
+        then versions uniqueOnDisk
+        else versions (go uniqueOnDisk extras)
 
 needMentions :: PackageKey -> DepNeed -> Bool
 needMentions k = \case
@@ -261,23 +296,22 @@ extrasBeyondKeep disk keep =
 -- | Remaining provider PVs after renaming Old to New (New included; Old dropped
 -- unless it is the same PV as New).
 remainingAfterRename ::
-  [EbuildVersion] ->
+  [ProviderVer] ->
   EbuildVersion ->
   EbuildVersion ->
-  [EbuildVersion]
+  [ProviderVer]
 remainingAfterRename disk old new =
-  nubOrd $
-    new
-      : [p | p <- disk, not (samePV p old)]
+  ProviderVer new True
+    : [p | p <- disk, not (samePV (pvVersion p) old)]
 
 -- | 'Just' the first remaining consumer need that remaining provider PVs
 -- would not satisfy.
 renameAwayUnsatisfied ::
   PackageKey ->
-  [EbuildVersion] ->
+  [ProviderVer] ->
   EbuildVersion ->
   EbuildVersion ->
-  (PackageKey -> [EbuildVersion]) ->
+  (PackageKey -> [ProviderVer]) ->
   [DepNeed] ->
   Maybe OverlayAtom
 renameAwayUnsatisfied provider disk old new pvsOf needs =
@@ -288,7 +322,14 @@ renameAwayUnsatisfied provider disk old new pvsOf needs =
       relevant = filter (needMentions provider) needs
    in firstUnsatisfiedAtom pvs relevant
 
-firstUnsatisfiedAtom :: (PackageKey -> [EbuildVersion]) -> [DepNeed] -> Maybe OverlayAtom
+isExactBunBinPin :: PackageKey -> EbuildVersion -> OverlayAtom -> Bool
+isExactBunBinPin provider old atom =
+  provider == bunBinKey
+    && oaKey atom == bunBinKey
+    && oaOp atom == OpEq
+    && maybe False (samePV old) (oaVersion atom)
+
+firstUnsatisfiedAtom :: (PackageKey -> [ProviderVer]) -> [DepNeed] -> Maybe OverlayAtom
 firstUnsatisfiedAtom pvsOf = go
   where
     go [] = Nothing
@@ -769,6 +810,10 @@ mapMaybeM f = go
 
 listNonLiveProviderPVs :: FilePath -> PackageKey -> IO [EbuildVersion]
 listNonLiveProviderPVs overlayRoot key =
+  map pvVersion <$> listNonLiveProviders overlayRoot key
+
+listNonLiveProviders :: FilePath -> PackageKey -> IO [ProviderVer]
+listNonLiveProviders overlayRoot key =
   case splitPackageKey key of
     Nothing -> pure []
     Just (cat, pn) -> do
@@ -778,14 +823,27 @@ listNonLiveProviderPVs overlayRoot key =
         then pure []
         else do
           names <- listDirectory pkgDir
-          pure $
-            [ parseEbuildVersion (T.pack verStr)
-            | n <- names,
-              Just (pkg, verStr) <- [parseEbuildFileName n],
-              T.pack pkg == pn,
-              let v = parseEbuildVersion (T.pack verStr),
-              not (isLivePackageVersion v)
-            ]
+          catMaybes
+            <$> mapM
+              ( \n ->
+                  case parseEbuildFileName n of
+                    Just (pkg, verStr)
+                      | T.pack pkg == pn -> do
+                          let v = parseEbuildVersion (T.pack verStr)
+                          if isLivePackageVersion v
+                            then pure Nothing
+                            else do
+                              eBody <-
+                                try (TIO.readFile (pkgDir </> n)) ::
+                                  IO (Either IOException Text)
+                              pure $
+                                case eBody of
+                                  Left _ -> Nothing
+                                  Right body ->
+                                    Just (ProviderVer v (parseEbuildSlot body == "0"))
+                    _ -> pure Nothing
+              )
+              names
 
 readPackageEbuildBodies ::
   FilePath ->
@@ -867,7 +925,7 @@ keepPVsForProvider mSession overlayRoot provider unique = do
   case eKeys of
     Left err -> pure (Left err)
     Right overlayKeys -> do
-      disk <- listNonLiveProviderPVs overlayRoot provider
+      diskP <- listNonLiveProviders overlayRoot provider
       bodies <- remainingConsumerBodies mSession overlayRoot overlayKeys provider
       case parseBodiesNeeds overlayKeys bodies of
         Left err -> pure (Left err)
@@ -875,9 +933,9 @@ keepPVsForProvider mSession overlayRoot provider unique = do
           otherPvs <- currentPvs overlayRoot overlayKeys
           let pvsOf k =
                 case mSession of
-                  Just s | Just ps <- Map.lookup k (acsPlannedRemaining s) -> ps
+                  Just s | Just ps <- Map.lookup k (acsPlannedRemaining s) -> asSlotZero ps
                   _ -> otherPvs k
-          pure (Right (keepProviderPVs provider unique disk pvsOf needs))
+          pure (Right (keepProviderPVs provider unique diskP pvsOf needs))
 
 ------------------------------------------------------------------------
 -- Session / wait
@@ -895,7 +953,34 @@ plannedRemainingFromWork overlayRoot key local = \case
   Right remote -> do
     disk <- listNonLiveProviderPVs overlayRoot key
     let siblings = [p | p <- disk, not (samePV p local)]
-    pure (nubOrd (siblings ++ [remote]))
+    keepOld <- bunBinWouldKeepPin overlayRoot key local remote
+    let kept = [local | keepOld]
+    pure (nubOrd (siblings ++ kept ++ [remote]))
+
+-- | Best-effort: bun-bin exact pin on Old means GitMv will add-keep, so Old remains.
+bunBinWouldKeepPin ::
+  FilePath ->
+  PackageKey ->
+  EbuildVersion ->
+  EbuildVersion ->
+  IO Bool
+bunBinWouldKeepPin overlayRoot provider old new
+  | provider /= bunBinKey = pure False
+  | otherwise = do
+      eKeys <- listOverlayPackageKeys overlayRoot
+      case eKeys of
+        Left _ -> pure False
+        Right overlayKeys -> do
+          disk <- listNonLiveProviders overlayRoot provider
+          bodies <- remainingConsumerBodies Nothing overlayRoot overlayKeys provider
+          case parseBodiesNeeds overlayKeys bodies of
+            Left _ -> pure False
+            Right needs -> do
+              otherPvs <- currentPvs overlayRoot overlayKeys
+              pure $
+                case renameAwayUnsatisfied provider disk old new otherPvs needs of
+                  Just atom -> isExactBunBinPin provider old atom
+                  Nothing -> False
 
 mkAtomClosureSession ::
   Map PackageKey [EbuildVersion] ->
@@ -1028,11 +1113,11 @@ atomWaitChoice (Just session) waited atom =
             then WaitAlreadyDone atom
             else WaitProvider provider
 
-currentPvs :: FilePath -> Set PackageKey -> IO (PackageKey -> [EbuildVersion])
+currentPvs :: FilePath -> Set PackageKey -> IO (PackageKey -> [ProviderVer])
 currentPvs overlayRoot overlayKeys = do
   pairs <-
     mapM
-      (\k -> (k,) <$> listNonLiveProviderPVs overlayRoot k)
+      (\k -> (k,) <$> listNonLiveProviders overlayRoot k)
       (Set.toList overlayKeys)
   let m = Map.fromList pairs
   pure (\k -> Map.findWithDefault [] k m)
@@ -1108,13 +1193,13 @@ guardGitMvRenameAway ::
   PackageKey ->
   EbuildVersion ->
   EbuildVersion ->
-  IO (Either Text ())
+  IO (Either Text GitMvRenamePlan)
 guardGitMvRenameAway mSession overlayRoot provider old new = do
   eKeys <- listOverlayPackageKeys overlayRoot
   case eKeys of
     Left err -> pure (Left err)
     Right overlayKeys -> do
-      disk <- listNonLiveProviderPVs overlayRoot provider
+      disk <- listNonLiveProviders overlayRoot provider
       bodies <- remainingConsumerBodies mSession overlayRoot overlayKeys provider
       case parseBodiesNeeds overlayKeys bodies of
         Left err -> pure (Left err)
@@ -1123,14 +1208,16 @@ guardGitMvRenameAway mSession overlayRoot provider old new = do
           -- Selected packages: planned remaining overrides current disk.
           let pvsOf k =
                 case mSession of
-                  Just s | Just ps <- Map.lookup k (acsPlannedRemaining s) -> ps
+                  Just s | Just ps <- Map.lookup k (acsPlannedRemaining s) -> asSlotZero ps
                   _ -> otherPvs k
           pure $
             case renameAwayUnsatisfied provider disk old new pvsOf needs of
-              Nothing -> Right ()
-              Just atom ->
-                Left $
-                  packageKeyText provider
-                    <> ": GitMv rename-away would leave overlay-internal atom "
-                    <> prettyOverlayAtom atom
-                    <> " unsatisfied; not renaming"
+              Nothing -> Right GitMvRenameNewest
+              Just atom
+                | isExactBunBinPin provider old atom -> Right GitMvAddKeepPin
+                | otherwise ->
+                    Left $
+                      packageKeyText provider
+                        <> ": GitMv rename-away would leave overlay-internal atom "
+                        <> prettyOverlayAtom atom
+                        <> " unsatisfied; not renaming"

@@ -39,7 +39,9 @@ import Update.Check
   )
 import Update.CheckCache (CheckCacheHandle, openCheckCache)
 import Update.Deps.Plan
-  ( DepsPlanOps (..),
+  ( BunProbe,
+    DepsPlanOps (..),
+    minimumBunProbe,
     planDepsPackageWithProgress,
     toGoPlanOps,
   )
@@ -171,7 +173,7 @@ mkDepsPlanOps ::
   (UpdateSource -> IO (Either T.Text [EbuildVersion])) ->
   (GoModKey -> IO (Either T.Text T.Text)) ->
   (T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
-  (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
+  (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)) ->
   (T.Text -> T.Text -> T.Text -> T.Text -> Maybe FilePath -> IO CargoTomlFetch) ->
   Maybe FilePath ->
   IO DepsPlanOps
@@ -209,7 +211,7 @@ unusedGoMod _ = pure (Left "go.mod unused")
 unusedNpm :: T.Text -> T.Text -> IO (Either T.Text T.Text)
 unusedNpm _ _ = pure (Left "npm engines unused")
 
-unusedBun :: T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)
+unusedBun :: T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)
 unusedBun _ _ _ _ = pure (Left "bun engines unused")
 
 unusedCargo ::
@@ -474,10 +476,11 @@ testPlanBunSuccess = do
       ( \_o _r _p pv ->
           pure $
             Right $
-              case pv of
-                "1.0.0" -> "1.1.0"
-                "1.5.0" -> "1.2.0"
-                _ -> "1.0.0"
+              minimumBunProbe $
+                case pv of
+                  "1.0.0" -> "1.1.0"
+                  "1.5.0" -> "1.2.0"
+                  _ -> "1.0.0"
       )
       unusedCargo
       (Just "/tmp/fake-overlay") -- required; ceilings pre-cached so not scanned
@@ -1075,7 +1078,7 @@ testContentFixBunReusable =
         body =
           T.unlines
             [ "EAPI=8",
-              "BDEPEND=\">=dev-lang/bun-bin-1.2.0\"",
+              "BDEPEND=\">=dev-lang/bun-bin-1.2.0:0\"",
               "KEYWORDS=\"~amd64 ~arm64\"",
               "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/ralph-tui-${PV}/ralph-tui-${PV}-deps.tar.xz\""
             ]
@@ -1088,7 +1091,7 @@ testContentFixBunReusable =
         (listFixed ["1.5.0"])
         unusedGoMod
         unusedNpm
-        (\_o _r _p _pv -> pure (Right "1.2.0"))
+        (\_o _r _p _pv -> pure (Right (minimumBunProbe "1.2.0")))
         unusedCargo
         (Just tmp)
     let e =
@@ -1415,7 +1418,7 @@ seedRalph overlay ver = do
 liveBunOps ::
   FilePath ->
   (UpdateSource -> IO (Either T.Text [EbuildVersion])) ->
-  (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
+  (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)) ->
   IO DepsPlanOps
 liveBunOps overlay listVers fetchBun = do
   ops <-
@@ -1430,14 +1433,15 @@ liveBunOps overlay listVers fetchBun = do
   pure ops
 
 bunEnginesForDelta ::
-  T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)
+  T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)
 bunEnginesForDelta _o _r _p pv =
   pure $
     Right $
-      case pv of
-        "1.0.0" -> "1.1.0"
-        "1.5.0" -> "1.2.0"
-        _ -> "1.0.0"
+      minimumBunProbe $
+        case pv of
+          "1.0.0" -> "1.1.0"
+          "1.5.0" -> "1.2.0"
+          _ -> "1.0.0"
 
 ralphEbuild :: FilePath -> T.Text -> Ebuild
 ralphEbuild path ver =

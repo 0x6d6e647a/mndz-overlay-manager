@@ -66,6 +66,7 @@ import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeFileName, (</>))
+import Update.EbuildEdit (parseEbuildSlot)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -373,18 +374,39 @@ discoverRuntimeMetasInDir pkgDir mPrefix = do
                 Nothing -> True
                 Just p -> p `T.isPrefixOf` T.pack n
             ]
-      metas <- mapM (readMeta pkgDir) ebuildNames
+      metas <- mapM (readMeta pkgDir Nothing) ebuildNames
       pure $ Right (catMaybes metas)
-  where
-    readMeta dir name = do
-      let path = dir </> name
-      content <- TIO.readFile path
-      pure (parseRuntimeEbuildMeta path content)
 
--- | Overlay bun-bin non-live ebuild metadata.
+readMeta :: FilePath -> Maybe (Text -> Bool) -> FilePath -> IO (Maybe RuntimeEbuildMeta)
+readMeta dir mPred name = do
+  let path = dir </> name
+  content <- TIO.readFile path
+  let ok = maybe True ($ content) mPred
+  pure $
+    if ok
+      then parseRuntimeEbuildMeta path content
+      else Nothing
+
+-- | Overlay bun-bin non-live @SLOT=0@ ebuild metadata (pin slots are ignored).
 discoverBunBinMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])
-discoverBunBinMetas overlayRoot =
-  discoverRuntimeMetasInDir (bunBinPackageDir overlayRoot) (Just "bun-bin-")
+discoverBunBinMetas overlayRoot = do
+  let pkgDir = bunBinPackageDir overlayRoot
+  exists <- doesDirectoryExist pkgDir
+  if not exists
+    then pure $ Left ("directory not found: " <> T.pack pkgDir)
+    else do
+      names <- listDirectory pkgDir
+      let ebuildNames =
+            [ n
+            | n <- names,
+              ".ebuild" `T.isSuffixOf` T.pack n,
+              "bun-bin-" `T.isPrefixOf` T.pack n
+            ]
+      metas <-
+        mapM
+          (readMeta pkgDir (Just (\c -> parseEbuildSlot c == "0")))
+          ebuildNames
+      pure $ Right (catMaybes metas)
 
 -- | Overlay qlot non-live ebuild metadata.
 discoverQlotMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])

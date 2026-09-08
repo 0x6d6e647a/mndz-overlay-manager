@@ -54,7 +54,7 @@ import Update.CheckCache
     lookupDeps,
     openCheckCache,
   )
-import Update.Deps.Plan (DepsPlanOps (..))
+import Update.Deps.Plan (BunProbe, DepsPlanOps (..), minimumBunProbe)
 import Update.DiskSpace (DiskSpaceProbe (..))
 import Update.Git (GitOps (..))
 import Update.Materialize (EnsureOutcome (..), NeededFloors (..))
@@ -204,14 +204,15 @@ disabledProgress = do
   mkProgressConfig False ColorOff hold (LogAction (\_ -> pure ()))
 
 bunEngines ::
-  T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)
+  T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)
 bunEngines _o _r _p pv =
   pure $
     Right $
-      case pv of
-        "1.0.0" -> "1.1.0"
-        "1.5.0" -> "1.2.0"
-        _ -> "1.0.0"
+      minimumBunProbe $
+        case pv of
+          "1.0.0" -> "1.1.0"
+          "1.5.0" -> "1.2.0"
+          _ -> "1.0.0"
 
 listRalphAndBun :: UpdateSource -> IO (Either T.Text [EbuildVersion])
 listRalphAndBun src = case src of
@@ -231,7 +232,7 @@ liveBunOps overlay = do
 
 mkWavePlanOps ::
   (UpdateSource -> IO (Either T.Text [EbuildVersion])) ->
-  (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
+  (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)) ->
   FilePath ->
   IO DepsPlanOps
 mkWavePlanOps listVers fetchBun overlay = do
@@ -945,10 +946,11 @@ testT0EnsureHypoBunFloor =
         bunEngines14 _o _r _p pv =
           pure $
             Right $
-              case pv of
-                "1.0.0" -> "1.3.14"
-                "1.5.0" -> "1.4.0"
-                _ -> "1.0.0"
+              minimumBunProbe $
+                case pv of
+                  "1.0.0" -> "1.3.14"
+                  "1.5.0" -> "1.4.0"
+                  _ -> "1.0.0"
         ebuilds =
           [ Ebuild "dev-lang" "bun-bin" "1.3.14" bunPath,
             Ebuild "dev-util" "ralph-tui" "1.0.0" ralphPath

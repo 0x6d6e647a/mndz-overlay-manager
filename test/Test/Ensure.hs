@@ -72,6 +72,7 @@ import Update.Materialize
     lookupRecipeArch,
     materializeGeneratorId,
     neededFloorsFromClassified,
+    overlayBunFloorFromMetas,
     overrideUnusableMessage,
     parseContainerdDump,
     parseDockerInfoJson,
@@ -93,7 +94,7 @@ import Update.Process.Docker
     materializeImageEnvVar,
     missingImageMessage,
   )
-import Update.Runtime.Ceilings (RuntimeEbuildMeta (..))
+import Update.Runtime.Ceilings (RuntimeEbuildMeta (..), discoverBunBinMetas)
 import Update.Types
   ( CargoSource (..),
     EcosystemSpec (..),
@@ -107,6 +108,7 @@ unitTests =
     "Ensure"
     [ testCase "union/satisfy Go floors" testUnionSatisfy,
       testCase "Bun-only first image omits SBCL" testBunOnlyOmitsSbcl,
+      testCase "pin-only bun-bin is not SLOT=0 for image floor" testPinOnlyBunBinNotImageFloor,
       testCase "rust-bin preferred over plain rust" testResolvePrefersRustBin,
       testCase "sbcl without -bin picks source and ~amd64 accept" testResolveSbclNoBinTilde,
       testCase "missing ebuilds at floor is a resolve miss" testResolveMissingFloorMiss,
@@ -226,10 +228,26 @@ testBunOnlyOmitsSbcl = do
   assertEq "no Go on bun-only" Nothing (nfGo needed)
   df <- renderMapped "x86_64" [bunInstall "1.2.0" "amd64"] "/overlay"
   assertTrue "recipe has bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` df)
+  assertTrue "recipe bun-bin is :0" (">=dev-lang/bun-bin-1.2.0:0::mndz" `T.isInfixOf` df)
   assertTrue "recipe omits sbcl emerge" (not ("dev-lisp/sbcl" `T.isInfixOf` df))
   assertTrue "bun-only omits SBCL_HOME" (not ("SBCL_HOME" `T.isInfixOf` df))
   assertTrue "bun-only omits qlot" (not ("dev-lisp/qlot" `T.isInfixOf` df))
   assertTrue "base still emerges wget" ("net-misc/wget" `T.isInfixOf` df)
+
+testPinOnlyBunBinNotImageFloor :: IO ()
+testPinOnlyBunBinNotImageFloor =
+  withSystemTempDirectory "om-ensure-pin-only" $ \tmp -> do
+    let pkgDir = tmp </> "dev-lang" </> "bun-bin"
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile
+      (pkgDir </> "bun-bin-1.3.14.ebuild")
+      "EAPI=8\nSLOT=\"1.3.14\"\nKEYWORDS=\"~amd64\"\n"
+    metas <- discoverBunBinMetas tmp
+    case metas of
+      Left err -> assertFailure (T.unpack err)
+      Right ms -> do
+        assertEq "pin slot ignored" [] ms
+        assertEq "no overlay bun floor" Nothing (overlayBunFloorFromMetas ms)
 
 testResolvePrefersRustBin :: IO ()
 testResolvePrefersRustBin = do
@@ -442,7 +460,7 @@ testRenderMndzNoOfficial = do
   assertTrue "::mndz" ("::mndz" `T.isInfixOf` df)
   assertTrue
     "accept_keywords bun-bin"
-    (">=dev-lang/bun-bin-1.2.21::mndz ~amd64" `T.isInfixOf` df)
+    (">=dev-lang/bun-bin-1.2.21:0::mndz ~amd64" `T.isInfixOf` df)
   assertTrue "go via portage" ("dev-lang/go" `T.isInfixOf` df)
   assertTrue "no go.dev" (not ("go.dev" `T.isInfixOf` df))
   assertTrue "no nodejs.org" (not ("nodejs.org" `T.isInfixOf` df))
@@ -501,7 +519,7 @@ testAmd64OpenrcRecipe = do
     (not ("FROM gentoo/stage3:amd64\n" `T.isInfixOf` df))
   assertTrue
     "bun-bin KEYWORDS"
-    (">=dev-lang/bun-bin-1.2.21::mndz ~amd64" `T.isInfixOf` df)
+    (">=dev-lang/bun-bin-1.2.21:0::mndz ~amd64" `T.isInfixOf` df)
 
 testPpc64leOpenrcRecipe :: IO ()
 testPpc64leOpenrcRecipe = do
@@ -511,7 +529,7 @@ testPpc64leOpenrcRecipe = do
     ("FROM gentoo/stage3:ppc64le-openrc" `T.isInfixOf` df)
   assertTrue
     "bun-bin KEYWORDS ppc64"
-    (">=dev-lang/bun-bin-1.2.21::mndz ~ppc64" `T.isInfixOf` df)
+    (">=dev-lang/bun-bin-1.2.21:0::mndz ~ppc64" `T.isInfixOf` df)
 
 testRenderSbclTestingFloor :: IO ()
 testRenderSbclTestingFloor = do
@@ -615,8 +633,8 @@ bunInstall ver kw =
     TkBun
     ResolvedToolchain
       { rtAtom = "dev-lang/bun-bin",
-        rtEmergeSpec = ">=dev-lang/bun-bin-" <> ver <> "::mndz",
-        rtAcceptLine = Just (">=dev-lang/bun-bin-" <> ver <> "::mndz ~" <> kw)
+        rtEmergeSpec = ">=dev-lang/bun-bin-" <> ver <> ":0::mndz",
+        rtAcceptLine = Just (">=dev-lang/bun-bin-" <> ver <> ":0::mndz ~" <> kw)
       }
 
 overlayQlotInstall :: T.Text -> T.Text -> ResolvedInstall

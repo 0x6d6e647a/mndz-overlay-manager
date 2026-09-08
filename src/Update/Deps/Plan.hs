@@ -2,6 +2,8 @@
 
 module Update.Deps.Plan
   ( DepsPlanOps (..),
+    BunProbe (..),
+    minimumBunProbe,
     productionDepsPlanOps,
     planDepsPackageWithProgress,
     planDepsPackageWithProgressFor,
@@ -34,7 +36,11 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion (..), comparePV, renderPVNoRev, samePV)
 import System.FilePath ((</>))
-import Update.Bun.Cache (parseEnginesBunFromPackageJson)
+import Update.Bun.Cache
+  ( BunProbe (..),
+    minimumBunProbe,
+    parseBunProbeFromPackageJson,
+  )
 import Update.Cargo.Msrv
   ( CargoTomlFetch (..),
     TagFloorResult (..),
@@ -89,7 +95,7 @@ data DepsPlanOps = DepsPlanOps
     dpoListVersions :: UpdateSource -> IO (Either Text [EbuildVersion]),
     dpoFetchGoMod :: GoModFetcher,
     dpoFetchNpmEngines :: Text -> Text -> IO (Either Text Text),
-    dpoFetchBunEngines :: Text -> Text -> Text -> Text -> IO (Either Text Text),
+    dpoFetchBunEngines :: Text -> Text -> Text -> Text -> IO (Either Text BunProbe),
     -- | Fetch package Cargo.toml body at tag for rust-version probe.
     dpoFetchCargoToml :: Text -> Text -> Text -> Text -> Maybe FilePath -> IO CargoTomlFetch,
     -- | Fetch rust-toolchain.toml at tag (lock subdir then repository root).
@@ -334,7 +340,7 @@ bunProbe ops owner repo prefix pv = do
       (renderPVNoRev pv)
   pure $ case eres of
     Left err -> Left (PlanProbeFailed err)
-    Right ver -> Right (Just ver)
+    Right probe -> Right (Just (bunProbeMinimum probe))
 
 ------------------------------------------------------------------------
 -- Cargo
@@ -623,7 +629,7 @@ fetchBunEnginesAtTag ::
   Text ->
   Text ->
   Text ->
-  IO (Either Text Text)
+  IO (Either Text BunProbe)
 fetchBunEnginesAtTag mgr mToken owner repo prefix pv = do
   let tag = versionTag prefix pv
       url =
@@ -656,8 +662,8 @@ fetchBunEnginesAtTag mgr mToken owner repo prefix pv = do
        in if code >= 200 && code < 300
             then
               let txt = TE.decodeUtf8 (BL.toStrict (responseBody resp))
-               in case parseEnginesBunFromPackageJson txt of
-                    Just v -> Right v
+               in case parseBunProbeFromPackageJson txt of
+                    Just p -> Right p
                     Nothing ->
                       Left
                         ( "missing or unparseable engines.bun / packageManager bun@ for "

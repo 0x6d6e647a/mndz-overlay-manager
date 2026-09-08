@@ -126,11 +126,15 @@ import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
   ( CargoSourceForm (..),
     assetsSrcUriParameterized,
+    bunCompilePinBdependAtom,
+    bunFloorBdependAtom,
     cargoProvenanceMismatch,
     ebuildHasDevLangGoBdepend,
     ebuildNeedsCargoBodyFix,
     ebuildNeedsCargoContentFix,
     ebuildNeedsContentFix,
+    ensureBunBdepend,
+    ensureBunBdependFor,
     ensureCargoAssetsSrcUri,
     ensureCargoAssetsSrcUriFor,
     ensureEmptyCrates,
@@ -146,9 +150,11 @@ import Update.EbuildEdit
     nextRevisionVersion,
     nodejsBdependMatches,
     parameterizeAssetsSrcUri,
+    parseEbuildSlot,
     parseManifestVendorSHA512,
     sbclBdependMatches,
     setKeywords,
+    setSlotField,
     stripWindowsOnlyGitCrates,
     writeVersionForPlannedPV,
   )
@@ -285,6 +291,7 @@ tests =
     [ testCase "Ebuild Edit" testEbuildEdit,
       testCase "Go Version Parse" testGoVersionParse,
       testCase "Go Bdepend Edit" testGoBdependEdit,
+      testCase "Bun Bdepend floor and compile pin" testBunBdependEdit,
       testCase "Sbcl Atom Preserve Body" testSbclAtomPreserveBody,
       testCase "Nodejs Bdepend Use Replace" testNodejsBdependUseReplace,
       testCase "Vendor Go Version Gate" testVendorGoVersionGate,
@@ -473,6 +480,48 @@ testGoVersionParse = do
   assertTrue
     "enrich mentions rebuild image"
     ("rebuild the image" `T.isInfixOf` enrichGoModDownloadError "toolchain not available")
+
+testBunBdependEdit :: IO ()
+testBunBdependEdit = do
+  let base =
+        T.unlines
+          [ "inherit shell-completion",
+            "",
+            "DESCRIPTION=\"x\"",
+            "RDEPEND=\"sys-apps/ripgrep\""
+          ]
+  inserted <- assertRight "insert floor" (ensureBunBdepend "1.3.6" base)
+  assertTrue "floor atom" (bunFloorBdependAtom "1.3.6" `T.isInfixOf` inserted)
+  assertTrue "ripgrep kept" ("sys-apps/ripgrep" `T.isInfixOf` inserted)
+  let unqualified =
+        T.unlines
+          [ "inherit shell-completion",
+            "BDEPEND=\">=dev-lang/bun-bin-1.2.0\"",
+            "RDEPEND=\"${BDEPEND}\""
+          ]
+  slotted <- assertRight "replace with :0" (ensureBunBdepend "1.3.6" unqualified)
+  assertTrue "new floor" (bunFloorBdependAtom "1.3.6" `T.isInfixOf` slotted)
+  assertTrue "old gone" (not (">=dev-lang/bun-bin-1.2.0\"" `T.isInfixOf` slotted))
+  assertTrue "RDEPEND copies BDEPEND" ("RDEPEND=\"${BDEPEND}\"" `T.isInfixOf` slotted)
+  let opencodeKey = mkPackageKey "dev-util" "opencode"
+      opencodeBody =
+        T.unlines
+          [ "inherit shell-completion",
+            "BDEPEND=\">=dev-lang/bun-bin-1.3.14\"",
+            "RDEPEND=\"sys-apps/ripgrep\""
+          ]
+  pinned <-
+    assertRight "compile pin" (ensureBunBdependFor opencodeKey "1.3.14" opencodeBody)
+  assertTrue "exact atom" (bunCompilePinBdependAtom "1.3.14" `T.isInfixOf` pinned)
+  case [ln | ln <- T.lines pinned, "RDEPEND=" `T.isPrefixOf` T.stripStart ln] of
+    (rdep : _) ->
+      assertTrue "RDEPEND still ripgrep only" ("sys-apps/ripgrep" `T.isInfixOf` rdep && not ("bun-bin" `T.isInfixOf` rdep))
+    [] -> do
+      hPutStrLn stderr "expected RDEPEND line"
+      exitFailure
+  let slottedEbuild = setSlotField "1.3.14" "EAPI=8\nSLOT=\"0\"\n"
+  assertEq "rewritten pin slot" "1.3.14" (parseEbuildSlot slottedEbuild)
+  assertEq "missing SLOT is 0" "0" (parseEbuildSlot "EAPI=8\n")
 
 testGoBdependEdit :: IO ()
 testGoBdependEdit = do

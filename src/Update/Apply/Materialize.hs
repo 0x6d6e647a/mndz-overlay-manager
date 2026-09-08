@@ -20,6 +20,7 @@ module Update.Apply.Materialize
 where
 
 import CLI.Progress (MultiHandle (..))
+import Control.Applicative ((<|>))
 import Control.Concurrent.MVar (withMVar)
 import Control.Exception (SomeException, catch)
 import Control.Monad (when)
@@ -89,12 +90,7 @@ import Update.Assets.Release
     lookupNamedAssets,
   )
 import Update.AtomClosure (keepPVsForProvider)
-import Update.Bun.Cache
-  ( BunCacheProgress (..),
-    buildBunDepsTarball,
-    bunPackagingModeFor,
-    mkBunCacheOps,
-  )
+import Update.Bun.Cache (BunCacheProgress (..), BunProbe (..), buildBunDepsTarball, bunPackagingModeFor, isBunCompilePinPackage, mkBunCacheOps)
 import Update.Cargo.Crates
   ( CargoProgress (..),
     CargoResult (..),
@@ -130,7 +126,8 @@ import Update.DiskSpace
     resolveTempRoot,
   )
 import Update.EbuildEdit
-  ( bunBdependAtom,
+  ( bunAtomVersion,
+    bunBdependAtomFor,
     cargoProvenanceMismatch,
     goBdependAtom,
     nodejsBdependAtom,
@@ -510,9 +507,10 @@ fetchRequiredBdependAtom ::
   ApplyEnv ->
   EcosystemSpec ->
   UpdateSource ->
+  PackageKey ->
   Text ->
   IO (Maybe Text)
-fetchRequiredBdependAtom env eco src pvNoRev =
+fetchRequiredBdependAtom env eco src key pvNoRev =
   case (eco, src) of
     (Go mSub, GitHub owner repo prefix) -> do
       mGo <- fetchGoModVersion env owner repo prefix pvNoRev mSub
@@ -526,7 +524,12 @@ fetchRequiredBdependAtom env eco src pvNoRev =
       eres <-
         dpoFetchBunEngines (aeDepsPlanOps env) owner repo prefix pvNoRev
       pure $ case eres of
-        Right ver -> Just (bunBdependAtom ver)
+        Right probe ->
+          let mVer =
+                if isBunCompilePinPackage key
+                  then bunProbeExactPin probe <|> Just (bunProbeMinimum probe)
+                  else Just (bunProbeMinimum probe)
+           in bunBdependAtomFor key <$> mVer
         Left _ -> Nothing
     (Sbcl, GitHub owner repo prefix) -> do
       eres <-
@@ -1230,9 +1233,10 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
         dpoFetchBunEngines (aeDepsPlanOps env) owner repo prefix pvNoRev
       case eng of
         Left err -> pure (Left err)
-        Right bunReq -> do
+        Right probe -> do
           let progress = bunCacheProgress stepsDoneRef mh key
               packMode = bunPackagingModeFor key
+              bunMin = bunProbeMinimum probe
           built <-
             buildBunDepsTarball
               (aeBunCacheOps env)
@@ -1242,13 +1246,13 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
               repo
               prefix
               pvNoRev
-              bunReq
+              bunMin
               workDir
               outDir
               tarballName
           pure $ case built of
             Left err -> Left err
-            Right p -> Right (p, Just bunReq, Nothing)
+            Right p -> Right (p, Just bunMin, Nothing)
     (Cargo mLock mPkg mCargoSrc, GitHub owner repo prefix) -> do
       let plannedPv = parseEbuildVersion pvNoRev
       donorPath <-
@@ -1664,7 +1668,7 @@ reuseDepsReleaseAsset
                           Left _ -> Nothing
                   _ -> pure (Right Nothing)
               _ -> do
-                mAtom <- fetchRequiredBdependAtom env eco src pvNoRev
+                mAtom <- fetchRequiredBdependAtom env eco src key pvNoRev
                 pure $
                   Right $
                     case mAtom of
@@ -1678,12 +1682,7 @@ reuseDepsReleaseAsset
                                       atom
                                   )
                               )
-                        | "bun-bin-" `T.isInfixOf` atom ->
-                            Just
-                              ( T.drop
-                                  (T.length (">=dev-lang/bun-bin-" :: Text))
-                                  atom
-                              )
+                        | "bun-bin-" `T.isInfixOf` atom -> bunAtomVersion atom
                         | otherwise -> Nothing
                       Nothing -> Nothing
             case reqResult of

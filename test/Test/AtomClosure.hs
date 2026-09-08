@@ -15,13 +15,16 @@ import Test.Tasty.HUnit (testCase)
 import Update.Apply.TestSupport
   ( DepNeed (..),
     OverlayAtom (..),
+    ProviderVer (..),
     VersionOp (..),
+    asSlotZero,
     atomMatchesPV,
     extrasBeyondKeep,
     keepProviderPVs,
     parseConsumerNeeds,
     prettyOverlayAtom,
     prettyWaitCycle,
+    pvsSatisfyNeed,
     renameAwayUnsatisfied,
     waitCycleWithEdge,
   )
@@ -47,6 +50,7 @@ unitTests =
       testCase "keep-set drops unneeded siblings" testKeepDropsUnversionedExtra,
       testCase "keep-set does not invent a missing PV" testKeepDoesNotInvent,
       testCase "rename-away exact pin fails; >= and unversioned succeed" testRenameAway,
+      testCase "bun-bin :0 floor matches SLOT=0 only" testBunBinSlotSatisfy,
       testCase "wait cycle path names both packages" testWaitCycle
     ]
 
@@ -217,9 +221,9 @@ testUnknownOpFailClosed = do
   err <- failClosed hkKey "RDEPEND=\"*dev-util/usage\"\n"
   assertTrue "unknown operator" ("unknown version operator" `T.isInfixOf` err)
 
-pvsUsage :: [EbuildVersion] -> PackageKey -> [EbuildVersion]
+pvsUsage :: [EbuildVersion] -> PackageKey -> [ProviderVer]
 pvsUsage usagePvs k
-  | k == usageKey = usagePvs
+  | k == usageKey = asSlotZero usagePvs
   | otherwise = []
 
 testKeepExactPin :: IO ()
@@ -233,7 +237,7 @@ testKeepExactPin = do
               oaOp = OpEq,
               oaVersion = Just (parseEbuildVersion "6.6.1")
             }
-      keep = keepProviderPVs usageKey unique disk (pvsUsage unique) [pin]
+      keep = keepProviderPVs usageKey unique (asSlotZero disk) (pvsUsage unique) [pin]
       extras = extrasBeyondKeep disk keep
   assertTrue "keeps 6.6.1" (parseEbuildVersion "6.6.1" `elem` keep)
   assertTrue "keeps planned" (parseEbuildVersion "6.8.0" `elem` keep)
@@ -244,7 +248,7 @@ testKeepDropsUnversionedExtra = do
   let unique = [parseEbuildVersion "6.8.0"]
       disk = [parseEbuildVersion "6.6.1", parseEbuildVersion "6.8.0"]
       unv = NeedAtom OverlayAtom {oaKey = usageKey, oaOp = OpUnversioned, oaVersion = Nothing}
-      keep = keepProviderPVs usageKey unique disk (pvsUsage unique) [unv]
+      keep = keepProviderPVs usageKey unique (asSlotZero disk) (pvsUsage unique) [unv]
       extras = extrasBeyondKeep disk keep
   assertEq "only planned" unique keep
   assertEq "drop 6.6.1" [parseEbuildVersion "6.6.1"] extras
@@ -260,7 +264,7 @@ testKeepDoesNotInvent = do
               oaOp = OpEq,
               oaVersion = Just (parseEbuildVersion "6.6.1")
             }
-      keep = keepProviderPVs usageKey unique disk (pvsUsage unique) [pin]
+      keep = keepProviderPVs usageKey unique (asSlotZero disk) (pvsUsage unique) [pin]
   assertEq "does not invent 6.6.1" disk keep
   assertTrue "6.6.1 absent" (parseEbuildVersion "6.6.1" `notElem` keep)
 
@@ -288,16 +292,50 @@ testRenameAway = do
   assertEq
     ">= still satisfied by New"
     Nothing
-    (renameAwayUnsatisfied bunBinKey bunDisk old new none [ge])
+    (renameAwayUnsatisfied bunBinKey (asSlotZero bunDisk) old new none [ge])
   assertEq
     "unversioned still satisfied by New"
     Nothing
-    (renameAwayUnsatisfied bunBinKey bunDisk old new none [unv])
+    (renameAwayUnsatisfied bunBinKey (asSlotZero bunDisk) old new none [unv])
   let usageDisk = [parseEbuildVersion "6.6.1"]
       usageNew = parseEbuildVersion "6.8.0"
-  case renameAwayUnsatisfied usageKey usageDisk (parseEbuildVersion "6.6.1") usageNew none [pin] of
+  case renameAwayUnsatisfied usageKey (asSlotZero usageDisk) (parseEbuildVersion "6.6.1") usageNew none [pin] of
     Just atom -> assertEq "exact pin" OpEq (oaOp atom)
     Nothing -> assertEq "expected pin fail" True False
+
+testBunBinSlotSatisfy :: IO ()
+testBunBinSlotSatisfy = do
+  let floorAtom =
+        OverlayAtom
+          { oaKey = bunBinKey,
+            oaOp = OpGe,
+            oaVersion = Just (parseEbuildVersion "1.3.6")
+          }
+      pinAtom =
+        OverlayAtom
+          { oaKey = bunBinKey,
+            oaOp = OpEq,
+            oaVersion = Just (parseEbuildVersion "1.3.14")
+          }
+      latest = ProviderVer (parseEbuildVersion "1.4.2") True
+      pin = ProviderVer (parseEbuildVersion "1.3.14") False
+      pvsBoth k
+        | k == bunBinKey = [latest, pin]
+        | otherwise = []
+      pvsPinOnly k
+        | k == bunBinKey = [pin]
+        | otherwise = []
+  assertTrue
+    "latest SLOT=0 satisfies :0 floor"
+    (pvsSatisfyNeed pvsBoth (NeedAtom floorAtom))
+  assertTrue
+    "pin alone does not satisfy :0 floor"
+    (not (pvsSatisfyNeed pvsPinOnly (NeedAtom floorAtom)))
+  assertTrue
+    "exact pin matches pin-slot PV"
+    (pvsSatisfyNeed pvsPinOnly (NeedAtom pinAtom))
+  err <- failClosed ralphKey "BDEPEND=\">=dev-lang/bun-bin-1.3.6:1.3.14\"\n"
+  assertTrue "consumer pin slot hard-fails" ("slot" `T.isInfixOf` err)
 
 testWaitCycle :: IO ()
 testWaitCycle = do

@@ -28,7 +28,7 @@ import Update.Check (PackageEntry (..))
 import Update.EbuildEdit
   ( ebuildFileNameWithRev,
     ebuildHasDevLangGoBdepend,
-    ensureBunBdepend,
+    ensureBunBdependFor,
     ensureCargoAssetsSrcUriFor,
     ensureEmptyCrates,
     ensureGoBdepend,
@@ -119,7 +119,7 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
             (NpmEco, Just ver) -> pure (ensureNodejsBdepend ver withKw)
             (NpmEco, Nothing) ->
               pure (Left "could not obtain engines.node for BDEPEND alignment")
-            (Bun, Just ver) -> pure (ensureBunBdepend ver withKw)
+            (Bun, Just ver) -> pure (ensureBunBdependFor key ver withKw)
             (Bun, Nothing) ->
               pure (Left "could not obtain engines.bun for BDEPEND alignment")
             (Cargo {}, Just msrv) -> pure (ensureRustMinVer msrv withKw)

@@ -55,7 +55,7 @@ import Update.Bun.Cache (BunCacheOps (..))
 import Update.Cargo.Crates (CargoOps (..))
 import Update.Cargo.Msrv (CargoTomlFetch (..))
 import Update.Check (PackageEntry (..))
-import Update.Deps.Plan (DepsPlanOps (..))
+import Update.Deps.Plan (BunProbe, DepsPlanOps (..), minimumBunProbe)
 import Update.Git (GitOps (..))
 import Update.Go.Lanes (PlannedEbuild (..))
 import Update.Go.ModFetch (GoModKey (..))
@@ -137,7 +137,7 @@ mkDepsPlanOps ::
   (UpdateSource -> IO (Either T.Text [EbuildVersion])) ->
   (GoModKey -> IO (Either T.Text T.Text)) ->
   (T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
-  (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)) ->
+  (T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)) ->
   (T.Text -> T.Text -> T.Text -> T.Text -> Maybe FilePath -> IO CargoTomlFetch) ->
   Maybe FilePath ->
   IO DepsPlanOps
@@ -178,7 +178,7 @@ unusedGoMod _ = pure (Left "go.mod unused")
 unusedNpm :: T.Text -> T.Text -> IO (Either T.Text T.Text)
 unusedNpm _ _ = pure (Left "npm engines unused")
 
-unusedBun :: T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)
+unusedBun :: T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)
 unusedBun _ _ _ _ = pure (Left "bun engines unused")
 
 unusedCargo ::
@@ -895,20 +895,21 @@ seedBunLocalOk overlayRoot pkgDir pn = do
   createDirectoryIfMissing True pkgDir
   TIO.writeFile
     (pkgDir </> "ralph-tui-1.0.0.ebuild")
-    (bunEbuildBody kwTilde ">=dev-lang/bun-bin-1.1.0")
+    (bunEbuildBody kwTilde ">=dev-lang/bun-bin-1.1.0:0")
   TIO.writeFile
     (pkgDir </> "Manifest")
     ("DIST " <> T.pack (depsTarballName pn "1.0.0") <> " 1 SHA512 deadbeef\n")
   writeMatchingCachesForPackage overlayRoot "dev-util" pn pkgDir
 
-bunEngines :: T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text T.Text)
+bunEngines :: T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)
 bunEngines _o _r _p pv =
   pure $
     Right $
-      case pv of
-        "1.0.0" -> "1.1.0"
-        "1.5.0" -> "1.2.0"
-        _ -> "1.0.0"
+      minimumBunProbe $
+        case pv of
+          "1.0.0" -> "1.1.0"
+          "1.5.0" -> "1.2.0"
+          _ -> "1.0.0"
 
 testBunFullPathSuccess :: IO ()
 testBunFullPathSuccess =
@@ -1025,7 +1026,7 @@ testBunSoftSkip =
     createDirectoryIfMissing True assetsRoot
     TIO.writeFile
       (pkgDir </> "ralph-tui-1.5.0.ebuild")
-      (bunEbuildBody kwTilde ">=dev-lang/bun-bin-1.2.0")
+      (bunEbuildBody kwTilde ">=dev-lang/bun-bin-1.2.0:0")
     TIO.writeFile
       (pkgDir </> "Manifest")
       ("DIST " <> T.pack (depsTarballName pn "1.5.0") <> " 1 SHA512 deadbeef\n")
@@ -1035,7 +1036,7 @@ testBunSoftSkip =
         (listFixed ["1.5.0"])
         unusedGoMod
         unusedNpm
-        (\_o _r _p _pv -> pure (Right "1.2.0"))
+        (\_o _r _p _pv -> pure (Right (minimumBunProbe "1.2.0")))
         unusedCargo
         (Just overlayRoot)
     env <-
@@ -1063,7 +1064,7 @@ seedOpencodeLocalOk overlayRoot pkgDir pn = do
   createDirectoryIfMissing True pkgDir
   TIO.writeFile
     (pkgDir </> "opencode-1.0.0.ebuild")
-    (opencodeEbuildBody kwTilde ">=dev-lang/bun-bin-1.1.0")
+    (opencodeEbuildBody kwTilde "=dev-lang/bun-bin-1.1.0")
   TIO.writeFile
     (pkgDir </> "Manifest")
     ( T.unlines
@@ -1176,7 +1177,7 @@ testOpencodeMultiAssetFullPath =
         (listFixed ["2.0.0", "1.0.0"])
         unusedGoMod
         unusedNpm
-        (\_o _r _p pv -> pure (Right (if pv == "2.0.0" then "1.2.0" else "1.1.0")))
+        (\_o _r _p pv -> pure (Right (minimumBunProbe (if pv == "2.0.0" then "1.2.0" else "1.1.0"))))
         unusedCargo
         (Just overlayRoot)
     env0 <-
@@ -1225,7 +1226,7 @@ testOpencodeMultiAssetReusePath =
         (listFixed ["2.0.0", "1.0.0"])
         unusedGoMod
         unusedNpm
-        (\_o _r _p pv -> pure (Right (if pv == "2.0.0" then "1.2.0" else "1.1.0")))
+        (\_o _r _p pv -> pure (Right (minimumBunProbe (if pv == "2.0.0" then "1.2.0" else "1.1.0"))))
         unusedCargo
         (Just overlayRoot)
     let bunOps =
@@ -1281,7 +1282,7 @@ testOpencodePartialReleaseFullPath =
         (listFixed ["2.0.0", "1.0.0"])
         unusedGoMod
         unusedNpm
-        (\_o _r _p pv -> pure (Right (if pv == "2.0.0" then "1.2.0" else "1.1.0")))
+        (\_o _r _p pv -> pure (Right (minimumBunProbe (if pv == "2.0.0" then "1.2.0" else "1.1.0"))))
         unusedCargo
         (Just overlayRoot)
     let bunOps =

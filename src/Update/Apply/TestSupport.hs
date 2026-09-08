@@ -30,6 +30,10 @@ module Update.Apply.TestSupport
     OverlayAtom (..),
     VersionOp (..),
     DepNeed (..),
+    ProviderVer (..),
+    asSlotZero,
+    pvsSatisfyNeed,
+    GitMvRenamePlan (..),
   )
 where
 
@@ -52,14 +56,18 @@ import Update.Apply.Materialize
 import Update.Apply.OverlayWrite (overlayAfterAssets)
 import Update.AtomClosure
   ( DepNeed (..),
+    GitMvRenamePlan (..),
     OverlayAtom (..),
+    ProviderVer (..),
     VersionOp (..),
+    asSlotZero,
     atomMatchesPV,
     extrasBeyondKeep,
     keepProviderPVs,
     parseConsumerNeeds,
     prettyOverlayAtom,
     prettyWaitCycle,
+    pvsSatisfyNeed,
     renameAwayUnsatisfied,
     waitCycleWithEdge,
   )

@@ -323,7 +323,8 @@ integrationTests =
       testCase "Atom-closure: unversioned usage does not wait" testAtomClosureUnversionedNoWait,
       testCase "Atom-closure: provider hard-fail fails waiting hk" testAtomClosureProviderFail,
       testCase "Atom-closure: wait cycle hard-fails both" testAtomClosureWaitCycle,
-      testCase "Atom-closure: GitMv rename-away exact pin fails" testAtomClosureRenameAwayPin,
+      testCase "Atom-closure: bun-bin compile pin add-keeps latest" testAtomClosureBunBinAddKeepPin,
+      testCase "Atom-closure: GitMv rename-away usage exact pin fails" testAtomClosureRenameAwayPin,
       testCase "Atom-closure: GitMv rename-away >= succeeds" testAtomClosureRenameAwayGe
     ]
 
@@ -2417,19 +2418,19 @@ testAtomClosureWaitCycle =
           doesFileExist (overlayRoot </> "dev-util" </> "usage" </> "usage-6.8.0.ebuild")
         assertTrue "neither mutated" (not hkNew && not usageNew)
 
-testAtomClosureRenameAwayPin :: IO ()
-testAtomClosureRenameAwayPin =
-  withSystemTempDirectory "mndz-atom-renpin-" $ \tmp -> do
+testAtomClosureBunBinAddKeepPin :: IO ()
+testAtomClosureBunBinAddKeepPin =
+  withSystemTempDirectory "mndz-atom-addkeep-" $ \tmp -> do
     let overlayRoot = tmp </> "overlay"
     bunPath <-
-      seedPkgEbuild overlayRoot "dev-lang" "bun-bin" "1.1.0" "EAPI=8\n"
+      seedPkgEbuild overlayRoot "dev-lang" "bun-bin" "1.3.14" "EAPI=8\nSLOT=\"0\"\n"
     _ <-
       seedPkgEbuild
         overlayRoot
         "dev-util"
-        "ralph-tui"
-        "1.0.0"
-        "EAPI=8\nBDEPEND=\"=dev-lang/bun-bin-1.1.0\"\n"
+        "opencode"
+        "1.18.29"
+        "EAPI=8\nBDEPEND=\"=dev-lang/bun-bin-1.3.14\"\n"
     overlayLock <- newMVar ()
     let gitOps =
           GitOps
@@ -2439,18 +2440,55 @@ testAtomClosureRenameAwayPin =
               goPush = \_ -> pure (Right ())
             }
     env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
-    let entries = [entryOf bunKeyA "bun-bin" "1.1.0" bunPath]
-        plans = [PlanNeedsWork bunKeyA (PlannedGitMv (parseEbuildVersion "1.2.0"))]
+    let entries = [entryOf bunKeyA "bun-bin" "1.3.14" bunPath]
+        plans = [PlanNeedsWork bunKeyA (PlannedGitMv (parseEbuildVersion "1.4.2"))]
     outcomes <- runClosureApply env overlayRoot entries plans
-    case [m | ApplyHardFail k m _ _ <- outcomes, k == bunKeyA] of
-      (msg : _) ->
-        assertTrue "rename-away names atom" ("=dev-lang/bun-bin-1.1.0" `T.isInfixOf` msg)
-      [] -> do
-        hPutStrLn stderr ("expected bun-bin rename-away fail, got " <> show outcomes)
-        exitFailure
+    assertTrue "no hard fail" (not (foldExitHardFail outcomes))
     oldStill <- doesFileExist bunPath
     newExists <-
-      doesFileExist (overlayRoot </> "dev-lang" </> "bun-bin" </> "bun-bin-1.2.0.ebuild")
+      doesFileExist (overlayRoot </> "dev-lang" </> "bun-bin" </> "bun-bin-1.4.2.ebuild")
+    assertTrue "1.3.14 stays" oldStill
+    assertTrue "1.4.2 added" newExists
+    oldBody <- TIO.readFile bunPath
+    newBody <-
+      TIO.readFile (overlayRoot </> "dev-lang" </> "bun-bin" </> "bun-bin-1.4.2.ebuild")
+    assertTrue "old is pin slot" ("SLOT=\"1.3.14\"" `T.isInfixOf` oldBody)
+    assertTrue "new is SLOT 0" ("SLOT=\"0\"" `T.isInfixOf` newBody)
+
+testAtomClosureRenameAwayPin :: IO ()
+testAtomClosureRenameAwayPin =
+  withSystemTempDirectory "mndz-atom-renpin-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    usagePath <-
+      seedPkgEbuild overlayRoot "dev-util" "usage" "6.6.1" "EAPI=8\n"
+    _ <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "hk"
+        "1.0.0"
+        "EAPI=8\nRDEPEND=\"=dev-util/usage-6.6.1\"\n"
+    overlayLock <- newMVar ()
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ())
+            }
+    env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
+    let entries = [entryOf usageKeyA "usage" "6.6.1" usagePath]
+        plans = [PlanNeedsWork usageKeyA (PlannedGitMv (parseEbuildVersion "6.8.0"))]
+    outcomes <- runClosureApply env overlayRoot entries plans
+    case [m | ApplyHardFail k m _ _ <- outcomes, k == usageKeyA] of
+      (msg : _) ->
+        assertTrue "rename-away names atom" ("=dev-util/usage-6.6.1" `T.isInfixOf` msg)
+      [] -> do
+        hPutStrLn stderr ("expected usage rename-away fail, got " <> show outcomes)
+        exitFailure
+    oldStill <- doesFileExist usagePath
+    newExists <-
+      doesFileExist (overlayRoot </> "dev-util" </> "usage" </> "usage-6.8.0.ebuild")
     assertTrue "old PV remains" oldStill
     assertTrue "not renamed" (not newExists)
 

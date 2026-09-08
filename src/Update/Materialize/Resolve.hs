@@ -276,15 +276,22 @@ chosenAtom arch floorTok atom metas repo =
 
 emergeSpec :: Text -> Text -> Text -> Text
 emergeSpec repo atom floorTok
-  | isAnyVersionFloor floorTok = qualifyRepo repo atom
-  | otherwise = ">=" <> qualifyRepo repo (atom <> "-" <> floorTok)
+  | isAnyVersionFloor floorTok = qualifyRepo repo (slotAtom atom)
+  | otherwise = ">=" <> qualifyRepo repo (slotAtom (atom <> "-" <> floorTok))
 
 acceptLine :: Text -> Text -> Text -> Arch -> Text
 acceptLine repo atom floorTok arch
   | isAnyVersionFloor floorTok =
-      atom <> "::" <> repo <> " ~" <> arch
+      slotAtom atom <> "::" <> repo <> " ~" <> arch
   | otherwise =
-      ">=" <> atom <> "-" <> floorTok <> "::" <> repo <> " ~" <> arch
+      ">=" <> slotAtom (atom <> "-" <> floorTok) <> "::" <> repo <> " ~" <> arch
+
+-- | Overlay bun-bin emerge/accept atoms are slot-qualified @:0@.
+slotAtom :: Text -> Text
+slotAtom atom
+  | atom == bunBinAtom = atom <> ":0"
+  | "dev-lang/bun-bin-" `T.isPrefixOf` atom = atom <> ":0"
+  | otherwise = atom
 
 -- | Overlay atoms carry @::repo@; gentoo tree atoms do not on the emerge spec.
 qualifyRepo :: Text -> Text -> Text
