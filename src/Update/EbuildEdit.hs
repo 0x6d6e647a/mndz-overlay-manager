@@ -31,6 +31,9 @@ module Update.EbuildEdit
     setSlotField,
     ensureSbclAtom,
     ensureRustMinVer,
+    parseQuotedAssignment,
+    ensureQuotedAssignment,
+    ensureCodexV8Overlay,
     ensureCargoAssetsSrcUri,
     ensureCargoAssetsSrcUriFor,
     stripWindowsOnlyGitCrates,
@@ -46,6 +49,7 @@ module Update.EbuildEdit
   )
 where
 
+import Control.Applicative ((<|>))
 import Data.Char (isAlpha, isDigit)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Text (Text)
@@ -681,6 +685,83 @@ ensureRustMinVer ver content =
                    in Right (T.unlines (before <> blanks <> [line] <> rest))
   where
     isRustMin ln = "RUST_MIN_VER=" `T.isPrefixOf` T.stripStart ln
+
+-- | Value of the first @KEY=\"...\"@ assignment, if present.
+parseQuotedAssignment :: Text -> Text -> Maybe Text
+parseQuotedAssignment key content =
+  case [ln | ln <- T.lines content, prefix `T.isPrefixOf` T.stripStart ln] of
+    (ln : _) ->
+      let rhs = T.drop (T.length prefix) (T.stripStart ln)
+       in Just (stripSurroundingQuotes (T.strip rhs))
+    [] -> Nothing
+  where
+    prefix = key <> "="
+
+-- | Replace or insert @KEY=\"value\"@. Inserts after an existing @RUSTY_V8_VER@,
+-- else @RUST_MIN_VER@, else last @inherit@, else at the end.
+ensureQuotedAssignment :: Text -> Text -> Text -> Text
+ensureQuotedAssignment key value content =
+  let line = key <> "=\"" <> value <> "\""
+      lns = T.lines content
+      isKey ln = (key <> "=") `T.isPrefixOf` T.stripStart ln
+      (pre, post) = break isKey lns
+      restWithout = filter (not . isKey) (drop 1 post)
+   in case post of
+        (_old : _) -> T.unlines (pre <> [line] <> restWithout)
+        [] ->
+          let insertAfter p =
+                case findLastPrefixIdx p lns of
+                  Nothing -> Nothing
+                  Just idx ->
+                    let (before, after) = splitAt (idx + 1) lns
+                        (blanks, rest) = span T.null after
+                     in Just (T.unlines (before <> blanks <> [line] <> rest))
+           in case insertAfter "RUSTY_V8_VER="
+                <|> insertAfter "RUST_MIN_VER=" of
+                Just t -> t
+                Nothing ->
+                  case findLastInheritIdx lns of
+                    Nothing -> T.unlines (lns <> ["", line])
+                    Just idx ->
+                      let (before, after) = splitAt (idx + 1) lns
+                          (blanks, rest) = span T.null after
+                       in T.unlines (before <> blanks <> [line] <> rest)
+
+findLastPrefixIdx :: Text -> [Text] -> Maybe Int
+findLastPrefixIdx p lns =
+  case [i | (i, ln) <- zip [0 ..] lns, p `T.isPrefixOf` T.stripStart ln] of
+    [] -> Nothing
+    xs -> Just (last xs)
+
+-- | Write @RUSTY_V8_VER@ and rusty-v8 SRC_URI tag from the lock pin.
+-- When clang/rust-toolchain names are @Just@, rewrite those assignments too.
+ensureCodexV8Overlay :: Text -> Maybe Text -> Maybe Text -> Text -> Text
+ensureCodexV8Overlay ver mClang mRust content =
+  let withVer = ensureQuotedAssignment "RUSTY_V8_VER" ver content
+      withUri = rewriteRustyV8AssetsTag withVer
+      withClang = maybe withUri (\c -> ensureQuotedAssignment "CLANG_DIST" c withUri) mClang
+   in maybe withClang (\r -> ensureQuotedAssignment "RUST_TC_DIST" r withClang) mRust
+
+-- | Keep rusty-v8 download tags on @${RUSTY_V8_VER}@ (never @{pn}-${PV}@).
+rewriteRustyV8AssetsTag :: Text -> Text
+rewriteRustyV8AssetsTag content =
+  case T.splitOn rustyMarker content of
+    [] -> content
+    prefix : rest -> T.intercalate rustyMarker (prefix : map fixSeg rest)
+  where
+    rustyMarker = "mndz-overlay-assets/releases/download/rusty-v8-"
+    fixSeg seg =
+      let newTag = "${RUSTY_V8_VER}"
+       in case T.uncons (snd (T.breakOn "/" seg)) of
+            Just ('/', afterSlash) ->
+              let (filePart, rest1) =
+                    T.break (\c -> c == ' ' || c == '"' || c == '\n') afterSlash
+                  newFile =
+                    if "rusty-v8-" `T.isPrefixOf` filePart
+                      then "rusty-v8-${RUSTY_V8_VER}-with-submodules.tar.xz"
+                      else filePart
+               in newTag <> "/" <> newFile <> rest1
+            _ -> newTag <> snd (T.breakOn "/" seg)
 
 -- | BDEPEND adequacy vs optional known go.mod language version.
 bdependNeedsFix :: Maybe Text -> Text -> Bool

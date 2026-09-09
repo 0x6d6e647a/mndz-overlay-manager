@@ -409,7 +409,8 @@ testContentFixManifest =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     assetsLock <- newMVar ()
     overlayLock <- newMVar ()
@@ -503,7 +504,8 @@ testReuseVsFullPublish =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     vendorCallRef <- newIORef (0 :: Int)
     createDirectoryIfMissing True pkgDir
@@ -730,7 +732,8 @@ testGitMvCommitsOnSuccess =
                 atomicModifyIORef' commitPaths (\ps -> (paths : ps, ()))
                 assertTrue "stages paths" (not (null paths))
                 pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         ebuildRun _pkg name = do
           -- Simulate ebuild manifest creating Manifest after rename.
@@ -861,7 +864,8 @@ testGoMultiPvSequentialCommits =
                 -- Commit clears dirt for those paths.
                 modifyIORef' dirtyPaths (filter (`notElem` paths))
                 pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         ebuildRun _pkg name = do
           let tarball =
@@ -1023,7 +1027,8 @@ testGoMultiPvStopOnHardFail =
               goAddAndCommit = \_ _ _ -> do
                 atomicModifyIORef' commitCount (\n -> (n + 1, ()))
                 pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         ebuildRun _pkg _name = do
           atomicModifyIORef' materializeCount (\n -> (n + 1, ()))
@@ -1240,7 +1245,8 @@ testFullPathApplyProgressSequence =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         ebuildRun _pkg _name = do
           TIO.writeFile
@@ -1410,7 +1416,8 @@ testReusePathApplyProgressSequence =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         ebuildRun _pkg _name = do
           TIO.writeFile
@@ -1596,7 +1603,8 @@ testOverlayCommitLock = do
               threadDelay 30_000
               atomicModifyIORef' inCritical (\x -> (x - 1, ()))
               pure (Right ()),
-            goPush = \_ -> pure (Right ())
+            goPush = \_ -> pure (Right ()),
+            goRevParseHead = \_ -> pure (Right "test-head")
           }
   assetsLock <- newMVar ()
   overlayLock <- newMVar ()
@@ -1764,7 +1772,8 @@ testApplyOverlayJobs1SoftHardMix =
                         paths
                     ),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         ebuildRun pkgDir name = do
           TIO.writeFile (pkgDir </> "Manifest") ("DIST " <> T.pack name <> " 1\n")
@@ -1859,7 +1868,8 @@ testApplyOverlayJobsConcurrent =
                 threadDelay 20_000
                 atomicModifyIORef' inCritical (\x -> (x - 1, ()))
                 pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         ebuildRun pkgDir name = do
           TIO.writeFile (pkgDir </> "Manifest") ("DIST " <> T.pack name <> " 1\n")
@@ -1921,7 +1931,8 @@ testGitMvResidualSoftHardDirty =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     assetsLock <- newMVar ()
     overlayLock <- newMVar ()
@@ -2183,7 +2194,8 @@ testAtomClosureWaitUsageBeforeHk =
               goAddAndCommit = \_ _ msg -> do
                 atomicModifyIORef' commits (\xs -> (msg : xs, ()))
                 pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
     let entries =
@@ -2244,7 +2256,8 @@ testAtomClosureRefuseNoExpand =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
     let entries = [entryOf hkKeyA "hk" "1.0.0" hkPath]
@@ -2286,7 +2299,8 @@ testAtomClosureUnversionedNoWait =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         mh =
           noopMultiHandle
@@ -2333,7 +2347,8 @@ testAtomClosureProviderFail =
                 pure $
                   Right (any (\p -> "usage" `T.isInfixOf` T.pack p) paths),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
     let entries =
@@ -2387,7 +2402,8 @@ testAtomClosureWaitCycle =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     env <- mkClosureEnv gitOps noopMultiHandle 2 overlayLock
     let entries =
@@ -2437,7 +2453,8 @@ testAtomClosureBunBinAddKeepPin =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
     let entries = [entryOf bunKeyA "bun-bin" "1.3.14" bunPath]
@@ -2474,7 +2491,8 @@ testAtomClosureRenameAwayPin =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
     let entries = [entryOf usageKeyA "usage" "6.6.1" usagePath]
@@ -2511,7 +2529,8 @@ testAtomClosureRenameAwayGe =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
     let entries = [entryOf bunKeyA "bun-bin" "1.1.0" bunPath]

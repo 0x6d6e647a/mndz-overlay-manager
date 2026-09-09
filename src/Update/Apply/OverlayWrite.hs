@@ -4,6 +4,7 @@
 module Update.Apply.OverlayWrite
   ( overlayAfterAssets,
     findTemplate,
+    CodexV8Overlay (..),
   )
 where
 
@@ -30,6 +31,7 @@ import Update.EbuildEdit
     ebuildHasDevLangGoBdepend,
     ensureBunBdependFor,
     ensureCargoAssetsSrcUriFor,
+    ensureCodexV8Overlay,
     ensureEmptyCrates,
     ensureGoBdepend,
     ensureNodejsBdepend,
@@ -47,9 +49,24 @@ import Update.Manifest.Dist (exactDistSHA512)
 import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
+    PackageKey (..),
     SuccessLine,
     cargoSource,
   )
+
+-- | Overlay writes for Codex rusty_v8 pin / Chromium GCS distfile names.
+data CodexV8Overlay = CodexV8Overlay
+  { cvoVer :: Text,
+    -- | @Nothing@ copies donor @CLANG_DIST@ / @RUST_TC_DIST@.
+    cvoClangDist :: Maybe Text,
+    cvoRustTcDist :: Maybe Text
+  }
+  deriving (Eq, Show)
+
+applyCodexV8 :: PackageKey -> Maybe CodexV8Overlay -> Text -> Text
+applyCodexV8 (PackageKey "dev-util/codex") (Just ov) content =
+  ensureCodexV8Overlay (cvoVer ov) (cvoClangDist ov) (cvoRustTcDist ov) content
+applyCodexV8 _ _ content = content
 
 overlayAfterAssets ::
   ApplyEnv ->
@@ -64,8 +81,10 @@ overlayAfterAssets ::
   Maybe Text ->
   -- | Optional ebuild body after full-path materialize (cargo pycargoebuild).
   Maybe Text ->
+  -- | Codex rusty_v8 pin write; 'Nothing' for every other package.
+  Maybe CodexV8Overlay ->
   IO ApplyOutcome
-overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDigests mReqVer mEbuildBody = do
+overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDigests mReqVer mEbuildBody mCodexV8 = do
   let key = peKey entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
@@ -122,7 +141,8 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
             (Bun, Just ver) -> pure (ensureBunBdependFor key ver withKw)
             (Bun, Nothing) ->
               pure (Left "could not obtain engines.bun for BDEPEND alignment")
-            (Cargo {}, Just msrv) -> pure (ensureRustMinVer msrv withKw)
+            (Cargo {}, Just msrv) ->
+              pure (fmap (applyCodexV8 key mCodexV8) (ensureRustMinVer msrv withKw))
             (Cargo {}, Nothing) ->
               pure
                 ( Left

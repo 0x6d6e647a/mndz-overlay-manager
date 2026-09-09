@@ -14,6 +14,12 @@ module Update.Assets.Layout
     releaseTag,
     releaseName,
     commitMessage,
+    rustyV8DirName,
+    rustyV8SidecarPaths,
+    rustyV8SnapshotBasename,
+    rustyV8ReleaseTag,
+    rustyV8ReleaseName,
+    rustyV8CommitMessage,
   )
 where
 
@@ -95,3 +101,34 @@ releaseName category pn pv =
 commitMessage :: Text -> Text -> Text -> Text
 commitMessage category pn pv =
   category <> "/" <> pn <> ": " <> pv
+
+-- | Pin-keyed rusty-v8 identity is not an overlay @{category}/{package}@.
+rustyV8DirName :: FilePath
+rustyV8DirName = "rusty-v8"
+
+-- | @{assets-root}/rusty-v8/{distfile}.{sha256,sha512,b3}@.
+rustyV8SidecarPaths :: FilePath -> FilePath -> SidecarPaths
+rustyV8SidecarPaths assetsRoot distfile =
+  let dir = assetsRoot </> rustyV8DirName
+   in SidecarPaths
+        { spSha256 = dir </> distfile <> ".sha256",
+          spSha512 = dir </> distfile <> ".sha512",
+          spB3 = dir </> distfile <> ".b3"
+        }
+
+-- | rusty_v8+submodules snapshot basename keyed by crates.io @v8@ version.
+rustyV8SnapshotBasename :: Text -> FilePath
+rustyV8SnapshotBasename ver =
+  T.unpack ("rusty-v8-" <> ver <> "-with-submodules.tar.xz")
+
+-- | GitHub @tag_name@ for a rusty_v8 snapshot (crate version, not overlay PV).
+rustyV8ReleaseTag :: Text -> Text
+rustyV8ReleaseTag ver = "rusty-v8-" <> ver
+
+-- | GitHub release @name@ equals the tag (not @{category}/{pn}-{pv}@).
+rustyV8ReleaseName :: Text -> Text
+rustyV8ReleaseName = rustyV8ReleaseTag
+
+-- | Assets commit / release body: @rusty-v8: ${ver}@.
+rustyV8CommitMessage :: Text -> Text
+rustyV8CommitMessage ver = "rusty-v8: " <> ver

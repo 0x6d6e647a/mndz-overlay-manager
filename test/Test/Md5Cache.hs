@@ -474,7 +474,8 @@ testMd5CacheGateBlocksGitMv =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         planOps =
           PlanOps
@@ -539,7 +540,8 @@ testGencacheForceAndMismatch =
               goAddAndCommit = \_ _ _ -> do
                 atomicModifyIORef' commitCalls (\n -> (n + 1, ()))
                 pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
     r1 <-
       gencachePackages

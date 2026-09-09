@@ -16,6 +16,7 @@ import Test.Tasty.HUnit (testCase)
 import Update.Git
   ( gitAddAndSignedCommit,
     gitPush,
+    gitRevParseHead,
     isGitWorkTree,
     pathsDirty,
     productionGitOps,
@@ -42,7 +43,8 @@ tests =
       testCase "Git Push No Remote Fails" testGitPushNoRemote,
       testCase "Git Add Commit Gpg Not Ready" testGitAddCommitGpgNotReady,
       testCase "Git Add Commit Commit Failure" testGitAddCommitCommitFails,
-      testCase "Production GitOps Wiring" testProductionGitOpsWiring
+      testCase "Production GitOps Wiring" testProductionGitOpsWiring,
+      testCase "Rev-parse HEAD" testGitRevParseHead
     ]
 
 initRepo :: FilePath -> IO ()
@@ -189,3 +191,16 @@ testProductionGitOpsWiring =
     err <- assertLeft "push ops" =<< Git.goPush ops root
     assertTrue "push" ("git push failed" `T.isInfixOf` err)
     teardownGpgHandle h
+
+testGitRevParseHead :: IO ()
+testGitRevParseHead =
+  withSystemTempDirectory "git-rev-parse" $ \tmp -> do
+    let root = tmp </> "repo"
+    createDirectoryIfMissing True root
+    initRepo root
+    sha <- assertRight "HEAD" =<< gitRevParseHead root
+    assertTrue "sha nonempty" (T.length sha >= 7)
+    missing <-
+      assertLeft "missing repo"
+        =<< gitRevParseHead (tmp </> "not-a-repo")
+    assertTrue "rev-parse fail" ("git rev-parse HEAD failed" `T.isInfixOf` missing)

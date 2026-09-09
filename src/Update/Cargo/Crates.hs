@@ -19,6 +19,10 @@ module Update.Cargo.Crates
     rustyV8SnapshotBasename,
     rustyV8ReleaseTag,
     harvestRustyV8Snapshot,
+    gitCloneRecursiveSubmodules,
+    parseV8DepsGcsLinux,
+    extractV8DepsFromSnapshot,
+    V8GcsLinuxDists (..),
     cargoChecksumJson,
     packCratesTarball,
     packCratesTarballWith,
@@ -36,6 +40,10 @@ import System.Directory
   )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
+import Update.Assets.Layout
+  ( rustyV8ReleaseTag,
+    rustyV8SnapshotBasename,
+  )
 import Update.Cargo.Lock
   ( RegistryPackage (..),
     crateDirName,
@@ -53,6 +61,11 @@ import Update.Cargo.Msrv
     parseDirectRustVersion,
     parseRustMinVerFromEbuild,
     probePolicyTagFloor,
+  )
+import Update.Cargo.V8Deps
+  ( V8GcsLinuxDists (..),
+    extractV8DepsFromSnapshot,
+    parseV8DepsGcsLinux,
   )
 import Update.DiskSpace
   ( MaterializeClass (FullCargo),
@@ -73,15 +86,6 @@ import Update.Types (CargoSource (..))
 -- | Internal tarball path prefix expected by cargo.eclass.
 crateTarballPrefix :: Text
 crateTarballPrefix = "cargo_home/gentoo"
-
--- | rusty_v8+submodules snapshot basename keyed by crates.io @v8@ version.
-rustyV8SnapshotBasename :: Text -> FilePath
-rustyV8SnapshotBasename ver =
-  T.unpack ("rusty-v8-" <> ver <> "-with-submodules.tar.xz")
-
--- | Assets release tag for a rusty_v8 snapshot (crate version, not overlay PV).
-rustyV8ReleaseTag :: Text -> Text
-rustyV8ReleaseTag ver = "rusty-v8-" <> ver
 
 -- | Canonical crates.io download endpoint for a published crate.
 cratesIoDownloadEndpoint :: Text -> Text -> Text
@@ -126,7 +130,11 @@ data CargoOps = CargoOps
       FilePath ->
       FilePath ->
       FilePath ->
-      IO (Either Text ())
+      IO (Either Text ()),
+    -- | @git clone --recurse-submodules --depth 1 --branch@ (rusty_v8 harvest).
+    coCloneRecursiveSubmodules :: Text -> Text -> FilePath -> IO (Either Text ()),
+    -- | Hermetic tar/xz of a source tree to a dest path (rusty_v8 snapshot).
+    coPackTree :: FilePath -> FilePath -> IO (Either Text ())
   }
 
 data CargoProgress = CargoProgress
@@ -147,7 +155,9 @@ mkCargoOps run =
     { coClone = gitCloneTag run,
       coFetchUnpackCrate = fetchAndUnpackCrate run,
       coPycargoebuild = runPycargoebuild run,
-      coPackCrates = packCratesTarballWith run
+      coPackCrates = packCratesTarballWith run,
+      coCloneRecursiveSubmodules = gitCloneRecursiveSubmodules run,
+      coPackTree = packRustyV8Tree run
     }
 
 productionCargoOps :: CargoOps
@@ -594,21 +604,42 @@ createArchiveAtomic run stageDir =
     ["cargo_home"]
 
 gitCloneTag :: CommandRunner -> Text -> Text -> FilePath -> IO (Either Text ())
-gitCloneTag run url tag dest = do
+gitCloneTag run url tag dest =
+  gitCloneWithArgs
+    run
+    [ "--depth",
+      "1",
+      "--branch",
+      T.unpack tag,
+      T.unpack url,
+      dest
+    ]
+
+-- | Shallow clone of @url@ at @tag@ with recursive submodules (rusty_v8).
+gitCloneRecursiveSubmodules ::
+  CommandRunner ->
+  Text ->
+  Text ->
+  FilePath ->
+  IO (Either Text ())
+gitCloneRecursiveSubmodules run url tag dest =
+  gitCloneWithArgs
+    run
+    [ "--recurse-submodules",
+      "--depth",
+      "1",
+      "--branch",
+      T.unpack tag,
+      T.unpack url,
+      dest
+    ]
+
+gitCloneWithArgs :: CommandRunner -> [String] -> IO (Either Text ())
+gitCloneWithArgs run args = do
   res <-
     run
       ProcessRequest
-        { prMode =
-            ExecCmd
-              "git"
-              [ "clone",
-                "--depth",
-                "1",
-                "--branch",
-                T.unpack tag,
-                T.unpack url,
-                dest
-              ],
+        { prMode = ExecCmd "git" ("clone" : args),
           prCwd = Nothing,
           prEnv = Nothing,
           prStdin = ""
@@ -617,6 +648,15 @@ gitCloneTag run url tag dest = do
     if prExitCode res == ExitSuccess
       then Right ()
       else Left ("git clone failed: " <> T.pack (prStderr res))
+
+packRustyV8Tree :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+packRustyV8Tree run src =
+  packTarXzAtomic
+    run
+    "rusty_v8 snapshot pack failed"
+    Nothing
+    (Just src)
+    ["."]
 
 -- | Reuse a verified rusty_v8 snapshot or clone @denoland/rusty_v8@ @v${ver}@
 -- with recursive submodules and pack a hermetic tar/xz.

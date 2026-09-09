@@ -8,7 +8,7 @@ import CLI.Jobs (newWorkBudget)
 import CLI.Progress (MultiHandle (..))
 import Control.Concurrent.MVar (modifyMVar_, newMVar)
 import Data.ByteString qualified as BS
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -18,7 +18,7 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Version (EbuildVersion, parseEbuildVersion, renderPV)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (exitFailure)
-import System.FilePath (takeBaseName, (</>))
+import System.FilePath (takeBaseName, takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertTrue)
@@ -44,11 +44,19 @@ import Update.Apply.TestSupport
     orderNeedPlannedUnits,
     overlayAfterAssets,
   )
-import Update.Assets.Hash (digestSHA512, hashBytes)
-import Update.Assets.Layout (cratesTarballName, depsTarballName, modelsDistfileName)
+import Update.Assets.Hash (digestSHA512, hashBytes, writeSidecars)
+import Update.Assets.Layout
+  ( SidecarPaths (..),
+    cratesTarballName,
+    depsTarballName,
+    modelsDistfileName,
+    rustyV8SidecarPaths,
+    rustyV8SnapshotBasename,
+  )
 import Update.Assets.Release
   ( ReleaseAsset (..),
     ReleaseInfo (..),
+    ReleaseMeta (..),
     ReleaseOps (..),
   )
 import Update.Bun.Cache (BunCacheOps (..))
@@ -96,6 +104,11 @@ integrationTests =
       testCase "opencode multi-asset reuse path" testOpencodeMultiAssetReusePath,
       testCase "opencode partial release hard-fails" testOpencodePartialReleaseFullPath,
       testCase "cargo full-path applyDepsAndAssets success" testCargoFullPathSuccess,
+      testCase "assets target_commitish is sidecar SHA not later HEAD" testTargetCommitishSidecarSha,
+      testCase "codex same-pin reuses rusty-v8 and publishes crates" testCodexSamePinReusesRustyV8,
+      testCase "codex missing pin harvests rusty-v8 release" testCodexPinChangeHarvestsRustyV8,
+      testCase "hk full-path does not harvest rusty-v8" testHkDoesNotHarvestRustyV8,
+      testCase "codex crates tag without rusty-v8 is not partial" testCodexCratesTagWithoutRustyV8NotPartial,
       testCase "cargo full-path staging crates then crates pack" testCargoFullPathStagingStatus,
       testCase "cargo reuse-path apply success" testCargoReusePathSuccess,
       testCase "cargo harvest above ceiling hard-fails before write" testCargoHarvestAboveCeilingNoWrite,
@@ -259,7 +272,11 @@ fakeCargoSuccessOps =
         onStage 1 1
         onArchive
         BS.writeFile outPath cargoAssetBytes
-        pure (Right ())
+        pure (Right ()),
+      coCloneRecursiveSubmodules = \_ _ _ ->
+        pure (Left "rusty_v8 clone should not run"),
+      coPackTree = \_ _ ->
+        pure (Left "rusty_v8 pack should not run")
     }
 
 ------------------------------------------------------------------------
@@ -272,7 +289,8 @@ cleanGitOps =
     { goIsWorkTree = \_ -> pure True,
       goPathsDirty = \_ _ -> pure (Right False),
       goAddAndCommit = \_ _ _ -> pure (Right ()),
-      goPush = \_ -> pure (Right ())
+      goPush = \_ -> pure (Right ()),
+      goRevParseHead = \_ -> pure (Right "test-head")
     }
 
 -- | Ebuild runner that writes a DIST line matching the ebuild basename + kind.
@@ -516,6 +534,7 @@ testMissingTemplateHardFail =
         targetVer
         [("crush-0.88.0-vendor.tar.xz", digests)]
         (Just "1.26.5")
+        Nothing
         Nothing
     case outcome of
       ApplyHardFail k msg _ _ -> do
@@ -2010,3 +2029,467 @@ testMaterializeSidecarMismatch =
         Nothing
     outcomes <- applyPackagePhase1 env overlayRoot entry
     expectHardFail "sidecar mismatch" "sidecar SHA512" outcomes
+
+------------------------------------------------------------------------
+-- rusty-v8 identity / Codex harvest
+------------------------------------------------------------------------
+
+rustyV8Bytes :: BS.ByteString
+rustyV8Bytes = encodeUtf8 "rusty-v8-snapshot-bytes"
+
+v8Lock :: T.Text -> T.Text
+v8Lock ver =
+  T.unlines
+    [ "[[package]]",
+      "name = \"v8\"",
+      "version = \"" <> ver <> "\"",
+      "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+      "checksum = \"v8sum\""
+    ]
+
+codexEbuildBody :: T.Text -> T.Text
+codexEbuildBody msrv =
+  T.unlines
+    [ "EAPI=8",
+      "inherit cargo",
+      "DESCRIPTION=\"codex test\"",
+      "RUST_MIN_VER=\"" <> msrv <> "\"",
+      "RUSTY_V8_VER=\"150.4.0\"",
+      "CLANG_DIST=\"clang-old.tar.xz\"",
+      "RUST_TC_DIST=\"rust-old.tar.xz\"",
+      "KEYWORDS=\"-* ~amd64\"",
+      "CRATES=\"\"",
+      "SRC_URI=\"https://github.com/openai/codex/archive/refs/tags/rust-v${PV}.tar.gz -> ${P}.tar.gz\"",
+      "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/codex-${PV}/codex-${PV}-crates.tar.xz\"",
+      "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/rusty-v8-${RUSTY_V8_VER}/rusty-v8-${RUSTY_V8_VER}-with-submodules.tar.xz\""
+    ]
+
+seedCodexLocalOk :: FilePath -> FilePath -> T.Text -> IO ()
+seedCodexLocalOk overlayRoot pkgDir pn = do
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile (pkgDir </> "codex-0.153.3.ebuild") (codexEbuildBody "1.80.0")
+  TIO.writeFile
+    (pkgDir </> "Manifest")
+    ("DIST " <> T.pack (cratesTarballName pn "0.153.3") <> " 1 SHA512 deadbeef\n")
+  writeMatchingCachesForPackage overlayRoot "dev-util" pn pkgDir
+
+codexTomls ::
+  T.Text ->
+  T.Text ->
+  T.Text ->
+  T.Text ->
+  Maybe FilePath ->
+  IO CargoTomlFetch
+codexTomls _o _r _p _pv mSub =
+  pure $
+    case mSub of
+      Just "codex-rs/cli" ->
+        CargoTomlBody "[package]\nrust-version = \"1.85.0\"\n"
+      _ -> CargoTomlMissing
+
+codexCloneWithPin :: T.Text -> FilePath -> IO (Either T.Text ())
+codexCloneWithPin ver dest = do
+  let lockRoot = dest </> "codex-rs"
+      pkg = lockRoot </> "cli"
+  createDirectoryIfMissing True pkg
+  TIO.writeFile (dest </> "Cargo.toml") "[workspace]\n"
+  TIO.writeFile (lockRoot </> "Cargo.toml") "[package]\nname = \"codex-rs\"\n"
+  TIO.writeFile
+    (pkg </> "Cargo.toml")
+    "[package]\nname = \"codex-cli\"\nrust-version = \"1.85.0\"\n"
+  TIO.writeFile (lockRoot </> "Cargo.lock") (v8Lock ver)
+  pure (Right ())
+
+writeRustyV8Sidecars :: FilePath -> T.Text -> BS.ByteString -> IO ()
+writeRustyV8Sidecars assetsRoot ver bytes = do
+  let base = rustyV8SnapshotBasename ver
+      sp = rustyV8SidecarPaths assetsRoot base
+      digests = hashBytes bytes
+  createDirectoryIfMissing True (takeDirectory (spSha256 sp))
+  writeSidecars ("dummy" </> base) digests (spSha256 sp) (spSha512 sp) (spB3 sp)
+
+rustyV8ReleaseOps ::
+  Bool ->
+  BS.ByteString ->
+  IORef [ReleaseMeta] ->
+  ReleaseOps
+rustyV8ReleaseOps present bytes metas =
+  ReleaseOps
+    { roGetReleaseByTag = \_ _ tag ->
+        if "rusty-v8-" `T.isPrefixOf` tag && present
+          then
+            pure $
+              Right $
+                Just
+                  ReleaseInfo
+                    { riId = 9,
+                      riTag = tag,
+                      riAssets =
+                        [ ReleaseAsset
+                            { raName = tag <> "-with-submodules.tar.xz",
+                              raBrowserDownloadUrl = "https://example/" <> tag,
+                              raSize = Nothing
+                            }
+                        ]
+                    }
+          else pure (Right Nothing),
+      roDownloadAsset = \_url dest -> do
+        BS.writeFile dest bytes
+        pure (Right ()),
+      roCreateReleaseWithAssets = \meta _ -> do
+        atomicModifyIORef' metas (\xs -> (xs <> [meta], ()))
+        pure (Right ())
+    }
+
+v8DepsExcerpt :: T.Text
+v8DepsExcerpt =
+  T.unlines
+    [ "deps = {",
+      "  'third_party/llvm-build/Release+Asserts': {",
+      "    'dep_type': 'gcs',",
+      "    'objects': [",
+      "      {",
+      "        'object_name': 'Linux_x64/clang-llvmorg-23-init-10931-g20b6ec66-11.tar.xz',",
+      "        'condition': 'host_os == \"linux\"',",
+      "      },",
+      "    ],",
+      "  },",
+      "  'third_party/rust-toolchain': {",
+      "    'dep_type': 'gcs',",
+      "    'objects': [",
+      "      {",
+      "        'object_name': 'Linux_x64/rust-toolchain-4c4205163abcbd08948b3efab796c543ba1ea687-4-llvmorg-23-init-10931-g20b6ec66.tar.xz',",
+      "        'condition': 'host_os == \"linux\"',",
+      "      },",
+      "    ],",
+      "  },",
+      "}"
+    ]
+
+testTargetCommitishSidecarSha :: IO ()
+testTargetCommitishSidecarSha =
+  withSystemTempDirectory "mndz-mat-commitish-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "hk"
+        pn = "hk" :: T.Text
+        local = parseEbuildVersion "0.40.0"
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "hk",
+              pePN = pn,
+              peLocal = local,
+              pePath = pkgDir </> "hk-0.40.0.ebuild"
+            }
+    headRef <- newIORef ("sidecar-sha" :: T.Text)
+    metas <- newIORef ([] :: [ReleaseMeta])
+    createDirectoryIfMissing True assetsRoot
+    seedCargoLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["0.50.0", "0.40.0"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        cargoTomls
+        (Just overlayRoot)
+    let gitOps =
+          cleanGitOps
+            { goRevParseHead = \_ -> Right <$> readIORef headRef,
+              goPush = \_ -> writeIORef headRef "later-head" >> pure (Right ())
+            }
+        releaseOps =
+          releaseMissing
+            { roCreateReleaseWithAssets = \meta _ -> do
+                atomicModifyIORef' metas (\xs -> (xs <> [meta], ()))
+                pure (Right ())
+            }
+    env <-
+      mkMatEnv
+        gitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir cratesKind cargoAssetBytes)
+        releaseOps
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        fakeCargoSuccessOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectSuccess "commitish" outcomes
+    recorded <- readIORef metas
+    case recorded of
+      [meta] -> do
+        assertEq "target_commitish is sidecar SHA" "sidecar-sha" (rmTargetCommitish meta)
+        later <- readIORef headRef
+        assertEq "HEAD moved after capture" "later-head" later
+      other -> do
+        hPutStrLn stderr ("expected one release, got " <> show (length other))
+        exitFailure
+
+testCodexSamePinReusesRustyV8 :: IO ()
+testCodexSamePinReusesRustyV8 =
+  withSystemTempDirectory "mndz-mat-codex-reuse-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "codex"
+        pn = "codex" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "codex",
+              pePN = pn,
+              peLocal = parseEbuildVersion "0.153.3",
+              pePath = pkgDir </> "codex-0.153.3.ebuild"
+            }
+    cloneV8 <- newIORef (0 :: Int)
+    metas <- newIORef ([] :: [ReleaseMeta])
+    createDirectoryIfMissing True assetsRoot
+    seedCodexLocalOk overlayRoot pkgDir pn
+    writeRustyV8Sidecars assetsRoot "150.4.0" rustyV8Bytes
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["0.153.4", "0.153.3"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        codexTomls
+        (Just overlayRoot)
+    let cargoOps =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> codexCloneWithPin "150.4.0" dest,
+              coCloneRecursiveSubmodules = \_ _ _ -> do
+                atomicModifyIORef' cloneV8 (\n -> (n + 1, ()))
+                pure (Left "should not clone rusty_v8 on same pin")
+            }
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir cratesKind cargoAssetBytes)
+        (rustyV8ReleaseOps True rustyV8Bytes metas)
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        cargoOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectSuccess "codex same pin" outcomes
+    n <- readIORef cloneV8
+    assertEq "same pin does not clone rusty_v8" 0 n
+    recorded <- readIORef metas
+    assertTrue
+      "published crates tag"
+      (any (\m -> rmTag m == "codex-0.153.4") recorded)
+    assertTrue
+      "did not attach rusty-v8 to crates tag"
+      (not (any (\m -> rmTag m == "rusty-v8-150.4.0") recorded))
+    body <- TIO.readFile (pkgDir </> "codex-0.153.4.ebuild")
+    assertTrue "RUSTY_V8_VER" ("RUSTY_V8_VER=\"150.4.0\"" `T.isInfixOf` body)
+    assertTrue "copied clang" ("CLANG_DIST=\"clang-old.tar.xz\"" `T.isInfixOf` body)
+    assertTrue
+      "rusty-v8 src tag"
+      ("/rusty-v8-${RUSTY_V8_VER}/" `T.isInfixOf` body)
+
+testCodexPinChangeHarvestsRustyV8 :: IO ()
+testCodexPinChangeHarvestsRustyV8 =
+  withSystemTempDirectory "mndz-mat-codex-harvest-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "codex"
+        pn = "codex" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "codex",
+              pePN = pn,
+              peLocal = parseEbuildVersion "0.153.3",
+              pePath = pkgDir </> "codex-0.153.3.ebuild"
+            }
+    cloneV8 <- newIORef (0 :: Int)
+    metas <- newIORef ([] :: [ReleaseMeta])
+    createDirectoryIfMissing True assetsRoot
+    seedCodexLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["0.153.4", "0.153.3"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        codexTomls
+        (Just overlayRoot)
+    let cargoOps =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> codexCloneWithPin "150.5.0" dest,
+              coCloneRecursiveSubmodules = \_url tag dest -> do
+                atomicModifyIORef' cloneV8 (\n -> (n + 1, ()))
+                assertEq "rusty_v8 tag" "v150.5.0" tag
+                createDirectoryIfMissing True (dest </> "v8")
+                TIO.writeFile (dest </> "v8" </> "DEPS") v8DepsExcerpt
+                pure (Right ()),
+              coPackTree = \_src dest -> do
+                createDirectoryIfMissing True (takeDirectory dest)
+                BS.writeFile dest rustyV8Bytes
+                pure (Right ())
+            }
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir cratesKind cargoAssetBytes)
+        (rustyV8ReleaseOps False rustyV8Bytes metas)
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        cargoOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectSuccess "codex harvest" outcomes
+    n <- readIORef cloneV8
+    assertEq "missing pin clones rusty_v8" 1 n
+    recorded <- readIORef metas
+    assertTrue
+      "published crates"
+      (any (\m -> rmTag m == "codex-0.153.4") recorded)
+    assertTrue
+      "published rusty-v8 tag"
+      (any (\m -> rmTag m == "rusty-v8-150.5.0") recorded)
+    assertTrue
+      "rusty-v8 name equals tag"
+      (any (\m -> rmName m == "rusty-v8-150.5.0") recorded)
+    body <- TIO.readFile (pkgDir </> "codex-0.153.4.ebuild")
+    assertTrue "wrote pin" ("RUSTY_V8_VER=\"150.5.0\"" `T.isInfixOf` body)
+    assertTrue
+      "wrote clang from DEPS"
+      ("CLANG_DIST=\"clang-llvmorg-23-init-10931-g20b6ec66-11.tar.xz\"" `T.isInfixOf` body)
+    rustySide <-
+      doesFileExist
+        (assetsRoot </> "rusty-v8" </> (rustyV8SnapshotBasename "150.5.0" <> ".sha256"))
+    assertTrue "rusty-v8 sidecars under rusty-v8/" rustySide
+    cratesSide <-
+      doesFileExist
+        (assetsRoot </> "dev-util" </> "codex" </> "codex-0.153.4-crates.tar.xz.sha256")
+    assertTrue "crates sidecars stay under category/package" cratesSide
+
+testHkDoesNotHarvestRustyV8 :: IO ()
+testHkDoesNotHarvestRustyV8 =
+  withSystemTempDirectory "mndz-mat-hk-v8-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "hk"
+        pn = "hk" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "hk",
+              pePN = pn,
+              peLocal = parseEbuildVersion "0.40.0",
+              pePath = pkgDir </> "hk-0.40.0.ebuild"
+            }
+    cloneV8 <- newIORef (0 :: Int)
+    createDirectoryIfMissing True assetsRoot
+    seedCargoLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["0.50.0", "0.40.0"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        cargoTomls
+        (Just overlayRoot)
+    let cargoOps =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> do
+                createDirectoryIfMissing True dest
+                TIO.writeFile (dest </> "Cargo.lock") (v8Lock "150.4.0")
+                TIO.writeFile
+                  (dest </> "Cargo.toml")
+                  "[package]\nname = \"hk\"\nrust-version = \"1.85.0\"\n"
+                pure (Right ()),
+              coCloneRecursiveSubmodules = \_ _ _ -> do
+                atomicModifyIORef' cloneV8 (\n -> (n + 1, ()))
+                pure (Left "hk must not harvest rusty_v8")
+            }
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir cratesKind cargoAssetBytes)
+        releaseMissing
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        cargoOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectSuccess "hk ignores v8 pin" outcomes
+    n <- readIORef cloneV8
+    assertEq "hk does not clone rusty_v8" 0 n
+
+testCodexCratesTagWithoutRustyV8NotPartial :: IO ()
+testCodexCratesTagWithoutRustyV8NotPartial =
+  withSystemTempDirectory "mndz-mat-codex-partial-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "codex"
+        pn = "codex" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "codex",
+              pePN = pn,
+              peLocal = parseEbuildVersion "0.153.3",
+              pePath = pkgDir </> "codex-0.153.3.ebuild"
+            }
+    cloneV8 <- newIORef (0 :: Int)
+    pycargo <- newIORef (0 :: Int)
+    createDirectoryIfMissing True assetsRoot
+    seedCodexLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["0.153.4", "0.153.3"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        codexTomls
+        (Just overlayRoot)
+    let cargoOps =
+          fakeCargoSuccessOps
+            { coCloneRecursiveSubmodules = \_ _ _ -> do
+                atomicModifyIORef' cloneV8 (\n -> (n + 1, ()))
+                pure (Left "reuse must not clone rusty_v8"),
+              coPycargoebuild = \_ _ _ _ -> do
+                atomicModifyIORef' pycargo (\n -> (n + 1, ()))
+                pure (Left "should not pycargo on crates reuse")
+            }
+        cratesFound = releaseFound cratesKind cargoAssetBytes
+        cratesOnly =
+          cratesFound
+            { roGetReleaseByTag = \o r tag ->
+                if "rusty-v8-" `T.isPrefixOf` tag
+                  then pure (Right Nothing)
+                  else roGetReleaseByTag cratesFound o r tag
+            }
+    env <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir cratesKind cargoAssetBytes)
+        cratesOnly
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        cargoOps
+        unusedVendorOps
+        Nothing
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    expectSuccess "crates tag complete without rusty-v8" outcomes
+    n <- readIORef cloneV8
+    assertEq "reuse does not clone rusty_v8" 0 n
+    p <- readIORef pycargo
+    assertEq "reuse does not pycargo" 0 p

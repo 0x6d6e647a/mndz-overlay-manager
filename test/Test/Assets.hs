@@ -119,10 +119,22 @@ import Update.Apply.TestSupport
 import Update.Assets.Hash (FileDigests (..), digestSHA512, hashBytes, sidecarLine)
 import Update.Assets.Layout
   ( DistfileKind (..),
+    SidecarPaths (..),
+    commitMessage,
     cratesTarballName,
     depsTarballName,
     distfileKindForEcosystem,
     modelsDistfileName,
+    packageAssetsDir,
+    releaseName,
+    releaseTag,
+    rustyV8CommitMessage,
+    rustyV8DirName,
+    rustyV8ReleaseName,
+    rustyV8ReleaseTag,
+    rustyV8SidecarPaths,
+    rustyV8SnapshotBasename,
+    sidecarPaths,
     vendorTarballName,
   )
 import Update.Assets.Release
@@ -148,7 +160,7 @@ import Update.Cargo.Msrv
     parseRustMinVerFromEbuild,
     parseRustVersionField,
   )
-import Update.Check (PackageEntry (..), groupNewest)
+import Update.Check (PackageEntry (..), groupNewest, requiredAssetBasenames)
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
   ( assetsSrcUriParameterized,
@@ -282,6 +294,7 @@ import Update.SshAgent
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types
   ( ApplyOutcome (..),
+    CargoSource (..),
     EcosystemSpec (..),
     OutdatedLine (..),
     PackageKey (..),
@@ -304,6 +317,8 @@ tests =
       testCase "Hash Bytes" testHashBytes,
       testCase "Sidecar Line" testSidecarLine,
       testCase "Deps Distfile Names" testDepsDistfileNames,
+      testCase "Pin-keyed rusty-v8 layout" testRustyV8Layout,
+      testCase "Codex crates required assets exclude rusty-v8" testCodexRequiredAssetsCratesOnly,
       testCase "Release Lookup" testReleaseLookup,
       testCase "Multi-asset Lookup" testMultiAssetLookup,
       testCase "Release HTTP Get By Tag" testReleaseHttpGetByTag,
@@ -454,6 +469,56 @@ testDepsDistfileNames = do
     "models"
     "opencode-1.18.4-models.json"
     (modelsDistfileName "opencode" "1.18.4")
+
+testRustyV8Layout :: IO ()
+testRustyV8Layout = do
+  let sp = rustyV8SidecarPaths "/assets" "rusty-v8-150.5.0-with-submodules.tar.xz"
+      hk = sidecarPaths "/assets" "dev-util" "hk" "hk-1.2.0-crates.tar.xz"
+  assertEq "dir" "rusty-v8" rustyV8DirName
+  assertEq
+    "basename"
+    "rusty-v8-150.5.0-with-submodules.tar.xz"
+    (rustyV8SnapshotBasename "150.5.0")
+  assertEq "tag" "rusty-v8-150.5.0" (rustyV8ReleaseTag "150.5.0")
+  assertEq "name equals tag" "rusty-v8-150.5.0" (rustyV8ReleaseName "150.5.0")
+  assertEq "commit" "rusty-v8: 150.5.0" (rustyV8CommitMessage "150.5.0")
+  assertEq
+    "sha256 sidecar"
+    "/assets/rusty-v8/rusty-v8-150.5.0-with-submodules.tar.xz.sha256"
+    (spSha256 sp)
+  assertEq
+    "sha512 sidecar"
+    "/assets/rusty-v8/rusty-v8-150.5.0-with-submodules.tar.xz.sha512"
+    (spSha512 sp)
+  assertEq
+    "b3 sidecar"
+    "/assets/rusty-v8/rusty-v8-150.5.0-with-submodules.tar.xz.b3"
+    (spB3 sp)
+  assertEq
+    "overlay package dir"
+    "/assets/dev-util/hk"
+    (packageAssetsDir "/assets" "dev-util" "hk")
+  assertEq
+    "hk sidecar still category/package"
+    "/assets/dev-util/hk/hk-1.2.0-crates.tar.xz.sha256"
+    (spSha256 hk)
+  assertEq "overlay tag" "hk-1.2.0" (releaseTag "hk" "1.2.0")
+  assertEq "overlay name" "dev-util/hk-1.2.0" (releaseName "dev-util" "hk" "1.2.0")
+  assertEq "overlay commit" "dev-util/hk: 1.2.0" (commitMessage "dev-util" "hk" "1.2.0")
+
+testCodexRequiredAssetsCratesOnly :: IO ()
+testCodexRequiredAssetsCratesOnly = do
+  let cargo = Cargo (Just "codex-rs") (Just "codex-rs/cli") CargoGitTag
+      names =
+        requiredAssetBasenames
+          (PackageKey "dev-util/codex")
+          cargo
+          "codex"
+          "0.153.4"
+  assertEq "crates only" ["codex-0.153.4-crates.tar.xz"] names
+  assertTrue
+    "no rusty-v8 on crates tag"
+    (not (any (("rusty-v8" `T.isInfixOf`) . T.pack) names))
 
 ------------------------------------------------------------------------
 -- Release lookup / reuse / Manifest content-fix

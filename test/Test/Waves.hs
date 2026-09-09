@@ -182,7 +182,8 @@ cleanGit =
     { goIsWorkTree = \_ -> pure True,
       goPathsDirty = \_ _ -> pure (Right False),
       goAddAndCommit = \_ _ _ -> pure (Right ()),
-      goPush = \_ -> pure (Right ())
+      goPush = \_ -> pure (Right ()),
+      goRevParseHead = \_ -> pure (Right "test-head")
     }
 
 fakeEbuildRun :: FilePath -> FilePath -> IO (Either T.Text ())

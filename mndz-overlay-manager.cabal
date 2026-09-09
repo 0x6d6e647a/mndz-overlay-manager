@@ -137,6 +137,7 @@ library
       , Update.Apply.OverlayWrite
       , Update.Apply.Plan
       , Update.Cargo.Lock
+      , Update.Cargo.V8Deps
       , Update.DiskSpace.StatVfs
       , Update.EbuildSelection
       , Update.Manifest.Dist

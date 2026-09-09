@@ -5,6 +5,7 @@ module Update.Git
     pathsDirty,
     gitAddAndSignedCommit,
     gitPush,
+    gitRevParseHead,
     relativeOverlayPath,
     GitOps (..),
     productionGitOps,
@@ -35,7 +36,9 @@ data GitOps = GitOps
   { goIsWorkTree :: FilePath -> IO Bool,
     goPathsDirty :: FilePath -> [FilePath] -> IO (Either Text Bool),
     goAddAndCommit :: FilePath -> [FilePath] -> Text -> IO (Either Text ()),
-    goPush :: FilePath -> IO (Either Text ())
+    goPush :: FilePath -> IO (Either Text ()),
+    -- | @git rev-parse HEAD@ in @dir@ (sidecar commit SHA for target_commitish).
+    goRevParseHead :: FilePath -> IO (Either Text Text)
   }
 
 -- | Production git ops: GPG readiness before every signed commit, TTY pinentry
@@ -46,7 +49,8 @@ productionGitOps gpg =
     { goIsWorkTree = isGitWorkTree,
       goPathsDirty = pathsDirty,
       goAddAndCommit = gitAddAndSignedCommit gpg,
-      goPush = gitPush
+      goPush = gitPush,
+      goRevParseHead = gitRevParseHead
     }
 
 -- | True if @dir@ is inside a git work tree.
@@ -116,6 +120,20 @@ gitAddAndSignedCommit gpg overlayRoot relPaths message = do
             if codeC == ExitSuccess
               then Right ()
               else Left ("git commit -S failed: " <> T.pack errC)
+
+-- | @git rev-parse HEAD@ for the work tree at @dir@.
+gitRevParseHead :: FilePath -> IO (Either Text Text)
+gitRevParseHead dir = do
+  rootAbs <- makeAbsolute dir
+  (code, out, err) <-
+    readProcessWithExitCode
+      "git"
+      ["-C", rootAbs, "rev-parse", "HEAD"]
+      ""
+  pure $
+    if code == ExitSuccess
+      then Right (T.strip (T.pack out))
+      else Left ("git rev-parse HEAD failed: " <> T.pack err)
 
 -- | Push the current branch to its configured remote.
 gitPush :: FilePath -> IO (Either Text ())

@@ -23,7 +23,7 @@ import CLI.Progress (MultiHandle (..))
 import Control.Applicative ((<|>))
 import Control.Concurrent.MVar (withMVar)
 import Control.Exception (SomeException, catch)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import Data.ByteString.Lazy qualified as LBS
 import Data.Containers.ListUtils (nubOrd)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
@@ -74,7 +74,7 @@ import Update.Apply.Errors
     applyUnitHardFail,
   )
 import Update.Apply.GitMv (requirePackageMd5Cache)
-import Update.Apply.OverlayWrite (findTemplate, overlayAfterAssets)
+import Update.Apply.OverlayWrite (CodexV8Overlay (..), findTemplate, overlayAfterAssets)
 import Update.Assets.Hash (FileDigests (..), hashFile, writeSidecars)
 import Update.Assets.Layout
   ( SidecarPaths (..),
@@ -82,24 +82,40 @@ import Update.Assets.Layout
     modelsDistfileName,
     releaseName,
     releaseTag,
+    rustyV8CommitMessage,
+    rustyV8DirName,
+    rustyV8ReleaseName,
+    rustyV8ReleaseTag,
+    rustyV8SidecarPaths,
+    rustyV8SnapshotBasename,
     sidecarPaths,
   )
 import Update.Assets.Release
-  ( ReleaseMeta (..),
+  ( ReleaseAsset (..),
+    ReleaseMeta (..),
     ReleaseOps (..),
+    findAssetByName,
     lookupNamedAssets,
   )
 import Update.AtomClosure (keepPVsForProvider)
 import Update.Bun.Cache (BunCacheProgress (..), BunProbe (..), buildBunDepsTarball, bunPackagingModeFor, isBunCompilePinPackage, mkBunCacheOps)
 import Update.Cargo.Crates
-  ( CargoProgress (..),
+  ( CargoOps (..),
+    CargoProgress (..),
     CargoResult (..),
     buildCargoCratesTarball,
+    harvestRustyV8Snapshot,
     mkCargoOps,
+    parseV8DepsGcsLinux,
+    parseV8RegistryPin,
   )
 import Update.Cargo.Msrv
   ( parseRustMinVerFromEbuild,
     rustMinVerTooLow,
+  )
+import Update.Cargo.V8Deps
+  ( V8GcsLinuxDists (..),
+    extractV8DepsFromSnapshot,
   )
 import Update.Check
   ( ContentAssessment (..),
@@ -131,6 +147,7 @@ import Update.EbuildEdit
     cargoProvenanceMismatch,
     goBdependAtom,
     nodejsBdependAtom,
+    parseQuotedAssignment,
     sbclBdependAtom,
     writeVersionForPlannedPV,
   )
@@ -1038,96 +1055,131 @@ fullDepsPublishAndOverlay
             pure $
               ApplyHardFail key (retainUnitError unit err) False False
           Right (paths, mReqVer, mEbuildBody) -> do
-            mhStatus mh key "committing assets"
-            distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
-            let relSidecars =
-                  [ T.unpack category </> T.unpack pn </> takeFileName p <> ext
-                  | p <- paths,
-                    ext <- [".sha256", ".sha512", ".b3"]
-                  ]
-            mapM_
-              ( \(p, digests) -> do
-                  let sp = sidecarPaths assetsRoot category pn (takeFileName p)
-                  createDirectoryIfMissing True (takeDirectory (spSha256 sp))
-                  writeSidecars p digests (spSha256 sp) (spSha512 sp) (spB3 sp)
-              )
-              distDigests
-            let msg = commitMessage category pn (renderPV targetVer)
-                meta =
-                  ReleaseMeta
-                    { rmOwner = aeAssetsOwner env,
-                      rmRepo = aeAssetsRepo env,
-                      rmTag = releaseTag pn pvNoRev,
-                      rmName = releaseName category pn pvNoRev,
-                      rmBody = msg,
-                      rmTargetCommitish = "main"
-                    }
-            pubResult <-
-              withMVar (aeAssetsLock env) $ \() -> do
-                committed <-
-                  goAddAndCommit
-                    (aeGitOps env)
-                    assetsRoot
-                    relSidecars
-                    msg
-                case committed of
-                  Left err -> pure (Left err)
-                  Right () -> do
-                    markMaterializeStep stepsDoneRef mh key "committing assets"
-                    mhStatus mh key "pushing assets"
-                    pushed <- goPush (aeGitOps env) assetsRoot
-                    case pushed of
-                      Left err -> pure (Left err)
-                      Right () -> do
-                        markMaterializeStep stepsDoneRef mh key "pushing assets"
-                        mhStatus mh key "uploading release asset"
-                        uploaded <-
-                          roCreateReleaseWithAssets
-                            (aeReleaseOps env)
-                            meta
-                            paths
-                        case uploaded of
-                          Left err -> pure (Left err)
-                          Right () -> do
-                            markMaterializeStep stepsDoneRef mh key "uploading release asset"
-                            pure (Right ())
-            case pubResult of
+            rusty <-
+              prepareCodexRustyV8
+                env
+                overlayRoot
+                entry
+                eco
+                pn
+                pvNoRev
+                assetsRoot
+                (udWork unit)
+                (udOut unit)
+                mEbuildBody
+            case rusty of
               Left err ->
                 pure $
-                  ApplyHardFail
-                    key
-                    (retainUnitError unit ("assets publish failed: " <> err))
-                    False
-                    False
-              Right () -> do
-                mhStatus mh key "regenerating manifest"
-                outcome <-
-                  overlayAfterAssets
+                  ApplyHardFail key (retainUnitError unit err) False False
+              Right (mHarvestPath, mCodexV8) -> do
+                let cratesMsg = commitMessage category pn (renderPV targetVer)
+                    cratesRel =
+                      [ T.unpack category </> T.unpack pn </> takeFileName p <> ext
+                      | p <- paths,
+                        ext <- [".sha256", ".sha512", ".b3"]
+                      ]
+                    cratesMeta sha =
+                      ReleaseMeta
+                        { rmOwner = aeAssetsOwner env,
+                          rmRepo = aeAssetsRepo env,
+                          rmTag = releaseTag pn pvNoRev,
+                          rmName = releaseName category pn pvNoRev,
+                          rmBody = cratesMsg,
+                          rmTargetCommitish = sha
+                        }
+                pubResult <-
+                  publishAssetCycle
                     env
-                    overlayRoot
-                    entry
-                    eco
-                    keywords
-                    lines_
-                    targetVer
-                    distDigests
-                    mReqVer
-                    mEbuildBody
-                case outcome of
-                  ApplySuccess {} -> do
-                    markMaterializeStep stepsDoneRef mh key "regenerating manifest"
-                    deleteUnit unit
-                    pure outcome
-                  ApplySoftSkip {} -> do
-                    deleteUnit unit
-                    pure outcome
-                  ApplyHardFail k failMsg half assetsPub ->
+                    key
+                    assetsRoot
+                    paths
+                    (sidecarPaths assetsRoot category pn)
+                    cratesRel
+                    cratesMsg
+                    cratesMeta
+                    stepsDoneRef
+                    mh
+                case pubResult of
+                  Left err ->
                     pure $
                       ApplyHardFail
-                        k
-                        (retainUnitError unit failMsg)
-                        half
-                        assetsPub
+                        key
+                        (retainUnitError unit ("assets publish failed: " <> err))
+                        False
+                        False
+                  Right distDigests -> do
+                    rustyPub <-
+                      case (mHarvestPath, mCodexV8) of
+                        (Nothing, _) -> pure (Right ())
+                        (Just harvestPath, Just ov) ->
+                          let ver = cvoVer ov
+                              base = takeFileName harvestPath
+                              rel =
+                                [ rustyV8DirName </> base <> ext
+                                | ext <- [".sha256", ".sha512", ".b3"]
+                                ]
+                              msg = rustyV8CommitMessage ver
+                              meta sha =
+                                ReleaseMeta
+                                  { rmOwner = aeAssetsOwner env,
+                                    rmRepo = aeAssetsRepo env,
+                                    rmTag = rustyV8ReleaseTag ver,
+                                    rmName = rustyV8ReleaseName ver,
+                                    rmBody = msg,
+                                    rmTargetCommitish = sha
+                                  }
+                           in void
+                                <$> publishAssetCycle
+                                  env
+                                  key
+                                  assetsRoot
+                                  [harvestPath]
+                                  (rustyV8SidecarPaths assetsRoot)
+                                  rel
+                                  msg
+                                  meta
+                                  stepsDoneRef
+                                  mh
+                        (Just _, Nothing) ->
+                          pure (Left "internal: harvested rusty_v8 without pin")
+                    case rustyPub of
+                      Left err ->
+                        pure $
+                          ApplyHardFail
+                            key
+                            (retainUnitError unit ("assets publish failed: " <> err))
+                            False
+                            False
+                      Right () -> do
+                        mhStatus mh key "regenerating manifest"
+                        outcome <-
+                          overlayAfterAssets
+                            env
+                            overlayRoot
+                            entry
+                            eco
+                            keywords
+                            lines_
+                            targetVer
+                            distDigests
+                            mReqVer
+                            mEbuildBody
+                            mCodexV8
+                        case outcome of
+                          ApplySuccess {} -> do
+                            markMaterializeStep stepsDoneRef mh key "regenerating manifest"
+                            deleteUnit unit
+                            pure outcome
+                          ApplySoftSkip {} -> do
+                            deleteUnit unit
+                            pure outcome
+                          ApplyHardFail k failMsg half assetsPub ->
+                            pure $
+                              ApplyHardFail
+                                k
+                                (retainUnitError unit failMsg)
+                                half
+                                assetsPub
 
 -- | Build all required distfiles (primary + companions); paths in asset order.
 materializeDistfiles ::
@@ -1712,6 +1764,7 @@ reuseDepsReleaseAsset
                     distDigests
                     mReq
                     Nothing
+                    Nothing
                 case outcome of
                   ApplySuccess k sls paths -> do
                     markMaterializeStep stepsDoneRef mh key "regenerating manifest"
@@ -1819,3 +1872,269 @@ fetchGoModVersion env owner repo prefix pvNoRev mSub = do
   pure $ case eres of
     Right body -> parseGoReqFromMod body
     Left _ -> Nothing
+
+------------------------------------------------------------------------
+-- Pin-keyed rusty-v8 harvest / publish (Codex only)
+------------------------------------------------------------------------
+
+isCodexKey :: PackageKey -> Bool
+isCodexKey (PackageKey "dev-util/codex") = True
+isCodexKey _ = False
+
+cargoLockPath :: EcosystemSpec -> Text -> Text -> FilePath -> FilePath
+cargoLockPath eco pn pv workDir =
+  let srcDir = workDir </> "src"
+      root = case eco of
+        Cargo mLock _ CargoGitTag -> maybe srcDir (srcDir </>) mLock
+        Cargo _ _ CargoCratesIo -> srcDir </> (T.unpack pn <> "-" <> T.unpack pv)
+        _ -> srcDir
+   in root </> "Cargo.lock"
+
+-- | After crates exist: reuse or harvest rusty_v8 for Codex. Other packages skip.
+prepareCodexRustyV8 ::
+  ApplyEnv ->
+  FilePath ->
+  PackageEntry ->
+  EcosystemSpec ->
+  Text ->
+  Text ->
+  FilePath ->
+  FilePath ->
+  FilePath ->
+  Maybe Text ->
+  IO (Either Text (Maybe FilePath, Maybe CodexV8Overlay))
+prepareCodexRustyV8 env _overlayRoot entry eco pn pv assetsRoot workDir outDir _mEbuildBody
+  | not (isCodexKey (peKey entry)) = pure (Right (Nothing, Nothing))
+  | otherwise = do
+      let lockPath = cargoLockPath eco pn pv workDir
+      hasLock <- doesFileExist lockPath
+      if not hasLock
+        then
+          pure $
+            Left
+              ( "Cargo.lock not found for rusty_v8 harvest at "
+                  <> T.pack lockPath
+              )
+        else do
+          lockBody <- TIO.readFile lockPath
+          case parseV8RegistryPin lockBody of
+            Nothing -> pure (Right (Nothing, Nothing))
+            Just ver -> do
+              donorPath <-
+                findTemplate
+                  (takeDirectory (pePath entry))
+                  pn
+                  (parseEbuildVersion pv)
+                  (pePath entry)
+              donorExists <- doesFileExist donorPath
+              donorContent <-
+                if donorExists
+                  then TIO.readFile donorPath
+                  else pure ""
+              resolveCodexRustyV8
+                env
+                assetsRoot
+                workDir
+                outDir
+                ver
+                donorContent
+
+resolveCodexRustyV8 ::
+  ApplyEnv ->
+  FilePath ->
+  FilePath ->
+  FilePath ->
+  Text ->
+  Text ->
+  IO (Either Text (Maybe FilePath, Maybe CodexV8Overlay))
+resolveCodexRustyV8 env assetsRoot workDir outDir ver donorContent = do
+  let base = rustyV8SnapshotBasename ver
+      tag = rustyV8ReleaseTag ver
+      sp = rustyV8SidecarPaths assetsRoot base
+      ops = aeReleaseOps env
+      owner = aeAssetsOwner env
+      repo = aeAssetsRepo env
+      donorPin = parseQuotedAssignment "RUSTY_V8_VER" donorContent
+      samePin = donorPin == Just ver
+  tagRes <- roGetReleaseByTag ops owner repo tag
+  case tagRes of
+    Left err -> pure (Left ("rusty-v8 release lookup failed: " <> err))
+    Right mInfo -> do
+      sidesOk <- rustyV8SidecarsPresent sp
+      case (mInfo, sidesOk) of
+        (Just info, True)
+          | Just asset <- findAssetByName info (T.pack base) -> do
+              let dest = outDir </> base
+              dl <- roDownloadAsset ops (raBrowserDownloadUrl asset) dest
+              case dl of
+                Left err ->
+                  pure (Left ("rusty-v8 asset download failed: " <> err))
+                Right () -> do
+                  digests <- hashFile dest
+                  match <- sidecarsMatchDigests sp digests
+                  case match of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                      gcs <-
+                        if samePin
+                          then pure (Right Nothing)
+                          else fmap Just <$> gcsFromSnapshotOrTree dest workDir
+                      pure $ case gcs of
+                        Left err -> Left err
+                        Right mGcs ->
+                          Right
+                            ( Nothing,
+                              Just (codexOverlay ver mGcs)
+                            )
+          | otherwise ->
+              pure $
+                Left
+                  ( "existing rusty-v8 release "
+                      <> tag
+                      <> " is missing "
+                      <> T.pack base
+                      <> "; remove or repair that release externally before retrying"
+                  )
+        (Just _, False) ->
+          pure $
+            Left
+              ( "existing rusty-v8 release "
+                  <> tag
+                  <> " does not match assets-worktree checksums; remove or repair \
+                     \that release externally before retrying"
+              )
+        (Nothing, _) -> do
+          harvested <-
+            harvestRustyV8Snapshot
+              (coCloneRecursiveSubmodules (aeCargoOps env))
+              (coPackTree (aeCargoOps env))
+              Nothing
+              ver
+              workDir
+              outDir
+          case harvested of
+            Left err -> pure (Left err)
+            Right path -> do
+              gcs <-
+                if samePin
+                  then pure (Right Nothing)
+                  else fmap Just <$> gcsFromCloneTree workDir
+              pure $ case gcs of
+                Left err -> Left err
+                Right mGcs ->
+                  Right
+                    ( Just path,
+                      Just (codexOverlay ver mGcs)
+                    )
+
+codexOverlay :: Text -> Maybe V8GcsLinuxDists -> CodexV8Overlay
+codexOverlay ver mGcs =
+  CodexV8Overlay
+    { cvoVer = ver,
+      cvoClangDist = v8ClangDist <$> mGcs,
+      cvoRustTcDist = v8RustTcDist <$> mGcs
+    }
+
+rustyV8SidecarsPresent :: SidecarPaths -> IO Bool
+rustyV8SidecarsPresent sp = do
+  a <- doesFileExist (spSha256 sp)
+  b <- doesFileExist (spSha512 sp)
+  c <- doesFileExist (spB3 sp)
+  pure (a && b && c)
+
+sidecarsMatchDigests :: SidecarPaths -> FileDigests -> IO (Either Text ())
+sidecarsMatchDigests sp digests = do
+  sha256 <- sidecarHex (spSha256 sp)
+  sha512 <- sidecarHex (spSha512 sp)
+  b3 <- sidecarHex (spB3 sp)
+  pure $
+    case (sha256, sha512, b3) of
+      (Right h256, Right h512, Right hb3)
+        | h256 == T.toLower (digestSHA256 digests)
+            && h512 == T.toLower (digestSHA512 digests)
+            && hb3 == T.toLower (digestBLAKE3 digests) ->
+            Right ()
+        | otherwise ->
+            Left
+              "rusty-v8 snapshot bytes do not match assets-worktree checksum sidecars"
+      (Left err, _, _) -> Left err
+      (_, Left err, _) -> Left err
+      (_, _, Left err) -> Left err
+
+sidecarHex :: FilePath -> IO (Either Text Text)
+sidecarHex path = do
+  text <- TIO.readFile path
+  pure $
+    case T.words (T.strip text) of
+      (hex : _) -> Right (T.toLower hex)
+      _ -> Left ("could not parse rusty-v8 sidecar " <> T.pack path)
+
+gcsFromCloneTree :: FilePath -> IO (Either Text V8GcsLinuxDists)
+gcsFromCloneTree workDir = do
+  let depsPath = workDir </> "rusty_v8" </> "v8" </> "DEPS"
+  exists <- doesFileExist depsPath
+  if not exists
+    then pure (Left ("v8/DEPS missing after rusty_v8 clone at " <> T.pack depsPath))
+    else parseV8DepsGcsLinux <$> TIO.readFile depsPath
+
+gcsFromSnapshotOrTree :: FilePath -> FilePath -> IO (Either Text V8GcsLinuxDists)
+gcsFromSnapshotOrTree tarball workDir = do
+  let depsPath = workDir </> "rusty_v8" </> "v8" </> "DEPS"
+  exists <- doesFileExist depsPath
+  if exists
+    then parseV8DepsGcsLinux <$> TIO.readFile depsPath
+    else do
+      extracted <- extractV8DepsFromSnapshot tarball
+      pure $ case extracted of
+        Left err -> Left err
+        Right body -> parseV8DepsGcsLinux body
+
+publishAssetCycle ::
+  ApplyEnv ->
+  PackageKey ->
+  FilePath ->
+  [FilePath] ->
+  (FilePath -> SidecarPaths) ->
+  [FilePath] ->
+  Text ->
+  (Text -> ReleaseMeta) ->
+  IORef Int ->
+  MultiHandle ->
+  IO (Either Text [(FilePath, FileDigests)])
+publishAssetCycle env key assetsRoot paths sidecarFn relSidecars msg mkMeta stepsDoneRef mh = do
+  mhStatus mh key "committing assets"
+  distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
+  mapM_
+    ( \(p, digests) -> do
+        let sp = sidecarFn (takeFileName p)
+        createDirectoryIfMissing True (takeDirectory (spSha256 sp))
+        writeSidecars p digests (spSha256 sp) (spSha512 sp) (spB3 sp)
+    )
+    distDigests
+  withMVar (aeAssetsLock env) $ \() -> do
+    committed <- goAddAndCommit (aeGitOps env) assetsRoot relSidecars msg
+    case committed of
+      Left err -> pure (Left err)
+      Right () -> do
+        sha <- goRevParseHead (aeGitOps env) assetsRoot
+        case sha of
+          Left err -> pure (Left err)
+          Right commitSha -> do
+            markMaterializeStep stepsDoneRef mh key "committing assets"
+            mhStatus mh key "pushing assets"
+            pushed <- goPush (aeGitOps env) assetsRoot
+            case pushed of
+              Left err -> pure (Left err)
+              Right () -> do
+                markMaterializeStep stepsDoneRef mh key "pushing assets"
+                mhStatus mh key "uploading release asset"
+                uploaded <-
+                  roCreateReleaseWithAssets
+                    (aeReleaseOps env)
+                    (mkMeta commitSha)
+                    paths
+                case uploaded of
+                  Left err -> pure (Left err)
+                  Right () -> do
+                    markMaterializeStep stepsDoneRef mh key "uploading release asset"
+                    pure (Right distDigests)

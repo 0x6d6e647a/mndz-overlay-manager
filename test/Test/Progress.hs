@@ -677,7 +677,8 @@ testApplyProgressSoftSkipHandle = do
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         planOps =
           PlanOps

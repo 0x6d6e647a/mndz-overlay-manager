@@ -137,6 +137,7 @@ import Update.EbuildEdit
     ensureBunBdependFor,
     ensureCargoAssetsSrcUri,
     ensureCargoAssetsSrcUriFor,
+    ensureCodexV8Overlay,
     ensureEmptyCrates,
     ensureGoBdepend,
     ensureNodejsBdepend,
@@ -297,6 +298,7 @@ tests =
       testCase "Vendor Go Version Gate" testVendorGoVersionGate,
       testCase "Cargo Content Fix" testCargoContentFix,
       testCase "Cargo Empty Crates SrcUri" testCargoEmptyCratesSrcUri,
+      testCase "Codex rusty_v8 overlay writes" testCodexV8OverlayWrites,
       testCase "Cargo GitCrates Windows Omit" testCargoGitCratesWindowsOmit,
       testCase "Cargo CratesIo SrcUri" testCargoCratesIoSrcUri,
       testCase "Cargo Provenance Coherence" testCargoProvenanceCoherence,
@@ -841,6 +843,36 @@ testCargoEmptyCratesSrcUri = do
   assertTrue
     "pycargo empty does not retag rusty_v8 as codex PV"
     (not ("/codex-${PV}/rusty-v8-" `T.isInfixOf` fixedPycargo))
+
+testCodexV8OverlayWrites :: IO ()
+testCodexV8OverlayWrites = do
+  let donor =
+        T.unlines
+          [ "inherit cargo",
+            "RUST_MIN_VER=\"1.85.0\"",
+            "RUSTY_V8_VER=\"150.4.0\"",
+            "CLANG_DIST=\"clang-old.tar.xz\"",
+            "RUST_TC_DIST=\"rust-old.tar.xz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/rusty-v8-150.4.0/rusty-v8-150.4.0-with-submodules.tar.xz\""
+          ]
+      same = ensureCodexV8Overlay "150.4.0" Nothing Nothing donor
+      changed =
+        ensureCodexV8Overlay
+          "150.5.0"
+          (Just "clang-llvmorg-new.tar.xz")
+          (Just "rust-toolchain-new.tar.xz")
+          donor
+  assertTrue "same pin keeps ver" ("RUSTY_V8_VER=\"150.4.0\"" `T.isInfixOf` same)
+  assertTrue "same pin keeps clang" ("CLANG_DIST=\"clang-old.tar.xz\"" `T.isInfixOf` same)
+  assertTrue
+    "src uses RUSTY_V8_VER"
+    ("/rusty-v8-${RUSTY_V8_VER}/" `T.isInfixOf` same)
+  assertTrue "pin change writes ver" ("RUSTY_V8_VER=\"150.5.0\"" `T.isInfixOf` changed)
+  assertTrue "pin change writes clang" ("CLANG_DIST=\"clang-llvmorg-new.tar.xz\"" `T.isInfixOf` changed)
+  assertTrue "pin change writes rust" ("RUST_TC_DIST=\"rust-toolchain-new.tar.xz\"" `T.isInfixOf` changed)
+  assertTrue
+    "parameterize does not retag rusty-v8 as codex PV"
+    (not ("/codex-${PV}/rusty-v8-" `T.isInfixOf` parameterizeAssetsSrcUri "codex" changed))
 
 testCargoGitCratesWindowsOmit :: IO ()
 testCargoGitCratesWindowsOmit = do

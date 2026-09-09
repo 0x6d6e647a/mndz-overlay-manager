@@ -57,11 +57,13 @@ import Update.Cargo.Crates
     CargoProgress (..),
     CargoResult (..),
     RegistryPackage (..),
+    V8GcsLinuxDists (..),
     buildCargoCratesTarball,
     cargoChecksumJson,
     crateTarballPrefix,
     cratesIoDownloadEndpoint,
     fetchAndUnpackCrate,
+    gitCloneRecursiveSubmodules,
     harvestCloneFloor,
     harvestRegistryPackageRoots,
     harvestRustyV8Snapshot,
@@ -69,6 +71,7 @@ import Update.Cargo.Crates
     packCratesTarball,
     packCratesTarballWith,
     parseRegistryPackages,
+    parseV8DepsGcsLinux,
     parseV8RegistryPin,
     rustyV8ReleaseTag,
     rustyV8SnapshotBasename,
@@ -167,6 +170,8 @@ unitTests =
           testCase "parseRegistryPackages fixtures" testParseRegistryPackages,
           testCase "parseV8RegistryPin and pack excludes git" testV8PinAndGitExcluded,
           testCase "harvestRustyV8Snapshot reuse vs clone" testHarvestRustyV8Snapshot,
+          testCase "recursive submodule clone argv" testGitCloneRecursiveArgv,
+          testCase "parse v8/DEPS GCS Linux_x64 objects" testParseV8DepsGcsLinux,
           testCase "cargoChecksumJson shape" testCargoChecksumJson
         ],
       testGroup
@@ -610,6 +615,140 @@ testHarvestRustyV8Snapshot =
     assertTrue
       "harvested basename"
       ("rusty-v8-150.5.0-with-submodules.tar.xz" `T.isSuffixOf` T.pack harvested)
+
+testGitCloneRecursiveArgv :: IO ()
+testGitCloneRecursiveArgv = do
+  argsRef <- newIORef ([] :: [String])
+  let run req = do
+        case prMode req of
+          ExecCmd "git" args -> atomicModifyIORef' argsRef (const (args, ()))
+          _ -> pure ()
+        pure
+          ProcessResult
+            { prExitCode = ExitSuccess,
+              prStdout = "",
+              prStderr = ""
+            }
+  void $
+    assertRight "clone"
+      =<< gitCloneRecursiveSubmodules
+        run
+        "https://github.com/denoland/rusty_v8"
+        "v150.5.0"
+        "/tmp/rusty_v8"
+  args <- readIORef argsRef
+  assertEq
+    "clone argv"
+    [ "clone",
+      "--recurse-submodules",
+      "--depth",
+      "1",
+      "--branch",
+      "v150.5.0",
+      "https://github.com/denoland/rusty_v8",
+      "/tmp/rusty_v8"
+    ]
+    args
+
+v8Deps15040Excerpt :: T.Text
+v8Deps15040Excerpt =
+  T.unlines
+    [ "vars = {",
+      "}",
+      "deps = {",
+      "  'third_party/llvm-build/Release+Asserts': {",
+      "    'dep_type': 'gcs',",
+      "    'bucket': 'chromium-browser-clang',",
+      "    'objects': [",
+      "      {",
+      "        'object_name': 'Linux_x64/clang-llvmorg-23-init-10931-g20b6ec66-11.tar.xz',",
+      "        'sha256sum': 'abc',",
+      "        'size_bytes': 1,",
+      "        'generation': 1,",
+      "        'condition': 'host_os == \"linux\"',",
+      "      },",
+      "      {",
+      "        'object_name': 'Linux_x64/clang-tidy-llvmorg-23-init-10931-g20b6ec66-11.tar.xz',",
+      "        'sha256sum': 'def',",
+      "        'size_bytes': 1,",
+      "        'generation': 1,",
+      "        'condition': 'host_os == \"linux\"',",
+      "      },",
+      "      {",
+      "        'object_name': 'Linux_x64/llvmobjdump-llvmorg-23-init-10931-g20b6ec66-11.tar.xz',",
+      "        'sha256sum': 'ghi',",
+      "        'size_bytes': 1,",
+      "        'generation': 1,",
+      "        'condition': 'host_os == \"linux\"',",
+      "      },",
+      "      {",
+      "        'object_name': 'Mac/clang-llvmorg-23-init-10931-g20b6ec66-11.tar.xz',",
+      "        'sha256sum': 'jkl',",
+      "        'size_bytes': 1,",
+      "        'generation': 1,",
+      "        'condition': 'host_os == \"mac\" and host_cpu == \"x64\"',",
+      "      },",
+      "    ],",
+      "  },",
+      "  'third_party/rust-toolchain': {",
+      "    'dep_type': 'gcs',",
+      "    'bucket': 'chromium-browser-clang',",
+      "    'objects': [",
+      "      {",
+      "        'object_name': 'Linux_x64/rust-toolchain-4c4205163abcbd08948b3efab796c543ba1ea687-4-llvmorg-23-init-10931-g20b6ec66.tar.xz',",
+      "        'sha256sum': 'mno',",
+      "        'size_bytes': 1,",
+      "        'generation': 1,",
+      "        'condition': 'host_os == \"linux\"',",
+      "      },",
+      "      {",
+      "        'object_name': 'Mac/rust-toolchain-4c4205163abcbd08948b3efab796c543ba1ea687-4-llvmorg-23-init-10931-g20b6ec66.tar.xz',",
+      "        'sha256sum': 'pqr',",
+      "        'size_bytes': 1,",
+      "        'generation': 1,",
+      "        'condition': 'host_os == \"mac\" and host_cpu == \"x64\"',",
+      "      },",
+      "    ],",
+      "  },",
+      "}"
+    ]
+
+testParseV8DepsGcsLinux :: IO ()
+testParseV8DepsGcsLinux = do
+  dists <-
+    case parseV8DepsGcsLinux v8Deps15040Excerpt of
+      Left err -> assertFailure ("parse 150.4.0 DEPS: " <> T.unpack err)
+      Right d -> pure d
+  assertEq
+    "clang"
+    "clang-llvmorg-23-init-10931-g20b6ec66-11.tar.xz"
+    (v8ClangDist dists)
+  assertEq
+    "rust-toolchain"
+    "rust-toolchain-4c4205163abcbd08948b3efab796c543ba1ea687-4-llvmorg-23-init-10931-g20b6ec66.tar.xz"
+    (v8RustTcDist dists)
+  case parseV8DepsGcsLinux (T.replace "'dep_type': 'gcs'" "'dep_type': 'cipd'" v8Deps15040Excerpt) of
+    Left err -> assertTrue "non-gcs" ("non-GCS" `T.isInfixOf` err)
+    Right _ -> assertFailure "expected non-GCS failure"
+  let missingClang =
+        T.replace
+          "Linux_x64/clang-llvmorg-23-init-10931-g20b6ec66-11.tar.xz"
+          "Linux_x64/not-clang.tar.xz"
+          v8Deps15040Excerpt
+  case parseV8DepsGcsLinux missingClang of
+    Left err -> assertTrue "missing keep-set" ("no unique" `T.isInfixOf` err)
+    Right _ -> assertFailure "expected missing clang object"
+  let dupClang =
+        T.replace
+          "Linux_x64/clang-tidy-llvmorg-23-init-10931-g20b6ec66-11.tar.xz"
+          "Linux_x64/clang-llvmorg-23-init-dup.tar.xz"
+          v8Deps15040Excerpt
+  case parseV8DepsGcsLinux dupClang of
+    Left err -> assertTrue "duplicate keep-set" ("duplicate" `T.isInfixOf` err)
+    Right _ -> assertFailure "expected duplicate clang objects"
+  case parseV8DepsGcsLinux "deps = {}\n" of
+    Left err -> assertTrue "missing key" ("missing DEPS key" `T.isInfixOf` err)
+    Right _ -> assertFailure "expected missing block"
 
 testHarvestRegistryRoots :: IO ()
 testHarvestRegistryRoots =
@@ -1132,7 +1271,11 @@ fakeCargoSuccessOps =
       coPackCrates = \_onStage onArchive _lock _dist _stage outPath -> do
         onArchive
         writeFile outPath "crates-tarball"
-        pure (Right ())
+        pure (Right ()),
+      coCloneRecursiveSubmodules = \_ _ _ ->
+        pure (Left "rusty_v8 clone should not run"),
+      coPackTree = \_ _ ->
+        pure (Left "rusty_v8 pack should not run")
     }
 
 testCargoBuilderSuccess :: IO ()
@@ -1308,8 +1451,11 @@ testCargoBuilderCloneFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
   let ops =
         CargoOps
           { coClone = \_ _ _ -> pure (Left "git clone failed: offline"),
+            coFetchUnpackCrate = \_ _ _ _ -> pure (Left "should not fetch"),
             coPycargoebuild = \_ _ _ _ -> pure (Left "should not run"),
-            coPackCrates = \_ _ _ _ _ _ -> pure (Left "should not pack")
+            coPackCrates = \_ _ _ _ _ _ -> pure (Left "should not pack"),
+            coCloneRecursiveSubmodules = \_ _ _ -> pure (Left "should not harvest"),
+            coPackTree = \_ _ -> pure (Left "should not pack tree")
           }
   result <-
     buildCargoCratesTarball
@@ -1340,8 +1486,11 @@ testCargoBuilderMissingLock = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> 
           { coClone = \_ _ dest -> do
               createDirectoryIfMissing True dest
               pure (Right ()),
+            coFetchUnpackCrate = \_ _ _ _ -> pure (Left "should not fetch"),
             coPycargoebuild = \_ _ _ _ -> pure (Left "should not run"),
-            coPackCrates = \_ _ _ _ _ _ -> pure (Left "should not pack")
+            coPackCrates = \_ _ _ _ _ _ -> pure (Left "should not pack"),
+            coCloneRecursiveSubmodules = \_ _ _ -> pure (Left "should not harvest"),
+            coPackTree = \_ _ -> pure (Left "should not pack tree")
           }
   result <-
     buildCargoCratesTarball
@@ -2780,7 +2929,8 @@ testApplyEnvFakeEcoOps =
             { goIsWorkTree = \_ -> pure True,
               goPathsDirty = \_ _ -> pure (Right False),
               goAddAndCommit = \_ _ _ -> pure (Right ()),
-              goPush = \_ -> pure (Right ())
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
             }
         planOps =
           PlanOps
@@ -2918,7 +3068,11 @@ testCargoCratesIoLaneOps =
                   "[package]\nname = \"hexagex\"\nrust-version = \"1.80\"\n"
                 onArchive
                 writeFile outPath "crates-tarball"
-                pure (Right ())
+                pure (Right ()),
+              coCloneRecursiveSubmodules = \_ _ _ ->
+                pure (Left "rusty_v8 clone should not run"),
+              coPackTree = \_ _ ->
+                pure (Left "rusty_v8 pack should not run")
             }
     res <-
       assertRight "cratesio lane"
