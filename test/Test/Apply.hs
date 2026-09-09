@@ -450,6 +450,7 @@ testContentFixManifest =
       "ebuild content ok"
       ( not
           ( ebuildNeedsContentFix
+              "crush"
               ["~amd64"]
               ebuildBody
               (Just "1.26.5")
@@ -1653,11 +1654,12 @@ testBdependMismatchNeedsFix = do
     (ebuildHasDevLangGoBdepend body)
   assertTrue
     "mismatch needs fix"
-    (ebuildNeedsContentFix ["~amd64"] body (Just "1.26.5"))
+    (ebuildNeedsContentFix "crush" ["~amd64"] body (Just "1.26.5"))
   assertTrue
     "matching does not need fix"
     ( not
         ( ebuildNeedsContentFix
+            "crush"
             ["~amd64"]
             (T.replace "1.24.11" "1.26.5" body)
             (Just "1.26.5")
@@ -1681,12 +1683,12 @@ testBdependMissingNeedsFix = do
           ]
   assertTrue
     "missing needs fix"
-    (ebuildNeedsContentFix ["~amd64"] body (Just "1.26.5"))
+    (ebuildNeedsContentFix "crush" ["~amd64"] body (Just "1.26.5"))
   inserted <- assertRight "insert" (ensureGoBdepend "1.26.5" body)
   assertTrue "matches after insert" (goBdependMatches "1.26.5" inserted)
   assertTrue
     "no longer needs fix"
-    (not (ebuildNeedsContentFix ["~amd64"] inserted (Just "1.26.5")))
+    (not (ebuildNeedsContentFix "crush" ["~amd64"] inserted (Just "1.26.5")))
   let withOld =
         T.unlines
           [ "EAPI=8",

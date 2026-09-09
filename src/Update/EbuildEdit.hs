@@ -2,7 +2,10 @@
 
 module Update.EbuildEdit
   ( assetsSrcUriParameterized,
+    assetsOwnedTagCollision,
     parameterizeAssetsSrcUri,
+    pnCollidesWithPinIdentity,
+    rustyV8PinIdentity,
     nextRevisionVersion,
     writeVersionForPlannedPV,
     ebuildFileNameWithRev,
@@ -70,17 +73,83 @@ import Update.Types (CargoSource (..), PackageKey)
 assetsMarker :: Text
 assetsMarker = "mndz-overlay-assets/releases/download/"
 
--- | True when every mndz-overlay-assets release download URL already uses @${PV}@.
-assetsSrcUriParameterized :: Text -> Bool
-assetsSrcUriParameterized content =
+-- | Reserved pin-keyed assets identity for the rusty_v8 snapshot.
+rustyV8PinIdentity :: Text
+rustyV8PinIdentity = "rusty-v8"
+
+-- | True when overlay PN prefix-collides with a reserved pin identity.
+--
+-- Collision is any of: equal names; @{pn}-@ is a prefix of @{identity}-@;
+-- @{identity}-@ is a prefix of @{pn}-@.
+pnCollidesWithPinIdentity :: Text -> Text -> Bool
+pnCollidesWithPinIdentity pn identity =
+  pn == identity
+    || (pn <> "-") `T.isPrefixOf` (identity <> "-")
+    || (identity <> "-") `T.isPrefixOf` (pn <> "-")
+
+-- | True when this assets-host release tag belongs to the overlay package.
+packageAssetsTag :: Text -> Text -> Bool
+packageAssetsTag pkgName tag =
+  "${PV}" `T.isInfixOf` tag
+    || (pkgName <> "-") `T.isPrefixOf` tag
+
+reservedPinIdentityTag :: Text -> Bool
+reservedPinIdentityTag tag =
+  tag == rustyV8PinIdentity
+    || (rustyV8PinIdentity <> "-") `T.isPrefixOf` tag
+
+ownedTagCollides :: Text -> Text -> Bool
+ownedTagCollides pkgName tag =
+  packageAssetsTag pkgName tag
+    && pnCollidesWithPinIdentity pkgName rustyV8PinIdentity
+    && reservedPinIdentityTag tag
+
+assetsPathOf :: Text -> Text
+assetsPathOf = T.takeWhile (\c -> c /= ' ' && c /= '"' && c /= '\n')
+
+assetsTagOf :: Text -> Text
+assetsTagOf seg = fst (T.breakOn "/" (assetsPathOf seg))
+
+-- | Hard-fail reason when a reserved pin-identity tag would be treated as
+-- package-owned (for example PN @rusty@ vs tag @rusty-v8-150.4.0@).
+assetsOwnedTagCollision :: Text -> Text -> Maybe Text
+assetsOwnedTagCollision pn content =
+  case colliding of
+    (tag : _) ->
+      Just $
+        "overlay PN "
+          <> pn
+          <> " prefix-collides with reserved pin identity "
+          <> rustyV8PinIdentity
+          <> " (assets tag "
+          <> tag
+          <> ")"
+    [] -> Nothing
+  where
+    colliding =
+      [ tag
+      | tag <- tags,
+        ownedTagCollides pn tag
+      ]
+    tags =
+      case T.splitOn assetsMarker content of
+        [] -> []
+        [_] -> []
+        _ : segs -> map assetsTagOf segs
+
+-- | True when every *package-owned* mndz-overlay-assets release download URL
+-- already uses @${PV}@. Non-owned tags (a different version axis) are ignored.
+assetsSrcUriParameterized :: Text -> Text -> Bool
+assetsSrcUriParameterized pn content =
   case T.splitOn assetsMarker content of
     [] -> True
     [_] -> True
-    _ : segs -> all segmentParameterized segs
+    _ : segs -> all (segmentParameterized pn) segs
   where
-    segmentParameterized seg =
-      let path = T.takeWhile (\c -> c /= ' ' && c /= '"' && c /= '\n') seg
-       in "${PV}" `T.isInfixOf` path
+    segmentParameterized pkgName seg =
+      let path = assetsPathOf seg
+          tag = fst (T.breakOn "/" path)
+       in not (packageAssetsTag pkgName tag) || "${PV}" `T.isInfixOf` path
 
 -- | Rewrite frozen version components in assets release URLs to @${PV}@.
 --
@@ -104,18 +173,18 @@ parameterizeAssetsSrcUri pn content =
               let (filePart, rest1) =
                     T.break (\c -> c == ' ' || c == '"' || c == '\n') afterSlash
                   -- Only rewrite this package's release tag. rusty_v8 is keyed
-                  -- by crate version (rusty-v8-150.4.0), not {pn}-${PV}.
+                  -- by crate version (rusty-v8-150.4.0), not {pn}-${PV}. A PN
+                  -- that would own that tag via prefix collision is left
+                  -- unrewritten here; rewrite/adequacy hard-fail separately.
+                  colliding = ownedTagCollides pkgName tagPart
                   newTag =
-                    if packageAssetsTag pkgName tagPart
+                    if packageAssetsTag pkgName tagPart && not colliding
                       then pkgName <> "-${PV}"
                       else tagPart
-                  newFile = rewriteFile pkgName filePart
+                  newFile =
+                    if colliding then filePart else rewriteFile pkgName filePart
                in newTag <> "/" <> newFile <> rest1
             _ -> seg
-
-    packageAssetsTag pkgName tag =
-      "${PV}" `T.isInfixOf` tag
-        || (pkgName <> "-") `T.isPrefixOf` tag
 
     rewriteFile pkgName filePart
       | not (T.isPrefixOf (pkgName <> "-") filePart) = filePart
@@ -189,17 +258,17 @@ manifestHasVendorDist = manifestHasExactDist
 -- When @mRequiredGo@ is @Just ver@, BDEPEND adequacy requires the exact atom
 -- @>=dev-lang\/go-\<ver\>:@= (not mere presence of @dev-lang\/go@). When
 -- unknown (@Nothing@), only a missing @dev-lang\/go@ atom counts as needs-work.
-ebuildNeedsContentFix :: [Text] -> Text -> Maybe Text -> Bool
-ebuildNeedsContentFix keywords content mRequiredGo =
-  not (assetsSrcUriParameterized content)
+ebuildNeedsContentFix :: Text -> [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsContentFix pn keywords content mRequiredGo =
+  not (assetsSrcUriParameterized pn content)
     || not (keywordsMatch keywords content)
     || bdependNeedsFix mRequiredGo content
 
 -- | Content fix when the full required BDEPEND atom string is known.
 -- @Nothing@ means no BDEPEND check (KEYWORDS / SRC_URI only).
-ebuildNeedsContentFixAtom :: [Text] -> Text -> Maybe Text -> Bool
-ebuildNeedsContentFixAtom keywords content mAtom =
-  not (assetsSrcUriParameterized content)
+ebuildNeedsContentFixAtom :: Text -> [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsContentFixAtom pn keywords content mAtom =
+  not (assetsSrcUriParameterized pn content)
     || not (keywordsMatch keywords content)
     || case mAtom of
       Just atom -> not (atom `T.isInfixOf` content)
@@ -208,25 +277,25 @@ ebuildNeedsContentFixAtom keywords content mAtom =
 -- | Cargo body fix excluding RUST_MIN_VER (SRC_URI, KEYWORDS, CRATES, list-era).
 -- CratesIo provenance additionally requires the canonical crates.io primary
 -- source line; GitTag requirements are unchanged.
-ebuildNeedsCargoBodyFix :: CargoSource -> [Text] -> Text -> Bool
-ebuildNeedsCargoBodyFix CargoCratesIo keywords content =
-  not (assetsSrcUriParameterized content)
+ebuildNeedsCargoBodyFix :: CargoSource -> Text -> [Text] -> Text -> Bool
+ebuildNeedsCargoBodyFix CargoCratesIo pn keywords content =
+  not (assetsSrcUriParameterized pn content)
     || not (keywordsMatch keywords content)
     || not (hasCratesAssetsSrcUri content)
     || not (hasCleanCratesIoSourceLine content)
     || hasListEraCargoDepsFor CargoCratesIo content
     || cratesFieldNonEmpty content
-ebuildNeedsCargoBodyFix CargoGitTag keywords content =
-  not (assetsSrcUriParameterized content)
+ebuildNeedsCargoBodyFix CargoGitTag pn keywords content =
+  not (assetsSrcUriParameterized pn content)
     || not (keywordsMatch keywords content)
     || not (hasCratesAssetsSrcUri content)
     || hasListEraCargoDeps content
     || cratesFieldNonEmpty content
 
 -- | Cargo content fix: body plus too-low-only RUST_MIN_VER vs the decision floor.
-ebuildNeedsCargoContentFix :: CargoSource -> [Text] -> Text -> Maybe Text -> Bool
-ebuildNeedsCargoContentFix cargoSrc keywords content mRequiredMsrv =
-  ebuildNeedsCargoBodyFix cargoSrc keywords content
+ebuildNeedsCargoContentFix :: CargoSource -> Text -> [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsCargoContentFix cargoSrc pn keywords content mRequiredMsrv =
+  ebuildNeedsCargoBodyFix cargoSrc pn keywords content
     || case mRequiredMsrv of
       Just ver ->
         case parseRustMinVerFromEbuild content of

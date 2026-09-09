@@ -45,7 +45,7 @@ import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isNothing)
+import Data.Maybe (isJust, isNothing)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -125,6 +125,7 @@ import Update.Check (PackageEntry (..), groupNewest)
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
   ( CargoSourceForm (..),
+    assetsOwnedTagCollision,
     assetsSrcUriParameterized,
     bunCompilePinBdependAtom,
     bunFloorBdependAtom,
@@ -153,6 +154,8 @@ import Update.EbuildEdit
     parameterizeAssetsSrcUri,
     parseEbuildSlot,
     parseManifestVendorSHA512,
+    pnCollidesWithPinIdentity,
+    rustyV8PinIdentity,
     sbclBdependMatches,
     setKeywords,
     setSlotField,
@@ -225,7 +228,7 @@ import Update.GpgAgent
     pinentryChildEnv,
     teardownGpgHandle,
   )
-import Update.Hardcoded (lookupHardcoded, lookupPolicy)
+import Update.Hardcoded (hardcodedPolicies, lookupHardcoded, lookupPolicy)
 import Update.Md5Cache
   ( EgencacheRequest (..),
     GencacheAction (..),
@@ -283,6 +286,7 @@ import Update.Types
     UpdateTechnique (..),
     mkPackageKey,
     packageKeyText,
+    splitPackageKey,
   )
 
 tests :: TestTree
@@ -298,6 +302,7 @@ tests =
       testCase "Vendor Go Version Gate" testVendorGoVersionGate,
       testCase "Cargo Content Fix" testCargoContentFix,
       testCase "Cargo Empty Crates SrcUri" testCargoEmptyCratesSrcUri,
+      testCase "Package owned assets URI" testPackageOwnedAssetsUri,
       testCase "Codex rusty_v8 overlay writes" testCodexV8OverlayWrites,
       testCase "Cargo GitCrates Windows Omit" testCargoGitCratesWindowsOmit,
       testCase "Cargo CratesIo SrcUri" testCargoCratesIoSrcUri,
@@ -316,8 +321,8 @@ testEbuildEdit = do
       fixed = parameterizeAssetsSrcUri "dolt" frozen
       already =
         "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/beads-${PV}/beads-${PV}-vendor.tar.xz\"\n"
-  assertEq "frozen not parameterized" False (assetsSrcUriParameterized frozen)
-  assertTrue "fixed parameterized" (assetsSrcUriParameterized fixed)
+  assertEq "frozen not parameterized" False (assetsSrcUriParameterized "dolt" frozen)
+  assertTrue "fixed parameterized" (assetsSrcUriParameterized "dolt" fixed)
   assertTrue "has ${PV} tag" ("dolt-${PV}/dolt-${PV}-vendor" `T.isInfixOf` fixed)
   -- Regression: intercalate must keep the assets host path (not strip it).
   assertTrue
@@ -343,8 +348,8 @@ testEbuildEdit = do
             jemallocCompanion
           ]
       badgerFixed = parameterizeAssetsSrcUri "badger" badgerFrozen
-  assertEq "badger frozen not parameterized" False (assetsSrcUriParameterized badgerFrozen)
-  assertTrue "badger fixed parameterized" (assetsSrcUriParameterized badgerFixed)
+  assertEq "badger frozen not parameterized" False (assetsSrcUriParameterized "badger" badgerFrozen)
+  assertTrue "badger fixed parameterized" (assetsSrcUriParameterized "badger" badgerFixed)
   assertTrue
     "badger vendor URL uses ${PV}"
     ( "https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/badger-${PV}/badger-${PV}-vendor.tar.xz"
@@ -602,7 +607,7 @@ testSbclAtomPreserveBody = do
   fixed <- assertRight "sbcl atom" (ensureSbclAtom "2.6.4" withAssets)
   let withKw = setKeywords ["~amd64", "~ppc", "~x86"] fixed
   assertTrue "floor atom" (sbclBdependMatches "2.6.4" withKw)
-  assertTrue "parameterized deps" (assetsSrcUriParameterized withKw)
+  assertTrue "parameterized deps" (assetsSrcUriParameterized "autolith" withKw)
   assertTrue "preserves private body" ("private-prefix stamp network-disable" `T.isInfixOf` withKw)
   assertTrue "preserves IUSE" ("IUSE=\"test\"" `T.isInfixOf` withKw)
   assertTrue "preserves RESTRICT" ("RESTRICT=" `T.isInfixOf` withKw)
@@ -756,7 +761,7 @@ testCargoContentFix = do
   assertTrue "RUST_MIN_VER" ("RUST_MIN_VER=\"1.88.0\"" `T.isInfixOf` msrvEd)
   assertTrue
     "list-era needs fix"
-    (ebuildNeedsCargoContentFix CargoGitTag ["~amd64"] listEra (Just "1.88.0"))
+    (ebuildNeedsCargoContentFix CargoGitTag "mise" ["~amd64"] listEra (Just "1.88.0"))
   let good =
         T.unlines
           [ "inherit cargo",
@@ -768,7 +773,7 @@ testCargoContentFix = do
           ]
   assertTrue
     "tarball form ok"
-    (not (ebuildNeedsCargoContentFix CargoGitTag ["~amd64"] good (Just "1.88.0")))
+    (not (ebuildNeedsCargoContentFix CargoGitTag "mise" ["~amd64"] good (Just "1.88.0")))
 
 testCargoEmptyCratesSrcUri :: IO ()
 testCargoEmptyCratesSrcUri = do
@@ -843,6 +848,99 @@ testCargoEmptyCratesSrcUri = do
   assertTrue
     "pycargo empty does not retag rusty_v8 as codex PV"
     (not ("/codex-${PV}/rusty-v8-" `T.isInfixOf` fixedPycargo))
+  -- Two-URL Codex body is adequate for parameterization (pin-keyed rusty-v8
+  -- is not a package-owned content fix).
+  let adequate =
+        T.unlines
+          [ "inherit cargo",
+            "KEYWORDS=\"-* ~amd64\"",
+            "CRATES=\"\"",
+            "RUST_MIN_VER=\"1.95.0\"",
+            "SRC_URI=\"https://github.com/openai/codex/archive/refs/tags/rust-v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" ${CARGO_CRATE_URIS}\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/codex-${PV}/codex-${PV}-crates.tar.xz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/rusty-v8-${RUSTY_V8_VER}/rusty-v8-${RUSTY_V8_VER}-with-submodules.tar.xz\""
+          ]
+  assertTrue
+    "codex two-url body parameterized"
+    (assetsSrcUriParameterized "codex" adequate)
+  assertTrue
+    "codex two-url body does not need cargo body fix"
+    (not (ebuildNeedsCargoBodyFix CargoGitTag "codex" ["-*", "~amd64"] adequate))
+  assertTrue
+    "codex two-url body does not need cargo content fix"
+    ( not
+        ( ebuildNeedsCargoContentFix
+            CargoGitTag
+            "codex"
+            ["-*", "~amd64"]
+            adequate
+            (Just "1.95.0")
+        )
+    )
+
+testPackageOwnedAssetsUri :: IO ()
+testPackageOwnedAssetsUri = do
+  let codexBody =
+        T.unlines
+          [ "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/codex-${PV}/codex-${PV}-crates.tar.xz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/rusty-v8-${RUSTY_V8_VER}/rusty-v8-${RUSTY_V8_VER}-with-submodules.tar.xz\""
+          ]
+      frozenHk =
+        "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/hk-0.50.0/hk-0.50.0-crates.tar.xz\"\n"
+      colliding =
+        "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/rusty-v8-150.4.0/rusty-v8-150.4.0-with-submodules.tar.xz\"\n"
+      mappedPns =
+        [ pn
+        | Just (_, pn) <- map splitPackageKey (Map.keys hardcodedPolicies)
+        ]
+  assertTrue
+    "codex crates plus rusty-v8 is parameterized"
+    (assetsSrcUriParameterized "codex" codexBody)
+  assertEq
+    "frozen hk crates URL is not parameterized"
+    False
+    (assetsSrcUriParameterized "hk" frozenHk)
+  assertEq
+    "all hardcoded keys split"
+    (Map.size hardcodedPolicies)
+    (length mappedPns)
+  assertTrue
+    "hardcoded PNs do not collide with rusty-v8"
+    (not (any (`pnCollidesWithPinIdentity` rustyV8PinIdentity) mappedPns))
+  assertTrue
+    "PN rusty collides with rusty-v8"
+    (pnCollidesWithPinIdentity "rusty" rustyV8PinIdentity)
+  assertTrue
+    "PN rusty-v8 collides with itself"
+    (pnCollidesWithPinIdentity rustyV8PinIdentity rustyV8PinIdentity)
+  assertTrue
+    "PN rusty-v8-extra collides (identity prefixes pn)"
+    (pnCollidesWithPinIdentity "rusty-v8-extra" rustyV8PinIdentity)
+  assertTrue
+    "codex does not collide"
+    (not (pnCollidesWithPinIdentity "codex" rustyV8PinIdentity))
+  assertTrue
+    "collision helper flags rusty + rusty-v8 tag"
+    (isJust (assetsOwnedTagCollision "rusty" colliding))
+  case assetsOwnedTagCollision "rusty" colliding of
+    Nothing -> do
+      hPutStrLn stderr "expected collision for PN rusty vs rusty-v8 tag"
+      exitFailure
+    Just err ->
+      assertTrue
+        "collision names rusty-v8"
+        ("rusty-v8" `T.isInfixOf` err)
+  let rewritten = parameterizeAssetsSrcUri "rusty" colliding
+  assertTrue
+    "colliding tag is not rewritten to rusty-${PV}"
+    (not ("rusty-${PV}" `T.isInfixOf` rewritten))
+  assertTrue
+    "colliding rusty-v8 tag is left in place"
+    ("/rusty-v8-150.4.0/" `T.isInfixOf` rewritten)
+  assertTrue
+    "codex does not collide on rusty-v8 tag"
+    (isNothing (assetsOwnedTagCollision "codex" colliding))
 
 testCodexV8OverlayWrites :: IO ()
 testCodexV8OverlayWrites = do
@@ -983,6 +1081,7 @@ testSetKeywords = do
   assertTrue
     "content-fix on bare → ~ upgrade"
     ( ebuildNeedsContentFix
+        "pkg"
         ["~amd64"]
         ( T.unlines
             [ "inherit go-module",
@@ -1047,11 +1146,12 @@ testCargoCratesIoSrcUri = do
   -- Body fix: CratesIo accepts the crates.io form; github form needs work.
   assertTrue
     "crates.io form ok"
-    (not (ebuildNeedsCargoBodyFix CargoCratesIo ["~amd64"] clean))
+    (not (ebuildNeedsCargoBodyFix CargoCratesIo "biodiff" ["~amd64"] clean))
   assertTrue
     "github form needs fix under CratesIo"
     ( ebuildNeedsCargoBodyFix
         CargoCratesIo
+        "biodiff"
         ["~amd64"]
         ( T.unlines
             [ "SRC_URI=\"https://github.com/8051Enthusiast/biodiff/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
@@ -1073,6 +1173,7 @@ testCargoCratesIoSrcUri = do
     "git tag body fix unchanged"
     ( ebuildNeedsCargoBodyFix
         CargoGitTag
+        "mise"
         ["~amd64"]
         gitTagBody
     )

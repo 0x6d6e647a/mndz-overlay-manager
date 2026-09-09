@@ -27,7 +27,8 @@ import Update.Assets.Hash (FileDigests (..))
 import Update.AtomClosure (ensureAtomClosedForWrite)
 import Update.Check (PackageEntry (..))
 import Update.EbuildEdit
-  ( ebuildFileNameWithRev,
+  ( assetsOwnedTagCollision,
+    ebuildFileNameWithRev,
     ebuildHasDevLangGoBdepend,
     ensureBunBdependFor,
     ensureCargoAssetsSrcUriFor,
@@ -119,95 +120,101 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
           let content = fromMaybe templateContent mEbuildBody
               -- Empty CRATES first so list-era detection does not treat
               -- pycargoebuild's multiline CRATES="\\n" as a crate list.
-              withAssets = case eco of
-                Cargo {} ->
-                  ensureCargoAssetsSrcUriFor
-                    (cargoSource eco)
-                    pn
-                    (ensureEmptyCrates content)
-                _ -> parameterizeAssetsSrcUri pn content
-              withKw = setKeywords keywords withAssets
-          contentFixed <- case (eco, mReqVer) of
-            (Go _, Just goVer) -> pure (ensureGoBdepend goVer withKw)
-            (Go _, Nothing)
-              | ebuildHasDevLangGoBdepend withKw -> pure (Right withKw)
-              | otherwise ->
-                  pure $
-                    Left
-                      "could not obtain go.mod version required for BDEPEND alignment"
-            (NpmEco, Just ver) -> pure (ensureNodejsBdepend ver withKw)
-            (NpmEco, Nothing) ->
-              pure (Left "could not obtain engines.node for BDEPEND alignment")
-            (Bun, Just ver) -> pure (ensureBunBdependFor key ver withKw)
-            (Bun, Nothing) ->
-              pure (Left "could not obtain engines.bun for BDEPEND alignment")
-            (Cargo {}, Just msrv) ->
-              pure (fmap (applyCodexV8 key mCodexV8) (ensureRustMinVer msrv withKw))
-            (Cargo {}, Nothing) ->
-              pure
-                ( Left
-                    "could not determine RUST_MIN_VER (no package.rust-version, \
-                    \dependency rust-version, or donor RUST_MIN_VER)"
-                )
-            (Sbcl, Just ver) -> pure (ensureSbclAtom ver withKw)
-            (Sbcl, Nothing) ->
-              pure (Left "could not obtain sbcl.version floor for SBCL atom alignment")
-          case contentFixed of
-            Left err -> pure $ ApplyHardFail key err False orphan
-            Right fixed -> do
-              closed <-
-                ensureAtomClosedForWrite
-                  (aeAtomClosure env)
-                  (aeMulti env)
-                  overlayRoot
-                  key
-                  fixed
-              case closed of
-                Left err ->
-                  pure $ applyUnitHardFail key (ApplyAtomClosure err) False orphan
-                Right () -> do
-                  let newName = ebuildFileNameWithRev pn targetVer
-                      newPath = pkgDir </> newName
-                  TIO.writeFile newPath fixed
-                  removedTemplate <-
-                    if templatePath /= newPath && takeFileName templatePath /= newName
-                      then do
-                        let templateIsTarget =
-                              case parseEbuildFileName (takeFileName templatePath) of
-                                Just (_, verStr) ->
-                                  case comparePV (parseEbuildVersion (T.pack verStr)) targetVer of
-                                    Just EQ -> True
-                                    _ -> False
-                                Nothing -> False
-                        if templateIsTarget
-                          then removeFile templatePath >> pure True
-                          else pure False
-                      else pure False
-                  manResult <- ebuildRun pkgDir newName
-                  case manResult of
-                    Left err -> pure $ ApplyHardFail key err True orphan
+              prepared = case eco of
+                Cargo {} -> ensureEmptyCrates content
+                _ -> content
+          case assetsOwnedTagCollision pn prepared of
+            Just err -> pure $ ApplyHardFail key err False orphan
+            Nothing -> do
+              let withAssets = case eco of
+                    Cargo {} ->
+                      ensureCargoAssetsSrcUriFor
+                        (cargoSource eco)
+                        pn
+                        prepared
+                    _ -> parameterizeAssetsSrcUri pn prepared
+                  withKw = setKeywords keywords withAssets
+              contentFixed <- case (eco, mReqVer) of
+                (Go _, Just goVer) -> pure (ensureGoBdepend goVer withKw)
+                (Go _, Nothing)
+                  | ebuildHasDevLangGoBdepend withKw -> pure (Right withKw)
+                  | otherwise ->
+                      pure $
+                        Left
+                          "could not obtain go.mod version required for BDEPEND alignment"
+                (NpmEco, Just ver) -> pure (ensureNodejsBdepend ver withKw)
+                (NpmEco, Nothing) ->
+                  pure (Left "could not obtain engines.node for BDEPEND alignment")
+                (Bun, Just ver) -> pure (ensureBunBdependFor key ver withKw)
+                (Bun, Nothing) ->
+                  pure (Left "could not obtain engines.bun for BDEPEND alignment")
+                (Cargo {}, Just msrv) ->
+                  pure (fmap (applyCodexV8 key mCodexV8) (ensureRustMinVer msrv withKw))
+                (Cargo {}, Nothing) ->
+                  pure
+                    ( Left
+                        "could not determine RUST_MIN_VER (no package.rust-version, \
+                        \dependency rust-version, or donor RUST_MIN_VER)"
+                    )
+                (Sbcl, Just ver) -> pure (ensureSbclAtom ver withKw)
+                (Sbcl, Nothing) ->
+                  pure (Left "could not obtain sbcl.version floor for SBCL atom alignment")
+              case contentFixed of
+                Left err -> pure $ ApplyHardFail key err False orphan
+                Right fixed -> do
+                  closed <-
+                    ensureAtomClosedForWrite
+                      (aeAtomClosure env)
+                      (aeMulti env)
+                      overlayRoot
+                      key
+                      fixed
+                  case closed of
+                    Left err ->
+                      pure $ applyUnitHardFail key (ApplyAtomClosure err) False orphan
                     Right () -> do
-                      manText <- TIO.readFile (pkgDir </> "Manifest")
-                      case verifyManifestDigests manText distDigests of
+                      let newName = ebuildFileNameWithRev pn targetVer
+                          newPath = pkgDir </> newName
+                      TIO.writeFile newPath fixed
+                      removedTemplate <-
+                        if templatePath /= newPath && takeFileName templatePath /= newName
+                          then do
+                            let templateIsTarget =
+                                  case parseEbuildFileName (takeFileName templatePath) of
+                                    Just (_, verStr) ->
+                                      case comparePV (parseEbuildVersion (T.pack verStr)) targetVer of
+                                        Just EQ -> True
+                                        _ -> False
+                                    Nothing -> False
+                            if templateIsTarget
+                              then removeFile templatePath >> pure True
+                              else pure False
+                          else pure False
+                      manResult <- ebuildRun pkgDir newName
+                      case manResult of
                         Left err -> pure $ ApplyHardFail key err True orphan
                         Right () -> do
-                          newRel <- relativeOverlayPath overlayRoot newPath
-                          manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
-                          let unitPaths =
-                                nubOrd $
-                                  [newRel, manRel]
-                                    <> [ebuildRel | removedTemplate || templatePath /= newPath]
-                              msg = unitCommitMessage key (renderPV targetVer)
-                          committed <-
-                            egencacheAndSignedCommit
-                              env
-                              overlayRoot
-                              key
-                              unitPaths
-                              msg
-                          pure $ case committed of
-                            Right paths -> ApplySuccess key lines_ paths
-                            Left err -> ApplyHardFail key err True orphan
+                          manText <- TIO.readFile (pkgDir </> "Manifest")
+                          case verifyManifestDigests manText distDigests of
+                            Left err -> pure $ ApplyHardFail key err True orphan
+                            Right () -> do
+                              newRel <- relativeOverlayPath overlayRoot newPath
+                              manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
+                              let unitPaths =
+                                    nubOrd $
+                                      [newRel, manRel]
+                                        <> [ebuildRel | removedTemplate || templatePath /= newPath]
+                                  msg = unitCommitMessage key (renderPV targetVer)
+                              committed <-
+                                egencacheAndSignedCommit
+                                  env
+                                  overlayRoot
+                                  key
+                                  unitPaths
+                                  msg
+                              pure $ case committed of
+                                Right paths -> ApplySuccess key lines_ paths
+                                Left err -> ApplyHardFail key err True orphan
 
 findTemplate :: FilePath -> Text -> EbuildVersion -> FilePath -> IO FilePath
 findTemplate pkgDir pn targetVer fallback = do

@@ -29,7 +29,8 @@ import Update.Cargo.Msrv
     rustMinVerTooLow,
   )
 import Update.EbuildEdit
-  ( bunBdependAtomFor,
+  ( assetsOwnedTagCollision,
+    bunBdependAtomFor,
     ebuildNeedsCargoBodyFix,
     ebuildNeedsContentFix,
     ebuildNeedsContentFixAtom,
@@ -110,25 +111,32 @@ assessPlannedFacts ::
   EcosystemSpec ->
   Text ->
   [PlannedPvFacts] ->
-  ContentAssessment
+  Either Text ContentAssessment
 assessPlannedFacts key eco pn facts =
-  ContentAssessment
-    { caNeedsWorkPVs = [ppfPV f | f <- facts, outcome f /= Adequate],
-      caForceFullPVs = [ppfPV f | f <- facts, outcome f == NeedsFull]
-    }
-  where
-    outcome = assessPresentFacts key eco pn
+  case traverse (assessPresentFacts key eco pn) facts of
+    Left err -> Left err
+    Right outcomes ->
+      Right
+        ContentAssessment
+          { caNeedsWorkPVs =
+              [ppfPV f | (f, o) <- zip facts outcomes, o /= Adequate],
+            caForceFullPVs =
+              [ppfPV f | (f, o) <- zip facts outcomes, o == NeedsFull]
+          }
 
 assessPresentFacts ::
   PackageKey ->
   EcosystemSpec ->
   Text ->
   PlannedPvFacts ->
-  PresentPvOutcome
+  Either Text PresentPvOutcome
 assessPresentFacts key eco pn facts =
   case ppfPresentContent facts of
-    Nothing -> assessMissing eco facts
-    Just content -> assessPresent key eco pn facts content
+    Nothing -> Right (assessMissing eco facts)
+    Just content ->
+      case assetsOwnedTagCollision pn content of
+        Just err -> Left err
+        Nothing -> Right (assessPresent key eco pn facts content)
 
 assessMissing :: EcosystemSpec -> PlannedPvFacts -> PresentPvOutcome
 assessMissing eco facts =
@@ -148,7 +156,7 @@ assessPresent ::
   PresentPvOutcome
 assessPresent key eco pn facts content =
   let manBad = manifestNeedsWork key eco pn facts
-      bodyBad = ebuildBodyNeedsWork key eco facts content
+      bodyBad = ebuildBodyNeedsWork key eco pn facts content
    in case eco of
         Cargo {} ->
           case cargoFloorOutcome (ppfTagFloor facts) content of
@@ -170,20 +178,20 @@ cargoFloorOutcome mTag content =
         (Just tag, Just written) ->
           if rustMinVerTooLow written tag then NeedsRewrite else Adequate
 
-ebuildBodyNeedsWork :: PackageKey -> EcosystemSpec -> PlannedPvFacts -> Text -> Bool
-ebuildBodyNeedsWork key eco facts content =
+ebuildBodyNeedsWork :: PackageKey -> EcosystemSpec -> Text -> PlannedPvFacts -> Text -> Bool
+ebuildBodyNeedsWork key eco pn facts content =
   let kws = ppfKeywords facts
    in case eco of
         Go _ ->
-          ebuildNeedsContentFix kws content (ppfRuntimeReq facts)
+          ebuildNeedsContentFix pn kws content (ppfRuntimeReq facts)
         NpmEco ->
-          ebuildNeedsContentFixAtom kws content (nodejsBdependAtom <$> ppfRuntimeReq facts)
+          ebuildNeedsContentFixAtom pn kws content (nodejsBdependAtom <$> ppfRuntimeReq facts)
         Bun ->
-          ebuildNeedsContentFixAtom kws content (bunBdependAtomFor key <$> ppfRuntimeReq facts)
+          ebuildNeedsContentFixAtom pn kws content (bunBdependAtomFor key <$> ppfRuntimeReq facts)
         Sbcl ->
-          ebuildNeedsContentFixAtom kws content (sbclBdependAtom <$> ppfRuntimeReq facts)
+          ebuildNeedsContentFixAtom pn kws content (sbclBdependAtom <$> ppfRuntimeReq facts)
         Cargo {} ->
-          ebuildNeedsCargoBodyFix (cargoSource eco) kws content
+          ebuildNeedsCargoBodyFix (cargoSource eco) pn kws content
 
 manifestNeedsWork :: PackageKey -> EcosystemSpec -> Text -> PlannedPvFacts -> Bool
 manifestNeedsWork key eco pn facts =

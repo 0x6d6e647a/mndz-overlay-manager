@@ -602,8 +602,10 @@ assessOverlayContent eco key pn locals plan = do
                 [ (pePV pe, invPath f)
                 | (pe, Just f) <- zip (glpEbuilds plan) sameSels
                 ]
-              ca = assessPlannedFacts key eco pn facts
-          pure (Right (ca, samePaths, invPath <$> mFallback))
+          case assessPlannedFacts key eco pn facts of
+            Left err -> pure (Left err)
+            Right ca ->
+              pure (Right (ca, samePaths, invPath <$> mFallback))
   where
     templateFloor Nothing = pure Nothing
     templateFloor (Just f) = do

@@ -54,7 +54,7 @@ For each non-`DepsAndAssets` package whose local PV is strictly less than the fe
 
 ### Requirement: Go tree-lane outdated reporting
 
-For each package whose technique is `DepsAndAssets`, the `outdated` check SHALL use the runtime-lane planner for that ecosystem (runtime package ceilings, candidate set, per-lane target PVs) instead of comparing only newest local PV to a single latest remote. For each lane that has a target PV and is not satisfied by the canonical highest-revision non-live same-PV ebuild with adequate content for that tip, the program SHALL write a stdout line of the form `category/package FROM -> TO (...)` using the lane label from `runtime-lanes` (for example `(dev-lang/go amd64)`, `(net-libs/nodejs ~amd64)`, `(dev-lang/bun-bin ~arm64)`, or `(dev-lang/rust|rust-bin ~amd64)`). Adequacy SHALL include parameterized asset URI, planned KEYWORDS, the ecosystem runtime comparison, and an exact Manifest `DIST` record for every required primary and companion basename.
+For each package whose technique is `DepsAndAssets`, the `outdated` check SHALL use the runtime-lane planner for that ecosystem (runtime package ceilings, candidate set, per-lane target PVs) instead of comparing only newest local PV to a single latest remote. For each lane that has a target PV and is not satisfied by the canonical highest-revision non-live same-PV ebuild with adequate content for that tip, the program SHALL write a stdout line of the form `category/package FROM -> TO (...)` using the lane label from `runtime-lanes` (for example `(dev-lang/go amd64)`, `(net-libs/nodejs ~amd64)`, `(dev-lang/bun-bin ~arm64)`, or `(dev-lang/rust|rust-bin ~amd64)`). Adequacy SHALL include parameterized asset URI as defined by `deps-assets` (package-owned mndz-overlay-assets release tags only), planned KEYWORDS, the ecosystem runtime comparison, and an exact Manifest `DIST` record for every required primary and companion basename.
 
 Split and converge mapping SHALL follow: when one local version maps to multiple new targets, emit one line per target with the same `FROM`; when multiple locals converge to one target, emit one line per local `FROM` to that `TO`. Versions SHALL use PV pretty form without a leading `v`.
 
@@ -123,6 +123,12 @@ A gap line MAY include ` [assets reusable]` only when the PV is not forced full 
 
 - **WHEN** the only matching-looking Manifest record adds a suffix such as `.asc` to the required companion basename
 - **THEN** `outdated` treats the exact companion record as missing
+
+#### Scenario: Codex pin-keyed rusty-v8 URL is not a same-PV gap
+
+- **WHEN** `dev-util/codex` has a non-live ebuild at planned PV `0.153.4` with adequate KEYWORDS, `RUST_MIN_VER`, empty `CRATES`, parameterized `codex-${PV}` crates URL, Manifest DIST for the crates tarball, and a rusty-v8 assets URL under tag `rusty-v8-${RUSTY_V8_VER}`
+- **WHEN** both rust lanes select that PV
+- **THEN** `outdated` does not print `0.153.4 -> 0.153.4` content-only lines for those lanes
 
 ### Requirement: Non-Go outdated unchanged
 

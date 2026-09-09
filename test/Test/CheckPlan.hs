@@ -126,6 +126,7 @@ integrationTests =
       testCase "contentFix Bun content-only reusable" testContentFixBunReusable,
       testCase "contentFix Cargo content-only reusable" testContentFixCargoReusable,
       testCase "Cargo written floor above tag is adequate" testCargoWrittenAboveTagAdequate,
+      testCase "Codex pin-keyed rusty-v8 URL is adequate" testCodexRustyV8UrlAdequate,
       testCase "Cargo usage path-closure adequacy" testUsagePathClosureAdequacy,
       testCase "Cargo incomplete candidate is not a zero-floor gap" testIncompleteNotZeroFloorGap,
       testCase "checkPackageDeps Sbcl outdated floor" testCheckPackageDepsSbclOutdated,
@@ -1245,6 +1246,79 @@ testCargoWrittenAboveTagAdequate =
         src
         (Cargo Nothing (Just "cli") CargoGitTag)
     assertOkStatus "usage 1.85 vs tag 1.80" (reportStatus report)
+
+-- | Codex-shaped two-URL SRC_URI at the present PV is Ok, not 0.153.4 -> 0.153.4.
+testCodexRustyV8UrlAdequate :: IO ()
+testCodexRustyV8UrlAdequate =
+  withSystemTempDirectory "mndz-cf-codex-" $ \tmp -> do
+    let pkgDir = tmp </> "dev-util" </> "codex"
+        pn = "codex" :: T.Text
+        ver = "0.153.4" :: T.Text
+        ebuildPath = pkgDir </> "codex-0.153.4.ebuild"
+        body =
+          T.unlines
+            [ "EAPI=8",
+              "inherit cargo",
+              "RUST_MIN_VER=\"1.95.0\"",
+              "KEYWORDS=\"-* ~amd64\"",
+              "CRATES=\"\"",
+              "SRC_URI=\"https://github.com/openai/codex/archive/refs/tags/rust-v${PV}.tar.gz -> ${P}.tar.gz\"",
+              "SRC_URI+=\" ${CARGO_CRATE_URIS}\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/codex-${PV}/codex-${PV}-crates.tar.xz\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/rusty-v8-${RUSTY_V8_VER}/rusty-v8-${RUSTY_V8_VER}-with-submodules.tar.xz\""
+            ]
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile ebuildPath body
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST codex-0.153.4-crates.tar.xz 1 SHA512 deadbeef\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["0.153.4"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        ( \_o _r _p _pv mSub ->
+            pure $
+              case mSub of
+                Just "codex-rs/cli" ->
+                  CargoTomlBody "[package]\nrust-version = \"1.95.0\"\n"
+                _ -> CargoTomlMissing
+        )
+        Nothing
+    modifyMVar_
+      (dpoRustCeilingsCache ops)
+      ( \_ ->
+          pure
+            ( Just
+                ( dualArchCeilings
+                    "dev-lang/rust|rust-bin"
+                    (Just "1.95.0")
+                    (Just "1.95.0")
+                )
+            )
+      )
+    let e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "codex",
+              pePN = pn,
+              peLocal = parseEbuildVersion ver,
+              pePath = ebuildPath
+            }
+        locals = [Ebuild "dev-util" pn ver ebuildPath]
+        src = GitHub "openai" "codex" "rust-v"
+    cache <- disabledCache
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        unusedFetch
+        ops
+        cache
+        e
+        locals
+        src
+        (Cargo (Just "codex-rs") (Just "codex-rs/cli") CargoGitTag)
+    assertOkStatus "codex 0.153.4 two-url body" (reportStatus report)
 
 -- | usage-style path closure: benches/xtask 1.99 must not raise T above 1.91.
 testUsagePathClosureAdequacy :: IO ()
