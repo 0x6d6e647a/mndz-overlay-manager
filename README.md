@@ -68,7 +68,7 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then the decrypted `github-token` envelope in the config. Using an environment token logs a warning (and an extra warning when that value is not a fine-grained PAT `github_pat_`). Unattended `update` should set `GITHUB_TOKEN` or `GH_TOKEN` so the wrap password is not required. The program never logs the raw token, wrap password, or ciphertext.
 
-The persisted token **must** be a fine-grained PAT (`github_pat_`) limited to the assets GitHub repository with **Contents: write** (Metadata: read comes with that grant). Store it with `github-token` (see below); do not put a live PAT in the TOML.
+The persisted token **must** be a fine-grained PAT (`github_pat_`) limited to the assets GitHub repository with **Contents: write** (Metadata: read comes with that grant). GitHub always includes read-only access to public repositories on a fine-grained PAT, so `github-token` still accepts a PAT when you own other public repositories. **Only select repositories** is operator guidance; the setter does not fail the probe because other owned repositories exist. Store it with `github-token` (see below); do not put a live PAT in the TOML.
 
 Work commands **hard-fail** (error-level log, exit `1`) when the config file is not exactly mode `0600` (owner read/write only), or when its mode cannot be read. Run `chmod 600` on that file (XDG default or `--config` path) before the next work command. Help-only paths do not load the file and do not emit this error.
 
@@ -262,7 +262,7 @@ cabal run mndz-overlay-manager -- github-token
 cabal run mndz-overlay-manager -- github-token --force
 ```
 
-Create the PAT on GitHub: **Fine-grained**, resource owner matching the assets repo, **Only select repositories** (that one assets repo), **Contents: write**.
+Create the PAT on GitHub: **Fine-grained**, resource owner matching the assets repo, **Only select repositories** (that one assets repo), **Contents: write**. GitHub always grants read-only access to public repositories, so `github-token` does **not** fail the probe when you own other public repositories. **Only select repositories** plus Contents: write on the assets origin is operator guidance rather than an extra-repository API check.
 
 ### `eclean`
 

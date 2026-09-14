@@ -907,53 +907,53 @@ testGitHubTokenProbe = do
   assertEq "stripped" "github_pat_ok" tok
   let owner = "alice"
       repo = "overlay-assets"
-      okHttp req =
-        let p = path req
-         in case method req of
-              "GET"
-                | "/repos/alice/overlay-assets" `BSC.isSuffixOf` p ->
-                    pure (Right (fakeResponse 200 "{}"))
-              "GET"
-                | "/user/repos" `BSC.isInfixOf` p ->
-                    pure
-                      ( Right
-                          ( fakeResponse
-                              200
-                              "[{\"full_name\":\"alice/overlay-assets\"}]"
-                          )
-                      )
-              "POST"
-                | "/releases" `BSC.isSuffixOf` p ->
-                    pure (Right (fakeResponse 422 "{\"message\":\"Validation Failed\"}"))
-              _ -> pure (Right (fakeResponse 500 "unexpected"))
-  _ <- assertRight "probe ok" =<< probeFineGrainedPat okHttp owner repo "github_pat_ok"
-  let extraHttp req =
-        if method req == "GET" && "/user/repos" `BSC.isInfixOf` path req
-          then
+      originPath = "/repos/alice/overlay-assets" :: BSC.ByteString
+      extraPath = "/repos/alice/other" :: BSC.ByteString
+      getOrigin req =
+        method req == "GET" && originPath `BSC.isSuffixOf` path req
+      getOwned req =
+        method req == "GET" && "/user/repos" `BSC.isInfixOf` path req
+      postOrigin req =
+        method req == "POST"
+          && (originPath <> "/releases") `BSC.isSuffixOf` path req
+      postExtra req =
+        method req == "POST"
+          && (extraPath <> "/releases") `BSC.isSuffixOf` path req
+      -- Extra listing/write endpoints would 500 or 422; origin-only probe must
+      -- still succeed when GET origin is 200 and empty POST origin is 422.
+      originOnlyHttp extraReposCode extraReleaseCode originPost req
+        | getOrigin req = pure (Right (fakeResponse 200 "{}"))
+        | getOwned req =
+            pure (Right (fakeResponse extraReposCode "should not list extras"))
+        | postExtra req = pure (Right (fakeResponse extraReleaseCode "{}"))
+        | postOrigin req =
             pure
               ( Right
                   ( fakeResponse
-                      200
-                      "[{\"full_name\":\"alice/overlay-assets\"},{\"full_name\":\"alice/other\"}]"
+                      originPost
+                      "{\"message\":\"Validation Failed\"}"
                   )
               )
-          else okHttp req
-  extraErr <-
-    assertLeft "extra repos"
-      =<< probeFineGrainedPat extraHttp owner repo "github_pat_ok"
-  assertTrue "extra names" ("only the assets" `T.isInfixOf` extraErr)
-  let forbidden req =
-        if method req == "POST"
-          then pure (Right (fakeResponse 403 "no write"))
-          else okHttp req
+        | otherwise = pure (Right (fakeResponse 500 "unexpected"))
+  _ <-
+    assertRight "origin only ignores extra listing 500 and extra 422"
+      =<< probeFineGrainedPat
+        (originOnlyHttp 500 422 422)
+        owner
+        repo
+        "github_pat_ok"
   forb <-
-    assertLeft "403"
-      =<< probeFineGrainedPat forbidden owner repo "github_pat_ok"
+    assertLeft "origin 403"
+      =<< probeFineGrainedPat
+        (originOnlyHttp 500 422 403)
+        owner
+        repo
+        "github_pat_ok"
   assertTrue "contents write" ("403" `T.isInfixOf` forb)
   let missing req =
-        if method req == "GET" && "/repos/alice/overlay-assets" `BSC.isSuffixOf` path req
+        if getOrigin req
           then pure (Right (fakeResponse 404 "{}"))
-          else okHttp req
+          else originOnlyHttp 500 422 422 req
   miss <-
     assertLeft "404"
       =<< probeFineGrainedPat missing owner repo "github_pat_ok"

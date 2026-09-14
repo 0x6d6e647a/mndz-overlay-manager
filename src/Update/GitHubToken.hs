@@ -13,9 +13,6 @@ where
 import Config.Loader (spliceGitHubToken, writeConfigAtomic)
 import Config.TokenEnvelope (wrapToken)
 import Config.Types (OverlayConfig (..))
-import Data.Aeson (Value, eitherDecode, withArray, withObject, (.:))
-import Data.Aeson.Types (Parser, parseMaybe)
-import Data.Foldable (toList)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -27,7 +24,6 @@ import Network.HTTP.Client
     parseRequest,
     requestBody,
     requestHeaders,
-    responseBody,
     responseStatus,
   )
 import Network.HTTP.Client.TLS (tlsManagerSettings)
@@ -71,7 +67,7 @@ requireFineGrainedPat raw =
             "a fine-grained PAT (github_pat_) is required; classic tokens \
             \(ghp_ and others) are refused"
 
--- | Probe the assets repo: GET repo, singleton owned repos, empty POST /releases 422.
+-- | Probe the assets origin: GET repo, empty POST /releases 422.
 probeFineGrainedPat ::
   HttpLbs ->
   Text ->
@@ -83,24 +79,7 @@ probeFineGrainedPat http owner repo token = do
   got <- getAssetsRepo http headers owner repo
   case got of
     Left err -> pure (Left err)
-    Right () -> do
-      owned <- listOwnedRepos http headers
-      case owned of
-        Left err -> pure (Left err)
-        Right names ->
-          let want = owner <> "/" <> repo
-           in if names /= [want]
-                then
-                  pure $
-                    Left
-                      ( "fine-grained PAT must have access to only the assets \
-                        \repository "
-                          <> want
-                          <> " (owned repos: "
-                          <> T.intercalate ", " names
-                          <> ")"
-                      )
-                else postEmptyRelease http headers owner repo
+    Right () -> postEmptyRelease http headers owner repo
 
 probeHeaders :: Text -> RequestHeaders
 probeHeaders token =
@@ -134,42 +113,6 @@ getAssetsRepo http headers owner repo = do
                     <> " failed with HTTP "
                     <> T.pack (show code)
                 )
-
-listOwnedRepos :: HttpLbs -> RequestHeaders -> IO (Either Text [Text])
-listOwnedRepos http headers = go (1 :: Int) []
-  where
-    go page acc = do
-      let url =
-            "https://api.github.com/user/repos?affiliation=owner&per_page=100&page="
-              <> show page
-      req0 <- parseRequest url
-      let req = req0 {method = "GET", requestHeaders = headers}
-      eres <- http req
-      case eres of
-        Left err -> pure (Left err)
-        Right resp ->
-          let code = statusCode (responseStatus resp)
-           in if code < 200 || code >= 300
-                then
-                  pure $
-                    Left
-                      ( "GET /user/repos failed with HTTP "
-                          <> T.pack (show code)
-                      )
-                else case eitherDecode (responseBody resp) of
-                  Left err -> pure (Left (T.pack err))
-                  Right val ->
-                    case parseMaybe parseRepoFullNames val of
-                      Nothing -> pure (Left "could not parse /user/repos")
-                      Just names ->
-                        let acc' = acc <> names
-                         in if length names < 100
-                              then pure (Right acc')
-                              else go (page + 1) acc'
-
-parseRepoFullNames :: Value -> Parser [Text]
-parseRepoFullNames = withArray "repos" $ \arr ->
-  mapM (withObject "repo" (.: "full_name")) (toList arr)
 
 postEmptyRelease ::
   HttpLbs ->
