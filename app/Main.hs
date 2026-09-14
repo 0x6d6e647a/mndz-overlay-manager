@@ -22,12 +22,18 @@ import CLI.Progress
     withStepProgress,
   )
 import Colog (LogAction, Message, WithLog, logError, logInfo, logWarning, usingLoggerT)
-import Config.Loader (configErrorMessage, loadConfig)
+import Config.Loader
+  ( configErrorMessage,
+    defaultConfigPath,
+    loadConfig,
+    loadConfigAllowPlaintextToken,
+  )
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.IORef (newIORef)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
 import Logging.Bootstrap (LogHold, mkLogHold, mkLogger)
@@ -40,7 +46,13 @@ import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import Update.Apply (foldExitHardFail, productionEbuildRunner)
 import Update.Assets.Release (ReleaseOps (..), productionReleaseOps)
-import Update.Auth (resolveGitHubToken)
+import Update.Auth
+  ( decryptConfigEnvelope,
+    envTokenWarnings,
+    productionSecretPrompt,
+    resolveGitHubToken,
+    resolveTokenSource,
+  )
 import Update.Check
   ( PackageEntry (..),
     checkOverlayWithDepsPlan,
@@ -60,6 +72,11 @@ import Update.Distfiles
     resolveDistfilesPath,
   )
 import Update.Git (isGitWorkTree, productionGitOps)
+import Update.GitHub (gitRemoteOriginUrl)
+import Update.GitHubToken
+  ( productionGitHubTokenOps,
+    runGitHubTokenCommand,
+  )
 import Update.GpgAgent
   ( newGpgHandle,
     productionGpgAgentOps,
@@ -145,6 +162,7 @@ main = do
           Cmd.Update refresh pkgs -> runUpdate rt refresh pkgs
           Cmd.Gencache targets force -> runGencache rt targets force
           Cmd.Eclean -> runEclean rt
+          Cmd.GitHubToken force -> runGitHubToken rt force
 
 runList :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runList rt = do
@@ -171,6 +189,7 @@ runOutdated rt refresh pkgArgs = do
               ebuilds
           total = length selectedEntries
       token <- liftIO (resolveGitHubToken cfg)
+      mapM_ logWarning =<< liftIO (envWarningsFor cfg)
       fetch <- liftIO (productionFetcherWithToken token)
       depsOps <-
         liftIO (productionDepsPlanOps token (rtJobs rt) (Just overlayResolved))
@@ -235,6 +254,7 @@ runUpdate rt refresh pkgArgs = do
         Left err -> dieError (T.unpack err)
         Right () -> pure ()
       token <- liftIO (resolveGitHubToken cfg)
+      mapM_ logWarning =<< liftIO (envWarningsFor cfg)
       -- Open check cache before plan phase.
       (cache, cacheWarn) <-
         liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayPath
@@ -242,7 +262,7 @@ runUpdate rt refresh pkgArgs = do
       fetch <- liftIO (productionFetcherWithToken token)
       depsOps <-
         liftIO (productionDepsPlanOps token (rtJobs rt) (Just overlayPath))
-      releaseOps <-
+      dummyReleaseOps <-
         liftIO $
           case token of
             Just t -> productionReleaseOps t
@@ -258,6 +278,10 @@ runUpdate rt refresh pkgArgs = do
             productionGpgAgentOps
               (pauseActivePanel pcfg)
               (resumeActivePanel pcfg)
+          secretPrompt =
+            productionSecretPrompt
+              (pauseActivePanel pcfg)
+              (resumeActivePanel pcfg)
       spineResult <-
         liftIO $
           bracket
@@ -268,6 +292,7 @@ runUpdate rt refresh pkgArgs = do
                 uname <- hostMachineArch
                 mOvr <- lookupEnv materializeImageEnvVar
                 prev <- newMVar Nothing
+                decryptCache <- newIORef Nothing
                 let ovr = case mOvr of
                       Just s | not (null s) -> Just s
                       _ -> Nothing
@@ -283,19 +308,30 @@ runUpdate rt refresh pkgArgs = do
                           ecPrevImageId = prev,
                           ecGentooRoot = gentooRepoPath productionPortageqRunner
                         }
+                    unlockEnvelope =
+                      case githubToken cfg of
+                        Nothing ->
+                          pure $
+                            Left
+                              "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
+                        Just envelope ->
+                          decryptConfigEnvelope secretPrompt decryptCache envelope
                     deps =
                       UpdateSpineDeps
                         { usdJobs = rtJobs rt,
                           usdProgress = pcfg,
                           usdFetcher = fetch,
                           usdDepsPlanOps = depsOps,
-                          usdReleaseOps = releaseOps,
+                          usdReleaseOps = dummyReleaseOps,
                           usdDiskProbe = productionDiskSpaceProbe,
                           usdGitOps = productionGitOps gpg,
                           usdCheckCache = cache,
                           usdAssetsOwner = "0x6d6e647a",
                           usdAssetsRepo = "mndz-overlay-assets",
                           usdGitHubToken = token,
+                          usdUnlockConfigToken = unlockEnvelope,
+                          usdMkReleaseOps = productionReleaseOps,
+                          usdGitOriginUrl = gitRemoteOriginUrl,
                           usdAssetsPathCfg = assetsPath cfg,
                           usdDistDir = distDir,
                           usdOverlayRoot = overlayPath,
@@ -372,6 +408,32 @@ emitOutcome = \case
           <> ": assets release may already be published but the overlay update did not complete"
 
 -- | Clean the manager private distfiles cache (never system Portage DISTDIR).
+runGitHubToken :: (WithLog env Message m, MonadIO m) => Runtime -> Bool -> m ()
+runGitHubToken rt force = do
+  let override = optConfig (rtOptions rt)
+  result <- liftIO (loadConfigAllowPlaintextToken override)
+  cfg <- case result of
+    Left err -> dieError (configErrorMessage err)
+    Right c -> pure c
+  configPath <- liftIO (maybe defaultConfigPath pure override)
+  let pcfg = rtProgress rt
+  ops <-
+    liftIO $
+      productionGitHubTokenOps
+        (pauseActivePanel pcfg)
+        (resumeActivePanel pcfg)
+  written <- liftIO (runGitHubTokenCommand ops configPath cfg force)
+  case written of
+    Left err -> dieError (T.unpack err)
+    Right writtenPath ->
+      logInfo ("wrote encrypted github-token to " <> T.pack writtenPath)
+
+envWarningsFor :: OverlayConfig -> IO [T.Text]
+envWarningsFor cfg = do
+  ght <- lookupEnv "GITHUB_TOKEN"
+  gh <- lookupEnv "GH_TOKEN"
+  pure (envTokenWarnings (resolveTokenSource ght gh (githubToken cfg)))
+
 runEclean :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runEclean rt = do
   cfg <- loadConfigOrDie (optConfig (rtOptions rt))

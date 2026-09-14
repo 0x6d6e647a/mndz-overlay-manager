@@ -47,6 +47,9 @@ data Command
         gencacheForce :: Bool
       }
   | Eclean
+  | GitHubToken
+      { githubTokenForce :: Bool
+      }
   deriving (Eq, Show)
 
 data Options = Options
@@ -299,6 +302,34 @@ ecleanInfo =
           )
     )
 
+githubTokenParser :: Parser Command
+githubTokenParser =
+  GitHubToken
+    <$> switch
+      ( long "force"
+          <> help
+            "Replace an existing github-token key after a successful probe \
+            \(migrate plaintext or rotate the wrapped PAT)"
+      )
+
+githubTokenInfo :: ParserInfo Command
+githubTokenInfo =
+  info
+    githubTokenParser
+    ( fullDesc
+        <> progDesc "Store an encrypted GitHub token in the overlay-manager configuration"
+        <> footer
+          ( "Prompt on a controlling TTY (no echo) for a fine-grained GitHub PAT \
+            \(github_pat_ only) scoped to the assets repository with Contents: write, \
+            \probe GitHub, then prompt twice for a wrapping password. Writes a mndz1. \
+            \ciphertext envelope into github-token (mode 0600) without putting secrets \
+            \on the command line. Requires assets-path whose origin is github.com \
+            \owner/repo. Refuses an existing github-token key unless --force is given. \
+            \Does not validate the overlay. "
+              <> globalsFooter
+          )
+    )
+
 commandParser :: Parser (Maybe Command)
 commandParser =
   optional $
@@ -308,6 +339,7 @@ commandParser =
           <> command "update" updateInfo
           <> command "gencache" gencacheInfo
           <> command "eclean" ecleanInfo
+          <> command "github-token" githubTokenInfo
           <> metavar "COMMAND"
       )
 

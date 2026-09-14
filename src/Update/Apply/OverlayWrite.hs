@@ -27,18 +27,19 @@ import Update.Assets.Hash (FileDigests (..))
 import Update.AtomClosure (ensureAtomClosedForWrite)
 import Update.Check (PackageEntry (..))
 import Update.EbuildEdit
-  ( assetsOwnedTagCollision,
+  ( AssetsHost (..),
+    assetsOwnedTagCollisionFor,
     ebuildFileNameWithRev,
     ebuildHasDevLangGoBdepend,
     ensureBunBdependFor,
-    ensureCargoAssetsSrcUriFor,
-    ensureCodexV8Overlay,
+    ensureCargoAssetsSrcUriForHost,
+    ensureCodexV8OverlayFor,
     ensureEmptyCrates,
     ensureGoBdepend,
     ensureNodejsBdepend,
     ensureRustMinVer,
     ensureSbclAtom,
-    parameterizeAssetsSrcUri,
+    parameterizeAssetsSrcUriFor,
     setKeywords,
   )
 import Update.EbuildSelection
@@ -64,10 +65,10 @@ data CodexV8Overlay = CodexV8Overlay
   }
   deriving (Eq, Show)
 
-applyCodexV8 :: PackageKey -> Maybe CodexV8Overlay -> Text -> Text
-applyCodexV8 (PackageKey "dev-util/codex") (Just ov) content =
-  ensureCodexV8Overlay (cvoVer ov) (cvoClangDist ov) (cvoRustTcDist ov) content
-applyCodexV8 _ _ content = content
+applyCodexV8 :: AssetsHost -> PackageKey -> Maybe CodexV8Overlay -> Text -> Text
+applyCodexV8 host (PackageKey "dev-util/codex") (Just ov) content =
+  ensureCodexV8OverlayFor host (cvoVer ov) (cvoClangDist ov) (cvoRustTcDist ov) content
+applyCodexV8 _ _ _ content = content
 
 overlayAfterAssets ::
   ApplyEnv ->
@@ -123,16 +124,22 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
               prepared = case eco of
                 Cargo {} -> ensureEmptyCrates content
                 _ -> content
-          case assetsOwnedTagCollision pn prepared of
+          let assetsHost =
+                AssetsHost
+                  { ahOwner = aeAssetsOwner env,
+                    ahRepo = aeAssetsRepo env
+                  }
+          case assetsOwnedTagCollisionFor assetsHost pn prepared of
             Just err -> pure $ ApplyHardFail key err False orphan
             Nothing -> do
               let withAssets = case eco of
                     Cargo {} ->
-                      ensureCargoAssetsSrcUriFor
+                      ensureCargoAssetsSrcUriForHost
+                        assetsHost
                         (cargoSource eco)
                         pn
                         prepared
-                    _ -> parameterizeAssetsSrcUri pn prepared
+                    _ -> parameterizeAssetsSrcUriFor assetsHost pn prepared
                   withKw = setKeywords keywords withAssets
               contentFixed <- case (eco, mReqVer) of
                 (Go _, Just goVer) -> pure (ensureGoBdepend goVer withKw)
@@ -149,7 +156,7 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
                 (Bun, Nothing) ->
                   pure (Left "could not obtain engines.bun for BDEPEND alignment")
                 (Cargo {}, Just msrv) ->
-                  pure (fmap (applyCodexV8 key mCodexV8) (ensureRustMinVer msrv withKw))
+                  pure (fmap (applyCodexV8 assetsHost key mCodexV8) (ensureRustMinVer msrv withKw))
                 (Cargo {}, Nothing) ->
                   pure
                     ( Left

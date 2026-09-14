@@ -124,16 +124,21 @@ import Update.Cargo.Msrv
 import Update.Check (PackageEntry (..), groupNewest)
 import Update.Deps.Plan (DepsPlanOps (..), productionDepsPlanOps)
 import Update.EbuildEdit
-  ( CargoSourceForm (..),
+  ( AssetsHost (..),
+    CargoSourceForm (..),
     assetsOwnedTagCollision,
     assetsSrcUriParameterized,
+    assetsSrcUriParameterizedFor,
     bunCompilePinBdependAtom,
     bunFloorBdependAtom,
+    cargoCratesSrcUriLine,
+    cargoCratesSrcUriLineFor,
     cargoProvenanceMismatch,
     ebuildHasDevLangGoBdepend,
     ebuildNeedsCargoBodyFix,
     ebuildNeedsCargoContentFix,
     ebuildNeedsContentFix,
+    ebuildNeedsContentFixAtom,
     ensureBunBdepend,
     ensureBunBdependFor,
     ensureCargoAssetsSrcUri,
@@ -152,6 +157,7 @@ import Update.EbuildEdit
     nextRevisionVersion,
     nodejsBdependMatches,
     parameterizeAssetsSrcUri,
+    parameterizeAssetsSrcUriFor,
     parseEbuildSlot,
     parseManifestVendorSHA512,
     pnCollidesWithPinIdentity,
@@ -308,7 +314,8 @@ tests =
       testCase "Cargo CratesIo SrcUri" testCargoCratesIoSrcUri,
       testCase "Cargo Provenance Coherence" testCargoProvenanceCoherence,
       testCase "Go Keywords Assembly" testGoKeywordsAssembly,
-      testCase "Set Keywords" testSetKeywords
+      testCase "Set Keywords" testSetKeywords,
+      testCase "Origin-derived assets SRC_URI" testOriginAssetsSrcUri
     ]
 
 testEbuildEdit :: IO ()
@@ -1224,3 +1231,51 @@ testCargoProvenanceCoherence = do
         "biodiff-1.2.0"
         "SRC_URI=\"https://example.com/something.tar.gz\"\n"
     )
+
+testOriginAssetsSrcUri :: IO ()
+testOriginAssetsSrcUri = do
+  let host =
+        AssetsHost
+          { ahOwner = "alice",
+            ahRepo = "overlay-assets"
+          }
+      frozenGo =
+        "SRC_URI+=\" https://github.com/alice/overlay-assets/releases/download/dolt-2.1.6/dolt-2.1.6-vendor.tar.xz\"\n"
+      jemalloc =
+        "SRC_URI+=\" jemalloc? ( https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2 )\""
+      body = frozenGo <> jemalloc
+      fixed = parameterizeAssetsSrcUriFor host "dolt" body
+  assertEq
+    "frozen not parameterized for origin repo"
+    False
+    (assetsSrcUriParameterizedFor host "dolt" frozenGo)
+  assertTrue
+    "origin vendor URL"
+    ("github.com/alice/overlay-assets/releases/download/dolt-${PV}/dolt-${PV}-vendor.tar.xz" `T.isInfixOf` fixed)
+  assertTrue "jemalloc untouched" (jemalloc `T.isInfixOf` fixed)
+  let crates = cargoCratesSrcUriLineFor host "hk"
+  assertTrue
+    "crates origin"
+    ("github.com/alice/overlay-assets/releases/download/hk-${PV}/hk-${PV}-crates.tar.xz" `T.isInfixOf` crates)
+  let rusty =
+        "SRC_URI+=\" https://github.com/alice/overlay-assets/releases/download/rusty-v8-${RUSTY_V8_VER}/rusty-v8-${RUSTY_V8_VER}-with-submodules.tar.xz\"\n"
+      cratesOk =
+        "SRC_URI+=\" https://github.com/alice/overlay-assets/releases/download/hk-${PV}/hk-${PV}-crates.tar.xz\"\n"
+      frozenPn =
+        "SRC_URI+=\" https://github.com/alice/overlay-assets/releases/download/hk-1.2.3/hk-1.2.3-crates.tar.xz\"\n"
+  assertTrue
+    "pin-keyed rusty-v8 is parameterized"
+    (assetsSrcUriParameterizedFor host "hk" (cratesOk <> rusty))
+  assertEq
+    "frozen package-owned still needs work"
+    False
+    (assetsSrcUriParameterizedFor host "hk" frozenPn)
+  assertTrue
+    "default crates line still uses mndz-overlay-assets"
+    ("mndz-overlay-assets" `T.isInfixOf` cargoCratesSrcUriLine "hk")
+  let defaultFrozen =
+        "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/dolt-2.1.6/dolt-2.1.6-vendor.tar.xz\"\n"
+  assertEq
+    "default atom check sees frozen package-owned URL"
+    True
+    (ebuildNeedsContentFixAtom "dolt" ["~amd64"] defaultFrozen Nothing)

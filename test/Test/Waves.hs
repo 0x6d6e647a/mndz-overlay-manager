@@ -378,6 +378,14 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
         usdAssetsOwner = "0x6d6e647a",
         usdAssetsRepo = "mndz-overlay-assets",
         usdGitHubToken = Just "tok",
+        usdUnlockConfigToken =
+          pure
+            ( Left
+                "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
+            ),
+        usdMkReleaseOps = \_ -> pure releaseOps,
+        usdGitOriginUrl =
+          \_ -> pure (Right "git@github.com:0x6d6e647a/mndz-overlay-assets.git"),
         usdAssetsPathCfg = Just assets,
         usdDistDir = dist,
         usdOverlayRoot = overlay,

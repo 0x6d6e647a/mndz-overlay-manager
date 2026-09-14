@@ -1,10 +1,4 @@
-# github-auth Specification
-
-## Purpose
-
-Resolve GitHub API tokens from environment and config for version fetch and release write.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: Plaintext github-token on disk hard-fails
 
@@ -27,6 +21,8 @@ When a command loads the overlay-manager TOML and the optional `github-token` ke
 - **WHEN** `github-token` starts with `mndz1.` and the operator runs `list`
 - **THEN** config load succeeds
 - **AND** the program does not prompt for a wrap password
+
+## MODIFIED Requirements
 
 ### Requirement: GitHub token resolution order
 
@@ -71,15 +67,6 @@ When (3) is the winner, the program SHALL prompt for the wrap password on a cont
 
 - **WHEN** assets publish requires the config envelope token and no controlling TTY is available
 - **THEN** the program logs an error and exits with status `1` without logging a secret
-
-### Requirement: Shared token for fetch and release
-
-GitHub version fetch and GitHub Releases create/upload SHALL use the same resolved token when a token is available. Version fetch MAY proceed without a token (unauthenticated API) subject to existing rate-limit behavior; release create and asset upload SHALL require a resolved token.
-
-#### Scenario: Release requires token
-
-- **WHEN** the program attempts to create an assets repository release
-- **THEN** it uses the resolved token in the Authorization header and does not attempt unauthenticated release creation as success
 
 ### Requirement: Optional github-token config key
 

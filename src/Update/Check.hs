@@ -63,6 +63,7 @@ import Update.Deps.Plan
     planDepsPackageWithCeilingsFor,
     planDepsPackageWithProgressFor,
   )
+import Update.EbuildEdit (defaultAssetsHost)
 import Update.EbuildSelection
   ( InventoryFile (..),
     inventoryFromEbuild,
@@ -632,7 +633,8 @@ assessOverlayContent eco key pn locals plan = do
             ppfManifest = mMan,
             ppfTagFloor = mTag,
             ppfRuntimeReq = plannedRuntimeReq plan (pePV pe),
-            ppfTemplateFloor = mTemplate
+            ppfTemplateFloor = mTemplate,
+            ppfAssetsHost = defaultAssetsHost
           }
 
 statusFromCompare :: EbuildVersion -> EbuildVersion -> UpdateStatus

@@ -1,9 +1,15 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.EbuildEdit
-  ( assetsSrcUriParameterized,
+  ( AssetsHost (..),
+    defaultAssetsHost,
+    assetsDownloadMarker,
+    assetsSrcUriParameterized,
+    assetsSrcUriParameterizedFor,
     assetsOwnedTagCollision,
+    assetsOwnedTagCollisionFor,
     parameterizeAssetsSrcUri,
+    parameterizeAssetsSrcUriFor,
     pnCollidesWithPinIdentity,
     rustyV8PinIdentity,
     nextRevisionVersion,
@@ -12,9 +18,12 @@ module Update.EbuildEdit
     parseManifestVendorSHA512,
     manifestHasVendorDist,
     ebuildNeedsContentFix,
+    ebuildNeedsContentFixFor,
     ebuildNeedsContentFixAtom,
+    ebuildNeedsContentFixAtomFor,
     ebuildNeedsCargoContentFix,
     ebuildNeedsCargoBodyFix,
+    ebuildNeedsCargoBodyFixFor,
     cargoProvenanceMismatch,
     CargoSourceForm (..),
     goBdependAtom,
@@ -37,13 +46,16 @@ module Update.EbuildEdit
     parseQuotedAssignment,
     ensureQuotedAssignment,
     ensureCodexV8Overlay,
+    ensureCodexV8OverlayFor,
     ensureCargoAssetsSrcUri,
     ensureCargoAssetsSrcUriFor,
+    ensureCargoAssetsSrcUriForHost,
     stripWindowsOnlyGitCrates,
     hasCleanCratesIoSourceLine,
     cargoCratesIoSrcUriLine,
     ensureEmptyCrates,
     cargoCratesSrcUriLine,
+    cargoCratesSrcUriLineFor,
     sbclBdependAtom,
     sbclBdependMatches,
     parseKeywordsLine,
@@ -70,8 +82,32 @@ import Update.Manifest.Dist (exactDistSHA512, manifestHasExactDist)
 import Update.TextUtil (stripSurroundingQuotes)
 import Update.Types (CargoSource (..), PackageKey)
 
-assetsMarker :: Text
-assetsMarker = "mndz-overlay-assets/releases/download/"
+-- | GitHub owner/repo for assets-repository SRC_URI (from @assets-path@ origin).
+data AssetsHost = AssetsHost
+  { ahOwner :: Text,
+    ahRepo :: Text
+  }
+  deriving (Eq, Show)
+
+-- | Historical mndz overlay assets host; tests and wrappers default here.
+defaultAssetsHost :: AssetsHost
+defaultAssetsHost =
+  AssetsHost
+    { ahOwner = "0x6d6e647a",
+      ahRepo = "mndz-overlay-assets"
+    }
+
+-- | @{repo}/releases/download/@ marker that identifies assets-host URLs.
+assetsDownloadMarker :: AssetsHost -> Text
+assetsDownloadMarker host = ahRepo host <> "/releases/download/"
+
+assetsReleasePrefix :: AssetsHost -> Text
+assetsReleasePrefix host =
+  "https://github.com/"
+    <> ahOwner host
+    <> "/"
+    <> ahRepo host
+    <> "/releases/download/"
 
 -- | Reserved pin-keyed assets identity for the rusty_v8 snapshot.
 rustyV8PinIdentity :: Text
@@ -113,7 +149,10 @@ assetsTagOf seg = fst (T.breakOn "/" (assetsPathOf seg))
 -- | Hard-fail reason when a reserved pin-identity tag would be treated as
 -- package-owned (for example PN @rusty@ vs tag @rusty-v8-150.4.0@).
 assetsOwnedTagCollision :: Text -> Text -> Maybe Text
-assetsOwnedTagCollision pn content =
+assetsOwnedTagCollision = assetsOwnedTagCollisionFor defaultAssetsHost
+
+assetsOwnedTagCollisionFor :: AssetsHost -> Text -> Text -> Maybe Text
+assetsOwnedTagCollisionFor host pn content =
   case colliding of
     (tag : _) ->
       Just $
@@ -126,22 +165,26 @@ assetsOwnedTagCollision pn content =
           <> ")"
     [] -> Nothing
   where
+    marker = assetsDownloadMarker host
     colliding =
       [ tag
       | tag <- tags,
         ownedTagCollides pn tag
       ]
     tags =
-      case T.splitOn assetsMarker content of
+      case T.splitOn marker content of
         [] -> []
         [_] -> []
         _ : segs -> map assetsTagOf segs
 
--- | True when every *package-owned* mndz-overlay-assets release download URL
+-- | True when every *package-owned* assets-repo release download URL
 -- already uses @${PV}@. Non-owned tags (a different version axis) are ignored.
 assetsSrcUriParameterized :: Text -> Text -> Bool
-assetsSrcUriParameterized pn content =
-  case T.splitOn assetsMarker content of
+assetsSrcUriParameterized = assetsSrcUriParameterizedFor defaultAssetsHost
+
+assetsSrcUriParameterizedFor :: AssetsHost -> Text -> Text -> Bool
+assetsSrcUriParameterizedFor host pn content =
+  case T.splitOn (assetsDownloadMarker host) content of
     [] -> True
     [_] -> True
     _ : segs -> all (segmentParameterized pn) segs
@@ -158,14 +201,18 @@ assetsSrcUriParameterized pn content =
 -- marker when there is only one segment (intercalate on a singleton never
 -- inserts the separator), which produced broken URLs like
 -- @https:\/\/github.com\/0x6d6e647a\/dolt-${PV}\/…@ instead of
--- @…\/mndz-overlay-assets\/releases\/download\/dolt-${PV}\/…@.
+-- @…\/{repo}\/releases\/download\/dolt-${PV}\/…@.
 parameterizeAssetsSrcUri :: Text -> Text -> Text
-parameterizeAssetsSrcUri pn content =
-  case T.splitOn assetsMarker content of
+parameterizeAssetsSrcUri = parameterizeAssetsSrcUriFor defaultAssetsHost
+
+parameterizeAssetsSrcUriFor :: AssetsHost -> Text -> Text -> Text
+parameterizeAssetsSrcUriFor host pn content =
+  case T.splitOn marker content of
     [] -> content
     prefix : rest ->
-      T.intercalate assetsMarker (prefix : map (fixSeg pn) rest)
+      T.intercalate marker (prefix : map (fixSeg pn) rest)
   where
+    marker = assetsDownloadMarker host
     fixSeg pkgName seg =
       let (tagPart, rest0) = T.breakOn "/" seg
        in case T.uncons rest0 of
@@ -259,16 +306,23 @@ manifestHasVendorDist = manifestHasExactDist
 -- @>=dev-lang\/go-\<ver\>:@= (not mere presence of @dev-lang\/go@). When
 -- unknown (@Nothing@), only a missing @dev-lang\/go@ atom counts as needs-work.
 ebuildNeedsContentFix :: Text -> [Text] -> Text -> Maybe Text -> Bool
-ebuildNeedsContentFix pn keywords content mRequiredGo =
-  not (assetsSrcUriParameterized pn content)
+ebuildNeedsContentFix = ebuildNeedsContentFixFor defaultAssetsHost
+
+ebuildNeedsContentFixFor :: AssetsHost -> Text -> [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsContentFixFor host pn keywords content mRequiredGo =
+  not (assetsSrcUriParameterizedFor host pn content)
     || not (keywordsMatch keywords content)
     || bdependNeedsFix mRequiredGo content
 
 -- | Content fix when the full required BDEPEND atom string is known.
 -- @Nothing@ means no BDEPEND check (KEYWORDS / SRC_URI only).
 ebuildNeedsContentFixAtom :: Text -> [Text] -> Text -> Maybe Text -> Bool
-ebuildNeedsContentFixAtom pn keywords content mAtom =
-  not (assetsSrcUriParameterized pn content)
+ebuildNeedsContentFixAtom = ebuildNeedsContentFixAtomFor defaultAssetsHost
+
+ebuildNeedsContentFixAtomFor ::
+  AssetsHost -> Text -> [Text] -> Text -> Maybe Text -> Bool
+ebuildNeedsContentFixAtomFor host pn keywords content mAtom =
+  not (assetsSrcUriParameterizedFor host pn content)
     || not (keywordsMatch keywords content)
     || case mAtom of
       Just atom -> not (atom `T.isInfixOf` content)
@@ -278,17 +332,21 @@ ebuildNeedsContentFixAtom pn keywords content mAtom =
 -- CratesIo provenance additionally requires the canonical crates.io primary
 -- source line; GitTag requirements are unchanged.
 ebuildNeedsCargoBodyFix :: CargoSource -> Text -> [Text] -> Text -> Bool
-ebuildNeedsCargoBodyFix CargoCratesIo pn keywords content =
-  not (assetsSrcUriParameterized pn content)
+ebuildNeedsCargoBodyFix = ebuildNeedsCargoBodyFixFor defaultAssetsHost
+
+ebuildNeedsCargoBodyFixFor ::
+  AssetsHost -> CargoSource -> Text -> [Text] -> Text -> Bool
+ebuildNeedsCargoBodyFixFor host CargoCratesIo pn keywords content =
+  not (assetsSrcUriParameterizedFor host pn content)
     || not (keywordsMatch keywords content)
-    || not (hasCratesAssetsSrcUri content)
+    || not (hasCratesAssetsSrcUriFor host content)
     || not (hasCleanCratesIoSourceLine content)
     || hasListEraCargoDepsFor CargoCratesIo content
     || cratesFieldNonEmpty content
-ebuildNeedsCargoBodyFix CargoGitTag pn keywords content =
-  not (assetsSrcUriParameterized pn content)
+ebuildNeedsCargoBodyFixFor host CargoGitTag pn keywords content =
+  not (assetsSrcUriParameterizedFor host pn content)
     || not (keywordsMatch keywords content)
-    || not (hasCratesAssetsSrcUri content)
+    || not (hasCratesAssetsSrcUriFor host content)
     || hasListEraCargoDeps content
     || cratesFieldNonEmpty content
 
@@ -303,9 +361,9 @@ ebuildNeedsCargoContentFix cargoSrc pn keywords content mRequiredMsrv =
           Nothing -> True
       Nothing -> False
 
-hasCratesAssetsSrcUri :: Text -> Bool
-hasCratesAssetsSrcUri content =
-  assetsMarker `T.isInfixOf` content
+hasCratesAssetsSrcUriFor :: AssetsHost -> Text -> Bool
+hasCratesAssetsSrcUriFor host content =
+  assetsDownloadMarker host `T.isInfixOf` content
     && "-crates.tar.xz" `T.isInfixOf` content
 
 -- | List-era crate deps via @CARGO_CRATE_URIS@ or crates.io crate dist URLs.
@@ -360,8 +418,12 @@ cratesAssignmentInner content =
 
 -- | Assets crates SRC_URI line (parameterized).
 cargoCratesSrcUriLine :: Text -> Text
-cargoCratesSrcUriLine pn =
-  "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/"
+cargoCratesSrcUriLine = cargoCratesSrcUriLineFor defaultAssetsHost
+
+cargoCratesSrcUriLineFor :: AssetsHost -> Text -> Text
+cargoCratesSrcUriLineFor host pn =
+  "SRC_URI+=\" "
+    <> assetsReleasePrefix host
     <> pn
     <> "-${PV}/"
     <> pn
@@ -391,20 +453,25 @@ hasCleanCratesIoSourceLine content =
 -- | Ensure the provenance-appropriate SRC_URI form (GitTag: github archive;
 -- CratesIo: canonical crates.io download distfile) plus the assets crates line.
 ensureCargoAssetsSrcUriFor :: CargoSource -> Text -> Text -> Text
-ensureCargoAssetsSrcUriFor cargoSrc pn content = case cargoSrc of
-  CargoGitTag -> ensureCargoAssetsSrcUri pn content
+ensureCargoAssetsSrcUriFor =
+  ensureCargoAssetsSrcUriForHost defaultAssetsHost
+
+ensureCargoAssetsSrcUriForHost ::
+  AssetsHost -> CargoSource -> Text -> Text -> Text
+ensureCargoAssetsSrcUriForHost host cargoSrc pn content = case cargoSrc of
+  CargoGitTag -> ensureCargoAssetsSrcUriHost host pn content
   CargoCratesIo ->
     -- Already in clean single-line crates.io + crates form: only parameterize.
-    if hasCratesAssetsSrcUri content
+    if hasCratesAssetsSrcUriFor host content
       && hasCleanCratesIoSourceLine content
       && not (hasListEraCargoDepsFor CargoCratesIo content)
-      then parameterizeAssetsSrcUri pn content
+      then parameterizeAssetsSrcUriFor host pn content
       else
         let (pre, _oldBlock, post) = splitSrcUriAssignment (T.lines content)
             sourceLine = cargoCratesIoSrcUriLine pn
-            cratesLine = cargoCratesSrcUriLine pn
+            cratesLine = cargoCratesSrcUriLineFor host pn
             rebuilt = T.unlines (pre <> [sourceLine, cratesLine] <> post)
-         in parameterizeAssetsSrcUri pn rebuilt
+         in parameterizeAssetsSrcUriFor host pn rebuilt
 
 ------------------------------------------------------------------------
 -- Provenance coherence (policy provenance <-> ebuild source-line form)
@@ -477,36 +544,39 @@ cargoSourceName CargoCratesIo = "CargoCratesIo"
 -- so multi-line donor\/pycargoebuild blocks (with @${CARGO_CRATE_URIS}@) cannot
 -- swallow the @SRC_URI+=@ line inside the quoted string.
 ensureCargoAssetsSrcUri :: Text -> Text -> Text
-ensureCargoAssetsSrcUri pn content
+ensureCargoAssetsSrcUri = ensureCargoAssetsSrcUriHost defaultAssetsHost
+
+ensureCargoAssetsSrcUriHost :: AssetsHost -> Text -> Text -> Text
+ensureCargoAssetsSrcUriHost host pn content
   -- Already in clean single-line source + crates form: only parameterize.
   -- Extra companion SRC_URI+= lines (V8 snapshot, GCS clang, git-crate URIs)
   -- are part of the assignment block; skip rewrite when the primary+crates
   -- pair is already present and this is not list-era.
-  | hasCratesAssetsSrcUri content
-      && hasCleanGithubSourceLine content
+  | hasCratesAssetsSrcUriFor host content
+      && hasCleanGithubSourceLineFor host content
       && not (hasListEraCargoDeps content) =
-      parameterizeAssetsSrcUri pn content
+      parameterizeAssetsSrcUriFor host pn content
   | otherwise =
       let (pre, oldBlock, post) = splitSrcUriAssignment (T.lines content)
-          mSource = extractGithubSourceArchiveUri content
+          mSource = extractGithubSourceArchiveUriFor host content
           sourceLine = case mSource of
             Just uri -> "SRC_URI=\"" <> uri <> "\""
             Nothing -> "SRC_URI=\"\""
-          cratesLine = cargoCratesSrcUriLine pn
-          extras = extraCargoSrcUriLines pn (hasListEraCargoDeps content) oldBlock
+          cratesLine = cargoCratesSrcUriLineFor host pn
+          extras = extraCargoSrcUriLines host pn (hasListEraCargoDeps content) oldBlock
           rebuilt = T.unlines (pre <> [sourceLine, cratesLine] <> extras <> post)
-       in parameterizeAssetsSrcUri pn rebuilt
+       in parameterizeAssetsSrcUriFor host pn rebuilt
 
 -- | Companion @SRC_URI+=@ lines that are neither the GitHub/crates.io primary
 -- source nor the assets crates tarball. List-era drops @CARGO_CRATE_URIS@;
 -- empty-@CRATES@ git-crate form keeps it.
-extraCargoSrcUriLines :: Text -> Bool -> [Text] -> [Text]
-extraCargoSrcUriLines pn dropCrateUris block =
+extraCargoSrcUriLines :: AssetsHost -> Text -> Bool -> [Text] -> [Text]
+extraCargoSrcUriLines host pn dropCrateUris block =
   [ "SRC_URI+=\" " <> T.strip body <> "\""
   | ln <- block,
     Just body <- [srcUriLineBody ln],
     not (T.null (T.strip body)),
-    keepCompanion pn dropCrateUris (T.strip body)
+    keepCompanion host pn dropCrateUris (T.strip body)
   ]
 
 srcUriLineBody :: Text -> Maybe Text
@@ -521,14 +591,14 @@ srcUriLineBody ln =
       unquoted = T.dropWhileEnd (== '"') (T.strip stripped)
    in if T.null unquoted then Nothing else Just unquoted
 
-keepCompanion :: Text -> Bool -> Text -> Bool
-keepCompanion pn dropCrateUris body
+keepCompanion :: AssetsHost -> Text -> Bool -> Text -> Bool
+keepCompanion host pn dropCrateUris body
   | "->" `T.isPrefixOf` T.strip body = False
   | "/archive/" `T.isInfixOf` body && "github.com/" `T.isInfixOf` body = False
-  | "mndz-overlay-assets" `T.isInfixOf` body
+  | ahRepo host `T.isInfixOf` body
       && (pn <> "-${PV}-crates.tar.xz") `T.isInfixOf` body =
       False
-  | "mndz-overlay-assets" `T.isInfixOf` body
+  | ahRepo host `T.isInfixOf` body
       && "-crates.tar.xz" `T.isInfixOf` body =
       False
   | dropCrateUris && "CARGO_CRATE_URIS" `T.isInfixOf` body = False
@@ -536,7 +606,10 @@ keepCompanion pn dropCrateUris body
   | otherwise = True
 
 hasCleanGithubSourceLine :: Text -> Bool
-hasCleanGithubSourceLine content =
+hasCleanGithubSourceLine = hasCleanGithubSourceLineFor defaultAssetsHost
+
+hasCleanGithubSourceLineFor :: AssetsHost -> Text -> Bool
+hasCleanGithubSourceLineFor host content =
   any
     ( \ln ->
         let s = T.stripStart ln
@@ -544,6 +617,7 @@ hasCleanGithubSourceLine content =
                 || (not ("SRC_URI" `T.isPrefixOf` s) && "https://github.com/" `T.isPrefixOf` s)
             )
               && "/archive/" `T.isInfixOf` s
+              && not (ahRepo host `T.isInfixOf` s)
               && not ("SRC_URI=\"SRC_URI=" `T.isInfixOf` s)
     )
     (T.lines content)
@@ -594,8 +668,8 @@ splitSrcUriAssignment lns =
        in not (T.null t) && T.last t == '"'
 
 -- | Prefer the GitHub source archive URI (including @-> ${P}.tar.gz@ rename) from ebuild text.
-extractGithubSourceArchiveUri :: Text -> Maybe Text
-extractGithubSourceArchiveUri content =
+extractGithubSourceArchiveUriFor :: AssetsHost -> Text -> Maybe Text
+extractGithubSourceArchiveUriFor host content =
   go (T.lines content)
   where
     go [] = Nothing
@@ -612,7 +686,7 @@ extractGithubSourceArchiveUri content =
                       T.strip (u <> " " <> T.strip n)
                 _ -> u
     cleanLine ln
-      | "mndz-overlay-assets" `T.isInfixOf` ln = Nothing
+      | ahRepo host `T.isInfixOf` ln = Nothing
       | "crates.io" `T.isInfixOf` ln = Nothing
       | not ("github.com/" `T.isInfixOf` ln) = Nothing
       | not ("/archive/" `T.isInfixOf` ln) = Nothing
@@ -805,20 +879,24 @@ findLastPrefixIdx p lns =
 -- | Write @RUSTY_V8_VER@ and rusty-v8 SRC_URI tag from the lock pin.
 -- When clang/rust-toolchain names are @Just@, rewrite those assignments too.
 ensureCodexV8Overlay :: Text -> Maybe Text -> Maybe Text -> Text -> Text
-ensureCodexV8Overlay ver mClang mRust content =
+ensureCodexV8Overlay = ensureCodexV8OverlayFor defaultAssetsHost
+
+ensureCodexV8OverlayFor ::
+  AssetsHost -> Text -> Maybe Text -> Maybe Text -> Text -> Text
+ensureCodexV8OverlayFor host ver mClang mRust content =
   let withVer = ensureQuotedAssignment "RUSTY_V8_VER" ver content
-      withUri = rewriteRustyV8AssetsTag withVer
+      withUri = rewriteRustyV8AssetsTagFor host withVer
       withClang = maybe withUri (\c -> ensureQuotedAssignment "CLANG_DIST" c withUri) mClang
    in maybe withClang (\r -> ensureQuotedAssignment "RUST_TC_DIST" r withClang) mRust
 
 -- | Keep rusty-v8 download tags on @${RUSTY_V8_VER}@ (never @{pn}-${PV}@).
-rewriteRustyV8AssetsTag :: Text -> Text
-rewriteRustyV8AssetsTag content =
+rewriteRustyV8AssetsTagFor :: AssetsHost -> Text -> Text
+rewriteRustyV8AssetsTagFor host content =
   case T.splitOn rustyMarker content of
     [] -> content
     prefix : rest -> T.intercalate rustyMarker (prefix : map fixSeg rest)
   where
-    rustyMarker = "mndz-overlay-assets/releases/download/rusty-v8-"
+    rustyMarker = assetsDownloadMarker host <> "rusty-v8-"
     fixSeg seg =
       let newTag = "${RUSTY_V8_VER}"
        in case T.uncons (snd (T.breakOn "/" seg)) of

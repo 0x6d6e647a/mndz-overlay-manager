@@ -36,6 +36,7 @@ import Config.Loader
   ( ConfigError (..),
     configErrorMessage,
     loadConfig,
+    loadConfigAllowPlaintextToken,
   )
 import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, parseCheckCacheTtl)
 import Control.Concurrent (threadDelay)
@@ -49,7 +50,7 @@ import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isNothing)
+import Data.Maybe (isJust, isNothing)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -291,7 +292,8 @@ tests =
       testCase "Config Check Cache TTL Invalid" testConfigCheckCacheTtlInvalid,
       testCase "Config mode 0644 hard-fails" testConfigModeWrong,
       testCase "Config mode 0600 loads" testConfigModeOk,
-      testCase "Config unreadable mode hard-fails" testConfigModeUnreadable
+      testCase "Config unreadable mode hard-fails" testConfigModeUnreadable,
+      testCase "Plaintext github-token hard-fails load" testPlaintextGitHubTokenLoad
     ]
 
 -- | Git does not persist @0600@ on tracked fixtures; temp files follow umask.
@@ -314,7 +316,7 @@ testConfigOptionalKeys = do
   cfg <- assertRight "full config" =<< loadConfig (Just "test/fixtures/full-config.toml")
   assertEq "path" "/tmp/overlay" (overlayPath cfg)
   assertEq "assets" (Just "/tmp/assets") (assetsPath cfg)
-  assertEq "token" (Just "secret-token") (githubToken cfg)
+  assertEq "token" (Just "mndz1.test-envelope") (githubToken cfg)
   assertEq "distfiles" (Just "/tmp/distfiles") (distfilesPath cfg)
   assertEq "check-cache-ttl 1h" (CacheTtl (60 * 60)) (checkCacheTtl cfg)
 
@@ -374,6 +376,9 @@ testConfigErrorMessages = do
     "unreadable mode message"
     "config file /tmp/c.toml: cannot read permission bits; expected mode 0600"
     (configErrorMessage (ConfigModeError "/tmp/c.toml" Nothing))
+  assertTrue
+    "plaintext token message"
+    ("mndz1." `T.isInfixOf` T.pack (configErrorMessage (ConfigPlaintextGitHubToken "/tmp/c.toml")))
 
 -- | Hit 'defaultConfigPath' via 'loadConfig Nothing' under controlled XDG.
 testConfigDefaultPathViaXdg :: IO ()
@@ -514,3 +519,50 @@ testConfigModeUnreadable =
       other -> do
         hPutStrLn stderr $ "expected ConfigModeError for unreadable mode, got " <> show other
         exitFailure
+
+testPlaintextGitHubTokenLoad :: IO ()
+testPlaintextGitHubTokenLoad =
+  withSystemTempDirectory "om-cfg-pat" $ \tmp -> do
+    let path = tmp </> "c.toml"
+        writeTok val = do
+          TIO.writeFile path $
+            "overlay-path = \"/tmp/ov\"\ngithub-token = \"" <> val <> "\"\n"
+          chmodConfig600 path
+    writeTok "ghp_classic"
+    errGhp <- assertLeft "ghp hard-fails" =<< loadConfig (Just path)
+    case errGhp of
+      ConfigPlaintextGitHubToken p -> assertEq "path" path p
+      other -> do
+        hPutStrLn stderr $ "expected ConfigPlaintextGitHubToken for ghp_, got " <> show other
+        exitFailure
+    assertEq
+      "secret not in message"
+      False
+      ("ghp_classic" `T.isInfixOf` T.pack (configErrorMessage errGhp))
+    writeTok "github_pat_live"
+    errPat <- assertLeft "pat hard-fails" =<< loadConfig (Just path)
+    case errPat of
+      ConfigPlaintextGitHubToken _ -> pure ()
+      other -> do
+        hPutStrLn stderr $ "expected ConfigPlaintextGitHubToken for github_pat_, got " <> show other
+        exitFailure
+    writeTok "mndz1.not-a-real-payload-but-prefix-ok"
+    cfg <- assertRight "envelope loads" =<< loadConfig (Just path)
+    assertTrue
+      "keeps envelope"
+      (maybe False ("mndz1." `T.isPrefixOf`) (githubToken cfg))
+    writeTok "   "
+    cfgBlank <- assertRight "whitespace omitted" =<< loadConfig (Just path)
+    assertEq "blank token" Nothing (githubToken cfgBlank)
+    writeTok "ghp_classic"
+    withEnvVar "GITHUB_TOKEN" (Just "github_pat_env") $ do
+      envErr <- assertLeft "env does not excuse" =<< loadConfig (Just path)
+      case envErr of
+        ConfigPlaintextGitHubToken _ -> pure ()
+        other -> do
+          hPutStrLn stderr $ "expected plaintext fail with env set, got " <> show other
+          exitFailure
+    allowed <-
+      assertRight "allow plaintext for setter"
+        =<< loadConfigAllowPlaintextToken (Just path)
+    assertTrue "present" (isJust (githubToken allowed))

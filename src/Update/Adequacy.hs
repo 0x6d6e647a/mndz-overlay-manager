@@ -29,11 +29,12 @@ import Update.Cargo.Msrv
     rustMinVerTooLow,
   )
 import Update.EbuildEdit
-  ( assetsOwnedTagCollision,
+  ( AssetsHost (..),
+    assetsOwnedTagCollisionFor,
     bunBdependAtomFor,
-    ebuildNeedsCargoBodyFix,
-    ebuildNeedsContentFix,
-    ebuildNeedsContentFixAtom,
+    ebuildNeedsCargoBodyFixFor,
+    ebuildNeedsContentFixAtomFor,
+    ebuildNeedsContentFixFor,
     nodejsBdependAtom,
     sbclBdependAtom,
   )
@@ -71,7 +72,9 @@ data PlannedPvFacts = PlannedPvFacts
     -- | Lane runtime requirement from the plan (go/npm/bun/sbcl).
     ppfRuntimeReq :: Maybe Text,
     -- | RUST_MIN_VER of the canonical selected template (same-PV or fallback).
-    ppfTemplateFloor :: Maybe Text
+    ppfTemplateFloor :: Maybe Text,
+    -- | Assets GitHub host used for SRC_URI ownership (origin-derived).
+    ppfAssetsHost :: AssetsHost
   }
   deriving (Eq, Show)
 
@@ -134,7 +137,7 @@ assessPresentFacts key eco pn facts =
   case ppfPresentContent facts of
     Nothing -> Right (assessMissing eco facts)
     Just content ->
-      case assetsOwnedTagCollision pn content of
+      case assetsOwnedTagCollisionFor (ppfAssetsHost facts) pn content of
         Just err -> Left err
         Nothing -> Right (assessPresent key eco pn facts content)
 
@@ -181,17 +184,18 @@ cargoFloorOutcome mTag content =
 ebuildBodyNeedsWork :: PackageKey -> EcosystemSpec -> Text -> PlannedPvFacts -> Text -> Bool
 ebuildBodyNeedsWork key eco pn facts content =
   let kws = ppfKeywords facts
+      host = ppfAssetsHost facts
    in case eco of
         Go _ ->
-          ebuildNeedsContentFix pn kws content (ppfRuntimeReq facts)
+          ebuildNeedsContentFixFor host pn kws content (ppfRuntimeReq facts)
         NpmEco ->
-          ebuildNeedsContentFixAtom pn kws content (nodejsBdependAtom <$> ppfRuntimeReq facts)
+          ebuildNeedsContentFixAtomFor host pn kws content (nodejsBdependAtom <$> ppfRuntimeReq facts)
         Bun ->
-          ebuildNeedsContentFixAtom pn kws content (bunBdependAtomFor key <$> ppfRuntimeReq facts)
+          ebuildNeedsContentFixAtomFor host pn kws content (bunBdependAtomFor key <$> ppfRuntimeReq facts)
         Sbcl ->
-          ebuildNeedsContentFixAtom pn kws content (sbclBdependAtom <$> ppfRuntimeReq facts)
+          ebuildNeedsContentFixAtomFor host pn kws content (sbclBdependAtom <$> ppfRuntimeReq facts)
         Cargo {} ->
-          ebuildNeedsCargoBodyFix (cargoSource eco) pn kws content
+          ebuildNeedsCargoBodyFixFor host (cargoSource eco) pn kws content
 
 manifestNeedsWork :: PackageKey -> EcosystemSpec -> Text -> PlannedPvFacts -> Bool
 manifestNeedsWork key eco pn facts =

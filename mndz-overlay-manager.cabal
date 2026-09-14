@@ -74,6 +74,7 @@ library
       , CLI.Parser
       , CLI.Progress
       , Config.Loader
+      , Config.TokenEnvelope
       , Config.Types
       , Logging.Bootstrap
       , Overlay.Discovery
@@ -99,6 +100,7 @@ library
       , Update.Engines
       , Update.Git
       , Update.GitHub
+      , Update.GitHubToken
       , Update.Go.Lanes
       , Update.Go.ModFetch
       , Update.Go.Plan

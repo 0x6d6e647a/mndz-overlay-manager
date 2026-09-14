@@ -62,13 +62,15 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 |-----|----------|---------|
 | `overlay-path` | yes | Root of the Gentoo overlay (must be a git work tree for `update` and `gencache`) |
 | `assets-path` | no | Git work tree for vendor/deps asset sidecars (required when `update` will publish assets) |
-| `github-token` | no | GitHub API token for authenticated fetch / release publish |
+| `github-token` | no | Encrypted (`mndz1.`) GitHub token envelope for authenticated fetch / release publish. A plaintext value hard-fails every command that loads config until you run `github-token --force`. |
 | `distfiles-path` | no | Private Portage `DISTDIR` for `ebuild … manifest` during `update` (default: XDG cache path below) |
 | `check-cache-ttl` | no | How long successful outdated-check / plan results are reused (human duration, default **5m**). Single unit: `s` / `m` / `h` / `d` (for example `30s`, `5m`, `1h`). **`0` or `0s` disables** the check cache (never read, never write) |
 
-**Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then `github-token` in the config. Prefer env vars in shared environments; the program never logs the raw token.
+**Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then the decrypted `github-token` envelope in the config. Using an environment token logs a warning (and an extra warning when that value is not a fine-grained PAT `github_pat_`). Unattended `update` should set `GITHUB_TOKEN` or `GH_TOKEN` so the wrap password is not required. The program never logs the raw token, wrap password, or ciphertext.
 
-Work commands **hard-fail** (error-level log, exit `1`) when the config file is not exactly mode `0600` (owner read/write only), or when its mode cannot be read. Run `chmod 600` on that file (XDG default or `--config` path) before the next work command. Token resolution is unchanged. Help-only paths do not load the file and do not emit this error.
+The persisted token **must** be a fine-grained PAT (`github_pat_`) limited to the assets GitHub repository with **Contents: write** (Metadata: read comes with that grant). Store it with `github-token` (see below); do not put a live PAT in the TOML.
+
+Work commands **hard-fail** (error-level log, exit `1`) when the config file is not exactly mode `0600` (owner read/write only), or when its mode cannot be read. Run `chmod 600` on that file (XDG default or `--config` path) before the next work command. Help-only paths do not load the file and do not emit this error.
 
 ### Manager distfiles (private DISTDIR)
 
@@ -86,7 +88,7 @@ Override with config key `distfiles-path` or global `--distfiles-path DIR` (CLI 
 ```toml
 overlay-path = "/path/to/mndz-overlay"
 assets-path = "/path/to/mndz-overlay-assets"
-# github-token = "ghp_..."   # optional; prefer GITHUB_TOKEN / GH_TOKEN
+# github-token = "mndz1...."  # set with: mndz-overlay-manager github-token
 # distfiles-path = "/path/to/private-distfiles"  # optional; default is XDG cache
 # check-cache-ttl = "5m"  # optional; default 5m; use "0s" to disable
 ```
@@ -173,7 +175,9 @@ cabal run mndz-overlay-manager -- --no-progress update category/package
 cabal run mndz-overlay-manager -- update --refresh
 ```
 
-`update` runs a **plan phase** first (using the check cache when enabled, same needs-work rules as `outdated` / apply), then an overlay **dirty preflight** on selected package directories and on overlay atoms the materialize image will emerge (`dev-lang/bun-bin` when the image installs overlay bun-bin, `dev-lisp/qlot` when the image installs overlay qlot, `dev-build/node-gyp` when the image installs overlay node-gyp): dirty, staged, untracked, or deleted paths there hard-fail with exit `1` before mutate or `docker build`. Restore or finish that tree relative to git HEAD (unrelated overlay-root files such as `README.md` do not fail this check). Then conditional assets/token checks for packages that need work, reuse vs full classification, `docker` + materialize-image checks when any unit is full path, the free-space gate, then concurrent mutate/apply. Spine tools (`git`, `ebuild`, `egencache`, `gpg`) and layout / manager-distfiles probes run before plan. When at least one package that needs work will attempt `DepsAndAssets`, it also checks that `assets-path` is a git work tree and a GitHub token can be resolved. Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
+`update` runs a **plan phase** first (using the check cache when enabled, same needs-work rules as `outdated` / apply), then an overlay **dirty preflight** on selected package directories and on overlay atoms the materialize image will emerge (`dev-lang/bun-bin` when the image installs overlay bun-bin, `dev-lisp/qlot` when the image installs overlay qlot, `dev-build/node-gyp` when the image installs overlay node-gyp): dirty, staged, untracked, or deleted paths there hard-fail with exit `1` before mutate or `docker build`. Restore or finish that tree relative to git HEAD (unrelated overlay-root files such as `README.md` do not fail this check). Then conditional assets/token checks for packages that need work, reuse vs full classification, `docker` + materialize-image checks when any unit is full path, the free-space gate, then concurrent mutate/apply. Spine tools (`git`, `ebuild`, `egencache`, `gpg`) and layout / manager-distfiles probes run before plan. When at least one package that needs work will attempt `DepsAndAssets`, it also checks that `assets-path` is a git work tree, that `origin` parses as `github.com/{owner}/{repo}` (SSH or HTTPS), and that a GitHub token can be resolved. GitHub Releases and assets `SRC_URI` use that origin `{owner}/{repo}` (not a hardcoded GitHub owner or repository name). Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
+
+If the winning token is the encrypted config envelope, `update` prompts once on a controlling TTY for the wrap password before assets GitHub work and keeps the decrypted token for that run. GitMv-only updates do not decrypt.
 
 Untargeted `update` plans Bun consumers against the selected bun-bin **remote** when bun-bin needs work (hypothetical overlay ceilings), and applies those consumers after bun-bin’s signed overlay commit **without** rediscovering ceilings from disk in the same run. Independent packages (mise, beads, grok-build-bin, …) may overlap bun-bin under `--jobs`; a withheld consumer does not occupy a job slot while waiting. When ensure ran, bun-bin’s GPG prompt is after the image-build attempt; GitMv-only bun-bin still commits immediately after `egencache`. `update ralph-tui` while bun-bin is unselected **does not** pull bun-bin into the selection: if a newer bun-bin would change ralph’s plan (or bun-bin’s latest cannot be fetched), ralph hard-fails naming `dev-lang/bun-bin` with recovery `update bun-bin` or untargeted `update`.
 
@@ -243,6 +247,22 @@ cabal run mndz-overlay-manager -- gencache --force crush
 2. Run `gencache` once for the full tree to populate `metadata/md5-cache/` and create a signed commit.
 3. Day-to-day version bumps use `update`, which regenerates package cache and co-commits it with ebuild/Manifest changes.
 4. When `update` reports missing cache, run `gencache category/package`. When it reports `_md5_` mismatch (or after major Gentoo eclass changes), run `gencache --force category/package` (or full-tree `--force`).
+
+### `github-token`
+
+Interactively store an encrypted GitHub token in the overlay-manager TOML. Prompts on a controlling TTY (no echo) for a **fine-grained PAT** (`github_pat_` only) scoped to the assets repository with Contents: write, probes GitHub, then prompts twice for a wrapping password. Writes a `mndz1.` ciphertext envelope into `github-token` (file mode stays `0600`). Secrets are not accepted as CLI flags.
+
+Requires `assets-path` whose `origin` is a `github.com/{owner}/{repo}` URL. Does not validate the overlay. An existing `github-token` key (plaintext or envelope) is refused unless `--force` is given; use `--force` to migrate a leftover plaintext PAT or to rotate.
+
+```bash
+# First store
+cabal run mndz-overlay-manager -- github-token
+
+# Replace plaintext or rotate the wrapped PAT
+cabal run mndz-overlay-manager -- github-token --force
+```
+
+Create the PAT on GitHub: **Fine-grained**, resource owner matching the assets repo, **Only select repositories** (that one assets repo), **Contents: write**.
 
 ### `eclean`
 

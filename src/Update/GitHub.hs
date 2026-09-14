@@ -6,11 +6,14 @@ module Update.GitHub
     listGitHubVersionsWith,
     listGitHubVersionsWithHttpLbs,
     stripAndParse,
+    parseGitHubOrigin,
+    gitRemoteOriginUrl,
   )
 where
 
 import Data.Aeson (Value, eitherDecode, withArray, withObject, (.:))
 import Data.Aeson.Types (Parser, parseMaybe)
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (toList)
 import Data.List (sortBy)
@@ -29,6 +32,8 @@ import Network.HTTP.Client
 import Network.HTTP.Types (RequestHeaders)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
+import System.Exit (ExitCode (..))
+import System.Process (readProcessWithExitCode)
 import Update.Http (HttpLbs, httpLbsEither)
 import Update.Types (UpdateSource (..))
 
@@ -205,6 +210,89 @@ parseTagName = withObject "release" $ \o -> o .: "tag_name"
 parseTagNames :: Value -> Parser [Text]
 parseTagNames = withArray "tags" $ \arr ->
   mapM (withObject "tag" (.: "name")) (toList arr)
+
+-- | Parse @github.com/{owner}/{repo}@ from an origin remote URL.
+--
+-- Accepts SSH (@git\@github.com:owner/repo.git@), @ssh://git\@github.com/…@,
+-- and HTTPS, with an optional @.git@ suffix. Other hosts and unparsable
+-- strings fail.
+parseGitHubOrigin :: Text -> Either Text (Text, Text)
+parseGitHubOrigin raw =
+  let t = T.strip raw
+   in case extractOwnerRepo t of
+        Just (owner, repo)
+          | validGitHubName owner && validGitHubName repo ->
+              Right (owner, repo)
+        _ ->
+          Left
+            "assets-path origin is not a github.com owner/repo URL \
+            \(SSH or HTTPS, optional .git)"
+
+extractOwnerRepo :: Text -> Maybe (Text, Text)
+extractOwnerRepo t
+  | "git@github.com:" `T.isPrefixOf` t =
+      splitOwnerRepo (T.drop (T.length ("git@github.com:" :: Text)) t)
+  | "ssh://git@github.com/" `T.isPrefixOf` t =
+      splitOwnerRepo (T.drop (T.length ("ssh://git@github.com/" :: Text)) t)
+  | "ssh://github.com/" `T.isPrefixOf` t =
+      splitOwnerRepo (T.drop (T.length ("ssh://github.com/" :: Text)) t)
+  | "https://github.com/" `T.isPrefixOf` t =
+      splitOwnerRepo (T.drop (T.length ("https://github.com/" :: Text)) t)
+  | "http://github.com/" `T.isPrefixOf` t =
+      splitOwnerRepo (T.drop (T.length ("http://github.com/" :: Text)) t)
+  | otherwise = Nothing
+
+splitOwnerRepo :: Text -> Maybe (Text, Text)
+splitOwnerRepo rest =
+  let trimmed = T.dropWhileEnd (== '/') (stripDotGit rest)
+      (owner, slashRepo) = T.breakOn "/" trimmed
+   in case T.uncons slashRepo of
+        Just ('/', repo)
+          | not (T.null owner),
+            not (T.null repo),
+            not ("/" `T.isInfixOf` repo) ->
+              Just (owner, repo)
+        _ -> Nothing
+
+stripDotGit :: Text -> Text
+stripDotGit t
+  | ".git" `T.isSuffixOf` t = T.dropEnd 4 t
+  | otherwise = t
+
+validGitHubName :: Text -> Bool
+validGitHubName name =
+  not (T.null name)
+    && T.all ok name
+  where
+    ok c =
+      isAsciiLower c
+        || isAsciiUpper c
+        || isDigit c
+        || c == '-'
+        || c == '_'
+        || c == '.'
+
+-- | @git remote get-url origin@ in @dir@.
+gitRemoteOriginUrl :: FilePath -> IO (Either Text Text)
+gitRemoteOriginUrl dir = do
+  (code, out, err) <-
+    readProcessWithExitCode
+      "git"
+      ["-C", dir, "remote", "get-url", "origin"]
+      ""
+  let stdoutT = T.strip (T.pack out)
+      errT = T.strip (T.pack err)
+  pure $
+    if code /= ExitSuccess
+      then
+        Left
+          ( "assets-path origin remote is missing or unreadable"
+              <> if T.null errT then "" else ": " <> errT
+          )
+      else
+        if T.null stdoutT
+          then Left "assets-path origin remote URL is empty"
+          else Right stdoutT
 
 stripAndParse :: Text -> Text -> Either Text EbuildVersion
 stripAndParse prefix tag =

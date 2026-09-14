@@ -65,6 +65,7 @@ import Update.DiskSpace
   )
 import Update.Distfiles (lookupPortageDistDir)
 import Update.Git (GitOps (..))
+import Update.GitHub (parseGitHubOrigin)
 import Update.Go.Vendor (mkVendorOps)
 import Update.Hardcoded (lookupPolicy)
 import Update.Materialize
@@ -128,6 +129,12 @@ data UpdateSpineDeps = UpdateSpineDeps
     usdAssetsOwner :: Text,
     usdAssetsRepo :: Text,
     usdGitHubToken :: Maybe Text,
+    -- | Decrypt the config envelope when a token is required and env is empty.
+    usdUnlockConfigToken :: IO (Either Text Text),
+    -- | Build release ops for a resolved live token.
+    usdMkReleaseOps :: Text -> IO ReleaseOps,
+    -- | @git remote get-url origin@ in the assets worktree.
+    usdGitOriginUrl :: FilePath -> IO (Either Text Text),
     usdAssetsPathCfg :: Maybe FilePath,
     usdDistDir :: FilePath,
     usdOverlayRoot :: FilePath,
@@ -152,6 +159,55 @@ data UpdateSpineResult = UpdateSpineResult
     usrCacheSummary :: Maybe Text
   }
   deriving (Eq, Show)
+
+-- | Token + origin parse when DepsAndAssets work needs GitHub. Fails before mutate.
+resolveAssetsGitHub ::
+  UpdateSpineDeps ->
+  IO
+    ( Either
+        Text
+        ( Maybe FilePath,
+          Text,
+          Text,
+          Maybe Text,
+          ReleaseOps
+        )
+    )
+resolveAssetsGitHub deps = do
+  toolsAssets <-
+    usdPreflightTools
+      deps
+      AssetsPreflight
+        { apNeedAssets = True,
+          apNeedGo = False,
+          apNeedNpm = False,
+          apNeedBun = False,
+          apNeedCargo = False,
+          apNeedDocker = False
+        }
+  case toolsAssets of
+    Left err -> pure (Left err)
+    Right () -> do
+      eTok <-
+        case usdGitHubToken deps of
+          Just t -> pure (Right t)
+          Nothing -> usdUnlockConfigToken deps
+      case eTok of
+        Left err -> pure (Left err)
+        Right token -> do
+          eRoot <- validateAssetsPath (usdAssetsPathCfg deps)
+          case eRoot of
+            Left err -> pure (Left err)
+            Right root -> do
+              eUrl <- usdGitOriginUrl deps root
+              case eUrl of
+                Left err -> pure (Left err)
+                Right url ->
+                  case parseGitHubOrigin url of
+                    Left err -> pure (Left err)
+                    Right (owner, repo) -> do
+                      ops <- usdMkReleaseOps deps token
+                      pure (Right (Just root, owner, repo, Just token, ops))
 
 -- | Production spine after spine tools / layout / distfiles already succeeded.
 --
@@ -208,37 +264,20 @@ runUpdatePhases deps entries allEbuilds selected = do
       -- Conditional assets/token before classify (token needed for probe)
       eTokenAssets <-
         if needDeps
-          then do
-            toolsAssets <-
-              usdPreflightTools
-                deps
-                AssetsPreflight
-                  { apNeedAssets = True,
-                    apNeedGo = False,
-                    apNeedNpm = False,
-                    apNeedBun = False,
-                    apNeedCargo = False,
-                    apNeedDocker = False
-                  }
-            case toolsAssets of
-              Left err -> pure (Left err)
-              Right () -> do
-                case usdGitHubToken deps of
-                  Nothing ->
-                    pure $
-                      Left
-                        "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
-                  Just _ -> do
-                    eRoot <- validateAssetsPath (usdAssetsPathCfg deps)
-                    pure $ case eRoot of
-                      Left err -> Left err
-                      Right p -> Right (Just p)
-          else pure (Right Nothing)
+          then resolveAssetsGitHub deps
+          else
+            pure $
+              Right
+                ( Nothing,
+                  usdAssetsOwner deps,
+                  usdAssetsRepo deps,
+                  usdGitHubToken deps,
+                  usdReleaseOps deps
+                )
       case eTokenAssets of
         Left err -> pure (Left err)
-        Right mAssetsRoot -> do
-          let releaseOps = usdReleaseOps deps
-              withheldNeedsWork =
+        Right (mAssetsRoot, assetsOwner, assetsRepo, resolvedToken, releaseOps) -> do
+          let withheldNeedsWork =
                 [ r
                 | r@PlanNeedsWork {} <- planResults,
                   planResultKey r `elem` withheldKeys
@@ -247,8 +286,8 @@ runUpdatePhases deps entries allEbuilds selected = do
           classifyResults <-
             classifyNeedsWorkPackages
               releaseOps
-              (usdAssetsOwner deps)
-              (usdAssetsRepo deps)
+              assetsOwner
+              assetsRepo
               overlayRoot
               (admittedPlans ++ withheldNeedsWork)
           let planResults' = mergeClassifyHardFails planResults classifyResults
@@ -380,8 +419,8 @@ runUpdatePhases deps entries allEbuilds selected = do
                     classifyR <-
                       classifyNeedsWorkPackages
                         releaseOps
-                        (usdAssetsOwner deps)
-                        (usdAssetsRepo deps)
+                        assetsOwner
+                        assetsRepo
                         overlayRoot
                         needWork
                     let planned' = mergeClassifyHardFails planned classifyR
@@ -448,9 +487,9 @@ runUpdatePhases deps entries allEbuilds selected = do
                               aeReleaseOps = releaseOps,
                               aeFetchModelsDev = fetchModelsDevApiJson,
                               aeAssetsRoot = mAssetsRoot,
-                              aeGitHubToken = usdGitHubToken deps,
-                              aeAssetsOwner = usdAssetsOwner deps,
-                              aeAssetsRepo = usdAssetsRepo deps,
+                              aeGitHubToken = resolvedToken,
+                              aeAssetsOwner = assetsOwner,
+                              aeAssetsRepo = assetsRepo,
                               aeAssetsLock = assetsLock,
                               aeOverlayLock = overlayLock,
                               aeJobs = jobs,

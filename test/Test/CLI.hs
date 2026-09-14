@@ -304,6 +304,7 @@ tests =
       testCase "Resolve Color Mode" testResolveColorMode,
       testCase "Resolve Jobs" testResolveJobs,
       testCase "Parser Pure Commands" testParserPureCommands,
+      testCase "Parser github-token" testParserGitHubToken,
       testCase "Parser Residual Edges" testParserResidualEdges,
       testCase "Help Catalogs Eclean And Distfiles" testHelpCatalogDistfiles,
       testCase "Show Top Level Help Exit 1" testShowTopLevelHelpExit1,
@@ -533,6 +534,24 @@ testParserPureCommands = do
     Nothing -> do
       hPutStrLn stderr "parse eclean failed"
       exitFailure
+  case parse ["github-token"] of
+    Just opts ->
+      assertEq
+        "github-token cmd"
+        (Just (CLI.GitHubToken {CLI.githubTokenForce = False}))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse github-token failed"
+      exitFailure
+  case parse ["github-token", "--force"] of
+    Just opts ->
+      assertEq
+        "github-token force"
+        (Just (CLI.GitHubToken {CLI.githubTokenForce = True}))
+        (optCommand opts)
+    Nothing -> do
+      hPutStrLn stderr "parse github-token --force failed"
+      exitFailure
   case parse ["--log-level", "error", "outdated"] of
     Just opts -> assertEq "log-level error" V.Error (optVerbosity opts)
     Nothing -> do
@@ -636,6 +655,7 @@ testHelpCatalogDistfiles = do
   let topFailure = parserFailure defaultPrefs parserInfo (ShowHelpText Nothing) mempty
       (topMsg, _) = renderFailure topFailure "mndz-overlay-manager"
   assertTrue "top help lists eclean" ("eclean" `isInfixOf` topMsg)
+  assertTrue "top help lists github-token" ("github-token" `isInfixOf` topMsg)
   assertTrue "top help lists distfiles-path" ("distfiles-path" `isInfixOf` topMsg)
   case execParserPure defaultPrefs parserInfo ["eclean", "--help"] of
     Failure failure -> do
@@ -671,6 +691,23 @@ testHelpCatalogDistfiles = do
       exitFailure
     CompletionInvoked _ -> do
       hPutStrLn stderr "expected update --help Failure, got CompletionInvoked"
+      exitFailure
+
+testParserGitHubToken :: IO ()
+testParserGitHubToken = do
+  case execParserPure defaultPrefs parserInfo ["github-token", "--help"] of
+    Failure failure -> do
+      let (msg, code) = renderFailure failure "mndz-overlay-manager"
+      assertEq "help exit 0" ExitSuccess code
+      assertTrue "mentions force" ("force" `isInfixOf` msg)
+      assertTrue "mentions wrap" ("password" `isInfixOf` msg || "wrap" `isInfixOf` msg)
+      assertTrue "mentions fine-grained" ("fine-grained" `isInfixOf` msg || "github_pat_" `isInfixOf` msg)
+      assertTrue "globals before subcommand" ("before the subcommand" `isInfixOf` msg)
+    Success _ -> do
+      hPutStrLn stderr "expected github-token --help Failure, got Success"
+      exitFailure
+    CompletionInvoked _ -> do
+      hPutStrLn stderr "expected github-token --help Failure, got CompletionInvoked"
       exitFailure
 
 testShowTopLevelHelpExit1 :: IO ()

@@ -32,7 +32,13 @@ import CLI.Progress
   )
 import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
-import Config.Loader (ConfigError (..), loadConfig)
+import Config.Loader (ConfigError (..), loadConfig, spliceGitHubToken)
+import Config.TokenEnvelope
+  ( decodeEnvelope,
+    isMndz1Envelope,
+    testEnvelopeParams,
+    wrapTokenWith,
+  )
 import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
@@ -151,7 +157,14 @@ import Update.Assets.Release
     lookupNamedAssets,
     parseReleaseInfo,
   )
-import Update.Auth (resolveGitHubToken, resolveGitHubTokenWith)
+import Update.Auth
+  ( SecretPrompt (..),
+    decryptConfigEnvelope,
+    envTokenWarnings,
+    resolveGitHubToken,
+    resolveGitHubTokenWith,
+    resolveTokenSource,
+  )
 import Update.Bun.Cache (productionBunCacheOps)
 import Update.Cargo.Crates (productionCargoOps)
 import Update.Cargo.Msrv
@@ -184,7 +197,13 @@ import Update.EbuildEdit
   )
 import Update.Engines (parseEnginesMinimum)
 import Update.Git (GitOps (..))
-import Update.GitHub (stripAndParse)
+import Update.GitHub (parseGitHubOrigin, stripAndParse)
+import Update.GitHubToken
+  ( GitHubTokenOps (..),
+    probeFineGrainedPat,
+    requireFineGrainedPat,
+    runGitHubTokenCommand,
+  )
 import Update.Go.Lanes
   ( GapLine (..),
     LaneId (..),
@@ -314,6 +333,12 @@ tests =
     "Assets"
     [ testCase "Token Resolver" testTokenResolver,
       testCase "Token Resolver IO" testTokenResolverIO,
+      testCase "mndz1 envelope round-trip" testEnvelopeRoundTrip,
+      testCase "GitHub origin parse" testParseGitHubOrigin,
+      testCase "github-token probe fakes" testGitHubTokenProbe,
+      testCase "github-token splice" testGitHubTokenSplice,
+      testCase "github-token existing key requires force" testGitHubTokenExistingKey,
+      testCase "decrypt envelope fake prompt" testDecryptFakePrompt,
       testCase "Hash Bytes" testHashBytes,
       testCase "Sidecar Line" testSidecarLine,
       testCase "Deps Distfile Names" testDepsDistfileNames,
@@ -338,13 +363,13 @@ testTokenResolver = do
     (Just "from-gh")
     (resolveGitHubTokenWith Nothing (Just "from-gh") (Just "cfg"))
   assertEq
-    "config last"
-    (Just "cfg")
-    (resolveGitHubTokenWith Nothing Nothing (Just "cfg"))
+    "config envelope is not a live token"
+    Nothing
+    (resolveGitHubTokenWith Nothing Nothing (Just "mndz1.cfg"))
   assertEq
     "empty env skipped"
-    (Just "cfg")
-    (resolveGitHubTokenWith (Just "") Nothing (Just "cfg"))
+    Nothing
+    (resolveGitHubTokenWith (Just "") Nothing (Just "mndz1.cfg"))
   assertEq
     "none"
     Nothing
@@ -353,11 +378,11 @@ testTokenResolver = do
   assertEq
     "whitespace-only github_token skipped"
     (Just "from-gh")
-    (resolveGitHubTokenWith (Just "   ") (Just "from-gh") (Just "cfg"))
+    (resolveGitHubTokenWith (Just "   ") (Just "from-gh") (Just "mndz1.cfg"))
   assertEq
     "whitespace-only gh_token skipped"
-    (Just "cfg")
-    (resolveGitHubTokenWith Nothing (Just " \t ") (Just "cfg"))
+    Nothing
+    (resolveGitHubTokenWith Nothing (Just " \t ") (Just "mndz1.cfg"))
   assertEq
     "whitespace-only config skipped"
     Nothing
@@ -371,13 +396,13 @@ testTokenResolver = do
     (Just "gh")
     (resolveGitHubTokenWith Nothing (Just "\tgh\n") Nothing)
   assertEq
-    "strip config token"
-    (Just "cfg")
-    (resolveGitHubTokenWith Nothing Nothing (Just " cfg "))
+    "strip config token is not live"
+    Nothing
+    (resolveGitHubTokenWith Nothing Nothing (Just " mndz1.cfg "))
   assertEq
-    "empty gh falls through to config"
-    (Just "cfg")
-    (resolveGitHubTokenWith Nothing (Just "") (Just "cfg"))
+    "empty gh does not use config envelope as token"
+    Nothing
+    (resolveGitHubTokenWith Nothing (Just "") (Just "mndz1.cfg"))
 
 -- | Thin IO wrapper over env lookup for GITHUB_TOKEN / GH_TOKEN.
 testTokenResolverIO :: IO ()
@@ -386,18 +411,18 @@ testTokenResolverIO = do
         OverlayConfig
           { overlayPath = "/tmp/ov",
             assetsPath = Nothing,
-            githubToken = Just "from-config",
+            githubToken = Just "mndz1.from-config",
             distfilesPath = Nothing,
             checkCacheTtl = defaultCheckCacheTtl
           }
   withAuthEnv Nothing Nothing $ do
-    assertEq "config only" (Just "from-config") =<< resolveGitHubToken cfg
+    assertEq "config envelope not decrypted" Nothing =<< resolveGitHubToken cfg
   withAuthEnv (Just "  env-tok  ") (Just "gh") $ do
     assertEq "GITHUB_TOKEN wins and strips" (Just "env-tok") =<< resolveGitHubToken cfg
   withAuthEnv Nothing (Just "  gh-tok  ") $ do
     assertEq "GH_TOKEN second" (Just "gh-tok") =<< resolveGitHubToken cfg
   withAuthEnv (Just "   ") Nothing $ do
-    assertEq "whitespace env skipped" (Just "from-config") =<< resolveGitHubToken cfg
+    assertEq "whitespace env skipped, no decrypt" Nothing =<< resolveGitHubToken cfg
   let cfgNoTok =
         OverlayConfig
           { overlayPath = "/tmp/ov",
@@ -810,4 +835,237 @@ testReleaseMultiAssetPartialDelete =
     deletes <- readIORef delRef
     assertEq "delete after partial multi upload" 1 deletes
 
--- | Dual-arch Go ceilings helper for tests.
+testEnvelopeRoundTrip :: IO ()
+testEnvelopeRoundTrip = do
+  assertTrue "prefix" (isMndz1Envelope "mndz1.abc")
+  assertEq "plaintext not envelope" False (isMndz1Envelope "github_pat_abc")
+  assertEq "ghp not envelope" False (isMndz1Envelope "ghp_abc")
+  eEnv <- wrapTokenWith testEnvelopeParams "wrap-pass" "github_pat_secret"
+  envelope <- assertRight "wrap" eEnv
+  assertTrue "starts mndz1." (isMndz1Envelope envelope)
+  assertEq
+    "round-trip"
+    (Right "github_pat_secret")
+    (decodeEnvelope "wrap-pass" envelope)
+  case decodeEnvelope "wrong-pass" envelope of
+    Left err ->
+      assertTrue
+        "wrong password"
+        ("incorrect wrap password" `T.isInfixOf` err)
+    Right _ -> do
+      hPutStrLn stderr "expected wrong-password failure"
+      exitFailure
+
+testParseGitHubOrigin :: IO ()
+testParseGitHubOrigin = do
+  assertEq
+    "ssh scp"
+    (Right ("alice", "overlay-assets"))
+    (parseGitHubOrigin "git@github.com:alice/overlay-assets.git")
+  assertEq
+    "ssh url"
+    (Right ("alice", "overlay-assets"))
+    (parseGitHubOrigin "ssh://git@github.com/alice/overlay-assets.git")
+  assertEq
+    "https no git"
+    (Right ("alice", "overlay-assets"))
+    (parseGitHubOrigin "https://github.com/alice/overlay-assets")
+  assertEq
+    "https git"
+    (Right ("bob", "assets"))
+    (parseGitHubOrigin "https://github.com/bob/assets.git")
+  case parseGitHubOrigin "git@gitlab.com:alice/overlay-assets.git" of
+    Left _ -> pure ()
+    Right pair -> do
+      hPutStrLn stderr $ "expected reject gitlab, got " <> show pair
+      exitFailure
+  case parseGitHubOrigin "https://example.com/alice/overlay-assets" of
+    Left _ -> pure ()
+    Right pair -> do
+      hPutStrLn stderr $ "expected reject host, got " <> show pair
+      exitFailure
+  case parseGitHubOrigin "not-a-url" of
+    Left _ -> pure ()
+    Right pair -> do
+      hPutStrLn stderr $ "expected reject unparsable, got " <> show pair
+      exitFailure
+  case parseGitHubOrigin "" of
+    Left _ -> pure ()
+    Right pair -> do
+      hPutStrLn stderr $ "expected reject empty, got " <> show pair
+      exitFailure
+
+testGitHubTokenProbe :: IO ()
+testGitHubTokenProbe = do
+  case requireFineGrainedPat "ghp_classic" of
+    Left err ->
+      assertTrue "classic refused" ("github_pat_" `T.isInfixOf` err)
+    Right _ -> do
+      hPutStrLn stderr "expected classic PAT refusal"
+      exitFailure
+  tok <- assertRight "fg prefix" (requireFineGrainedPat "github_pat_ok")
+  assertEq "stripped" "github_pat_ok" tok
+  let owner = "alice"
+      repo = "overlay-assets"
+      okHttp req =
+        let p = path req
+         in case method req of
+              "GET"
+                | "/repos/alice/overlay-assets" `BSC.isSuffixOf` p ->
+                    pure (Right (fakeResponse 200 "{}"))
+              "GET"
+                | "/user/repos" `BSC.isInfixOf` p ->
+                    pure
+                      ( Right
+                          ( fakeResponse
+                              200
+                              "[{\"full_name\":\"alice/overlay-assets\"}]"
+                          )
+                      )
+              "POST"
+                | "/releases" `BSC.isSuffixOf` p ->
+                    pure (Right (fakeResponse 422 "{\"message\":\"Validation Failed\"}"))
+              _ -> pure (Right (fakeResponse 500 "unexpected"))
+  _ <- assertRight "probe ok" =<< probeFineGrainedPat okHttp owner repo "github_pat_ok"
+  let extraHttp req =
+        if method req == "GET" && "/user/repos" `BSC.isInfixOf` path req
+          then
+            pure
+              ( Right
+                  ( fakeResponse
+                      200
+                      "[{\"full_name\":\"alice/overlay-assets\"},{\"full_name\":\"alice/other\"}]"
+                  )
+              )
+          else okHttp req
+  extraErr <-
+    assertLeft "extra repos"
+      =<< probeFineGrainedPat extraHttp owner repo "github_pat_ok"
+  assertTrue "extra names" ("only the assets" `T.isInfixOf` extraErr)
+  let forbidden req =
+        if method req == "POST"
+          then pure (Right (fakeResponse 403 "no write"))
+          else okHttp req
+  forb <-
+    assertLeft "403"
+      =<< probeFineGrainedPat forbidden owner repo "github_pat_ok"
+  assertTrue "contents write" ("403" `T.isInfixOf` forb)
+  let missing req =
+        if method req == "GET" && "/repos/alice/overlay-assets" `BSC.isSuffixOf` path req
+          then pure (Right (fakeResponse 404 "{}"))
+          else okHttp req
+  miss <-
+    assertLeft "404"
+      =<< probeFineGrainedPat missing owner repo "github_pat_ok"
+  assertTrue "get failed" ("GET /repos/" `T.isInfixOf` miss)
+
+testGitHubTokenSplice :: IO ()
+testGitHubTokenSplice = do
+  let original =
+        T.unlines
+          [ "# keep me",
+            "overlay-path = \"/tmp/ov\"",
+            "assets-path = \"/tmp/assets\"",
+            "github-token = \"ghp_old\"",
+            "distfiles-path = \"/tmp/df\""
+          ]
+  spliced <-
+    assertRight "splice replace" (spliceGitHubToken original "mndz1.abc")
+  assertTrue "keeps comment" ("# keep me" `T.isInfixOf` spliced)
+  assertTrue "keeps sibling" ("distfiles-path = \"/tmp/df\"" `T.isInfixOf` spliced)
+  assertTrue "envelope" ("github-token = \"mndz1.abc\"" `T.isInfixOf` spliced)
+  assertEq "old gone" False ("ghp_old" `T.isInfixOf` spliced)
+  let omitted =
+        T.unlines
+          [ "overlay-path = \"/tmp/ov\"",
+            "assets-path = \"/tmp/assets\""
+          ]
+  appended <-
+    assertRight "splice append" (spliceGitHubToken omitted "mndz1.xyz")
+  assertTrue
+    "appended key"
+    ("github-token = \"mndz1.xyz\"" `T.isInfixOf` appended)
+
+testGitHubTokenExistingKey :: IO ()
+testGitHubTokenExistingKey = do
+  let cfg =
+        OverlayConfig
+          { overlayPath = "/tmp/ov",
+            assetsPath = Just "/tmp/assets",
+            githubToken = Just "mndz1.existing",
+            distfilesPath = Nothing,
+            checkCacheTtl = defaultCheckCacheTtl
+          }
+      boom = error "github-token should not prompt or probe without --force"
+      ops =
+        GitHubTokenOps
+          { gtoHttp = const boom,
+            gtoPrompt =
+              SecretPrompt
+                { spControllingTty = boom,
+                  spReadSecret = \_ _ -> boom,
+                  spPauseUi = boom,
+                  spResumeUi = boom
+                },
+            gtoWrap = \_ _ -> boom,
+            gtoOriginUrl = const boom
+          }
+  err <-
+    assertLeft "existing key"
+      =<< runGitHubTokenCommand ops "/tmp/c.toml" cfg False
+  assertTrue "mentions force" ("--force" `T.isInfixOf` err)
+  let noAssets = cfg {githubToken = Nothing, assetsPath = Nothing}
+  miss <-
+    assertLeft "missing assets-path"
+      =<< runGitHubTokenCommand ops "/tmp/c.toml" noAssets False
+  assertTrue "names assets-path" ("assets-path" `T.isInfixOf` miss)
+  let ttyOps =
+        ops
+          { gtoPrompt =
+              SecretPrompt
+                { spControllingTty = pure Nothing,
+                  spReadSecret = \_ _ -> boom,
+                  spPauseUi = pure (),
+                  spResumeUi = pure ()
+                }
+          }
+      withAssets = cfg {githubToken = Nothing}
+  noTty <-
+    assertLeft "no tty"
+      =<< runGitHubTokenCommand ttyOps "/tmp/c.toml" withAssets False
+  assertTrue "names terminal" ("terminal" `T.isInfixOf` noTty || "TTY" `T.isInfixOf` noTty)
+
+testDecryptFakePrompt :: IO ()
+testDecryptFakePrompt = do
+  eEnv <- wrapTokenWith testEnvelopeParams "wrap-pass" "github_pat_secret"
+  envelope <- assertRight "wrap" eEnv
+  cache <- newIORef Nothing
+  pauseN <- newIORef (0 :: Int)
+  resumeN <- newIORef (0 :: Int)
+  let prompt =
+        SecretPrompt
+          { spControllingTty = pure (Just "/dev/null"),
+            spReadSecret = \_ _ -> pure (Right "wrap-pass"),
+            spPauseUi = atomicModifyIORef' pauseN (\n -> (n + 1, ())),
+            spResumeUi = atomicModifyIORef' resumeN (\n -> (n + 1, ()))
+          }
+  tok <- assertRight "decrypt" =<< decryptConfigEnvelope prompt cache envelope
+  assertEq "plaintext" "github_pat_secret" tok
+  tok2 <- assertRight "cached" =<< decryptConfigEnvelope prompt cache envelope
+  assertEq "same" tok tok2
+  pauses <- readIORef pauseN
+  resumes <- readIORef resumeN
+  assertEq "paused once" 1 pauses
+  assertEq "resumed once" 1 resumes
+  let srcEnv =
+        resolveTokenSource (Just "github_pat_env") Nothing (Just envelope)
+  assertTrue
+    "env warning"
+    (any ("GITHUB_TOKEN" `T.isInfixOf`) (envTokenWarnings srcEnv))
+  let srcClassic =
+        resolveTokenSource (Just "ghp_classic") Nothing (Just envelope)
+  assertEq "two warnings" 2 (length (envTokenWarnings srcClassic))
+  assertEq
+    "outdated skips decrypt"
+    Nothing
+    (resolveGitHubTokenWith Nothing Nothing (Just envelope))

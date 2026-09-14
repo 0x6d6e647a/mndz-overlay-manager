@@ -1,5 +1,5 @@
 overlay-path = "/tmp/overlay"
 assets-path = "/tmp/assets"
-github-token = "secret-token"
+github-token = "mndz1.test-envelope"
 distfiles-path = "/tmp/distfiles"
 check-cache-ttl = "1h"
