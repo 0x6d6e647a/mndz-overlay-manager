@@ -2122,7 +2122,11 @@ publishAssetCycle env key assetsRoot paths sidecarFn relSidecars msg mkMeta step
           Right commitSha -> do
             markMaterializeStep stepsDoneRef mh key "committing assets"
             mhStatus mh key "pushing assets"
-            pushed <- goPush (aeGitOps env) assetsRoot
+            gitOpsOk <- aeGitOperationsHealth env
+            pushed <-
+              case gitOpsOk of
+                Left err -> pure (Left err)
+                Right () -> goPush (aeGitOps env) assetsRoot
             case pushed of
               Left err -> pure (Left err)
               Right () -> do

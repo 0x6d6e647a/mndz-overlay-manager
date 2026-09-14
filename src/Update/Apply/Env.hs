@@ -102,5 +102,7 @@ data ApplyEnv = ApplyEnv
     aeMaterializeDocker :: Maybe (MaterializeDockerCfg, CommandRunner),
     -- | Overlay-internal atom-closure wait/refuse session for this apply
     -- run. @Nothing@ checks current disk only (no wait).
-    aeAtomClosure :: Maybe AtomClosureSession
+    aeAtomClosure :: Maybe AtomClosureSession,
+    -- | Git Operations Statuspage check immediately before assets @git push@.
+    aeGitOperationsHealth :: IO (Either Text ())
   }

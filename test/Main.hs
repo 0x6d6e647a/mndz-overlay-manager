@@ -13,6 +13,7 @@ import Test.EbuildEdit qualified as EbuildEdit
 import Test.Ecosystems qualified as Ecosystems
 import Test.Ensure qualified as Ensure
 import Test.Git qualified as Git
+import Test.GitHubResilience qualified as GitHubResilience
 import Test.Gpg qualified as Gpg
 import Test.Lanes qualified as Lanes
 import Test.Materialize qualified as Materialize
@@ -66,6 +67,7 @@ main =
             Ssh.tests,
             Gpg.tests,
             Git.tests,
+            GitHubResilience.unitTests,
             CLI.tests,
             Lanes.unitTests,
             Progress.unitTests,
@@ -86,6 +88,7 @@ main =
             Md5Cache.integrationTests,
             Ecosystems.integrationTests,
             CheckPlan.integrationTests,
+            GitHubResilience.integrationTests,
             Waves.integrationTests
           ]
       ]

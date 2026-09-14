@@ -5,6 +5,7 @@ module Update.Deps.Plan
     BunProbe (..),
     minimumBunProbe,
     productionDepsPlanOps,
+    productionDepsPlanOpsWithLatch,
     planDepsPackageWithProgress,
     planDepsPackageWithProgressFor,
     planDepsPackageWithCeilingsFor,
@@ -48,7 +49,7 @@ import Update.Cargo.Msrv
     cargoFloorPolicyKey,
     probePolicyTagFloor,
   )
-import Update.GitHub (listGitHubVersionsWith)
+import Update.GitHub (GitHubLatch, listGitHubVersionsWithLatch, newGitHubLatch)
 import Update.Go.Lanes
   ( CargoFloorCoverage (..),
     CargoPathProvenance (..),
@@ -125,6 +126,16 @@ toGoPlanOps d =
 
 productionDepsPlanOps :: Maybe Text -> Int -> Maybe FilePath -> IO DepsPlanOps
 productionDepsPlanOps mToken jobs mOverlay = do
+  latch <- newGitHubLatch
+  productionDepsPlanOpsWithLatch latch mToken jobs mOverlay
+
+productionDepsPlanOpsWithLatch ::
+  GitHubLatch ->
+  Maybe Text ->
+  Int ->
+  Maybe FilePath ->
+  IO DepsPlanOps
+productionDepsPlanOpsWithLatch latch mToken jobs mOverlay = do
   mgr <- newManager tlsManagerSettings
   baseMod <- productionGoModFetcher mToken
   cachedMod <- withGoModCache baseMod
@@ -138,7 +149,7 @@ productionDepsPlanOps mToken jobs mOverlay = do
     DepsPlanOps
       { dpoPortageq = productionPortageqRunner,
         dpoListVersions = \src -> case src of
-          GitHub {} -> listGitHubVersionsWith mgr mToken src
+          GitHub {} -> listGitHubVersionsWithLatch latch mgr mToken src
           Npm pkg -> listNpmVersions mgr pkg
           _ -> pure (Left "unsupported update source for deps planning"),
         dpoFetchGoMod = cachedMod,

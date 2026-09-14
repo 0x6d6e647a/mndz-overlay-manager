@@ -2,18 +2,15 @@
 
 module Update.Assets.Release
   ( createReleaseWithAssetHttpLbs,
-    createReleaseWithAssetsHttp,
     createReleaseWithAssetsHttpLbs,
     ReleaseMeta (..),
     -- Lookup / download (reuse path)
     ReleaseAsset (..),
     ReleaseInfo (..),
     ReleaseOps (..),
-    productionReleaseOps,
-    getReleaseByTagHttp,
+    productionReleaseOpsWithLatch,
     getReleaseByTagHttpLbs,
     findAssetByName,
-    downloadReleaseAssetHttp,
     downloadReleaseAssetHttpLbs,
     lookupNamedAsset,
     lookupNamedAssets,
@@ -44,6 +41,7 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders, statusCode)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, takeFileName)
+import Update.GitHub (GitHubLatch, latchedHttp)
 import Update.Http (HttpLbs, httpLbsEither)
 
 data ReleaseMeta = ReleaseMeta
@@ -84,15 +82,18 @@ data ReleaseOps = ReleaseOps
   }
 
 -- | Production ops using the same Bearer token headers as create-release.
-productionReleaseOps :: Text -> IO ReleaseOps
-productionReleaseOps token = do
+productionReleaseOpsWithLatch :: GitHubLatch -> Text -> IO ReleaseOps
+productionReleaseOpsWithLatch latch token = do
   mgr <- newManager tlsManagerSettings
-  pure
-    ReleaseOps
-      { roGetReleaseByTag = getReleaseByTagHttp mgr token,
-        roDownloadAsset = downloadReleaseAssetHttp mgr token,
-        roCreateReleaseWithAssets = createReleaseWithAssetsHttp mgr token
-      }
+  pure (releaseOpsHttp (latchedHttp latch (httpLbsEither mgr)) token)
+
+releaseOpsHttp :: HttpLbs -> Text -> ReleaseOps
+releaseOpsHttp http token =
+  ReleaseOps
+    { roGetReleaseByTag = getReleaseByTagHttpLbs http token,
+      roDownloadAsset = downloadReleaseAssetHttpLbs http token,
+      roCreateReleaseWithAssets = createReleaseWithAssetsHttpLbs http token
+    }
 
 -- | Injectable HTTP path for create + single upload (list-of-one convenience).
 createReleaseWithAssetHttpLbs ::
@@ -103,17 +104,6 @@ createReleaseWithAssetHttpLbs ::
   IO (Either Text ())
 createReleaseWithAssetHttpLbs http token meta path =
   createReleaseWithAssetsHttpLbs http token meta [path]
-
--- | Create a GitHub release and upload N assets. On any upload failure after
--- create, best-effort deletes the release so retries do not leave a partial set.
-createReleaseWithAssetsHttp ::
-  Manager ->
-  Text ->
-  ReleaseMeta ->
-  [FilePath] ->
-  IO (Either Text ())
-createReleaseWithAssetsHttp mgr =
-  createReleaseWithAssetsHttpLbs (httpLbsEither mgr)
 
 -- | Injectable HTTP path for create + multi upload (+ best-effort delete on fail).
 createReleaseWithAssetsHttpLbs ::
@@ -290,16 +280,6 @@ deleteReleaseBestEffortHttp http headers owner repo releaseId = do
 --
 -- @Right Nothing@ = release tag not found (HTTP 404).
 -- @Left@ = network / auth / parse hard errors.
-getReleaseByTagHttp ::
-  Manager ->
-  Text ->
-  Text ->
-  Text ->
-  Text ->
-  IO (Either Text (Maybe ReleaseInfo))
-getReleaseByTagHttp mgr =
-  getReleaseByTagHttpLbs (httpLbsEither mgr)
-
 getReleaseByTagHttpLbs ::
   HttpLbs ->
   Text ->
@@ -380,15 +360,6 @@ findAssetByName info name =
     [] -> Nothing
 
 -- | Download asset bytes from @browser_download_url@ to @destPath@.
-downloadReleaseAssetHttp ::
-  Manager ->
-  Text ->
-  Text ->
-  FilePath ->
-  IO (Either Text ())
-downloadReleaseAssetHttp mgr =
-  downloadReleaseAssetHttpLbs (httpLbsEither mgr)
-
 downloadReleaseAssetHttpLbs ::
   HttpLbs ->
   Text ->

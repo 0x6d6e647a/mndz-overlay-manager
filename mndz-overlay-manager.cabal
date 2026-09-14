@@ -100,6 +100,7 @@ library
       , Update.Engines
       , Update.Git
       , Update.GitHub
+      , Update.GitHubHealth
       , Update.GitHubToken
       , Update.Go.Lanes
       , Update.Go.ModFetch
@@ -244,6 +245,7 @@ test-suite mndz-overlay-manager-test
         Test.Ensure
         Test.Ecosystems
         Test.Git
+        Test.GitHubResilience
         Test.Gpg
         Test.HttpFake
         Test.Lanes

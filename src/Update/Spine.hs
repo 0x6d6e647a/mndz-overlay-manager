@@ -65,7 +65,7 @@ import Update.DiskSpace
   )
 import Update.Distfiles (lookupPortageDistDir)
 import Update.Git (GitOps (..))
-import Update.GitHub (parseGitHubOrigin)
+import Update.GitHub (GitHubLatch, gitHubAbortLog, parseGitHubOrigin, peekGitHubLatch)
 import Update.Go.Vendor (mkVendorOps)
 import Update.Hardcoded (lookupPolicy)
 import Update.Materialize
@@ -150,7 +150,10 @@ data UpdateSpineDeps = UpdateSpineDeps
     usdSweepMaterialize :: IO (),
     -- | Inner @docker@ CLI for per-unit sessions. @Nothing@ keeps placeholder
     -- ops (tests). Production is @Just productionCommandRunner@.
-    usdMaterializeDockerRunner :: Maybe CommandRunner
+    usdMaterializeDockerRunner :: Maybe CommandRunner,
+    usdGitHubLatch :: GitHubLatch,
+    -- | Git Operations Statuspage check before assets @git push@ (no-op when unused).
+    usdGitOperationsHealth :: IO (Either Text ())
   }
 
 data UpdateSpineResult = UpdateSpineResult
@@ -236,6 +239,25 @@ runUpdatePhases deps entries allEbuilds selected = do
       jobs
       selected
       byPkg
+  mPlanAbort <- peekGitHubLatch (usdGitHubLatch deps)
+  case mPlanAbort of
+    Just err -> pure (Left (gitHubAbortLog err))
+    Nothing -> runAfterPlan deps entries allEbuilds selected planResults cache overlayRoot distDir byPkg jobs pcfg
+
+runAfterPlan ::
+  UpdateSpineDeps ->
+  [PackageEntry] ->
+  [Ebuild] ->
+  [PackageEntry] ->
+  [PackagePlanResult] ->
+  CheckCacheHandle ->
+  FilePath ->
+  FilePath ->
+  Map.Map PackageKey [Ebuild] ->
+  Int ->
+  ProgressConfig ->
+  IO (Either Text UpdateSpineResult)
+runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot distDir _byPkg jobs pcfg = do
   let kinds = [(planResultKey r, planKind r) | r <- planResults]
       admit = classifyAdmit overlayCeilingProviderForKey kinds
       admittedKeys = asReady admit
@@ -499,7 +521,8 @@ runUpdatePhases deps entries allEbuilds selected = do
                               aeTempRun = tempRun,
                               aeCheckCache = cache,
                               aeMaterializeDocker = mMatDocker,
-                              aeAtomClosure = Nothing
+                              aeAtomClosure = Nothing,
+                              aeGitOperationsHealth = usdGitOperationsHealth deps
                             }
                         overlapReady =
                           [ r

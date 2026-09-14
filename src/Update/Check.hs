@@ -10,7 +10,9 @@ module Update.Check
     checkPackageDeps,
     contentFixPVs,
     assessOverlayContent,
-    productionFetcherWithToken,
+    productionFetcherWithLatch,
+    needsLiveGitHubApi,
+    finishOutdatedReports,
     statusFromCompare,
     renderPVNoRev,
     selectCanonicalSamePV,
@@ -27,7 +29,7 @@ import CLI.Jobs (mapConcurrentlyN)
 import CLI.Progress (MultiHandle (..))
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -35,7 +37,7 @@ import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPVNoRev, samePV)
-import System.Directory (doesFileExist)
+import System.Directory (doesDirectoryExist, doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 import Update.Adequacy
   ( ContentAssessment (..),
@@ -51,6 +53,7 @@ import Update.CheckCache
   ( CheckCacheHandle,
     cachedCargoPlanUsable,
     computeFingerprint,
+    computeFingerprintFromDir,
     lookupDeps,
     lookupLatest,
     recordFetch,
@@ -70,7 +73,14 @@ import Update.EbuildSelection
     selectCanonicalSamePV,
     selectHighestNonLive,
   )
-import Update.GitHub (fetchGitHubWith)
+import Update.GitHub
+  ( GitHubLatch,
+    fetchGitHubWithLatch,
+    formatGitHubHttpError,
+    gitHubAbortLog,
+    githubLatchAbortedMessage,
+    peekGitHubLatch,
+  )
 import Update.Go.Lanes
   ( GapLine (..),
     PlannedEbuild (..),
@@ -110,6 +120,7 @@ import Update.Types
     UpdateTechnique (..),
     mkPackageKey,
     packageKeyText,
+    splitPackageKey,
   )
 
 -- | One package's newest local ebuild used for checks / apply entry.
@@ -660,10 +671,142 @@ statusFromCompare local remote =
         )
 
 -- | Production fetcher dispatching to Http / GitHub / npm clients.
-productionFetcherWithToken :: Maybe T.Text -> IO Fetcher
-productionFetcherWithToken mToken = do
+productionFetcherWithLatch :: GitHubLatch -> Maybe T.Text -> IO Fetcher
+productionFetcherWithLatch latch mToken = do
   mgr <- newManager tlsManagerSettings
   pure $ \src -> case src of
     Http {} -> fetchHttpWith mgr src
-    GitHub {} -> fetchGitHubWith mgr mToken src
+    GitHub {} -> fetchGitHubWithLatch latch mgr mToken src
     Npm {} -> fetchNpmWith mgr src
+
+-- | True when selected GitHub sources will live-call @api.github.com@.
+needsLiveGitHubApi ::
+  CheckCacheHandle ->
+  FilePath ->
+  [PackageEntry] ->
+  Map.Map PackageKey [Ebuild] ->
+  IO Bool
+needsLiveGitHubApi cache overlayRoot entries byPkg =
+  go entries
+  where
+    go [] = pure False
+    go (e : es) = do
+      live <- packageNeedsLiveGitHub cache overlayRoot byPkg e
+      if live then pure True else go es
+
+packageNeedsLiveGitHub ::
+  CheckCacheHandle ->
+  FilePath ->
+  Map.Map PackageKey [Ebuild] ->
+  PackageEntry ->
+  IO Bool
+packageNeedsLiveGitHub cache overlayRoot byPkg entry =
+  case lookupPolicy (peKey entry) of
+    Nothing -> pure False
+    Just policy ->
+      case policySource policy of
+        GitHub {} ->
+          let locals = Map.findWithDefault [] (peKey entry) byPkg
+           in case policyTechnique policy of
+                GitMvAndManifest -> gitMvNeedsLive cache entry locals (policySource policy)
+                DepsAndAssets eco ->
+                  depsNeedsLive cache overlayRoot entry locals (policySource policy) eco
+                Unsupported _ -> pure False
+        _ -> pure False
+
+gitMvNeedsLive ::
+  CheckCacheHandle ->
+  PackageEntry ->
+  [Ebuild] ->
+  UpdateSource ->
+  IO Bool
+gitMvNeedsLive cache entry locals src = do
+  let ebuilds = if null locals then syntheticLocals entry else locals
+  fp <- computeFingerprint src ebuilds
+  mCached <- lookupLatest cache (peKey entry) fp
+  pure (isNothing mCached)
+
+depsNeedsLive ::
+  CheckCacheHandle ->
+  FilePath ->
+  PackageEntry ->
+  [Ebuild] ->
+  UpdateSource ->
+  EcosystemSpec ->
+  IO Bool
+depsNeedsLive cache overlayRoot entry locals src eco = do
+  let tech = DepsAndAssets eco
+      localPVs = localNonLivePVs locals
+  fp <- computeFingerprint src locals
+  mProvFp <- computeOverlayProviderFingerprint overlayRoot tech
+  mCached <-
+    case (overlayCeilingProvider tech, mProvFp) of
+      (Just _, Nothing) -> pure Nothing
+      (Just _, Just pfp) -> lookupDeps cache (peKey entry) fp (Just pfp)
+      (Nothing, _) -> lookupDeps cache (peKey entry) fp Nothing
+  planLive <- case mCached of
+    Just plan
+      | cachedCargoPlanUsable eco src plan -> do
+          assessed <-
+            assessOverlayContent eco (peKey entry) (pePN entry) locals plan
+          pure $ case assessed of
+            Left _ -> True
+            Right (ca, _, _) ->
+              let missing = missingTargets localPVs plan
+                  contentFix =
+                    [ pv
+                    | pv <- caNeedsWorkPVs ca,
+                      not (any (samePV pv) missing)
+                    ]
+               in planNeedsWork localPVs contentFix plan
+    _ -> pure True
+  providerLive <-
+    case overlayCeilingProvider tech of
+      Nothing -> pure False
+      Just provider -> providerLatestMiss cache overlayRoot provider
+  pure (planLive || providerLive)
+
+providerLatestMiss :: CheckCacheHandle -> FilePath -> PackageKey -> IO Bool
+providerLatestMiss cache overlayRoot providerKey =
+  case (splitPackageKey providerKey, lookupPolicy providerKey) of
+    (Just (cat, pn), Just policy) -> do
+      let dir = overlayRoot </> T.unpack cat </> T.unpack pn
+      exists <- doesDirectoryExist dir
+      if not exists
+        then pure False
+        else do
+          fp <- computeFingerprintFromDir (policySource policy) dir pn
+          mCached <- lookupLatest cache providerKey fp
+          pure (isNothing mCached)
+    _ -> pure False
+
+syntheticLocals :: PackageEntry -> [Ebuild]
+syntheticLocals entry =
+  [ Ebuild
+      { ebuildCategory = "",
+        ebuildPackage = pePN entry,
+        ebuildVersion = renderPVNoRev (peLocal entry),
+        ebuildPath = pePath entry
+      }
+  ]
+
+-- | Drop latch-class fetch errors; return command abort text when tripped.
+finishOutdatedReports ::
+  GitHubLatch ->
+  [UpdateReport] ->
+  IO ([UpdateReport], Maybe Text)
+finishOutdatedReports latch reports = do
+  mErr <- peekGitHubLatch latch
+  case mErr of
+    Nothing -> pure (reports, Nothing)
+    Just err ->
+      let formatted = formatGitHubHttpError err
+          keep =
+            [ r
+            | r <- reports,
+              case reportStatus r of
+                FetchError t ->
+                  t /= githubLatchAbortedMessage && t /= formatted
+                _ -> True
+            ]
+       in pure (keep, Just (gitHubAbortLog err))

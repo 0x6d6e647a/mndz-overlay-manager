@@ -1,32 +1,4 @@
-# github-auth Specification
-
-## Purpose
-
-Resolve GitHub API tokens from environment and config for version fetch and release write.
-
-## Requirements
-
-### Requirement: Plaintext github-token on disk hard-fails
-
-When a command loads the overlay-manager TOML and the optional `github-token` key is present and non-empty after stripping, the value SHALL be a `mndz1.` ciphertext envelope. Any other present value (including a live `github_pat_`, `ghp_`, `gho_`, or other secret) SHALL be a config-load error: error-level log that does not include the secret, exit status `1`, and the command SHALL NOT continue. This SHALL apply even when `GITHUB_TOKEN` or `GH_TOKEN` is set. Whitespace-only or omitted `github-token` SHALL NOT fail config load by itself. Help-only paths SHALL NOT load the file and SHALL NOT emit this error.
-
-#### Scenario: Plaintext PAT in config hard-fails list
-
-- **WHEN** the operator runs `list` and `github-token` is a `github_pat_` or `ghp_` string
-- **THEN** the program logs an error that the on-disk token is not encrypted
-- **AND** the program exits with status `1`
-- **AND** the log does not contain the token value
-
-#### Scenario: Env does not excuse plaintext on disk
-
-- **WHEN** `GITHUB_TOKEN` is set and the config `github-token` is plaintext
-- **THEN** the program still hard-fails config load with exit `1`
-
-#### Scenario: Envelope loads without decrypt
-
-- **WHEN** `github-token` starts with `mndz1.` and the operator runs `list`
-- **THEN** config load succeeds
-- **AND** the program does not prompt for a wrap password
+## MODIFIED Requirements
 
 ### Requirement: GitHub token resolution order
 
@@ -93,12 +65,3 @@ GitHub version fetch and GitHub Releases create/upload SHALL use the same resolv
 - **WHEN** `outdated` will live-fetch GitHub versions and neither env nor config `github-token` is available
 - **THEN** version fetch MAY proceed unauthenticated
 - **AND** the unauthenticated-quota warning specified by `github-api-resilience` applies
-
-### Requirement: Optional github-token config key
-
-The configuration schema SHALL accept an optional `github-token` string key. Absence of the key SHALL NOT fail config load for commands that do not need GitHub write access. When the key is present and non-empty, its value SHALL be a `mndz1.` envelope as specified by the plaintext-on-disk hard-fail requirement; the program SHALL NOT treat a live PAT string as a usable config token.
-
-#### Scenario: Config without token loads
-
-- **WHEN** the config file defines `overlay-path` but omits `github-token`
-- **THEN** config load succeeds and the token is resolved from the environment if present

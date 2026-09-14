@@ -9,6 +9,8 @@ module Update.Auth
     fineGrainedPatPrefix,
     isFineGrainedPat,
     decryptConfigEnvelope,
+    prepareGitHubToken,
+    unauthenticatedGitHubWarning,
     SecretPrompt (..),
     productionSecretPrompt,
     promptSecretOnTty,
@@ -108,6 +110,43 @@ envTokenWarnings = \case
     "using GITHUB_TOKEN or GH_TOKEN instead of an encrypted config github-token"
       : ["environment GitHub token is not a fine-grained PAT (github_pat_)" | not fine]
   _ -> []
+
+unauthenticatedGitHubWarning :: Text
+unauthenticatedGitHubWarning =
+  "unauthenticated GitHub requests are limited to 60 per hour; \
+  \set GITHUB_TOKEN, GH_TOKEN, or github-token"
+
+-- | Resolve or decrypt a token when this run will call @api.github.com@.
+--
+-- Envelope decrypt runs only when @willLiveApi@ is true. No controlling TTY
+-- is a hard error (no silent unauthenticated fallback).
+prepareGitHubToken ::
+  OverlayConfig ->
+  SecretPrompt ->
+  IORef (Maybe Text) ->
+  Bool ->
+  IO (Either Text (Maybe Text, [Text]))
+prepareGitHubToken cfg prompt cache willLiveApi = do
+  ght <- lookupEnv "GITHUB_TOKEN"
+  gh <- lookupEnv "GH_TOKEN"
+  let src = resolveTokenSource ght gh (githubToken cfg)
+      envWarns = envTokenWarnings src
+  case src of
+    ResolvedEnv tok _ ->
+      pure (Right (Just tok, envWarns))
+    NoToken
+      | willLiveApi ->
+          pure (Right (Nothing, [unauthenticatedGitHubWarning]))
+      | otherwise ->
+          pure (Right (Nothing, []))
+    NeedsDecrypt envelope
+      | not willLiveApi ->
+          pure (Right (Nothing, []))
+      | otherwise -> do
+          eTok <- decryptConfigEnvelope prompt cache envelope
+          pure $ case eTok of
+            Left err -> Left err
+            Right tok -> Right (Just tok, [])
 
 -- | Injectable TTY secret prompt (unit tests supply fakes; no live TTY).
 data SecretPrompt = SecretPrompt

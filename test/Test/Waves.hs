@@ -57,6 +57,7 @@ import Update.CheckCache
 import Update.Deps.Plan (BunProbe, DepsPlanOps (..), minimumBunProbe)
 import Update.DiskSpace (DiskSpaceProbe (..))
 import Update.Git (GitOps (..))
+import Update.GitHub (newGitHubLatch)
 import Update.Materialize (EnsureOutcome (..), NeededFloors (..))
 import Update.Preflight (AssetsPreflight (..))
 import Update.Runtime.Ceilings (RuntimeCeilings (..))
@@ -365,6 +366,7 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
   pcfg <- disabledProgress
   (cache, _) <- openCheckCache CacheDisabled False overlay
   depsOps <- liveBunOps overlay
+  latch <- newGitHubLatch
   pure
     UpdateSpineDeps
       { usdJobs = jobs,
@@ -396,7 +398,9 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
         usdEnsureImage = \_ -> pure (Right EnsureSkipped),
         usdPruneMaterialize = pure (),
         usdSweepMaterialize = pure (),
-        usdMaterializeDockerRunner = Nothing
+        usdMaterializeDockerRunner = Nothing,
+        usdGitHubLatch = latch,
+        usdGitOperationsHealth = pure (Right ())
       }
 
 outcomeKey :: ApplyOutcome -> PackageKey

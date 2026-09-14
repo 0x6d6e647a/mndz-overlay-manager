@@ -45,26 +45,27 @@ import Overlay.Version (EbuildVersion (..), prettyVersion)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import Update.Apply (foldExitHardFail, productionEbuildRunner)
-import Update.Assets.Release (ReleaseOps (..), productionReleaseOps)
+import Update.Assets.Release (ReleaseOps (..), productionReleaseOpsWithLatch)
 import Update.Auth
   ( decryptConfigEnvelope,
-    envTokenWarnings,
+    prepareGitHubToken,
     productionSecretPrompt,
-    resolveGitHubToken,
-    resolveTokenSource,
   )
 import Update.Check
   ( PackageEntry (..),
     checkOverlayWithDepsPlan,
+    finishOutdatedReports,
+    groupByPackage,
     groupNewest,
-    productionFetcherWithToken,
+    needsLiveGitHubApi,
+    productionFetcherWithLatch,
   )
 import Update.CheckCache
   ( cacheSummaryLine,
     flushCheckCache,
     openCheckCache,
   )
-import Update.Deps.Plan (productionDepsPlanOps)
+import Update.Deps.Plan (productionDepsPlanOpsWithLatch)
 import Update.DiskSpace (productionDiskSpaceProbe)
 import Update.Distfiles
   ( cleanManagerDistfiles,
@@ -72,7 +73,14 @@ import Update.Distfiles
     resolveDistfilesPath,
   )
 import Update.Git (isGitWorkTree, productionGitOps)
-import Update.GitHub (gitRemoteOriginUrl)
+import Update.GitHub (GitHubLatch, gitRemoteOriginUrl, newGitHubLatch)
+import Update.GitHubHealth
+  ( GitHubHealthScope (..),
+    interpretHealthOutcome,
+    productionGitHubHealthHttp,
+    runGitHubHealthPreflight,
+    runGitOperationsHealth,
+  )
 import Update.GitHubToken
   ( productionGitHubTokenOps,
     runGitHubTokenCommand,
@@ -188,14 +196,35 @@ runOutdated rt refresh pkgArgs = do
               )
               ebuilds
           total = length selectedEntries
-      token <- liftIO (resolveGitHubToken cfg)
-      mapM_ logWarning =<< liftIO (envWarningsFor cfg)
-      fetch <- liftIO (productionFetcherWithToken token)
-      depsOps <-
-        liftIO (productionDepsPlanOps token (rtJobs rt) (Just overlayResolved))
+          byPkg = groupByPackage ebuilds
       (cache, cacheWarn) <-
         liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayResolved
       mapM_ logWarning cacheWarn
+      willLive <-
+        liftIO (needsLiveGitHubApi cache overlayResolved selectedEntries byPkg)
+      decryptCache <- liftIO (newIORef Nothing)
+      let secretPrompt =
+            productionSecretPrompt
+              (pauseActivePanel (rtProgress rt))
+              (resumeActivePanel (rtProgress rt))
+      prepared <-
+        liftIO (prepareGitHubToken cfg secretPrompt decryptCache willLive)
+      (token, latch) <- case prepared of
+        Left err -> dieError (T.unpack err)
+        Right (tok, warns) -> do
+          mapM_ logWarning warns
+          l <- liftIO newGitHubLatch
+          when willLive $ runGitHubHealth l tok
+          pure (tok, l)
+      fetch <- liftIO (productionFetcherWithLatch latch token)
+      depsOps <-
+        liftIO
+          ( productionDepsPlanOpsWithLatch
+              latch
+              token
+              (rtJobs rt)
+              (Just overlayResolved)
+          )
       reports <-
         liftIO $
           withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
@@ -209,7 +238,11 @@ runOutdated rt refresh pkgArgs = do
       liftIO (flushCheckCache cache)
       mSummary <- liftIO (cacheSummaryLine cache)
       mapM_ logInfo mSummary
-      mapM_ emitReport reports
+      (keep, mAbort) <- liftIO (finishOutdatedReports latch reports)
+      mapM_ emitReport keep
+      case mAbort of
+        Just err -> dieError (T.unpack err)
+        Nothing -> pure ()
 
 runUpdate ::
   (WithLog env Message m, MonadIO m) => Runtime -> Bool -> [String] -> m ()
@@ -253,19 +286,40 @@ runUpdate rt refresh pkgArgs = do
       case probeOk of
         Left err -> dieError (T.unpack err)
         Right () -> pure ()
-      token <- liftIO (resolveGitHubToken cfg)
-      mapM_ logWarning =<< liftIO (envWarningsFor cfg)
       -- Open check cache before plan phase.
       (cache, cacheWarn) <-
         liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayPath
       mapM_ logWarning cacheWarn
-      fetch <- liftIO (productionFetcherWithToken token)
+      willLive <-
+        liftIO (needsLiveGitHubApi cache overlayPath selected (groupByPackage ebuilds))
+      decryptCache <- liftIO (newIORef Nothing)
+      let pcfg = rtProgress rt
+          secretPrompt =
+            productionSecretPrompt
+              (pauseActivePanel pcfg)
+              (resumeActivePanel pcfg)
+      prepared <-
+        liftIO (prepareGitHubToken cfg secretPrompt decryptCache willLive)
+      (token, latch) <- case prepared of
+        Left err -> dieError (T.unpack err)
+        Right (tok, warns) -> do
+          mapM_ logWarning warns
+          l <- liftIO newGitHubLatch
+          when willLive $ runGitHubHealth l tok
+          pure (tok, l)
+      fetch <- liftIO (productionFetcherWithLatch latch token)
       depsOps <-
-        liftIO (productionDepsPlanOps token (rtJobs rt) (Just overlayPath))
+        liftIO
+          ( productionDepsPlanOpsWithLatch
+              latch
+              token
+              (rtJobs rt)
+              (Just overlayPath)
+          )
       dummyReleaseOps <-
         liftIO $
           case token of
-            Just t -> productionReleaseOps t
+            Just t -> productionReleaseOpsWithLatch latch t
             Nothing ->
               pure
                 ReleaseOps
@@ -273,13 +327,8 @@ runUpdate rt refresh pkgArgs = do
                     roDownloadAsset = \_ _ -> pure (Left "GitHub token required"),
                     roCreateReleaseWithAssets = \_ _ -> pure (Left "GitHub token required")
                   }
-      let pcfg = rtProgress rt
-          gpgOps =
+      let gpgOps =
             productionGpgAgentOps
-              (pauseActivePanel pcfg)
-              (resumeActivePanel pcfg)
-          secretPrompt =
-            productionSecretPrompt
               (pauseActivePanel pcfg)
               (resumeActivePanel pcfg)
       spineResult <-
@@ -292,7 +341,6 @@ runUpdate rt refresh pkgArgs = do
                 uname <- hostMachineArch
                 mOvr <- lookupEnv materializeImageEnvVar
                 prev <- newMVar Nothing
-                decryptCache <- newIORef Nothing
                 let ovr = case mOvr of
                       Just s | not (null s) -> Just s
                       _ -> Nothing
@@ -330,7 +378,7 @@ runUpdate rt refresh pkgArgs = do
                           usdAssetsRepo = "mndz-overlay-assets",
                           usdGitHubToken = token,
                           usdUnlockConfigToken = unlockEnvelope,
-                          usdMkReleaseOps = productionReleaseOps,
+                          usdMkReleaseOps = productionReleaseOpsWithLatch latch,
                           usdGitOriginUrl = gitRemoteOriginUrl,
                           usdAssetsPathCfg = assetsPath cfg,
                           usdDistDir = distDir,
@@ -347,7 +395,9 @@ runUpdate rt refresh pkgArgs = do
                               productionCommandRunner
                               isLiveOverlayManagerPid,
                           usdMaterializeDockerRunner =
-                            Just productionCommandRunner
+                            Just productionCommandRunner,
+                          usdGitHubLatch = latch,
+                          usdGitOperationsHealth = productionGitOperationsHealth
                         }
                 runUpdatePhases deps entries ebuilds selected
             )
@@ -428,11 +478,34 @@ runGitHubToken rt force = do
     Right writtenPath ->
       logInfo ("wrote encrypted github-token to " <> T.pack writtenPath)
 
-envWarningsFor :: OverlayConfig -> IO [T.Text]
-envWarningsFor cfg = do
-  ght <- lookupEnv "GITHUB_TOKEN"
-  gh <- lookupEnv "GH_TOKEN"
-  pure (envTokenWarnings (resolveTokenSource ght gh (githubToken cfg)))
+runGitHubHealth ::
+  (WithLog env Message m, MonadIO m) =>
+  GitHubLatch ->
+  Maybe T.Text ->
+  m ()
+runGitHubHealth latch token = do
+  http <- liftIO productionGitHubHealthHttp
+  outcome <-
+    liftIO $
+      runGitHubHealthPreflight
+        latch
+        http
+        token
+        GitHubHealthScope
+          { ghsCheckApiRequests = True,
+            ghsCheckGitOperations = False
+          }
+  case interpretHealthOutcome outcome of
+    Left err -> dieError (T.unpack err)
+    Right warns -> mapM_ logWarning warns
+
+productionGitOperationsHealth :: IO (Either T.Text ())
+productionGitOperationsHealth = do
+  http <- productionGitHubHealthHttp
+  outcome <- runGitOperationsHealth http
+  pure $ case interpretHealthOutcome outcome of
+    Left err -> Left err
+    Right _ -> Right ()
 
 runEclean :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runEclean rt = do
