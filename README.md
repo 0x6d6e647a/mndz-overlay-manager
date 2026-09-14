@@ -32,6 +32,8 @@ Bun inside the image comes from overlay `dev-lang/bun-bin::mndz` (overlay bind-m
 - `$XDG_CACHE_HOME/mndz/overlay-manager/materialize/` when `XDG_CACHE_HOME` is set and non-empty (`image.json` plus the last generated `Dockerfile`)
 - otherwise `~/.cache/mndz/overlay-manager/materialize/`
 
+Image Portage DISTDIR (`/var/cache/distfiles`), PKGDIR (`/var/cache/binpkgs`), and binhost fetch caches (`/var/cache/binhost`) live in Docker BuildKit, not as XDG binpkg trees under that overlay-manager cache path (except `image.json` and the last generated Dockerfile). A successful default-tag `docker build` runs Gentoo `eclean-pkg --deep` and `eclean-dist --deep` after toolchain install so those caches keep the exact installed versions. `docker builder prune` wipes them; ensure does not run it. Cache sizes appear in the ensure build log. Moving a warm cache to another machine means copying `image.json` together with the docker image, not copying a host directory of binpkgs.
+
 Override with `MNDZ_MATERIALIZE_IMAGE` to an **existing** tag: the CLI inspects/satisfies that tag only and does not `docker build` or `docker rmi` it. The image must match the **host CPU architecture** (no qemu/foreign-arch materialize).
 
 While a **full-path** unit is running, `update` keeps one named Docker container for that unit (`mndz-mat-<run-id>-<category>-<package>-<pv>`, slashes replaced so the name is Docker-legal). `docker ps`, `docker stats`, and `docker exec` can target it **while the unit runs**. The container is removed when that unit ends (`--rm` / `docker rm`). Do not drop `--rm` or keep failed containers for debugging; a hard-fail retains the host unit `work/` directory (see temp workspace below) as the investigation artifact.

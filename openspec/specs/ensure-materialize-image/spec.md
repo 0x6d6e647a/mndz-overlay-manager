@@ -205,7 +205,15 @@ The program SHALL treat the materialize image as satisfying a prepare when every
 
 The program SHALL generate the Dockerfile (or equivalent build recipe) used by ensure. The image SHALL be Gentoo on the host CPU architecture. The generated `FROM` line SHALL name an official `gentoo/stage3` **glibc OpenRC** flavor tag mapped from the host machine (`uname -m`), not the Portage KEYWORDS token concatenated onto `gentoo/stage3:`. The program SHALL NOT use Hub tags `amd64` or `arm64` as `FROM`, SHALL NOT use `gentoo/stage3:latest` as the generated `FROM`, and SHALL NOT use systemd, musl, llvm, hardened, or desktop flavor tags for that `FROM`. Portage `package.accept_keywords` SHALL use the Gentoo KEYWORDS token for the host (`amd64`, `arm64`, `ppc64`, `riscv`, `s390`, `x86`, `arm`).
 
-Before `docker build`, the program SHALL choose **one** Portage atom per needed toolchain by scanning the gentoo (or overlay, for bun-bin) package directories: if a `-bin` package exists and has a host-arch ebuild whose version is greater than or equal to the floor (plain or tilde KEYWORDS), that `-bin` atom SHALL be used; otherwise the corresponding source package SHALL be used when it likewise has such an ebuild. The generated recipe SHALL `emerge` that single atom (`>=` the floor, or unversioned when the floor token is any-version). The recipe SHALL NOT trial-emerge a missing `-bin` package with a shell `||` fallback. A local binpkg of the chosen atom SHALL be preferred over compiling (`usepkg` / PKGDIR, then `getbinpkg` from the configured binhost, then compile). After a successful merge the build SHALL write a binpkg (`buildpkg`) into the image’s PKGDIR cache mount. That cache mount SHALL use a stable BuildKit cache id so a later recipe or generator rebuild can reuse it. The program SHALL NOT install Go, Node, Bun, Rust, or SBCL from upstream official tarball/zip URLs as a substitute for Portage. Overlay ebuild KEYWORDS and BDEPEND/RDEPEND SHALL remain as specified by runtime-lanes and ecosystem capabilities; the image is not an overlay package. Image SBCL SHALL NOT enable `USE=source`.
+Before `docker build`, the program SHALL choose **one** Portage atom per needed toolchain by scanning the gentoo (or overlay, for bun-bin) package directories: if a `-bin` package exists and has a host-arch ebuild whose version is greater than or equal to the floor (plain or tilde KEYWORDS), that `-bin` atom SHALL be used; otherwise the corresponding source package SHALL be used when it likewise has such an ebuild. The generated recipe SHALL `emerge` that single atom (`>=` the floor, or unversioned when the floor token is any-version). The recipe SHALL NOT trial-emerge a missing `-bin` package with a shell `||` fallback. A local binpkg of the chosen atom SHALL be preferred over compiling (`usepkg` / PKGDIR, then `getbinpkg` from the configured binhost, then compile). After a successful merge the build SHALL write a binpkg (`buildpkg`) into the image’s PKGDIR cache mount.
+
+Every recipe `RUN` that invokes Portage (`emerge`, `emerge-webrsync`, `getuto`, `eclean-pkg`, or `eclean-dist`) SHALL cache-mount all three of:
+
+- `/var/cache/distfiles` with BuildKit cache id `mndz-materialize-distfiles`
+- `/var/cache/binpkgs` with BuildKit cache id `mndz-materialize-binpkgs`
+- `/var/cache/binhost` with BuildKit cache id `mndz-materialize-binhost`
+
+Those ids SHALL stay stable across generator and recipe-text changes so a later rebuild can reuse the same caches. The program SHALL NOT bind-mount host filesystem paths as those three Portage directories during `docker build`. The program SHALL NOT install Go, Node, Bun, Rust, or SBCL from upstream official tarball/zip URLs as a substitute for Portage. Overlay ebuild KEYWORDS and BDEPEND/RDEPEND SHALL remain as specified by runtime-lanes and ecosystem capabilities; the image is not an overlay package. Image SBCL SHALL NOT enable `USE=source`. The generated image SHALL include `app-portage/gentoolkit` so `eclean-pkg` and `eclean-dist` are available for Portage cache prune as specified below.
 
 When the chosen atom has no host-arch ebuild ≥ the floor with **plain** KEYWORDS, the recipe SHALL write package-level `package.accept_keywords` of the form `>=cat/pkg-VER::repo ~<keywords-token>` (`::gentoo` for tree toolchains, `::mndz` for overlay bun-bin) and SHALL NOT set whole-image `ACCEPT_KEYWORDS` to `~arch`. When a plain-visible ebuild already meets the floor, that line SHALL be omitted for that atom.
 
@@ -261,6 +269,46 @@ When generating a recipe, the program SHALL map host `uname -m` as follows:
 
 - **WHEN** the recipe emerges `dev-lisp/sbcl` to meet a floor
 - **THEN** that atom does not enable `USE=source`
+
+#### Scenario: Portage RUNs share three stable cache ids
+
+- **WHEN** ensure generates a Dockerfile that emerges at least one toolchain
+- **THEN** each Portage `RUN` cache-mounts `/var/cache/distfiles` with id `mndz-materialize-distfiles`, `/var/cache/binpkgs` with id `mndz-materialize-binpkgs`, and `/var/cache/binhost` with id `mndz-materialize-binhost`
+- **AND** the recipe emerges `app-portage/gentoolkit`
+
+### Requirement: Prune Portage caches after union toolchain install
+
+When default-tag ensure `docker build`s, the generated recipe SHALL, **after** every toolchain and overlay-atom emerge step for that image, run `eclean-pkg --deep` and `eclean-dist --deep` in a Portage `RUN` that uses the same three cache mounts specified for emerge. That prune `RUN` SHALL report the sizes of `/var/cache/binhost`, `/var/cache/binpkgs`, and `/var/cache/distfiles` before and after those `eclean` commands (for example `du -sh` of each). The program SHALL NOT pass `--package-names` to `eclean-pkg`. Failure of that prune `RUN` SHALL fail ensure (the image is not recorded as satisfying the prepare).
+
+The recipe SHALL NOT run `eclean-pkg --deep` or `eclean-dist --deep` before the first emerge of that build, and SHALL NOT run them at the end of an intermediate toolchain `RUN` while later toolchains in the same recipe have not yet been emerged. When ensure skips `docker build` (union already satisfies), the program SHALL NOT run those `eclean` commands. When `MNDZ_MATERIALIZE_IMAGE` is set, the program SHALL NOT run them. The program SHALL NOT run `docker builder prune` to reclaim Portage caches.
+
+#### Scenario: Successful default-tag build prunes after toolchains
+
+- **WHEN** ensure `docker build`s the default tag for a union that includes Go and SBCL
+- **THEN** the generated recipe runs `eclean-pkg --deep` and `eclean-dist --deep` after those toolchain emerge steps
+- **AND** that prune step cache-mounts the same three Portage cache ids as the emerge steps
+- **AND** it does not pass `--package-names` to `eclean-pkg`
+
+#### Scenario: Prune is not at the start of the build
+
+- **WHEN** ensure generates a Dockerfile
+- **THEN** `eclean-pkg --deep` and `eclean-dist --deep` do not appear before the first `emerge` in that recipe
+
+#### Scenario: Satisfies skip does not prune caches
+
+- **WHEN** `image.json` already satisfies this prepare and ensure does not `docker build`
+- **THEN** the program does not run `eclean-pkg` or `eclean-dist`
+
+#### Scenario: Override tag does not prune caches
+
+- **WHEN** `MNDZ_MATERIALIZE_IMAGE` is set to a non-empty tag
+- **THEN** the program does not run `eclean-pkg` or `eclean-dist` against BuildKit Portage caches
+
+#### Scenario: Failed prune fails ensure
+
+- **WHEN** default-tag `docker build` reaches the prune step and that step fails
+- **THEN** ensure fails
+- **AND** the sidecar is not recorded as a successful satisfy for this prepare
 
 ### Requirement: Unmapped host architecture fails before docker build
 

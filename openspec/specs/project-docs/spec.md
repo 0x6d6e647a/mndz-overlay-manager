@@ -288,6 +288,7 @@ Operator documentation in `README.md` SHALL document the optional `check-cache-t
 4. That `update` **ensures** the default materialize image when full-path work needs it (generate and `docker build` if the current image does not satisfy those floors); that GitMv/reuse may proceed while ensure runs; that Bun in the image comes from overlay `dev-lang/bun-bin::mndz`; that qlot in the image (when SBCL is installed) comes from overlay `dev-lisp/qlot::mndz` rather than a live Quicklisp installer fetch; that `node-gyp` in the image (when bun or node is installed) comes from overlay `dev-build/node-gyp::mndz`; that metadata lives under the XDG cache `…/mndz/overlay-manager/materialize/` (`image.json`); that `MNDZ_MATERIALIZE_IMAGE` uses an existing tag and is not built or deleted by the CLI; that a manual `docker build` of an in-repo Dockerfile is **not** a required prerequisite of `update`; that the git tree SHALL NOT ship `docker/materialize/` (recipe or pointer) as operator documentation; that ensure’s generated recipe uses an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture; and that a host architecture with no such official flavor hard-fails ensure (no host language-toolchain fallback).
 5. That work commands warn when the overlay-manager TOML is not mode `0600`, without changing token resolution.
 6. That the generated image installs language toolchains via Portage: prefers a Gentoo `-bin` package when one can meet the floor, accepts testing KEYWORDS per atom (`~arch`, `::gentoo` or `::mndz`) when the floor is not stable-visible, does not set whole-image `ACCEPT_KEYWORDS` to `~arch`, and reuses local binpkgs across image rebuilds.
+7. That image Portage DISTDIR, PKGDIR, and binhost fetch caches live in Docker BuildKit (not under XDG `…/mndz/overlay-manager/` except `image.json` / the last Dockerfile); that a successful default-tag `docker build` runs `eclean-pkg --deep` and `eclean-dist --deep` after toolchain install so those caches keep exact installed versions; that `docker builder prune` wipes them (ensure does not run it); that sizes appear in the ensure build log; and that moving a warm cache to another machine means copying `image.json` together with the docker image, not copying a host directory of binpkgs.
 
 #### Scenario: Operator finds Docker in the runtime table
 
@@ -325,6 +326,14 @@ Operator documentation in `README.md` SHALL document the optional `check-cache-t
 - **THEN** the text states that toolchains come from Portage `-bin` when available
 - **AND** that testing toolchain versions are accepted per package, not by setting the whole image to `~arch`
 - **AND** that image rebuilds reuse locally built binpkgs
+
+#### Scenario: Operator finds BuildKit Portage caches and prune
+
+- **WHEN** an operator reads `README.md` materialize image documentation
+- **THEN** the text states that DISTDIR, PKGDIR, and binhost caches live in Docker BuildKit, not as XDG binpkg trees
+- **AND** that a successful image build prunes those caches to installed versions with Gentoo `eclean --deep`
+- **AND** that `docker builder prune` wipes them
+- **AND** that a cache-only copy is not a migrate path (copy `image.json` and the docker image, or accept a cold compile)
 
 ### Requirement: README documents live materialize container names
 

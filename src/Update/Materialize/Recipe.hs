@@ -50,15 +50,19 @@ distfilesCacheId = "mndz-materialize-distfiles"
 binpkgsCacheId :: Text
 binpkgsCacheId = "mndz-materialize-binpkgs"
 
+binhostCacheId :: Text
+binhostCacheId = "mndz-materialize-binhost"
+
 -- | Render a BuildKit Dockerfile from already-resolved toolchain installs.
 --
 -- Overlay is bind-mounted at the host path (read-only) via an extra build
--- context named @overlay@; distfiles/binpkgs use stable-id cache mounts. Bun is
--- @dev-lang/bun-bin::mndz@ only. Qlot is overlay @dev-lisp/qlot::mndz@ after
--- @ENV SBCL_HOME@. Node-gyp is overlay @dev-build/node-gyp::mndz@ after Node
--- and before go/bun. No official go.dev / nodejs.org / GitHub zip toolchain
--- URLs. @FROM@ uses the OpenRC Hub tag. Layer order is rust → sbcl → qlot →
--- node → node-gyp → go → bun.
+-- context named @overlay@; distfiles/binpkgs/binhost use stable-id cache
+-- mounts. Bun is @dev-lang/bun-bin::mndz@ only. Qlot is overlay
+-- @dev-lisp/qlot::mndz@ after @ENV SBCL_HOME@. Node-gyp is overlay
+-- @dev-build/node-gyp::mndz@ after Node and before go/bun. No official go.dev /
+-- nodejs.org / GitHub zip toolchain URLs. @FROM@ uses the OpenRC Hub tag.
+-- Layer order is rust → sbcl → qlot → node → node-gyp → go → bun, then a
+-- Portage cache prune @RUN@.
 renderMaterializeDockerfile ::
   RecipeArch ->
   -- | Host overlay path (bind destination and repos.conf location).
@@ -70,6 +74,7 @@ renderMaterializeDockerfile arch overlayPath installs =
     header
       <> [runCache baseCmds]
       <> concatMap (installRuns overlay (raKeywords arch)) ordered
+      <> [runCache pruneCmds, ""]
       <> builderHome
   where
     overlay = T.pack overlayPath
@@ -88,7 +93,13 @@ renderMaterializeDockerfile arch overlayPath installs =
       [ "emerge-webrsync",
         "(command -v getuto >/dev/null && getuto || true)",
         "emerge --oneshot sys-apps/portage",
-        "emerge -n app-arch/tar app-arch/xz-utils app-misc/ca-certificates app-arch/unzip dev-vcs/git net-misc/aria2 net-misc/wget"
+        "emerge -n app-arch/tar app-arch/xz-utils app-misc/ca-certificates app-arch/unzip dev-vcs/git net-misc/aria2 net-misc/wget app-portage/gentoolkit"
+      ]
+    pruneCmds =
+      [ "du -sh /var/cache/binhost /var/cache/binpkgs /var/cache/distfiles",
+        "eclean-pkg --deep",
+        "eclean-dist --deep",
+        "du -sh /var/cache/binhost /var/cache/binpkgs /var/cache/distfiles"
       ]
     builderHome =
       [ "RUN mkdir -p /home/builder/.config /tmp/builder-cache \\",
@@ -192,27 +203,30 @@ kindFile = \case
   TkGo -> "go"
   TkBun -> "bun"
 
-runCache :: [Text] -> Text
-runCache cmds =
-  "RUN --mount=type=cache,id="
+portageCacheMounts :: Text
+portageCacheMounts =
+  "--mount=type=cache,id="
     <> distfilesCacheId
     <> ",target=/var/cache/distfiles \\\n\
        \    --mount=type=cache,id="
     <> binpkgsCacheId
     <> ",target=/var/cache/binpkgs \\\n\
-       \    "
+       \    --mount=type=cache,id="
+    <> binhostCacheId
+    <> ",target=/var/cache/binhost"
+
+runCache :: [Text] -> Text
+runCache cmds =
+  "RUN "
+    <> portageCacheMounts
+    <> " \\\n    "
     <> T.intercalate " \\\n && " cmds
 
 runCacheOverlay :: Text -> [Text] -> Text
 runCacheOverlay overlay cmds =
   "RUN --mount=type=bind,from=overlay,source=/,target="
     <> overlay
-    <> ",ro \\\n\
-       \    --mount=type=cache,id="
-    <> distfilesCacheId
-    <> ",target=/var/cache/distfiles \\\n\
-       \    --mount=type=cache,id="
-    <> binpkgsCacheId
-    <> ",target=/var/cache/binpkgs \\\n\
-       \    "
+    <> ",ro \\\n    "
+    <> portageCacheMounts
+    <> " \\\n    "
     <> T.intercalate " \\\n && " cmds

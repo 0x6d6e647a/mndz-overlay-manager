@@ -117,6 +117,7 @@ unitTests =
       testCase "Cargo declared tag floor feeds ensure" testCargoDeclaredTagFloorFeedsEnsure,
       testCase "Cargo selection 0.0.0 is not an image floor" testCargoAbsenceNotImageFloor,
       testCase "render contains ::mndz and no official tarball URLs" testRenderMndzNoOfficial,
+      testCase "prune RUN follows Go and SBCL toolchain emerges" testRenderPruneAfterToolchains,
       testCase "uname map splits KEYWORDS from OpenRC Hub tag" testLookupRecipeArch,
       testCase "x86_64 recipe uses amd64-openrc FROM and ~amd64 keywords" testAmd64OpenrcRecipe,
       testCase "ppc64le recipe uses ppc64le-openrc FROM and ~ppc64 keywords" testPpc64leOpenrcRecipe,
@@ -233,6 +234,9 @@ testBunOnlyOmitsSbcl = do
   assertTrue "bun-only omits SBCL_HOME" (not ("SBCL_HOME" `T.isInfixOf` df))
   assertTrue "bun-only omits qlot" (not ("dev-lisp/qlot" `T.isInfixOf` df))
   assertTrue "base still emerges wget" ("net-misc/wget" `T.isInfixOf` df)
+  assertGentoolkitInBase "bun-only" df
+  assertPortageCacheIds "bun-only" df
+  assertPruneRun "bun-only" df
 
 testPinOnlyBunBinNotImageFloor :: IO ()
 testPinOnlyBunBinNotImageFloor =
@@ -478,6 +482,11 @@ testRenderMndzNoOfficial = do
   assertTrue
     "stable binpkgs cache id"
     ("id=mndz-materialize-binpkgs" `T.isInfixOf` df)
+  assertTrue
+    "stable binhost cache id"
+    ("id=mndz-materialize-binhost" `T.isInfixOf` df)
+  assertPortageCacheIds "go+bun" df
+  assertGentoolkitInBase "go+bun" df
   assertTrue "no sbcl-bin ||" (not ("sbcl-bin" `T.isInfixOf` df))
   assertTrue "no shell fallback" (not ("|| emerge" `T.isInfixOf` df))
 
@@ -587,6 +596,9 @@ testRenderSbclTestingFloor = do
     (all ("from=overlay" `T.isInfixOf`) qlotRuns)
   assertTrue "base still emerges wget" ("net-misc/wget" `T.isInfixOf` df)
   assertTrue "base still emerges aria2" ("net-misc/aria2" `T.isInfixOf` df)
+  assertPortageCacheIds "sbcl+qlot" df
+  assertGentoolkitInBase "sbcl+qlot" df
+  assertPruneRun "sbcl+qlot" df
 
 testRenderSbclX86Libdir :: IO ()
 testRenderSbclX86Libdir = do
@@ -627,6 +639,106 @@ renderMapped uname installs overlay =
     Nothing -> assertFailure (uname <> " should map")
     Just arch -> pure (renderMaterializeDockerfile arch overlay installs)
 
+threeCacheIds :: [T.Text]
+threeCacheIds =
+  [ "id=mndz-materialize-distfiles",
+    "id=mndz-materialize-binpkgs",
+    "id=mndz-materialize-binhost"
+  ]
+
+dockerfileRuns :: T.Text -> [T.Text]
+dockerfileRuns = T.splitOn "RUN "
+
+isPortageRun :: T.Text -> Bool
+isPortageRun r =
+  any
+    (`T.isInfixOf` r)
+    ["emerge", "getuto", "eclean-pkg", "eclean-dist"]
+
+assertPortageCacheIds :: String -> T.Text -> IO ()
+assertPortageCacheIds label df = do
+  let runs = filter isPortageRun (dockerfileRuns df)
+  assertTrue (label <> ": Portage RUNs present") (not (null runs))
+  mapM_
+    ( \cid ->
+        assertTrue
+          (label <> ": every Portage RUN has " <> T.unpack cid)
+          (all (cid `T.isInfixOf`) runs)
+    )
+    threeCacheIds
+
+assertGentoolkitInBase :: String -> T.Text -> IO ()
+assertGentoolkitInBase label df = do
+  let runs = filter isPortageRun (dockerfileRuns df)
+  case runs of
+    [] -> assertFailure (label <> ": no Portage RUN for gentoolkit")
+    (base : _) ->
+      assertTrue
+        (label <> ": base RUN emerges gentoolkit")
+        ("app-portage/gentoolkit" `T.isInfixOf` base)
+
+assertPruneRun :: String -> T.Text -> IO ()
+assertPruneRun label df = do
+  assertTrue
+    (label <> ": eclean-pkg --deep")
+    ("eclean-pkg --deep" `T.isInfixOf` df)
+  assertTrue
+    (label <> ": eclean-dist --deep")
+    ("eclean-dist --deep" `T.isInfixOf` df)
+  assertTrue
+    (label <> ": no --package-names")
+    (not ("--package-names" `T.isInfixOf` df))
+  assertTrue
+    (label <> ": du -sh of the three caches twice")
+    ( T.count
+        "du -sh /var/cache/binhost /var/cache/binpkgs /var/cache/distfiles"
+        df
+        >= 2
+    )
+  let (beforeEmerge, _) = T.breakOn "emerge" df
+  assertTrue
+    (label <> ": no eclean-pkg --deep before first emerge")
+    (not ("eclean-pkg --deep" `T.isInfixOf` beforeEmerge))
+  assertTrue
+    (label <> ": no eclean-dist --deep before first emerge")
+    (not ("eclean-dist --deep" `T.isInfixOf` beforeEmerge))
+  let pruneRuns = filter ("eclean-pkg --deep" `T.isInfixOf`) (dockerfileRuns df)
+  assertTrue (label <> ": prune RUN present") (not (null pruneRuns))
+  mapM_
+    ( \cid ->
+        assertTrue
+          (label <> ": prune RUN has " <> T.unpack cid)
+          (all (cid `T.isInfixOf`) pruneRuns)
+    )
+    threeCacheIds
+
+assertNoEcleanDocker :: String -> [[String]] -> IO ()
+assertNoEcleanDocker label calls = do
+  assertTrue
+    (label <> ": no docker run")
+    (not (any ("run" `elem`) calls))
+  assertTrue
+    (label <> ": no eclean in docker args")
+    (not (any (any (("eclean" `T.isInfixOf`) . T.pack)) calls))
+
+testRenderPruneAfterToolchains :: IO ()
+testRenderPruneAfterToolchains = do
+  df <-
+    renderMapped
+      "x86_64"
+      [goInstall "1.26.5", sbclInstall "2.6.6"]
+      "/overlay"
+  assertPortageCacheIds "go+sbcl" df
+  assertGentoolkitInBase "go+sbcl" df
+  assertPruneRun "go+sbcl" df
+  let (beforePrune, _) = T.breakOn "eclean-pkg --deep" df
+  assertTrue
+    "Go emerge before prune"
+    ("dev-lang/go" `T.isInfixOf` beforePrune)
+  assertTrue
+    "SBCL emerge before prune"
+    ("dev-lisp/sbcl" `T.isInfixOf` beforePrune)
+
 bunInstall :: T.Text -> T.Text -> ResolvedInstall
 bunInstall ver kw =
   ResolvedInstall
@@ -654,6 +766,16 @@ goInstall ver =
     ResolvedToolchain
       { rtAtom = "dev-lang/go",
         rtEmergeSpec = ">=dev-lang/go-" <> ver,
+        rtAcceptLine = Nothing
+      }
+
+sbclInstall :: T.Text -> ResolvedInstall
+sbclInstall ver =
+  ResolvedInstall
+    TkSbcl
+    ResolvedToolchain
+      { rtAtom = "dev-lisp/sbcl",
+        rtEmergeSpec = ">=dev-lisp/sbcl-" <> ver,
         rtAcceptLine = Nothing
       }
 
@@ -1004,6 +1126,7 @@ testSkipWhenSatisfies =
     assertEq "skipped" (Right EnsureSkipped) got
     calls <- readIORef builds
     assertEq "no docker build" [] calls
+    assertNoEcleanDocker "skip satisfies" calls
 
 testGeneratorMismatchRebuilds :: IO ()
 testGeneratorMismatchRebuilds =
@@ -1024,8 +1147,14 @@ testGeneratorMismatchRebuilds =
     bs <- BS.readFile (sidecarImageJsonPath sidecar)
     case decodeImageSidecar bs of
       Left err -> assertFailure err
-      Right side ->
+      Right side -> do
         assertEq "records current generator" materializeGeneratorId (isGenerator side)
+        assertEq
+          "generator is materialize-7"
+          "mndz-overlay-manager-materialize-7"
+          materializeGeneratorId
+    df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
+    assertPruneRun "generator rebuild" df
 
 testNewerQlotRebuilds :: IO ()
 testNewerQlotRebuilds =
@@ -1189,6 +1318,7 @@ testOverrideUnmappedNoBuild =
     assertEq "inspect-only skip" (Right EnsureSkipped) got
     calls <- readIORef builds
     assertEq "no docker build" [] calls
+    assertNoEcleanDocker "override unmapped" calls
 
 testOverrideMissingNoBuild :: IO ()
 testOverrideMissingNoBuild =
@@ -1213,6 +1343,7 @@ testOverrideMissingNoBuild =
       Right o -> assertFailure ("expected fail, got " <> show o)
     calls <- readIORef builds
     assertEq "no docker build of override" [] calls
+    assertNoEcleanDocker "override missing" calls
     -- Message helper stays aligned with spec copy.
     assertTrue
       "helper names tag"
@@ -1248,6 +1379,8 @@ testFakeBuildRecordsUnion =
     df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
     assertTrue "recipe ::mndz" ("::mndz" `T.isInfixOf` df)
     assertTrue "recipe still has go" ("dev-lang/go" `T.isInfixOf` df)
+    assertPortageCacheIds "union build" df
+    assertPruneRun "union build" df
 
 testDiskGateSkippedWhenSatisfies :: IO ()
 testDiskGateSkippedWhenSatisfies =
@@ -1264,6 +1397,7 @@ testDiskGateSkippedWhenSatisfies =
     assertEq "tiny disk still skip when satisfies" (Right EnsureSkipped) got
     calls <- readIORef builds
     assertEq "no build" [] calls
+    assertNoEcleanDocker "disk skip" calls
     let msg =
           imageDiskInsufficientMessage
             "/var/lib/docker"
