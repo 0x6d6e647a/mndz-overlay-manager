@@ -286,7 +286,7 @@ Operator documentation in `README.md` SHALL document the optional `check-cache-t
 2. That reuse of existing assets releases does not require Docker or those language tools.
 3. That GPG-signed commits, SSH `git push`, GitHub token, `ebuild` / `egencache`, and overlay/assets worktrees stay on the host.
 4. That `update` **ensures** the default materialize image when full-path work needs it (generate and `docker build` if the current image does not satisfy those floors); that GitMv/reuse may proceed while ensure runs; that Bun in the image comes from overlay `dev-lang/bun-bin::mndz`; that qlot in the image (when SBCL is installed) comes from overlay `dev-lisp/qlot::mndz` rather than a live Quicklisp installer fetch; that `node-gyp` in the image (when bun or node is installed) comes from overlay `dev-build/node-gyp::mndz`; that metadata lives under the XDG cache `…/mndz/overlay-manager/materialize/` (`image.json`); that `MNDZ_MATERIALIZE_IMAGE` uses an existing tag and is not built or deleted by the CLI; that a manual `docker build` of an in-repo Dockerfile is **not** a required prerequisite of `update`; that the git tree SHALL NOT ship `docker/materialize/` (recipe or pointer) as operator documentation; that ensure’s generated recipe uses an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture; and that a host architecture with no such official flavor hard-fails ensure (no host language-toolchain fallback).
-5. That work commands warn when the overlay-manager TOML is not mode `0600`, without changing token resolution.
+5. That work commands hard-fail when the overlay-manager TOML is not exactly mode `0600` or its mode cannot be read, without changing token resolution.
 6. That the generated image installs language toolchains via Portage: prefers a Gentoo `-bin` package when one can meet the floor, accepts testing KEYWORDS per atom (`~arch`, `::gentoo` or `::mndz`) when the floor is not stable-visible, does not set whole-image `ACCEPT_KEYWORDS` to `~arch`, and reuses local binpkgs across image rebuilds.
 7. That image Portage DISTDIR, PKGDIR, and binhost fetch caches live in Docker BuildKit (not under XDG `…/mndz/overlay-manager/` except `image.json` / the last Dockerfile); that a successful default-tag `docker build` runs `eclean-pkg --deep` and `eclean-dist --deep` after toolchain install so those caches keep exact installed versions; that `docker builder prune` wipes them (ensure does not run it); that sizes appear in the ensure build log; and that moving a warm cache to another machine means copying `image.json` together with the docker image, not copying a host directory of binpkgs.
 
@@ -300,7 +300,7 @@ Operator documentation in `README.md` SHALL document the optional `check-cache-t
 #### Scenario: Operator finds config mode warning
 
 - **WHEN** an operator reads `README.md` configuration documentation
-- **THEN** the documentation states that a config file not mode `0600` produces a warning
+- **THEN** the documentation states that a config file not mode `0600` is a hard failure
 
 #### Scenario: Operator finds auto-ensure not a manual docker build recipe
 
