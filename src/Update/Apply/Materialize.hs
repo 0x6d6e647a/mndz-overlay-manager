@@ -14,7 +14,6 @@ module Update.Apply.Materialize
     reusePathMaterializeSteps,
     materializeStepTotalUpper,
     reviseMaterializeStepTotal,
-    fetchModelsDevApiJson,
     harvestVsLaneCeiling,
   )
 where
@@ -22,9 +21,7 @@ where
 import CLI.Progress (MultiHandle (..))
 import Control.Applicative ((<|>))
 import Control.Concurrent.MVar (withMVar)
-import Control.Exception (SomeException, catch)
 import Control.Monad (void, when)
-import Data.ByteString.Lazy qualified as LBS
 import Data.Containers.ListUtils (nubOrd)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sortOn)
@@ -32,18 +29,6 @@ import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Network.HTTP.Client
-  ( Manager,
-    httpLbs,
-    method,
-    newManager,
-    parseRequest,
-    requestHeaders,
-    responseBody,
-    responseStatus,
-  )
-import Network.HTTP.Client.TLS (tlsManagerSettings)
-import Network.HTTP.Types (statusCode)
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version
@@ -56,6 +41,7 @@ import Overlay.Version
   )
 import System.Directory
   ( createDirectoryIfMissing,
+    doesDirectoryExist,
     doesFileExist,
     listDirectory,
     removeFile,
@@ -79,7 +65,6 @@ import Update.Assets.Hash (FileDigests (..), hashFile, writeSidecars)
 import Update.Assets.Layout
   ( SidecarPaths (..),
     commitMessage,
-    modelsDistfileName,
     releaseName,
     releaseTag,
     rustyV8CommitMessage,
@@ -148,6 +133,7 @@ import Update.EbuildEdit
     goBdependAtom,
     nodejsBdependAtom,
     parseQuotedAssignment,
+    parseSrcCompileCd,
     sbclBdependAtom,
     writeVersionForPlannedPV,
   )
@@ -1289,6 +1275,10 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
           let progress = bunCacheProgress stepsDoneRef mh key
               packMode = bunPackagingModeFor key
               bunMin = bunProbeMinimum probe
+              bunEbuildVer =
+                if isBunCompilePinPackage key
+                  then fromMaybe bunMin (bunProbeExactPin probe)
+                  else bunMin
           built <-
             buildBunDepsTarball
               (aeBunCacheOps env)
@@ -1302,9 +1292,14 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
               workDir
               outDir
               tarballName
-          pure $ case built of
-            Left err -> Left err
-            Right p -> Right (p, Just bunMin, Nothing)
+          case built of
+            Left err -> pure (Left err)
+            Right p -> do
+              guarded <-
+                guardOpencodeCompileLayout key entry pvNoRev workDir
+              pure $ case guarded of
+                Left err -> Left err
+                Right () -> Right (p, Just bunEbuildVer, Nothing)
     (Cargo mLock mPkg mCargoSrc, GitHub owner repo prefix) -> do
       let plannedPv = parseEbuildVersion pvNoRev
       donorPath <-
@@ -1434,7 +1429,8 @@ harvestVsLaneCeiling plan pv tagFloor harvest =
       ]
     hNeed = fromMaybe "0.0.0" harvest
 
--- | Companion distfiles (e.g. models JSON) required beyond the primary tarball.
+-- | Companion distfiles required beyond the primary tarball.
+-- Opencode is deps-only; no package currently publishes companions.
 materializeCompanionAssets ::
   ApplyEnv ->
   PackageKey ->
@@ -1444,71 +1440,67 @@ materializeCompanionAssets ::
   [FilePath] ->
   IO (Either Text [FilePath])
 materializeCompanionAssets _ _ _ _ _ [] = pure (Right [])
-materializeCompanionAssets env key pn pvNoRev outDir names =
-  case key of
-    PackageKey "dev-util/opencode" ->
-      goOpencode names
-    _ ->
+materializeCompanionAssets _ key _ _ _ names =
+  pure $
+    Left
+      ( "unknown companion assets for "
+          <> let PackageKey k = key
+              in k
+                   <> ": "
+                   <> T.intercalate ", " (map T.pack names)
+      )
+
+-- | After the opencode GitHub clone, require the donor @src_compile@ @cd@
+-- target and @script/build.ts@ under it. Does not rewrite the @cd@ path.
+guardOpencodeCompileLayout ::
+  PackageKey ->
+  PackageEntry ->
+  Text ->
+  FilePath ->
+  IO (Either Text ())
+guardOpencodeCompileLayout (PackageKey "dev-util/opencode") entry pvNoRev workDir = do
+  let pkgDir = takeDirectory (pePath entry)
+      plannedPv = parseEbuildVersion pvNoRev
+      cloneDir = workDir </> "src"
+  donorPath <- findTemplate pkgDir (pePN entry) plannedPv (pePath entry)
+  donorExists <- doesFileExist donorPath
+  if not donorExists
+    then
       pure $
-        Left
-          ( "unknown companion assets for "
-              <> let PackageKey k = key in k
-          )
-  where
-    goOpencode [] = pure (Right [])
-    goOpencode (n : rest)
-      | n == modelsDistfileName pn pvNoRev = do
-          fetched <- aeFetchModelsDev env (outDir </> n)
-          case fetched of
-            Left err -> pure (Left err)
-            Right p -> do
-              more <- goOpencode rest
-              pure $ case more of
-                Left err -> Left err
-                Right ps -> Right (p : ps)
-      | otherwise =
+        Left $
+          applyUnitErrorMessage $
+            ApplyMissingDonorTemplate (peKey entry) (renderPV plannedPv) donorPath
+    else do
+      donorContent <- TIO.readFile donorPath
+      case parseSrcCompileCd donorContent of
+        Nothing ->
           pure $
-            Left ("unexpected companion distfile for opencode: " <> T.pack n)
-
--- | GET https://models.dev/api.json → write raw body to dest path.
-fetchModelsDevApiJson :: FilePath -> IO (Either Text FilePath)
-fetchModelsDevApiJson destPath = do
-  mgr <- newManager tlsManagerSettings
-  fetchModelsDevApiJsonWith mgr destPath
-
-fetchModelsDevApiJsonWith :: Manager -> FilePath -> IO (Either Text FilePath)
-fetchModelsDevApiJsonWith mgr destPath = do
-  req0 <- parseRequest "https://models.dev/api.json"
-  let req =
-        req0
-          { method = "GET",
-            requestHeaders =
-              [ ("User-Agent", "mndz-overlay-manager"),
-                ("Accept", "application/json")
-              ]
-          }
-  eres <-
-    (Right <$> httpLbs req mgr)
-      `catch` \(e :: SomeException) -> pure (Left (T.pack (show e)))
-  case eres of
-    Left err -> pure (Left ("models.dev fetch failed: " <> err))
-    Right resp ->
-      let code = statusCode (responseStatus resp)
-       in if code >= 200 && code < 300
-            then do
-              let body = responseBody resp
-              if LBS.null body
-                then pure (Left "models.dev returned empty body")
-                else do
-                  createDirectoryIfMissing True (takeDirectory destPath)
-                  LBS.writeFile destPath body
-                  pure (Right destPath)
-            else
+            Left $
+              "could not parse src_compile cd for opencode-" <> pvNoRev
+        Just rel -> do
+          let cwd = cloneDir </> T.unpack rel
+              buildTs = cwd </> "script" </> "build.ts"
+          cwdExists <- doesDirectoryExist cwd
+          if not cwdExists
+            then
               pure $
                 Left $
-                  "models.dev HTTP "
-                    <> T.pack (show code)
-                    <> " fetching api.json"
+                  "opencode-"
+                    <> pvNoRev
+                    <> " compile cwd missing: "
+                    <> rel
+            else do
+              tsExists <- doesFileExist buildTs
+              if not tsExists
+                then
+                  pure $
+                    Left $
+                      "opencode-"
+                        <> pvNoRev
+                        <> " missing script/build.ts under "
+                        <> rel
+                else pure (Right ())
+guardOpencodeCompileLayout _ _ _ _ = pure (Right ())
 
 npmCacheProgress :: IORef Int -> MultiHandle -> PackageKey -> NpmCacheProgress
 npmCacheProgress stepsDoneRef mh key =

@@ -334,6 +334,15 @@ testBunBinSlotSatisfy = do
   assertTrue
     "exact pin matches pin-slot PV"
     (pvsSatisfyNeed pvsPinOnly (NeedAtom pinAtom))
+  let tildePin =
+        OverlayAtom
+          { oaKey = bunBinKey,
+            oaOp = OpApprox,
+            oaVersion = Just (parseEbuildVersion "1.3.14")
+          }
+  assertTrue
+    "tilde pin matches pin-slot PV"
+    (pvsSatisfyNeed pvsPinOnly (NeedAtom tildePin))
   err <- failClosed ralphKey "BDEPEND=\">=dev-lang/bun-bin-1.3.6:1.3.14\"\n"
   assertTrue "consumer pin slot hard-fails" ("slot" `T.isInfixOf` err)
 

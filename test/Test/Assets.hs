@@ -344,6 +344,7 @@ tests =
       testCase "Deps Distfile Names" testDepsDistfileNames,
       testCase "Pin-keyed rusty-v8 layout" testRustyV8Layout,
       testCase "Codex crates required assets exclude rusty-v8" testCodexRequiredAssetsCratesOnly,
+      testCase "Opencode required assets are deps-only" testOpencodeRequiredAssetsDepsOnly,
       testCase "Release Lookup" testReleaseLookup,
       testCase "Multi-asset Lookup" testMultiAssetLookup,
       testCase "Release HTTP Get By Tag" testReleaseHttpGetByTag,
@@ -544,6 +545,19 @@ testCodexRequiredAssetsCratesOnly = do
   assertTrue
     "no rusty-v8 on crates tag"
     (not (any (("rusty-v8" `T.isInfixOf`) . T.pack) names))
+
+testOpencodeRequiredAssetsDepsOnly :: IO ()
+testOpencodeRequiredAssetsDepsOnly = do
+  let names =
+        requiredAssetBasenames
+          (PackageKey "dev-util/opencode")
+          Bun
+          "opencode"
+          "2.0.3"
+  assertEq "deps only" ["opencode-2.0.3-deps.tar.xz"] names
+  assertTrue
+    "models.json is not required"
+    (not (any (("models.json" `T.isInfixOf`) . T.pack) names))
 
 ------------------------------------------------------------------------
 -- Release lookup / reuse / Manifest content-fix

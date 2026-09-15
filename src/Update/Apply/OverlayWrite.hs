@@ -25,6 +25,7 @@ import Update.Apply.Errors
   )
 import Update.Assets.Hash (FileDigests (..))
 import Update.AtomClosure (ensureAtomClosedForWrite)
+import Update.Bun.Cache (isBunCompilePinPackage)
 import Update.Check (PackageEntry (..))
 import Update.EbuildEdit
   ( AssetsHost (..),
@@ -40,6 +41,7 @@ import Update.EbuildEdit
     ensureRustMinVer,
     ensureSbclAtom,
     parameterizeAssetsSrcUriFor,
+    rewriteBunExactInvocations,
     setKeywords,
   )
 import Update.EbuildSelection
@@ -152,7 +154,14 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
                 (NpmEco, Just ver) -> pure (ensureNodejsBdepend ver withKw)
                 (NpmEco, Nothing) ->
                   pure (Left "could not obtain engines.node for BDEPEND alignment")
-                (Bun, Just ver) -> pure (ensureBunBdependFor key ver withKw)
+                (Bun, Just ver) ->
+                  pure $
+                    case ensureBunBdependFor key ver withKw of
+                      Left err -> Left err
+                      Right withBun
+                        | isBunCompilePinPackage key ->
+                            Right (rewriteBunExactInvocations ver withBun)
+                        | otherwise -> Right withBun
                 (Bun, Nothing) ->
                   pure (Left "could not obtain engines.bun for BDEPEND alignment")
                 (Cargo {}, Just msrv) ->

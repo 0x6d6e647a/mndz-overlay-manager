@@ -160,7 +160,9 @@ import Update.EbuildEdit
     parameterizeAssetsSrcUriFor,
     parseEbuildSlot,
     parseManifestVendorSHA512,
+    parseSrcCompileCd,
     pnCollidesWithPinIdentity,
+    rewriteBunExactInvocations,
     rustyV8PinIdentity,
     sbclBdependMatches,
     setKeywords,
@@ -303,6 +305,8 @@ tests =
       testCase "Go Version Parse" testGoVersionParse,
       testCase "Go Bdepend Edit" testGoBdependEdit,
       testCase "Bun Bdepend floor and compile pin" testBunBdependEdit,
+      testCase "Bun exact invocation rewrite" testBunExactInvocationRewrite,
+      testCase "src_compile cd parse" testParseSrcCompileCd,
       testCase "Sbcl Atom Preserve Body" testSbclAtomPreserveBody,
       testCase "Nodejs Bdepend Use Replace" testNodejsBdependUseReplace,
       testCase "Vendor Go Version Gate" testVendorGoVersionGate,
@@ -536,6 +540,73 @@ testBunBdependEdit = do
   let slottedEbuild = setSlotField "1.3.14" "EAPI=8\nSLOT=\"0\"\n"
   assertEq "rewritten pin slot" "1.3.14" (parseEbuildSlot slottedEbuild)
   assertEq "missing SLOT is 0" "0" (parseEbuildSlot "EAPI=8\n")
+
+testBunExactInvocationRewrite :: IO ()
+testBunExactInvocationRewrite = do
+  let opencodeKey = mkPackageKey "dev-util" "opencode"
+      donor =
+        T.unlines
+          [ "inherit shell-completion",
+            "BDEPEND=\">=dev-lang/bun-bin-1.3.14\"",
+            "src_compile() {",
+            "\t# keep bun-1.3.14 in this comment",
+            "\tcd packages/cli || die",
+            "\tbun-1.3.14 --bun ./script/build.ts --single --skip-install || die",
+            "}",
+            "src_test() {",
+            "\tcd packages/cli || die",
+            "\tbun test --timeout 30000 --only-failures || die",
+            "}"
+          ]
+  withBdepend <-
+    assertRight "compile pin bdepend" (ensureBunBdependFor opencodeKey "1.4.2" donor)
+  let rewritten = rewriteBunExactInvocations "1.4.2" withBdepend
+  assertTrue "exact BDEPEND" (bunCompilePinBdependAtom "1.4.2" `T.isInfixOf` rewritten)
+  assertTrue "compile bun-exact" ("bun-1.4.2 --bun" `T.isInfixOf` rewritten)
+  assertTrue "test bun-exact" ("bun-1.4.2 test" `T.isInfixOf` rewritten)
+  assertTrue "comment unchanged" ("# keep bun-1.3.14 in this comment" `T.isInfixOf` rewritten)
+  assertTrue "old compile token gone" (not ("bun-1.3.14 --bun" `T.isInfixOf` rewritten))
+  assertTrue "unversioned bun test gone" (not ("\tbun test" `T.isInfixOf` rewritten))
+  assertEq "cd not rewritten" (Just "packages/cli") (parseSrcCompileCd rewritten)
+
+testParseSrcCompileCd :: IO ()
+testParseSrcCompileCd = do
+  assertEq
+    "plain cd"
+    (Just "packages/cli")
+    ( parseSrcCompileCd $
+        T.unlines
+          [ "src_compile() {",
+            "\tcd packages/cli || die",
+            "\tbun-1.4.2 --bun ./script/build.ts --single --skip-install || die",
+            "}"
+          ]
+    )
+  assertEq
+    "S-prefixed cd"
+    (Just "packages/cli")
+    ( parseSrcCompileCd $
+        T.unlines
+          [ "src_compile() {",
+            "\tcd \"${S}/packages/cli\" || die",
+            "}"
+          ]
+    )
+  assertEq
+    "comment then cd"
+    (Just "packages/opencode")
+    ( parseSrcCompileCd $
+        T.unlines
+          [ "src_compile() {",
+            "\t# cd packages/cli",
+            "\tcd packages/opencode || die",
+            "}"
+          ]
+    )
+  assertEq
+    "missing function"
+    Nothing
+    (parseSrcCompileCd "DESCRIPTION=\"x\"\n")
 
 testGoBdependEdit :: IO ()
 testGoBdependEdit = do

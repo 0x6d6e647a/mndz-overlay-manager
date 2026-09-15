@@ -42,7 +42,7 @@ This parse SHALL NOT create overlay wait-edges as specified by `overlay-apply-wa
 
 An overlay-internal atom SHALL be satisfiable when at least one retained non-live provider ebuild’s PV matches the atom using unversioned (any PV), `>=`, `<=`, `>`, `<`, `=`, or `~` (same PV, any revision), compared with the overlay’s existing PV comparison. KEYWORDS visibility SHALL NOT be required. Subslots SHALL NOT be interpreted; a trailing `:=` on an atom SHALL NOT by itself make the atom unsatisfiable. An explicit slot other than omitted or `0` on an overlay-internal atom SHALL hard-fail the package whose ebuild contains it, **except** that `dev-lang/bun-bin` pin slots use `SLOT="${PV}"` on the **provider ebuild** (consumer atoms SHALL NOT name those pin slots). Self-atoms (consumer `category/package` naming itself) SHALL be ignored.
 
-A bun-bin atom whose slot is omitted or `0` (including `>=dev-lang/bun-bin-<min>:0`) SHALL be satisfiable only by a retained non-live bun-bin ebuild whose `SLOT` is `0` (or omitted, treated as `0`) and whose PV matches the version operator. A bun-bin ebuild with `SLOT="${PV}"` other than `0` SHALL NOT satisfy a `:0` or unslotted bun-bin floor atom. An exact `=dev-lang/bun-bin-<PV>` atom SHALL be satisfiable by a retained ebuild of that PV regardless of SLOT.
+A bun-bin atom whose slot is omitted or `0` (including `>=dev-lang/bun-bin-<min>:0`) SHALL be satisfiable only by a retained non-live bun-bin ebuild whose `SLOT` is `0` (or omitted, treated as `0`) and whose PV matches the version operator. A bun-bin ebuild with `SLOT="${PV}"` other than `0` SHALL NOT satisfy a `:0` or unslotted bun-bin floor atom. A compile-pin `=dev-lang/bun-bin-<PV>` or `~dev-lang/bun-bin-<PV>` atom SHALL be satisfiable by a retained ebuild of that PV regardless of SLOT (`~` is the revision-agnostic pin; `=` does not match `-rN`).
 
 #### Scenario: Unversioned usage matches any remaining usage PV
 
@@ -62,6 +62,11 @@ A bun-bin atom whose slot is omitted or `0` (including `>=dev-lang/bun-bin-<min>
 #### Scenario: Exact pin matches pin-slot PV
 
 - **WHEN** a remaining opencode ebuild contains `=dev-lang/bun-bin-1.3.14` and overlay bun-bin has `1.3.14` with `SLOT="1.3.14"`
+- **THEN** the atom is satisfiable
+
+#### Scenario: Tilde pin matches pin-slot PV and revisions
+
+- **WHEN** a remaining opencode ebuild contains `~dev-lang/bun-bin-1.4.2` and overlay bun-bin has `1.4.2-r1` with `SLOT="0"`
 - **THEN** the atom is satisfiable
 
 #### Scenario: Exact pin is unsatisfied after that PV is gone
@@ -153,7 +158,7 @@ When `DepsAndAssets` prune runs after a successful planned-PV apply for provider
 
 When `GitMvAndManifest` would rename the newest non-live provider ebuild from PV Old to PV New, the program SHALL hard-fail that unit without renaming if dropping Old would leave some planned-remaining consumer overlay-internal atom unsatisfied and no remaining sibling provider PV (including New, once renamed) would satisfy it. Other non-newest versions SHALL remain as already specified for GitMv.
 
-For `dev-lang/bun-bin` only, when that unsatisfied atom is an exact compile pin `=dev-lang/bun-bin-Old`, the program SHALL NOT hard-fail: it SHALL add New and keep Old as specified by update-apply bun-bin GitMv add-latest. The program SHALL NOT copy Old aside as a new exact-set for GitMv packages other than bun-bin compile-pin keep.
+For `dev-lang/bun-bin` only, when that unsatisfied atom is a compile pin `=dev-lang/bun-bin-Old` or `~dev-lang/bun-bin-Old`, the program SHALL NOT hard-fail: it SHALL add New and keep Old as specified by update-apply bun-bin GitMv add-latest. The program SHALL NOT copy Old aside as a new exact-set for GitMv packages other than bun-bin compile-pin keep.
 
 #### Scenario: Rename newer still satisfies greater-or-equal
 
@@ -163,7 +168,7 @@ For `dev-lang/bun-bin` only, when that unsatisfied atom is an exact compile pin 
 
 #### Scenario: bun-bin exact pin is kept by adding latest
 
-- **WHEN** bun-bin GitMv would move newest `1.3.14` to `1.4.2` and a remaining opencode ebuild contains `=dev-lang/bun-bin-1.3.14`
+- **WHEN** bun-bin GitMv would move newest `1.3.14` to `1.4.2` and a remaining opencode ebuild contains `=dev-lang/bun-bin-1.3.14` or `~dev-lang/bun-bin-1.3.14`
 - **THEN** the unit does not hard-fail
 - **AND** `1.3.14` remains on disk as a pin slot as specified by update-apply
 

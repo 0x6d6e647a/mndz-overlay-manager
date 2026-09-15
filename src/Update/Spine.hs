@@ -32,7 +32,6 @@ import Update.Apply
     EbuildRunner,
     MutateEnsure (..),
     applyOverlayFromPlan,
-    fetchModelsDevApiJson,
   )
 import Update.Apply.Plan
   ( ClassifyPackageResult (..),
@@ -507,7 +506,6 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                               aeCargoOps = mkCargoOps closedRun,
                               aeSbclDepsOps = mkSbclDepsOps closedRun,
                               aeReleaseOps = releaseOps,
-                              aeFetchModelsDev = fetchModelsDevApiJson,
                               aeAssetsRoot = mAssetsRoot,
                               aeGitHubToken = resolvedToken,
                               aeAssetsOwner = assetsOwner,

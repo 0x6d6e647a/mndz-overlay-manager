@@ -239,14 +239,15 @@ atomMatchesPV atom pv =
     (OpEq, Just want) -> samePV pv want
     (OpApprox, Just want) -> samePV pv want
 
--- | bun-bin floor / omitted-slot atoms match SLOT=0 only; exact @=@ matches any SLOT.
+-- | bun-bin floor / omitted-slot atoms match SLOT=0 only; compile-pin
+-- @=@ / @~@ matches that PV any SLOT (including @SLOT="${PV}"@ pins).
 atomMatchesProvider :: OverlayAtom -> ProviderVer -> Bool
 atomMatchesProvider atom pv =
   atomMatchesPV atom (pvVersion pv) && bunSlotOk
   where
     bunSlotOk
       | oaKey atom /= bunBinKey = True
-      | oaOp atom == OpEq = True
+      | oaOp atom == OpEq || oaOp atom == OpApprox = True
       | otherwise = pvSlotZero pv
 
 pvsSatisfyNeed :: (PackageKey -> [ProviderVer]) -> DepNeed -> Bool
@@ -326,7 +327,7 @@ isExactBunBinPin :: PackageKey -> EbuildVersion -> OverlayAtom -> Bool
 isExactBunBinPin provider old atom =
   provider == bunBinKey
     && oaKey atom == bunBinKey
-    && oaOp atom == OpEq
+    && (oaOp atom == OpEq || oaOp atom == OpApprox)
     && maybe False (samePV old) (oaVersion atom)
 
 firstUnsatisfiedAtom :: (PackageKey -> [ProviderVer]) -> [DepNeed] -> Maybe OverlayAtom

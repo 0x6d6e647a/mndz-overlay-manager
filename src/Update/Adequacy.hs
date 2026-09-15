@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 -- | Shared content assessment over a planned requirement snapshot and one
 -- canonical local ebuild. Performs no upstream fetch.
 module Update.Adequacy
@@ -21,7 +19,6 @@ import Overlay.Version (EbuildVersion, renderPVNoRev, samePV)
 import Update.Assets.Layout
   ( distfileKindForEcosystem,
     distfileTarballName,
-    modelsDistfileName,
   )
 import Update.Cargo.Msrv
   ( maxMaybeRustVersions,
@@ -79,14 +76,10 @@ data PlannedPvFacts = PlannedPvFacts
   deriving (Eq, Show)
 
 -- | Required release/Manifest basenames (primary + companions).
+-- Opencode is deps-only: models.json is not a required companion.
 requiredAssetBasenames :: PackageKey -> EcosystemSpec -> Text -> Text -> [FilePath]
-requiredAssetBasenames key eco pn pvNoRev =
-  let primary = distfileTarballName (distfileKindForEcosystem eco) pn pvNoRev
-      extras =
-        case key of
-          PackageKey "dev-util/opencode" -> [modelsDistfileName pn pvNoRev]
-          _ -> []
-   in primary : extras
+requiredAssetBasenames _key eco pn pvNoRev =
+  [distfileTarballName (distfileKindForEcosystem eco) pn pvNoRev]
 
 lookupDirectTagFloor :: RuntimeLanePlan -> EbuildVersion -> Maybe (Maybe Text)
 lookupDirectTagFloor plan pv =

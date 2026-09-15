@@ -325,7 +325,6 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeCargoOps = productionCargoOps,
         aeSbclDepsOps = productionSbclDepsOps,
         aeReleaseOps = releaseOps,
-        aeFetchModelsDev = \_ -> pure (Left "models.dev unused"),
         aeAssetsRoot = assetsRoot,
         aeGitHubToken = Just "tok",
         aeAssetsOwner = "0x6d6e647a",

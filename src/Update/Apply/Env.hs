@@ -79,8 +79,6 @@ data ApplyEnv = ApplyEnv
     aeCargoOps :: CargoOps,
     aeSbclDepsOps :: SbclDepsOps,
     aeReleaseOps :: ReleaseOps,
-    -- | Write models.dev API JSON body to the given destination path.
-    aeFetchModelsDev :: FilePath -> IO (Either Text FilePath),
     aeAssetsRoot :: Maybe FilePath,
     aeGitHubToken :: Maybe Text,
     aeAssetsOwner :: Text,

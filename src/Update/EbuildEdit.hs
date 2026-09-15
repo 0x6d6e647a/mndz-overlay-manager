@@ -39,6 +39,8 @@ module Update.EbuildEdit
     ensureNodejsBdepend,
     ensureBunBdepend,
     ensureBunBdependFor,
+    parseSrcCompileCd,
+    rewriteBunExactInvocations,
     parseEbuildSlot,
     setSlotField,
     ensureSbclAtom,
@@ -65,8 +67,9 @@ module Update.EbuildEdit
 where
 
 import Control.Applicative ((<|>))
-import Data.Char (isAlpha, isDigit)
+import Data.Char (isAlpha, isAlphaNum, isDigit)
 import Data.Containers.ListUtils (nubOrd)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), renderPV, samePV)
@@ -927,9 +930,9 @@ nodejsBdependAtom ver = ">=net-libs/nodejs-" <> ver <> "[npm]"
 bunFloorBdependAtom :: Text -> Text
 bunFloorBdependAtom ver = ">=dev-lang/bun-bin-" <> ver <> ":0"
 
--- | Compile-pin atom: @=dev-lang/bun-bin-\<exact\>@.
+-- | Compile-pin atom: @~dev-lang/bun-bin-\<exact\>@ (this PV, any revision).
 bunCompilePinBdependAtom :: Text -> Text
-bunCompilePinBdependAtom ver = "=dev-lang/bun-bin-" <> ver
+bunCompilePinBdependAtom ver = "~dev-lang/bun-bin-" <> ver
 
 -- | BDEPEND atom for a Bun package key at the given version (min or exact).
 bunBdependAtomFor :: PackageKey -> Text -> Text
@@ -937,7 +940,7 @@ bunBdependAtomFor key ver
   | isBunCompilePinPackage key = bunCompilePinBdependAtom ver
   | otherwise = bunFloorBdependAtom ver
 
--- | Version token from a bun-bin BDEPEND atom (@>=…:0@ or @=…@).
+-- | Version token from a bun-bin BDEPEND atom (@>=…:0@, @=…@, or @~…@).
 bunAtomVersion :: Text -> Maybe Text
 bunAtomVersion raw =
   let t0 = T.dropWhile (\c -> c == '>' || c == '=' || c == '<' || c == '~') (T.strip raw)
@@ -1005,6 +1008,145 @@ ensureBunBdependFor key ver =
     "dev-lang/bun-bin"
     (bunBdependAtomFor key ver)
     ver
+
+-- | First @cd@ target in @src_compile@, with @${S}/@ stripped.
+-- Comment lines are ignored. Does not rewrite the ebuild.
+parseSrcCompileCd :: Text -> Maybe Text
+parseSrcCompileCd content = do
+  body <- ebuildFunctionBody "src_compile" content
+  cdLine <-
+    firstJust
+      [ T.strip code
+      | ln <- T.lines body,
+        let stripped = T.strip ln,
+        not (T.null stripped),
+        not ("#" `T.isPrefixOf` stripped),
+        let code = T.takeWhile (/= '#') stripped,
+        "cd " `T.isPrefixOf` T.strip code || T.strip code == "cd"
+      ]
+  let afterCd = T.strip (T.drop 2 (T.strip cdLine))
+      token = T.takeWhile (\c -> c /= ' ' && c /= ';' && c /= '&' && c /= '|') afterCd
+      unquoted = T.dropAround (\c -> c == '"' || c == '\'') token
+      strippedS = fromMaybe unquoted (T.stripPrefix "${S}/" unquoted <|> T.stripPrefix "$S/" unquoted)
+  if T.null strippedS then Nothing else Just strippedS
+  where
+    firstJust [] = Nothing
+    firstJust (x : xs)
+      | T.null x = firstJust xs
+      | otherwise = Just x
+
+-- | Rewrite versioned @bun-\<X.Y.Z\>@ and unversioned command @bun@ in
+-- @src_compile@ / @src_test@ to @bun-\<exact\>. Comment text is left unchanged.
+rewriteBunExactInvocations :: Text -> Text -> Text
+rewriteBunExactInvocations exact content
+  | T.null (T.strip exact) = content
+  | otherwise =
+      mapEbuildFunctionBody "src_compile" rewritePhase $
+        mapEbuildFunctionBody "src_test" rewritePhase content
+  where
+    rewritePhase =
+      T.intercalate "\n" . map (rewritePhaseLine exact) . T.splitOn "\n"
+
+rewritePhaseLine :: Text -> Text -> Text
+rewritePhaseLine exact ln =
+  let stripped = T.dropWhile (\c -> c == ' ' || c == '\t') ln
+   in if "#" `T.isPrefixOf` stripped
+        then ln
+        else
+          let (code, hashAndComment) = T.break (== '#') ln
+           in rewriteBunCommandTokens exact code <> hashAndComment
+
+rewriteBunCommandTokens :: Text -> Text -> Text
+rewriteBunCommandTokens exact = go
+  where
+    needle = "bun" :: Text
+    go t =
+      case T.breakOn needle t of
+        (before, rest)
+          | T.null rest -> t
+          | otherwise ->
+              let after = T.drop (T.length needle) rest
+                  leftOk =
+                    T.null before
+                      || not (isIdentChar (T.last before))
+               in if not leftOk
+                    then before <> needle <> go after
+                    else case parseAfterBun after of
+                      (Versioned leftover) ->
+                        before <> "bun-" <> exact <> go leftover
+                      Bare leftover ->
+                        before <> "bun-" <> exact <> go leftover
+                      Skip ->
+                        before <> needle <> go after
+
+data AfterBun
+  = Versioned Text
+  | Bare Text
+  | Skip
+
+parseAfterBun :: Text -> AfterBun
+parseAfterBun rest =
+  case T.uncons rest of
+    Just ('-', more) ->
+      case T.uncons more of
+        Just (c, _)
+          | isDigit c ->
+              let (ver, leftover) = T.span (\x -> isDigit x || x == '.') more
+               in if T.null ver then Skip else Versioned leftover
+        _ -> Skip
+    Just (c, _)
+      | isIdentChar c || c == '.' -> Skip
+    _ -> Bare rest
+
+isIdentChar :: Char -> Bool
+isIdentChar c = isAlphaNum c || c == '_'
+
+ebuildFunctionBody :: Text -> Text -> Maybe Text
+ebuildFunctionBody name content =
+  case T.breakOn (name <> "()") content of
+    (_, rest)
+      | T.null rest -> Nothing
+      | otherwise ->
+          let afterSig = T.drop (T.length name + 2) rest
+              afterWs = T.dropWhile (`elem` [' ', '\t', '\n', '\r']) afterSig
+           in case T.uncons afterWs of
+                Just ('{', bodyAndRest) -> fst <$> splitMatchingBrace bodyAndRest
+                _ -> Nothing
+
+mapEbuildFunctionBody :: Text -> (Text -> Text) -> Text -> Text
+mapEbuildFunctionBody name f content =
+  case T.breakOn (name <> "()") content of
+    (before, rest)
+      | T.null rest -> content
+      | otherwise ->
+          let sig = name <> "()"
+              afterSig = T.drop (T.length sig) rest
+              (ws, afterWs) =
+                T.span (`elem` [' ', '\t', '\n', '\r']) afterSig
+           in case T.uncons afterWs of
+                Just ('{', bodyAndRest) ->
+                  case splitMatchingBrace bodyAndRest of
+                    Just (body, after) ->
+                      before <> sig <> ws <> "{" <> f body <> "}" <> after
+                    Nothing -> content
+                _ -> content
+
+splitMatchingBrace :: Text -> Maybe (Text, Text)
+splitMatchingBrace = go (1 :: Int) []
+  where
+    go n acc rest
+      | n == 0 = Just (T.concat (reverse acc), rest)
+      | T.null rest = Nothing
+      | otherwise =
+          case T.uncons rest of
+            Nothing -> Nothing
+            Just ('{', xs) -> go (n + 1) (T.singleton '{' : acc) xs
+            Just ('}', xs)
+              | n == 1 -> Just (T.concat (reverse acc), xs)
+              | otherwise -> go (n - 1) (T.singleton '}' : acc) xs
+            Just (c, xs) ->
+              let (chunk, more) = T.break (\x -> x == '{' || x == '}') xs
+               in go n (T.cons c chunk : acc) more
 
 -- | Ensure @>=dev-lisp/sbcl-<floor>:=[source]@ (RDEPEND/BDEPEND body).
 -- Replaces every @dev-lisp/sbcl@ atom when present; otherwise inserts BDEPEND.

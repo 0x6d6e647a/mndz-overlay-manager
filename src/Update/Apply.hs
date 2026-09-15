@@ -15,7 +15,6 @@ module Update.Apply
     productionEbuildRunner,
     mkEbuildRunner,
     ApplyEnv (..),
-    fetchModelsDevApiJson,
     -- | Exported for 'Update.Apply.TestSupport' and direct unit tests.
     applyPackagePhase1,
     -- | Exported for multi-progress terminal-handle unit tests.
@@ -61,7 +60,6 @@ import Update.Apply.GitMv
 import Update.Apply.Materialize
   ( applyDepsAndAssets,
     applyDepsAndAssetsFromPlan,
-    fetchModelsDevApiJson,
   )
 import Update.Apply.Plan
 import Update.AtomClosure

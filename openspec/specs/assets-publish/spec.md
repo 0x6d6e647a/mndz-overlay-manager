@@ -65,8 +65,14 @@ After writing sidecars for a package version, the program SHALL create a GPG-sig
 
 #### Scenario: Multi-distfile sidecars in one commit
 
-- **WHEN** publishing `opencode-1.18.4-deps.tar.xz` and `opencode-1.18.4-models.json` for `dev-util/opencode`
-- **THEN** one assets commit stages sidecars for both basenames under `dev-util/opencode/` with message `dev-util/opencode: 1.18.4`
+- **WHEN** publishing two required distfiles for the same PV (for example a deps tarball plus a companion the package still requires)
+- **THEN** one assets commit stages sidecars for both basenames under that package directory with message `category/package: version`
+
+#### Scenario: Opencode deps-only sidecars in one commit
+
+- **WHEN** publishing `opencode-2.0.3-deps.tar.xz` for `dev-util/opencode`
+- **THEN** one assets commit stages sidecars for that basename under `dev-util/opencode/` with message `dev-util/opencode: 2.0.3`
+- **AND** the commit is not required to stage a models.json sidecar
 
 ### Requirement: GitHub release with tarball asset
 
@@ -171,17 +177,29 @@ Assets hashing, worktree commit/push, and release upload SHALL accept one or mor
 
 ### Requirement: Multi-asset reuse requires all basenames
 
-When materializing a PV via reuse of an existing assets release, the program SHALL treat reuse as successful only when the release tag `{pn}-{pv}` exists and **every** required asset basename for that package/PV is present and downloadable. If the tag is missing, or any required basename is missing, the program SHALL treat the outcome as not-found for reuse and take the full materialize path (or hard-fail if full path is not applicable). Partial presence of a subset of required assets SHALL NOT count as successful reuse.
+When materializing a PV via reuse of an existing assets release, the program SHALL treat reuse as successful only when the release tag `{pn}-{pv}` exists and **every** required asset basename for that package/PV is present and downloadable. If the tag is missing, or any required basename is missing, the program SHALL treat the outcome as not-found for reuse and take the full materialize path (or hard-fail if full path is not applicable). Partial presence of a subset of required assets SHALL NOT count as successful reuse. Extra unrequired assets on the tag (for example an unused models.json) SHALL NOT cause reuse to fail.
 
 #### Scenario: Both deps and models present
 
-- **WHEN** release `opencode-1.18.4` has assets `opencode-1.18.4-deps.tar.xz` and `opencode-1.18.4-models.json`
-- **THEN** reuse for opencode at that PV downloads both files
+- **WHEN** release `opencode-2.0.3` has assets `opencode-2.0.3-deps.tar.xz` and `opencode-2.0.3-models.json`
+- **THEN** reuse for opencode at that PV succeeds
+- **AND** the required download is the deps tarball (models.json is extra/unrequired)
 
-#### Scenario: Deps without models is not reusable
+#### Scenario: Deps without models is reusable
 
-- **WHEN** release `opencode-1.18.4` has only `opencode-1.18.4-deps.tar.xz`
-- **THEN** reuse for opencode at that PV reports not-found (or equivalent non-success) for the multi-asset set
+- **WHEN** release `opencode-2.0.3` has only `opencode-2.0.3-deps.tar.xz`
+- **THEN** reuse for opencode at that PV succeeds (models.json is not a required basename)
+
+#### Scenario: Opencode deps-only reuse
+
+- **WHEN** release `opencode-2.0.3` has asset `opencode-2.0.3-deps.tar.xz`
+- **THEN** reuse for opencode at that PV downloads that file
+- **AND** a models.json asset is not required
+
+#### Scenario: Extra unused models.json does not block reuse
+
+- **WHEN** release `opencode-2.0.3` has `opencode-2.0.3-deps.tar.xz` and also `opencode-2.0.3-models.json`
+- **THEN** reuse for opencode at that PV succeeds using the deps asset
 
 ### Requirement: Models distfile release assets
 
@@ -236,10 +254,17 @@ When a `DepsAndAssets` PV requires full materialization/publication, the program
 
 The program SHALL NOT upload into, replace assets on, delete, or recreate a release tag observed before the full-publication attempt or at its route recheck. This SHALL NOT remove the existing best-effort rollback deletion of a release created by the current attempt when a later upload fails. A GitHub tag created externally after the final recheck MAY still cause release creation to fail after assets-repository work; existing partial-success diagnostics apply. `outdated` MAY continue reporting the package as needs-work but SHALL NOT describe a partial or forced-full release as reusable.
 
+For `dev-util/opencode`, the required asset set is the deps tarball only. Presence or absence of a models.json companion on an existing tag SHALL NOT by itself classify the release as a partial required set.
+
 #### Scenario: Partial release blocks full publication
 
-- **WHEN** an opencode release tag contains its deps asset but lacks its required models companion
+- **WHEN** a DepsAndAssets release tag exists but lacks a still-required asset basename (not an unrequired extra such as opencode models.json)
 - **THEN** initial classification hard-fails the package before image admission and identifies the conflicting release tag
+
+#### Scenario: Opencode deps present is complete
+
+- **WHEN** an opencode release tag contains its deps asset and may or may not contain a models.json file
+- **THEN** classification does not hard-fail solely because models.json is missing or extra
 
 #### Scenario: Complete release blocks forced-full publication
 
