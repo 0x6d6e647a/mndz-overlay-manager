@@ -19,6 +19,7 @@ import Test.Lanes qualified as Lanes
 import Test.Materialize qualified as Materialize
 import Test.Md5Cache qualified as Md5Cache
 import Test.Overlay qualified as Overlay
+import Test.OverlayTree qualified as OverlayTree
 import Test.OverlayWaves qualified as OverlayWaves
 import Test.Policy qualified as Policy
 import Test.Preflight qualified as Preflight
@@ -52,6 +53,7 @@ main =
       [ testGroup
           "Unit"
           [ Overlay.tests,
+            OverlayTree.tests,
             OverlayWaves.tests,
             AtomClosure.unitTests,
             Config.tests,

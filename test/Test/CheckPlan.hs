@@ -56,6 +56,7 @@ import Update.Go.Lanes
   )
 import Update.Go.ModFetch (GoModKey (..))
 import Update.Go.Plan (noopPlanProgress)
+import Update.OverlayTree (withNewTreeLock)
 import Update.OverlayWaves (bunBinPackageKey)
 import Update.Runtime.Ceilings (RuntimeCeilings (..))
 import Update.Types
@@ -1570,7 +1571,8 @@ mkRalphPlanEnv fetch ops cache selected =
       peCheckCache = cache,
       peJobs = 1,
       peMulti = noopMultiHandle,
-      peSelectedKeys = selected
+      peSelectedKeys = selected,
+      peObserveTree = withNewTreeLock
     }
 
 testRefusePlanDelta :: IO ()

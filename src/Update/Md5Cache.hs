@@ -70,6 +70,12 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import Update.Git (GitOps (..))
 import Update.Go.Plan (isLivePackageVersion)
+import Update.OverlayTree
+  ( InTree,
+    listEbuildNames,
+    readEbuildBytes,
+    withNewTreeLock,
+  )
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -147,7 +153,7 @@ checkLayoutCacheFormats overlayRoot = do
           "missing metadata/layout.conf; add cache-formats = md5-dict and commit \
           \before cache work"
     else do
-      text <- TIO.readFile path
+      text <- TIO.readFile path -- allow-non-ebuild: config
       pure $
         if layoutHasMd5Dict text
           then Right ()
@@ -183,10 +189,10 @@ breakKv line =
 -- MD5 helpers
 ------------------------------------------------------------------------
 
--- | Lowercase hex MD5 of file contents (binary read).
-ebuildFileMd5 :: FilePath -> IO Text
-ebuildFileMd5 path = do
-  bs <- BS.readFile path
+-- | Lowercase hex MD5 of ebuild bytes.
+ebuildFileMd5 :: InTree -> FilePath -> IO Text
+ebuildFileMd5 tree path = do
+  bs <- readEbuildBytes tree path
   pure $ md5Hex bs
 
 md5Hex :: BS.ByteString -> Text
@@ -200,7 +206,7 @@ readCacheMd5Field path = do
   if not exists
     then pure Nothing
     else do
-      text <- TIO.readFile path
+      text <- TIO.readFile path -- allow-non-ebuild: md5-cache
       pure $ findMd5Field text
 
 findMd5Field :: Text -> Maybe Text
@@ -231,13 +237,13 @@ cacheFilePath overlayRoot category pn verText =
 ------------------------------------------------------------------------
 
 -- | Non-live ebuild versions under a package directory: @(version text, path)@.
-listNonLiveEbuildVersions :: FilePath -> Text -> IO [(Text, FilePath)]
-listNonLiveEbuildVersions pkgDir pn = do
+listNonLiveEbuildVersions :: InTree -> FilePath -> Text -> IO [(Text, FilePath)]
+listNonLiveEbuildVersions tree pkgDir pn = do
   exists <- doesDirectoryExist pkgDir
   if not exists
     then pure []
     else do
-      names <- listDirectory pkgDir
+      names <- listEbuildNames tree pkgDir
       pure $
         [ (T.pack verStr, pkgDir </> name)
         | name <- names,
@@ -247,14 +253,21 @@ listNonLiveEbuildVersions pkgDir pn = do
           not (isLivePackageVersion v)
         ]
 
-classifyVersionCache :: FilePath -> Text -> Text -> Text -> FilePath -> IO VersionCacheStatus
-classifyVersionCache overlayRoot category pn verText ebuildPath = do
+classifyVersionCache ::
+  InTree ->
+  FilePath ->
+  Text ->
+  Text ->
+  Text ->
+  FilePath ->
+  IO VersionCacheStatus
+classifyVersionCache tree overlayRoot category pn verText ebuildPath = do
   let cpath = cacheFilePath overlayRoot category pn verText
   exists <- doesFileExist cpath
   if not exists
     then pure VersionCacheMissing
     else do
-      fileMd5 <- ebuildFileMd5 ebuildPath
+      fileMd5 <- ebuildFileMd5 tree ebuildPath
       mCache <- readCacheMd5Field cpath
       pure $ case mCache of
         Just c | T.toLower c == T.toLower fileMd5 -> VersionCacheMatch
@@ -263,17 +276,18 @@ classifyVersionCache overlayRoot category pn verText ebuildPath = do
 
 -- | Inspect all non-live versions; missing wins over mismatch for gate messaging.
 inspectPackageCache ::
+  InTree ->
   FilePath ->
   Text ->
   Text ->
   FilePath ->
   IO (Either PackageCacheIssue ())
-inspectPackageCache overlayRoot category pn pkgDir = do
-  vers <- listNonLiveEbuildVersions pkgDir pn
+inspectPackageCache tree overlayRoot category pn pkgDir = do
+  vers <- listNonLiveEbuildVersions tree pkgDir pn
   statuses <-
     mapM
       ( \(verText, path) -> do
-          st <- classifyVersionCache overlayRoot category pn verText path
+          st <- classifyVersionCache tree overlayRoot category pn verText path
           pure (verText, st)
       )
       vers
@@ -512,7 +526,9 @@ gencachePackages runner gitOps overlayRoot keys force mJobs = do
             case packageDirForKey overlayRoot key of
               Nothing -> pure (Left ("invalid package key: " <> packageKeyText key))
               Just pkgDir -> do
-                inspected <- inspectPackageCache overlayRoot category pn pkgDir
+                inspected <-
+                  withNewTreeLock $ \tree ->
+                    inspectPackageCache tree overlayRoot category pn pkgDir
                 case decideGencacheAction force inspected of
                   GencacheSkip -> go rest
                   GencacheError msg ->

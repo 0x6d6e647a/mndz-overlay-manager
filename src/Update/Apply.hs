@@ -34,8 +34,9 @@ import Control.Concurrent (newQSem, signalQSem, waitQSem)
 import Control.Concurrent.Async (mapConcurrently_, wait, withAsync)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
-import Control.Exception (bracket_)
+import Control.Exception (IOException, bracket_, try)
 import Control.Monad (replicateM_, unless, void, when)
+import Data.Either (partitionEithers)
 import Data.Foldable (for_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
@@ -76,6 +77,7 @@ import Update.Git (GitOps (..))
 import Update.Go.Lanes (RuntimeLanePlan (..))
 import Update.Hardcoded (lookupPolicy)
 import Update.Materialize (waitingOnMaterializeImage)
+import Update.OverlayTree (InTree, ioExceptionMessage, withOverlayTree)
 import Update.OverlayWaves
   ( AdmitSets (..),
     OverlayPlanKind (..),
@@ -191,7 +193,6 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare mutate = d
     else do
       let kinds = [(planResultKey r, planKindOf r) | r <- planResults]
           admit = classifyAdmit overlayCeilingProviderForKey kinds
-          withheldSet = Map.fromList (asWithheld admit)
           terminalKeys = asTerminal admit
           carried =
             mapMaybe
@@ -210,44 +211,82 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare mutate = d
               Just e <- [Map.lookup k byEntry]
             ]
           withheldPairs = asWithheld admit
-          panelTotal = length admittedWork + length withheldPairs
-          (readyWork, ensureWork) =
-            partitionEnsure (meFullPathKeys mutate) admittedWork
-      session <-
-        mkApplyAtomClosureSession
-          overlayRoot
-          byEntry
-          planByKey
-          (map planResultKey planResults)
-      let envSess = env {aeAtomClosure = Just session}
-      nested <-
-        if panelTotal <= 0 && not (meRunEnsure mutate)
-          then pure []
-          else withMultiProgress pcfg "Updating packages" (max 1 panelTotal) $ \mh -> do
-            for_ withheldPairs $ \(consumer, provider) ->
-              mhWait mh consumer ("waiting on " <> packageKeyText provider)
-            for_ ensureWork $ \(e, _) ->
-              mhWait mh (peKey e) waitingOnMaterializeImage
-            let env' = envSess {aeMulti = mh}
-            if panelTotal <= 0
-              then do
-                -- Ensure-only (no admitted/withheld rows): still run t0 ensure.
-                void (meImageEnsure mutate mh)
-                pure []
-              else
-                runAdmitPool
-                  env'
-                  overlayRoot
-                  readyWork
-                  ensureWork
-                  mutate
-                  withheldSet
-                  byEntry
-                  prepare
-      let outcomes = carried <> nested
-      unless (any outcomeIsHardFail outcomes) $
-        cleanupRunSuccess (aeTempRun env)
-      pure outcomes
+      eSession <-
+        try @IOException $
+          withOverlayTree (aeTreeLock env) $ \tree ->
+            mkApplyAtomClosureSession
+              tree
+              overlayRoot
+              byEntry
+              planByKey
+              (map planResultKey planResults)
+      case eSession of
+        Left err ->
+          pure
+            ( carried
+                <> [ ApplyHardFail
+                       (PackageKey "")
+                       (ioExceptionMessage err)
+                       False
+                       False
+                   ]
+            )
+        Right (setupFails, session) -> do
+          let failedKeys = map fst setupFails
+              setupOutcomes =
+                [ ApplyHardFail k msg False False
+                | (k, msg) <- setupFails
+                ]
+              cascadeFails =
+                [ ApplyHardFail c (overlayProviderCascadeMessage p) False False
+                | (c, p) <- withheldPairs,
+                  p `elem` failedKeys,
+                  c `notElem` failedKeys
+                ]
+              withheldKeep =
+                [ pair
+                | pair@(c, p) <- withheldPairs,
+                  p `notElem` failedKeys,
+                  c `notElem` failedKeys
+                ]
+              admittedWork' =
+                [ item
+                | item@(e, _) <- admittedWork,
+                  peKey e `notElem` failedKeys
+                ]
+              (readyWork, ensureWork) =
+                partitionEnsure (meFullPathKeys mutate) admittedWork'
+              panelTotal = length admittedWork' + length withheldKeep
+              withheldSet = Map.fromList withheldKeep
+              envSess = env {aeAtomClosure = Just session}
+          nested <-
+            if panelTotal <= 0 && not (meRunEnsure mutate)
+              then pure []
+              else withMultiProgress pcfg "Updating packages" (max 1 panelTotal) $ \mh -> do
+                for_ withheldKeep $ \(consumer, provider) ->
+                  mhWait mh consumer ("waiting on " <> packageKeyText provider)
+                for_ ensureWork $ \(e, _) ->
+                  mhWait mh (peKey e) waitingOnMaterializeImage
+                let env' = envSess {aeMulti = mh}
+                if panelTotal <= 0
+                  then do
+                    -- Ensure-only (no admitted/withheld rows): still run t0 ensure.
+                    void (meImageEnsure mutate mh)
+                    pure []
+                  else
+                    runAdmitPool
+                      env'
+                      overlayRoot
+                      readyWork
+                      ensureWork
+                      mutate
+                      withheldSet
+                      byEntry
+                      prepare
+          let outcomes = carried <> setupOutcomes <> cascadeFails <> nested
+          unless (any outcomeIsHardFail outcomes) $
+            cleanupRunSuccess (aeTempRun env)
+          pure outcomes
 
 partitionEnsure ::
   [PackageKey] ->
@@ -262,36 +301,43 @@ partitionEnsure fullKeys items =
       )
 
 mkApplyAtomClosureSession ::
+  InTree ->
   FilePath ->
   Map PackageKey PackageEntry ->
   Map PackageKey PackagePlanResult ->
   [PackageKey] ->
-  IO AtomClosureSession
-mkApplyAtomClosureSession overlayRoot byEntry planByKey selectedKeys = do
+  IO ([(PackageKey, Text)], AtomClosureSession)
+mkApplyAtomClosureSession tree overlayRoot byEntry planByKey selectedKeys = do
   remainingPairs <- mapM remainingOne selectedKeys
-  let remaining = Map.fromList remainingPairs
+  let (fails, oks) = partitionEithers remainingPairs
+      remaining = Map.fromList oks
       selected = Set.fromList selectedKeys
       prefilled =
         Map.fromList $
           mapMaybe prefill (Map.elems planByKey)
-  mkAtomClosureSession remaining selected prefilled
+            <> map (\(k, _) -> (k, TerminalOverlayFail)) fails
+  session <- mkAtomClosureSession remaining selected prefilled
+  pure (fails, session)
   where
     prefill = \case
       PlanSoftSkip k _ -> Just (k, TerminalOverlayOk)
       PlanHardFail k _ -> Just (k, TerminalOverlayFail)
       PlanNeedsWork {} -> Nothing
     remainingOne k = do
-      pvs <-
+      ePvs <-
         case Map.lookup k planByKey of
           Just (PlanNeedsWork _ work)
             | Just e <- Map.lookup k byEntry ->
                 plannedRemainingFromWork
+                  tree
                   overlayRoot
                   k
                   (peLocal e)
                   (workShape work)
-          _ -> listNonLiveProviderPVs overlayRoot k
-      pure (k, pvs)
+          _ -> listNonLiveProviderPVs tree overlayRoot k
+      pure $ case ePvs of
+        Left err -> Left (k, err)
+        Right pvs -> Right (k, pvs)
     workShape = \case
       PlannedGitMv remote -> Right remote
       PlannedDeps _ _ plan _ _ _ _ -> Left (glpUniquePVs plan)

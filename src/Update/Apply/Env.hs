@@ -30,6 +30,7 @@ import Update.Go.Plan (PlanOps)
 import Update.Go.Vendor (VendorOps)
 import Update.Md5Cache (EgencacheRunner)
 import Update.Npm.Cache (NpmCacheOps)
+import Update.OverlayTree (TreeLock)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -86,6 +87,8 @@ data ApplyEnv = ApplyEnv
     aeAssetsLock :: MVar (),
     -- | Serializes package @egencache@ + overlay @git add@ / signed @git commit@.
     aeOverlayLock :: MVar (),
+    -- | Overlay ebuild observation and the publish that follows from it.
+    aeTreeLock :: TreeLock,
     aeJobs :: Int,
     aeMulti :: MultiHandle,
     aePlanOps :: PlanOps,

@@ -83,6 +83,7 @@ import Update.Materialize
     unionFloors,
     unmappedArchMessage,
   )
+import Update.OverlayTree (newTreeLock, withNewTreeLock)
 import Update.Process
   ( ProcessMode (..),
     ProcessRequest (..),
@@ -101,6 +102,11 @@ import Update.Types
     UpdateSource (..),
     mkPackageKey,
   )
+
+ensureImage :: EnsureConfig -> NeededFloors -> IO (Either T.Text EnsureOutcome)
+ensureImage cfg needed = do
+  lock <- newTreeLock
+  ensureMaterializeImage lock cfg needed
 
 unitTests :: TestTree
 unitTests =
@@ -246,7 +252,7 @@ testPinOnlyBunBinNotImageFloor =
     TIO.writeFile
       (pkgDir </> "bun-bin-1.3.14.ebuild")
       "EAPI=8\nSLOT=\"1.3.14\"\nKEYWORDS=\"~amd64\"\n"
-    metas <- discoverBunBinMetas tmp
+    metas <- withNewTreeLock $ \tree -> discoverBunBinMetas tree tmp
     case metas of
       Left err -> assertFailure (T.unpack err)
       Right ms -> do
@@ -1122,7 +1128,7 @@ testSkipWhenSatisfies =
     builds <- mkLogRef
     fake <- mkFakeDocker True iid builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     assertEq "skipped" (Right EnsureSkipped) got
     calls <- readIORef builds
     assertEq "no docker build" [] calls
@@ -1140,7 +1146,7 @@ testGeneratorMismatchRebuilds =
     builds <- mkLogRef
     fake <- mkFakeDocker True iid builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     assertEq "rebuilt" (Right EnsureBuilt) got
     calls <- readIORef builds
     assertTrue "docker build ran" (any ("-t" `elem`) calls)
@@ -1189,7 +1195,7 @@ testNewerQlotRebuilds =
             { nfSbcl = Just "2.6.6",
               nfQlot = Just "1.8.5"
             }
-    got <- ensureMaterializeImage cfg needed
+    got <- ensureImage cfg needed
     assertEq "rebuilt for newer qlot" (Right EnsureBuilt) got
     calls <- readIORef builds
     assertTrue "docker build ran" (any ("-t" `elem`) calls)
@@ -1235,7 +1241,7 @@ testNewerNodeGypRebuilds =
             { nfNode = Just "22.22.2",
               nfNodeGyp = Just "13.0.1"
             }
-    got <- ensureMaterializeImage cfg needed
+    got <- ensureImage cfg needed
     assertEq "rebuilt for newer node-gyp" (Right EnsureBuilt) got
     calls <- readIORef builds
     assertTrue "docker build ran" (any ("-t" `elem`) calls)
@@ -1290,7 +1296,7 @@ testUnmappedDefaultNoBuild =
     builds <- mkLogRef
     fake <- mkFakeDocker False "" builds
     cfg <- mkCfgUname overlay sidecar fake plentyDisk Nothing uname
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     case got of
       Left msg -> do
         assertTrue "names sparc64" ("sparc64" `T.isInfixOf` msg)
@@ -1314,7 +1320,7 @@ testOverrideUnmappedNoBuild =
     builds <- mkLogRef
     fake <- mkFakeDocker True "sha256:override" builds
     cfg <- mkCfgUname overlay sidecar fake plentyDisk (Just tag) "sparc64"
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     assertEq "inspect-only skip" (Right EnsureSkipped) got
     calls <- readIORef builds
     assertEq "no docker build" [] calls
@@ -1330,7 +1336,7 @@ testOverrideMissingNoBuild =
     builds <- mkLogRef
     fake <- mkFakeDocker False "" builds
     cfg <- mkCfg overlay sidecar fake plentyDisk (Just tag)
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     case got of
       Left msg -> do
         assertTrue "names override" (T.pack tag `T.isInfixOf` msg)
@@ -1363,7 +1369,7 @@ testFakeBuildRecordsUnion =
     fake <- mkFakeDocker True oldId builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
     let needed = emptyFloors {nfBun = Just "1.3.0"}
-    got <- ensureMaterializeImage cfg needed
+    got <- ensureImage cfg needed
     assertEq "built" (Right EnsureBuilt) got
     calls <- readIORef builds
     assertTrue "docker build ran" (any ("-t" `elem`) calls)
@@ -1393,7 +1399,7 @@ testDiskGateSkippedWhenSatisfies =
     builds <- mkLogRef
     fake <- mkFakeDocker True iid builds
     cfg <- mkCfg overlay sidecar fake tinyDisk Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     assertEq "tiny disk still skip when satisfies" (Right EnsureSkipped) got
     calls <- readIORef builds
     assertEq "no build" [] calls
@@ -1418,7 +1424,7 @@ testFirstBuildDiskFail =
     builds <- mkLogRef
     fake <- mkFakeDocker False "" builds
     cfg <- mkCfg overlay sidecar fake tinyDisk Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     case got of
       Left msg -> do
         assertTrue "names docker path" ("/var/lib/docker" `T.isInfixOf` msg)
@@ -1446,7 +1452,7 @@ testResolveMissNoBuild =
     builds <- mkLogRef
     fake <- mkFakeDocker False "" builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
-    got <- ensureMaterializeImage cfg (emptyFloors {nfSbcl = Just "2.7.0"})
+    got <- ensureImage cfg (emptyFloors {nfSbcl = Just "2.7.0"})
     case got of
       Left msg ->
         assertTrue "names floor" ("2.7.0" `T.isInfixOf` msg)
@@ -1730,7 +1736,7 @@ testSplitCacheShort =
     fake <- systemSnapshotterFake dockerRoot (Just layerRoot) builds
     let probe = splitProbe dockerRoot layerRoot giB (50 * giB)
     cfg <- mkCfg overlay sidecar fake probe Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     case got of
       Left msg -> do
         assertTrue "names cache path" (T.pack dockerRoot `T.isInfixOf` msg)
@@ -1757,7 +1763,7 @@ testSplitLayersShort =
     fake <- systemSnapshotterFake dockerRoot (Just layerRoot) builds
     let probe = splitProbe dockerRoot layerRoot (50 * giB) giB
     cfg <- mkCfg overlay sidecar fake probe Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     case got of
       Left msg -> do
         assertTrue "names cache path" (T.pack dockerRoot `T.isInfixOf` msg)
@@ -1782,7 +1788,7 @@ testSplitAmpleOverlayTiny =
     fake <- systemSnapshotterFake dockerRoot (Just layerRoot) builds
     let probe = splitProbe dockerRoot layerRoot (100 * giB) (100 * giB)
     cfg <- mkCfg overlay sidecar fake probe Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     assertEq "built despite tiny overlay" (Right EnsureBuilt) got
     calls <- readIORef builds
     assertTrue "docker build ran" (any ("-t" `elem`) calls)
@@ -1799,7 +1805,7 @@ testSnapshotterDumpMiss =
     builds <- mkLogRef
     fake <- systemSnapshotterFake dockerRoot Nothing builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     case got of
       Left msg -> do
         assertTrue
@@ -1842,7 +1848,7 @@ testSnapshotterRootMissing =
     builds <- mkLogRef
     fake <- systemSnapshotterFake dockerRoot (Just missingRoot) builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     case got of
       Left msg -> do
         assertTrue
@@ -1870,7 +1876,7 @@ testBundledSnapshotterNoDump =
                   "/run/docker/containerd/containerd.sock"
             }
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
-    got <- ensureMaterializeImage cfg neededGo
+    got <- ensureImage cfg neededGo
     assertEq "bundled still builds" (Right EnsureBuilt) got
     calls <- readIORef builds
     assertTrue "docker build ran" (any ("-t" `elem`) calls)

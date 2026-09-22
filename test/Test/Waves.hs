@@ -59,6 +59,7 @@ import Update.DiskSpace (DiskSpaceProbe (..))
 import Update.Git (GitOps (..))
 import Update.GitHub (newGitHubLatch)
 import Update.Materialize (EnsureOutcome (..), NeededFloors (..))
+import Update.OverlayTree (TreeLock, withNewTreeLock)
 import Update.Preflight (AssetsPreflight (..))
 import Update.Runtime.Ceilings (RuntimeCeilings (..))
 import Update.Spine
@@ -395,7 +396,7 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
         usdEbuildRunner = fakeEbuildRun,
         usdEgencacheRunner = mockEgencacheWriteMatching,
         usdPreflightTools = preflight,
-        usdEnsureImage = \_ -> pure (Right EnsureSkipped),
+        usdEnsureImage = \_ _ -> pure (Right EnsureSkipped),
         usdPruneMaterialize = pure (),
         usdSweepMaterialize = pure (),
         usdMaterializeDockerRunner = Nothing,
@@ -576,14 +577,15 @@ testSameRunBunThenRalph =
 
 countingEnsure ::
   IORef Int ->
+  TreeLock ->
   NeededFloors ->
   IO (Either T.Text EnsureOutcome)
-countingEnsure ref _ = do
+countingEnsure ref _ _ = do
   atomicModifyIORef' ref (\n -> (n + 1, ()))
   pure (Right EnsureSkipped)
 
-failingEnsure :: NeededFloors -> IO (Either T.Text EnsureOutcome)
-failingEnsure _ = pure (Left "ensure failed for test")
+failingEnsure :: TreeLock -> NeededFloors -> IO (Either T.Text EnsureOutcome)
+failingEnsure _ _ = pure (Left "ensure failed for test")
 
 testGitMvOnlyNeverEnsure :: IO ()
 testGitMvOnlyNeverEnsure =
@@ -861,7 +863,7 @@ testEnsureWaitsForBunBinManifest =
     let delayedEbuild pkgDir name = do
           threadDelay 150_000
           fakeEbuildRun pkgDir name
-        gatedEnsure _floors = do
+        gatedEnsure _lock _floors = do
           man <- TIO.readFile bunMan
           writeIORef sawReady ("bun-bin-1.2.0" `T.isInfixOf` man)
           pure (Right EnsureSkipped)
@@ -899,7 +901,7 @@ testGrokBuildBinOverlapsEnsure =
               takeMVar grokUnblock
               fakeEbuildRun pkgDir name
             else fakeEbuildRun pkgDir name
-        overlappingEnsure _ = do
+        overlappingEnsure _ _ = do
           writeIORef ensureStarted True
           putMVar grokUnblock ()
           pure (Right EnsureSkipped)
@@ -949,7 +951,7 @@ testT0EnsureHypoBunFloor =
     initGitDir assets
     createDirectoryIfMissing True dist
     floorsRef <- newIORef (Nothing :: Maybe NeededFloors)
-    let recordFloors floors = do
+    let recordFloors _lock floors = do
           writeIORef floorsRef (Just floors)
           pure (Right EnsureSkipped)
         fetch14 src = case src of
@@ -1059,15 +1061,19 @@ testHypoPlanNotCachedUnderOldBunBin =
     createDirectoryIfMissing True dist
     (cache, _) <- openCheckCache (CacheTtl (60 * 60)) False overlay
     bunFp <-
-      computeFingerprintFromDir
-        (GitHub "oven-sh" "bun" "bun-v")
-        (overlay </> "dev-lang" </> "bun-bin")
-        "bun-bin"
+      withNewTreeLock $ \tree ->
+        computeFingerprintFromDir
+          tree
+          (GitHub "oven-sh" "bun" "bun-v")
+          (overlay </> "dev-lang" </> "bun-bin")
+          "bun-bin"
     ralphFp <-
-      computeFingerprintFromDir
-        (GitHub "subsy" "ralph-tui" "v")
-        (overlay </> "dev-util" </> "ralph-tui")
-        "ralph-tui"
+      withNewTreeLock $ \tree ->
+        computeFingerprintFromDir
+          tree
+          (GitHub "subsy" "ralph-tui" "v")
+          (overlay </> "dev-util" </> "ralph-tui")
+          "ralph-tui"
     let (entries, ebuilds) = mkEntries bunPath ralphPath
         ralphKey = mkPackageKey "dev-util" "ralph-tui"
     deps0 <-
@@ -1245,7 +1251,7 @@ testEnsureWaitsForQlotManifestCommitNotDelayed =
         delayedQlot pkgDir name = do
           when ("qlot" `T.isInfixOf` T.pack name) (threadDelay 150_000)
           fakeEbuildRun pkgDir name
-        gatedEnsure _floors = do
+        gatedEnsure _lock _floors = do
           man <- TIO.readFile qlotMan
           writeIORef sawMan ("qlot-1.8.5" `T.isInfixOf` man)
           cs <- readIORef commits

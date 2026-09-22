@@ -44,7 +44,6 @@ import System.Directory
     doesDirectoryExist,
     doesFileExist,
     listDirectory,
-    removeFile,
   )
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import Update.Adequacy
@@ -167,6 +166,13 @@ import Update.Npm.Cache
     buildNpmDepsTarball,
     mkNpmCacheOps,
   )
+import Update.OverlayTree
+  ( InTree,
+    listEbuildNames,
+    readEbuild,
+    removeEbuild,
+    withOverlayTreeChecked,
+  )
 import Update.OverlayWaves
   ( bunBinPackageKey,
     computeOverlayProviderFingerprint,
@@ -220,69 +226,80 @@ applyDepsAndAssets env overlayRoot entry src eco = do
   planDoneRef <- newIORef (0 :: Int)
   let progress = depsApplyPlanProgress mh key eco planDoneRef
   localPVs <- listLocalNonLivePVs pkgDir pn
-  fp <- computeFingerprintFromDir src pkgDir pn
-  mProvFp <- computeOverlayProviderFingerprint overlayRoot (DepsAndAssets eco)
-  mCached <-
-    case (overlayCeilingProvider (DepsAndAssets eco), mProvFp) of
-      (Just _, Nothing) -> pure Nothing
-      (Just _, Just pfp) -> lookupDeps cache key fp (Just pfp)
-      (Nothing, _) -> lookupDeps cache key fp Nothing
-  planResult <- case mCached of
-    Just plan
-      | cachedCargoPlanUsable eco src plan -> do
-          recordHit cache
-          pure (Right plan)
-    _ -> do
-      recordFetch cache
-      planDepsPackageWithProgressFor
-        (aeDepsPlanOps env)
-        progress
-        eco
-        src
-        localPVs
-        (lookupLaneArches key)
-  case planResult of
-    Left err ->
-      pure
-        [ ApplyHardFail
-            key
-            ("runtime-lane plan failed: " <> planErrorMessage err)
-            False
-            False
-        ]
-    Right plan -> do
-      -- Persist successful live plans; cache hits leave the existing entry.
-      case mCached of
-        Nothing -> storeDeps cache key fp mProvFp plan
-        Just _ -> pure ()
-      locals <- listLocalEbuilds key pn pkgDir
-      assessed <- assessOverlayContent eco key pn locals plan
-      case assessed of
+  eObserved <-
+    underTree env $ \tree -> do
+      fp <- computeFingerprintFromDir tree src pkgDir pn
+      mProv <- computeOverlayProviderFingerprint tree overlayRoot (DepsAndAssets eco)
+      pure (fp, mProv)
+  case eObserved of
+    Left err -> pure [ApplyHardFail key err False False]
+    Right (fp, mProvFp) -> do
+      mCached <-
+        case (overlayCeilingProvider (DepsAndAssets eco), mProvFp) of
+          (Just _, Nothing) -> pure Nothing
+          (Just _, Just pfp) -> lookupDeps cache key fp (Just pfp)
+          (Nothing, _) -> lookupDeps cache key fp Nothing
+      planResult <- case mCached of
+        Just plan
+          | cachedCargoPlanUsable eco src plan -> do
+              recordHit cache
+              pure (Right plan)
+        _ -> do
+          recordFetch cache
+          planDepsPackageWithProgressFor
+            (aeDepsPlanOps env)
+            progress
+            eco
+            src
+            localPVs
+            (lookupLaneArches key)
+      case planResult of
         Left err ->
-          pure [ApplyHardFail key err False False]
-        Right (ca, _, _) -> do
-          let missing = missingTargets localPVs plan
-              contentFix =
-                [ pv
-                | pv <- caNeedsWorkPVs ca,
-                  not (any (samePV pv) missing)
-                ]
-              forceFull = caForceFullPVs ca
-          if not (planNeedsWork localPVs contentFix plan)
-            then pure [ApplySoftSkip key "already matches runtime-lane plan"]
-            else
-              applyDepsAndAssetsFromPlan
-                env
-                overlayRoot
-                entry
-                src
-                eco
-                plan
-                localPVs
-                contentFix
-                forceFull
-                Nothing
-                =<< readIORef planDoneRef
+          pure
+            [ ApplyHardFail
+                key
+                ("runtime-lane plan failed: " <> planErrorMessage err)
+                False
+                False
+            ]
+        Right plan -> do
+          -- Persist successful live plans; cache hits leave the existing entry.
+          case mCached of
+            Nothing -> storeDeps cache key fp mProvFp plan
+            Just _ -> pure ()
+          locals <- listLocalEbuilds key pn pkgDir
+          eAssessed <-
+            underTree env $ \tree ->
+              assessOverlayContent tree eco key pn locals plan
+          case eAssessed of
+            Left err -> pure [ApplyHardFail key err False False]
+            Right assessed ->
+              case assessed of
+                Left err ->
+                  pure [ApplyHardFail key err False False]
+                Right (ca, _, _) -> do
+                  let missing = missingTargets localPVs plan
+                      contentFix =
+                        [ pv
+                        | pv <- caNeedsWorkPVs ca,
+                          not (any (samePV pv) missing)
+                        ]
+                      forceFull = caForceFullPVs ca
+                  if not (planNeedsWork localPVs contentFix plan)
+                    then pure [ApplySoftSkip key "already matches runtime-lane plan"]
+                    else
+                      applyDepsAndAssetsFromPlan
+                        env
+                        overlayRoot
+                        entry
+                        src
+                        eco
+                        plan
+                        localPVs
+                        contentFix
+                        forceFull
+                        Nothing
+                        =<< readIORef planDoneRef
 
 -- | Mutate using a plan-phase result (skip re-plan / re-content-fix).
 applyDepsAndAssetsFromPlan ::
@@ -314,22 +331,26 @@ applyDepsAndAssetsFromPlan
     let key = peKey entry
         pkgDir = takeDirectory (pePath entry)
         pn = pePN entry
-    coherence <- cargoProvenanceGate eco entry
+    coherence <- cargoProvenanceGate env eco entry
     case coherence of
       Just msg -> pure [ApplyHardFail key msg False False]
       Nothing ->
         if not (planNeedsWork localPVs contentFix plan)
           then pure [ApplySoftSkip key "already matches runtime-lane plan"]
           else do
-            asserted <- assertHypoProviderPv overlayRoot key mHypo
+            asserted <- assertHypoProviderPv env overlayRoot key mHypo
             case asserted of
               Left msg ->
                 pure [ApplyHardFail key msg False False]
               Right () -> do
-                cacheGate <- requirePackageMd5Cache overlayRoot key pkgDir
-                case cacheGate of
-                  Left unitErr -> pure [applyUnitHardFail key unitErr False False]
-                  Right () -> do
+                eGate <-
+                  underTree env $ \tree ->
+                    requirePackageMd5Cache tree overlayRoot key pkgDir
+                case eGate of
+                  Left err -> pure [ApplyHardFail key err False False]
+                  Right (Left unitErr) ->
+                    pure [applyUnitHardFail key unitErr False False]
+                  Right (Right ()) -> do
                     outcomes <-
                       materializeDepsPlan
                         env
@@ -343,10 +364,19 @@ applyDepsAndAssetsFromPlan
                         forceFull
                         planDone
                     when (any isApplySuccess outcomes) $ do
-                      fp' <- computeFingerprintFromDir src pkgDir pn
-                      mProvFp' <-
-                        computeOverlayProviderFingerprint overlayRoot (DepsAndAssets eco)
-                      storeDeps (aeCheckCache env) key fp' mProvFp' plan
+                      eFp' <-
+                        underTree env $ \tree -> do
+                          fp' <- computeFingerprintFromDir tree src pkgDir pn
+                          mProv <-
+                            computeOverlayProviderFingerprint
+                              tree
+                              overlayRoot
+                              (DepsAndAssets eco)
+                          pure (fp', mProv)
+                      case eFp' of
+                        Left _ -> pure ()
+                        Right (fp', mProvFp') ->
+                          storeDeps (aeCheckCache env) key fp' mProvFp' plan
                     pure outcomes
     where
       isApplySuccess ApplySuccess {} = True
@@ -355,8 +385,8 @@ applyDepsAndAssetsFromPlan
 -- | Provenance coherence gate (apply-time, before any mutation): every present
 -- non-live ebuild of the package must agree with the policy Cargo provenance
 -- on the primary source-line form; a mismatch names expected vs observed.
-cargoProvenanceGate :: EcosystemSpec -> PackageEntry -> IO (Maybe Text)
-cargoProvenanceGate eco entry = case eco of
+cargoProvenanceGate :: ApplyEnv -> EcosystemSpec -> PackageEntry -> IO (Maybe Text)
+cargoProvenanceGate env eco entry = case eco of
   Cargo {cargoSource = cargoSrc} -> do
     let pkgDir = takeDirectory (pePath entry)
     locals <- listLocalEbuilds (peKey entry) (pePN entry) pkgDir
@@ -365,16 +395,20 @@ cargoProvenanceGate eco entry = case eco of
           | eb <- locals,
             not (isLivePackageVersion (parseEbuildVersion (ebuildVersion eb)))
           ]
-    errs <- mapM (checkOne cargoSrc) nonLive
-    pure (listToMaybe (catMaybes errs))
+    eErrs <-
+      underTree env $ \tree ->
+        mapM (checkOne tree cargoSrc) nonLive
+    pure $ case eErrs of
+      Left err -> Just err
+      Right errs -> listToMaybe (catMaybes errs)
   _ -> pure Nothing
   where
-    checkOne cargoSrc eb = do
+    checkOne tree cargoSrc eb = do
       exists <- doesFileExist (ebuildPath eb)
       if not exists
         then pure Nothing
         else do
-          content <- TIO.readFile (ebuildPath eb)
+          content <- readEbuild tree (ebuildPath eb)
           pure
             ( cargoProvenanceMismatch
                 cargoSrc
@@ -384,35 +418,39 @@ cargoProvenanceGate eco entry = case eco of
 
 -- | Overlay write of a hypo-planned consumer requires the provider PV to match.
 assertHypoProviderPv ::
+  ApplyEnv ->
   FilePath ->
   PackageKey ->
   Maybe (PackageKey, EbuildVersion) ->
   IO (Either Text ())
-assertHypoProviderPv _overlayRoot _key Nothing = pure (Right ())
-assertHypoProviderPv overlayRoot key (Just (provider, plannedPv)) = do
+assertHypoProviderPv _ _ _ Nothing = pure (Right ())
+assertHypoProviderPv env overlayRoot key (Just (provider, plannedPv)) = do
   eMetas <-
     if provider == bunBinPackageKey
-      then discoverBunBinMetas overlayRoot
-      else pure (Left "no overlay provider metas")
+      then underTree env $ \tree -> discoverBunBinMetas tree overlayRoot
+      else pure (Right (Left "no overlay provider metas"))
   let overlayPv = case eMetas of
-        Right metas -> newestNonLivePv metas
-        Left _ -> Nothing
-  pure $ case overlayPv of
-    Just got
-      | comparePV got plannedPv == Just EQ -> Right ()
-      | otherwise ->
-          Left (overlayProviderPvMismatchMessage key provider plannedPv got)
-    Nothing ->
-      Left
-        ( packageKeyText key
-            <> ": overlay ceiling provider "
-            <> packageKeyText provider
-            <> " has no newest non-live ebuild (plan assumed "
-            <> renderPV plannedPv
-            <> "); the provider bump did not land as planned and this package was not mutated. Restore or finish "
-            <> packageKeyText provider
-            <> " relative to git HEAD, then retry"
-        )
+        Right (Right metas) -> newestNonLivePv metas
+        _ -> Nothing
+  pure $ case eMetas of
+    Left err -> Left err
+    _ ->
+      case overlayPv of
+        Just got
+          | comparePV got plannedPv == Just EQ -> Right ()
+          | otherwise ->
+              Left (overlayProviderPvMismatchMessage key provider plannedPv got)
+        Nothing ->
+          Left
+            ( packageKeyText key
+                <> ": overlay ceiling provider "
+                <> packageKeyText provider
+                <> " has no newest non-live ebuild (plan assumed "
+                <> renderPV plannedPv
+                <> "); the provider bump did not land as planned and this package was not mutated. Restore or finish "
+                <> packageKeyText provider
+                <> " relative to git HEAD, then retry"
+            )
 
 -- | Planning progress during update apply (same 3-step model as outdated).
 depsApplyPlanProgress ::
@@ -461,15 +499,21 @@ listLocalNonLivePVs pkgDir pn = do
 
 -- | Present planned PVs whose ebuild content, BDEPEND, or Manifest needs fix.
 contentFixFromAssessment ::
+  ApplyEnv ->
   EcosystemSpec ->
   PackageKey ->
   Text ->
   FilePath ->
   RuntimeLanePlan ->
   IO [EbuildVersion]
-contentFixFromAssessment eco key pn pkgDir plan = do
+contentFixFromAssessment env eco key pn pkgDir plan = do
   locals <- listLocalEbuilds key pn pkgDir
-  assessed <- assessOverlayContent eco key pn locals plan
+  eAssessed <-
+    underTree env $ \tree ->
+      assessOverlayContent tree eco key pn locals plan
+  let assessed = case eAssessed of
+        Left _ -> Left "unreadable ebuild"
+        Right a -> a
   pure $ case assessed of
     Left _ -> []
     Right (ca, _, _) ->
@@ -502,8 +546,8 @@ contentFixNeededEnv ::
   PackageKey ->
   RuntimeLanePlan ->
   IO [EbuildVersion]
-contentFixNeededEnv _env eco _src pkgDir pn key =
-  contentFixFromAssessment eco key pn pkgDir
+contentFixNeededEnv env eco _src pkgDir pn key =
+  contentFixFromAssessment env eco key pn pkgDir
 
 -- | Full required BDEPEND atom for a planned PV, when obtainable.
 fetchRequiredBdependAtom ::
@@ -753,33 +797,47 @@ pruneExtras env overlayRoot entry plan = do
   let pkgDir = takeDirectory (pePath entry)
       pn = pePN entry
       key = peKey entry
-  names <- listDirectory pkgDir
-  keepResult <-
-    keepPVsForProvider
-      (aeAtomClosure env)
-      overlayRoot
-      key
-      (glpUniquePVs plan)
-  case keepResult of
+  eRemoved <-
+    underTree env $ \tree -> do
+      names <- listEbuildNames tree pkgDir
+      keepResult <-
+        keepPVsForProvider
+          (aeAtomClosure env)
+          tree
+          overlayRoot
+          key
+          (glpUniquePVs plan)
+      case keepResult of
+        Left err -> pure (Left err)
+        Right keep -> do
+          let extras =
+                [ pkgDir </> n
+                | n <- names,
+                  Just (pkg, verStr) <- [parseEbuildFileName n],
+                  T.pack pkg == pn,
+                  let v = parseEbuildVersion (T.pack verStr),
+                  not (isLivePackageVersion v),
+                  not (any (samePV v) keep)
+                ]
+          mapM_ (removeEbuild tree) extras
+          let keptNames =
+                [ n
+                | n <- names,
+                  ".ebuild" `T.isSuffixOf` T.pack n,
+                  n `notElem` map takeFileName extras
+                ]
+          pure (Right (extras, keptNames))
+  case eRemoved of
     Left err -> pure (Left err)
-    Right keep -> do
-      let extras =
-            [ pkgDir </> n
-            | n <- names,
-              Just (pkg, verStr) <- [parseEbuildFileName n],
-              T.pack pkg == pn,
-              let v = parseEbuildVersion (T.pack verStr),
-              not (isLivePackageVersion v),
-              not (any (samePV v) keep)
-            ]
+    Right (Left err) -> pure (Left err)
+    Right (Right (extras, keptNames)) ->
       if null extras
         then pure (Right [])
         else do
-          mapM_ removeFile extras
           rels <- mapM (relativeOverlayPath overlayRoot) extras
           -- Manifest after deletions.
           manResult <-
-            case [n | n <- names, ".ebuild" `T.isSuffixOf` T.pack n, n `notElem` map takeFileName extras] of
+            case keptNames of
               (keepName : _) -> aeEbuildRunner env pkgDir keepName
               [] -> pure (Right ())
           case manResult of
@@ -787,6 +845,27 @@ pruneExtras env overlayRoot entry plan = do
             Right () -> do
               manRel <- relativeOverlayPath overlayRoot (pkgDir </> "Manifest")
               pure (Right (rels <> [manRel]))
+
+underTree :: ApplyEnv -> (InTree -> IO a) -> IO (Either Text a)
+underTree env = withOverlayTreeChecked (aeTreeLock env)
+
+-- | Template path and body. 'Left' path means the file is absent.
+readDonorEbuild ::
+  ApplyEnv ->
+  FilePath ->
+  Text ->
+  EbuildVersion ->
+  FilePath ->
+  IO (Either Text (Either FilePath (FilePath, Text)))
+readDonorEbuild env pkgDir pn ver fallback =
+  underTree env $ \tree -> do
+    path <- findTemplate tree pkgDir pn ver fallback
+    exists <- doesFileExist path
+    if not exists
+      then pure (Left path)
+      else do
+        body <- readEbuild tree path
+        pure (Right (path, body))
 
 -- | Full materialize path: 7 discrete multi-progress steps.
 fullPathMaterializeSteps :: Int
@@ -1296,27 +1375,28 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
             Left err -> pure (Left err)
             Right p -> do
               guarded <-
-                guardOpencodeCompileLayout key entry pvNoRev workDir
+                guardOpencodeCompileLayout env key entry pvNoRev workDir
               pure $ case guarded of
                 Left err -> Left err
                 Right () -> Right (p, Just bunEbuildVer, Nothing)
     (Cargo mLock mPkg mCargoSrc, GitHub owner repo prefix) -> do
       let plannedPv = parseEbuildVersion pvNoRev
-      donorPath <-
-        findTemplate
+      eDonor <-
+        readDonorEbuild
+          env
           (takeDirectory (pePath entry))
           (pePN entry)
           plannedPv
           (pePath entry)
-      donorExists <- doesFileExist donorPath
-      if not donorExists
-        then
+      case eDonor of
+        Left err -> pure (Left err)
+        Right (Left donorPath) ->
           pure $
             Left $
               applyUnitErrorMessage $
                 ApplyMissingDonorTemplate key (renderPV plannedPv) donorPath
-        else do
-          donorContent <- TIO.readFile donorPath
+        Right (Right (_donorPath, donorContent)) -> do
+          let donorPath = _donorPath
           let progress = cargoCratesProgress stepsDoneRef mh key mCargoSrc
               plannedPv' = parseEbuildVersion pvNoRev
               tagFloor = fromMaybe Nothing (lookupDirectTagFloor plan plannedPv')
@@ -1453,25 +1533,26 @@ materializeCompanionAssets _ key _ _ _ names =
 -- | After the opencode GitHub clone, require the donor @src_compile@ @cd@
 -- target and @script/build.ts@ under it. Does not rewrite the @cd@ path.
 guardOpencodeCompileLayout ::
+  ApplyEnv ->
   PackageKey ->
   PackageEntry ->
   Text ->
   FilePath ->
   IO (Either Text ())
-guardOpencodeCompileLayout (PackageKey "dev-util/opencode") entry pvNoRev workDir = do
+guardOpencodeCompileLayout env (PackageKey "dev-util/opencode") entry pvNoRev workDir = do
   let pkgDir = takeDirectory (pePath entry)
       plannedPv = parseEbuildVersion pvNoRev
       cloneDir = workDir </> "src"
-  donorPath <- findTemplate pkgDir (pePN entry) plannedPv (pePath entry)
-  donorExists <- doesFileExist donorPath
-  if not donorExists
-    then
+  eDonor <-
+    readDonorEbuild env pkgDir (pePN entry) plannedPv (pePath entry)
+  case eDonor of
+    Left err -> pure (Left err)
+    Right (Left donorPath) ->
       pure $
         Left $
           applyUnitErrorMessage $
             ApplyMissingDonorTemplate (peKey entry) (renderPV plannedPv) donorPath
-    else do
-      donorContent <- TIO.readFile donorPath
+    Right (Right (_donorPath, donorContent)) -> do
       case parseSrcCompileCd donorContent of
         Nothing ->
           pure $
@@ -1500,7 +1581,7 @@ guardOpencodeCompileLayout (PackageKey "dev-util/opencode") entry pvNoRev workDi
                         <> " missing script/build.ts under "
                         <> rel
                 else pure (Right ())
-guardOpencodeCompileLayout _ _ _ _ = pure (Right ())
+guardOpencodeCompileLayout _ _ _ _ _ = pure (Right ())
 
 npmCacheProgress :: IORef Int -> MultiHandle -> PackageKey -> NpmCacheProgress
 npmCacheProgress stepsDoneRef mh key =
@@ -1670,15 +1751,16 @@ reuseDepsReleaseAsset
                     fetchGoModVersion env owner repo prefix pvNoRev mSub
                   _ -> pure Nothing
               Cargo {} -> do
-                donorPath <-
-                  findTemplate
+                eDonor <-
+                  readDonorEbuild
+                    env
                     (takeDirectory (pePath entry))
                     (pePN entry)
                     targetVer
                     (pePath entry)
-                donorExists <- doesFileExist donorPath
-                if not donorExists
-                  then
+                case eDonor of
+                  Left err -> pure (Left (ApplyHardFail key err False True))
+                  Right (Left donorPath) ->
                     pure $
                       Left $
                         applyUnitHardFail
@@ -1690,8 +1772,7 @@ reuseDepsReleaseAsset
                           )
                           False
                           True
-                  else do
-                    donorContent <- TIO.readFile donorPath
+                  Right (Right (_donorPath, donorContent)) -> do
                     let mTag = fromMaybe Nothing (lookupDirectTagFloor plan targetVer)
                         mTemplate = parseRustMinVerFromEbuild donorContent
                     pure (Right (cargoReuseWriteFloor mTag mTemplate))
@@ -1824,7 +1905,7 @@ checkSidecarSha512IfPresent assetsRoot category pn tarballName expectedSha = do
   if not exists
     then pure (Right ())
     else do
-      text <- TIO.readFile path
+      text <- TIO.readFile path -- allow-non-ebuild: sidecar
       case T.words (T.strip text) of
         (hex : _)
           | T.toLower hex == T.toLower expectedSha -> pure (Right ())
@@ -1908,21 +1989,20 @@ prepareCodexRustyV8 env _overlayRoot entry eco pn pv assetsRoot workDir outDir _
                   <> T.pack lockPath
               )
         else do
-          lockBody <- TIO.readFile lockPath
+          lockBody <- TIO.readFile lockPath -- allow-non-ebuild: Cargo.lock
           case parseV8RegistryPin lockBody of
             Nothing -> pure (Right (Nothing, Nothing))
             Just ver -> do
-              donorPath <-
-                findTemplate
+              eDonor <-
+                readDonorEbuild
+                  env
                   (takeDirectory (pePath entry))
                   pn
                   (parseEbuildVersion pv)
                   (pePath entry)
-              donorExists <- doesFileExist donorPath
-              donorContent <-
-                if donorExists
-                  then TIO.readFile donorPath
-                  else pure ""
+              donorContent <- case eDonor of
+                Right (Right (_, body)) -> pure body
+                _ -> pure ""
               resolveCodexRustyV8
                 env
                 assetsRoot
@@ -2055,7 +2135,7 @@ sidecarsMatchDigests sp digests = do
 
 sidecarHex :: FilePath -> IO (Either Text Text)
 sidecarHex path = do
-  text <- TIO.readFile path
+  text <- TIO.readFile path -- allow-non-ebuild: sidecar
   pure $
     case T.words (T.strip text) of
       (hex : _) -> Right (T.toLower hex)
@@ -2067,14 +2147,14 @@ gcsFromCloneTree workDir = do
   exists <- doesFileExist depsPath
   if not exists
     then pure (Left ("v8/DEPS missing after rusty_v8 clone at " <> T.pack depsPath))
-    else parseV8DepsGcsLinux <$> TIO.readFile depsPath
+    else parseV8DepsGcsLinux <$> TIO.readFile depsPath -- allow-non-ebuild: work-tree
 
 gcsFromSnapshotOrTree :: FilePath -> FilePath -> IO (Either Text V8GcsLinuxDists)
 gcsFromSnapshotOrTree tarball workDir = do
   let depsPath = workDir </> "rusty_v8" </> "v8" </> "DEPS"
   exists <- doesFileExist depsPath
   if exists
-    then parseV8DepsGcsLinux <$> TIO.readFile depsPath
+    then parseV8DepsGcsLinux <$> TIO.readFile depsPath -- allow-non-ebuild: work-tree
     else do
       extracted <- extractV8DepsFromSnapshot tarball
       pure $ case extracted of

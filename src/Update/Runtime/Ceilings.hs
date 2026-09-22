@@ -67,6 +67,12 @@ import System.Directory (doesDirectoryExist, listDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeFileName, (</>))
 import Update.EbuildEdit (parseEbuildSlot)
+import Update.OverlayTree
+  ( InTree,
+    listEbuildNames,
+    readEbuildEither,
+    tryEbuild,
+  )
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -380,7 +386,7 @@ discoverRuntimeMetasInDir pkgDir mPrefix = do
 readMeta :: FilePath -> Maybe (Text -> Bool) -> FilePath -> IO (Maybe RuntimeEbuildMeta)
 readMeta dir mPred name = do
   let path = dir </> name
-  content <- TIO.readFile path
+  content <- TIO.readFile path -- allow-non-ebuild: gentoo-repo
   let ok = maybe True ($ content) mPred
   pure $
     if ok
@@ -388,35 +394,69 @@ readMeta dir mPred name = do
       else Nothing
 
 -- | Overlay bun-bin non-live @SLOT=0@ ebuild metadata (pin slots are ignored).
-discoverBunBinMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])
-discoverBunBinMetas overlayRoot = do
-  let pkgDir = bunBinPackageDir overlayRoot
+discoverBunBinMetas :: InTree -> FilePath -> IO (Either Text [RuntimeEbuildMeta])
+discoverBunBinMetas tree overlayRoot =
+  readOverlayMetas
+    tree
+    (bunBinPackageDir overlayRoot)
+    (Just "bun-bin-")
+    (Just (\c -> parseEbuildSlot c == "0"))
+
+-- | Overlay qlot non-live ebuild metadata.
+discoverQlotMetas :: InTree -> FilePath -> IO (Either Text [RuntimeEbuildMeta])
+discoverQlotMetas tree overlayRoot =
+  readOverlayMetas tree (qlotPackageDir overlayRoot) (Just "qlot-") Nothing
+
+-- | Overlay node-gyp non-live ebuild metadata.
+discoverNodeGypMetas :: InTree -> FilePath -> IO (Either Text [RuntimeEbuildMeta])
+discoverNodeGypMetas tree overlayRoot =
+  readOverlayMetas tree (nodeGypPackageDir overlayRoot) (Just "node-gyp-") Nothing
+
+readOverlayMetas ::
+  InTree ->
+  FilePath ->
+  Maybe Text ->
+  Maybe (Text -> Bool) ->
+  IO (Either Text [RuntimeEbuildMeta])
+readOverlayMetas tree pkgDir mPrefix mPred = do
   exists <- doesDirectoryExist pkgDir
   if not exists
     then pure $ Left ("directory not found: " <> T.pack pkgDir)
     else do
-      names <- listDirectory pkgDir
-      let ebuildNames =
-            [ n
-            | n <- names,
-              ".ebuild" `T.isSuffixOf` T.pack n,
-              "bun-bin-" `T.isPrefixOf` T.pack n
-            ]
-      metas <-
-        mapM
-          (readMeta pkgDir (Just (\c -> parseEbuildSlot c == "0")))
-          ebuildNames
-      pure $ Right (catMaybes metas)
+      eNames <- tryEbuild pkgDir (listEbuildNames tree pkgDir)
+      case eNames of
+        Left err -> pure (Left err)
+        Right names -> do
+          let ebuildNames =
+                [ n
+                | n <- names,
+                  ".ebuild" `T.isSuffixOf` T.pack n,
+                  case mPrefix of
+                    Nothing -> True
+                    Just p -> p `T.isPrefixOf` T.pack n
+                ]
+          foldOverlayMetas tree pkgDir mPred [] ebuildNames
 
--- | Overlay qlot non-live ebuild metadata.
-discoverQlotMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])
-discoverQlotMetas overlayRoot =
-  discoverRuntimeMetasInDir (qlotPackageDir overlayRoot) (Just "qlot-")
-
--- | Overlay node-gyp non-live ebuild metadata.
-discoverNodeGypMetas :: FilePath -> IO (Either Text [RuntimeEbuildMeta])
-discoverNodeGypMetas overlayRoot =
-  discoverRuntimeMetasInDir (nodeGypPackageDir overlayRoot) (Just "node-gyp-")
+foldOverlayMetas ::
+  InTree ->
+  FilePath ->
+  Maybe (Text -> Bool) ->
+  [RuntimeEbuildMeta] ->
+  [FilePath] ->
+  IO (Either Text [RuntimeEbuildMeta])
+foldOverlayMetas _ _ _ acc [] = pure (Right (reverse acc))
+foldOverlayMetas tree pkgDir mPred acc (name : rest) = do
+  let path = pkgDir </> name
+  eContent <- readEbuildEither tree path
+  case eContent of
+    Left err -> pure (Left err)
+    Right content ->
+      let ok = maybe True ($ content) mPred
+          acc' =
+            case (ok, parseRuntimeEbuildMeta path content) of
+              (True, Just meta) -> meta : acc
+              _ -> acc
+       in foldOverlayMetas tree pkgDir mPred acc' rest
 
 -- | Scan a package directory of @*.ebuild@ files for ceilings.
 discoverRuntimeCeilingsInDir ::
@@ -458,12 +498,13 @@ discoverNodejsCeilingsWith run = do
         (Just "nodejs-")
 
 -- | Discover bun-bin ceilings from the overlay package directory.
-discoverBunBinCeilings :: FilePath -> IO (Either Text RuntimeCeilings)
-discoverBunBinCeilings overlayRoot =
-  discoverRuntimeCeilingsInDir
-    bunBinRuntimeAtom
-    (bunBinPackageDir overlayRoot)
-    (Just "bun-bin-")
+discoverBunBinCeilings :: InTree -> FilePath -> IO (Either Text RuntimeCeilings)
+discoverBunBinCeilings tree overlayRoot = do
+  result <-
+    readOverlayMetas tree (bunBinPackageDir overlayRoot) (Just "bun-bin-") Nothing
+  pure $ case result of
+    Left err -> Left (bunBinRuntimeAtom <> " " <> err)
+    Right metas -> Right (computeCeilings bunBinRuntimeAtom metas)
 
 -- | Discover SBCL ceilings from gentoo @dev-lisp/sbcl@.
 discoverSbclCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)

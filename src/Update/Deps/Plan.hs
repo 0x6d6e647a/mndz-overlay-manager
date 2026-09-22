@@ -79,6 +79,7 @@ import Update.Go.Plan
   )
 import Update.Go.Vendor (versionTag)
 import Update.Npm.Cache (fetchNpmEnginesNode, listNpmVersions)
+import Update.OverlayTree (withNewTreeLock)
 import Update.Runtime.Ceilings
   ( PortageqRunner,
     RuntimeCeilings (..),
@@ -371,7 +372,9 @@ planBun ops progress src locals mCeilings allowlist =
                 allowlist
                 ( discoverCeilingsCached
                     (dpoBunCeilingsCache ops)
-                    (discoverBunBinCeilings overlayRoot)
+                    ( withNewTreeLock $ \tree ->
+                        discoverBunBinCeilings tree overlayRoot
+                    )
                 )
                 (bunProbe ops owner repo prefix)
     _ -> pure (Left (PlanFailed "DepsAndAssets Bun requires a GitHub update source"))

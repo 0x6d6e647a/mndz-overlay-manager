@@ -71,6 +71,7 @@ import Update.GitHubHealth
   )
 import Update.Http (HttpLbs)
 import Update.Md5Cache (gencachePackages)
+import Update.OverlayTree (withNewTreeLock)
 import Update.Types
   ( UpdateReport (..),
     UpdateSource (..),
@@ -605,7 +606,7 @@ testCacheHitSkipsLiveNeed =
     now <- getCurrentTime
     (cache, _) <-
       openCheckCacheAt (pure now) (Just cacheDir) (CacheTtl (5 * 60)) False overlay
-    fp <- computeFingerprint src [eb]
+    fp <- withNewTreeLock $ \tree -> computeFingerprint tree src [eb]
     storeLatest cache key fp (parseEbuildVersion "1.1.0")
     live <- needsLiveGitHubApi cache overlay [entry] (groupByPackage [eb])
     assertTrue "full cache hit is not live GitHub" (not live)

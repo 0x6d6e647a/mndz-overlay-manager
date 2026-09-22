@@ -88,7 +88,6 @@ import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
     getHomeDirectory,
-    listDirectory,
     makeAbsolute,
     renameFile,
   )
@@ -116,6 +115,7 @@ import Update.Go.Lanes
     RuntimeLanePlan (..),
   )
 import Update.Go.Plan (isLivePackageVersion)
+import Update.OverlayTree (InTree, listEbuildNames, readEbuildBytes)
 import Update.Runtime.Ceilings (KeywordTier (..))
 import Update.Types
   ( EcosystemSpec (..),
@@ -219,8 +219,8 @@ instance FromJSON CacheFingerprint where
       <*> o .: "content_hash"
 
 -- | Fingerprint from discovered ebuild records for a package.
-computeFingerprint :: UpdateSource -> [Ebuild] -> IO CacheFingerprint
-computeFingerprint src ebuilds = do
+computeFingerprint :: InTree -> UpdateSource -> [Ebuild] -> IO CacheFingerprint
+computeFingerprint tree src ebuilds = do
   let nonLive =
         [ e
         | e <- ebuilds,
@@ -232,7 +232,7 @@ computeFingerprint src ebuilds = do
           | e <- nonLive
           ]
       paths = sort (map ebuildPath nonLive)
-  ebuildBodies <- mapM readFileBytesStrict paths
+  ebuildBodies <- mapM (readIfPresent tree) paths
   let pkgDir =
         case ebuilds of
           (e : _) -> takeDirectory (ebuildPath e)
@@ -240,7 +240,9 @@ computeFingerprint src ebuilds = do
       manPath = pkgDir </> "Manifest"
   manBody <- do
     exists <- doesFileExist manPath
-    if exists then Just <$> BS.readFile manPath else pure Nothing
+    if exists
+      then Just <$> BS.readFile manPath -- allow-non-ebuild: Manifest
+      else pure Nothing
   pure
     CacheFingerprint
       { cfLocalPvs = pvs,
@@ -249,9 +251,14 @@ computeFingerprint src ebuilds = do
       }
 
 -- | Fingerprint by scanning a package directory for non-live ebuilds + Manifest.
-computeFingerprintFromDir :: UpdateSource -> FilePath -> Text -> IO CacheFingerprint
-computeFingerprintFromDir src pkgDir pn = do
-  names <- listDirectory pkgDir
+computeFingerprintFromDir ::
+  InTree ->
+  UpdateSource ->
+  FilePath ->
+  Text ->
+  IO CacheFingerprint
+computeFingerprintFromDir tree src pkgDir pn = do
+  names <- listEbuildNames tree pkgDir
   let ebuildNames =
         sort
           [ name
@@ -266,11 +273,13 @@ computeFingerprintFromDir src pkgDir pn = do
         | name <- ebuildNames,
           Just (_pkg, verStr) <- [parseEbuildFileName name]
         ]
-  ebuildBodies <- mapM (\n -> readFileBytesStrict (pkgDir </> n)) ebuildNames
+  ebuildBodies <- mapM (\n -> readIfPresent tree (pkgDir </> n)) ebuildNames
   manBody <- do
     let manPath = pkgDir </> "Manifest"
     exists <- doesFileExist manPath
-    if exists then Just <$> readFileBytesStrict manPath else pure Nothing
+    if exists
+      then Just <$> BS.readFile manPath -- allow-non-ebuild: Manifest
+      else pure Nothing
   pure
     CacheFingerprint
       { cfLocalPvs = pvs,
@@ -278,10 +287,10 @@ computeFingerprintFromDir src pkgDir pn = do
         cfContentHash = hashPackageContents ebuildBodies manBody
       }
 
-readFileBytesStrict :: FilePath -> IO BS.ByteString
-readFileBytesStrict path = do
+readIfPresent :: InTree -> FilePath -> IO BS.ByteString
+readIfPresent tree path = do
   exists <- doesFileExist path
-  if exists then BS.readFile path else pure BS.empty
+  if exists then readEbuildBytes tree path else pure BS.empty
 
 hashPackageContents :: [BS.ByteString] -> Maybe BS.ByteString -> Text
 hashPackageContents ebuildBodies mMan =
@@ -669,7 +678,7 @@ loadPackagesSoft path = do
   if not exists
     then pure (Map.empty, Nothing)
     else do
-      result <- try @IOError (BS.readFile path)
+      result <- try @IOError (BS.readFile path) -- allow-non-ebuild: check-cache
       case result of
         Left e ->
           pure
@@ -871,8 +880,8 @@ atomicWriteDoc path doc = do
   createDirectoryIfMissing True (takeDirectory path)
   let tmp = path <> ".tmp"
       body = LBS.toStrict (encodeCheckCacheDoc doc)
-  BS.writeFile tmp body
-  renameFile tmp path
+  BS.writeFile tmp body -- allow-non-ebuild: check-cache
+  renameFile tmp path -- allow-non-ebuild: check-cache
 
 withExclusiveLock :: FilePath -> IO a -> IO a
 withExclusiveLock lockPath action = do

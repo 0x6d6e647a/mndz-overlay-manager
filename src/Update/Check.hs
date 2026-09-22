@@ -97,6 +97,7 @@ import Update.Go.Plan
 import Update.Hardcoded (lookupLaneArches, lookupPolicy)
 import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
+import Update.OverlayTree (InTree, readEbuild, withNewTreeLock)
 import Update.OverlayWaves
   ( OverlayCeilingPlan (..),
     blockedOnLabel,
@@ -248,7 +249,7 @@ checkPackage fetch cache entry locals = do
                     }
                 ]
               else locals
-      fp <- computeFingerprint src ebuilds
+      fp <- withNewTreeLock $ \tree -> computeFingerprint tree src ebuilds
       mCached <- lookupLatest cache key fp
       case mCached of
         Just remote -> do
@@ -288,10 +289,12 @@ checkPackageDeps mh fetch depsOps cache entry locals src eco = do
       progress = depsPlanProgress mh key eco
       localPVs = localNonLivePVs locals
       tech = DepsAndAssets eco
-  fp <- computeFingerprint src locals
+  fp <- withNewTreeLock $ \tree -> computeFingerprint tree src locals
   mProvFp <-
     case dpoOverlayRoot depsOps of
-      Just overlayRoot -> computeOverlayProviderFingerprint overlayRoot tech
+      Just overlayRoot ->
+        withNewTreeLock $ \tree ->
+          computeOverlayProviderFingerprint tree overlayRoot tech
       Nothing -> pure Nothing
   mCached <-
     case (overlayCeilingProvider tech, mProvFp) of
@@ -339,7 +342,9 @@ reportFromDepsPlan ::
 reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan = do
   let key = peKey entry
       pn = pePN entry
-  assessed <- assessOverlayContent eco key pn locals plan
+  assessed <-
+    withNewTreeLock $ \tree ->
+      assessOverlayContent tree eco key pn locals plan
   case assessed of
     Left err ->
       pure
@@ -428,7 +433,7 @@ applyOverlayBlockIndication mh fetch depsOps cache eco src entry locals localPVs
               }
         Just overlayRoot -> do
           eRemote <-
-            fetchOverlayProviderLatest fetch cache overlayRoot provider
+            fetchOverlayProviderLatest withNewTreeLock fetch cache overlayRoot provider
           case eRemote of
             Left _ ->
               pure
@@ -436,7 +441,8 @@ applyOverlayBlockIndication mh fetch depsOps cache eco src entry locals localPVs
                   { reportStatus = FetchError (overlayFailClosedMessage provider)
                   }
             Right remote -> do
-              eMetas <- discoverBunBinMetas overlayRoot
+              eMetas <-
+                withNewTreeLock $ \tree -> discoverBunBinMetas tree overlayRoot
               case eMetas of
                 Left _ ->
                   pure
@@ -464,7 +470,9 @@ applyOverlayBlockIndication mh fetch depsOps cache eco src entry locals localPVs
                               { reportStatus = FetchError (overlayFailClosedMessage provider)
                               }
                         Right hypoPlan -> do
-                          hypoFix <- contentFixPVs depsOps eco src locals hypoPlan
+                          hypoFix <-
+                            withNewTreeLock $ \tree ->
+                              contentFixPVs tree depsOps eco src locals hypoPlan
                           let hypoNeed = planNeedsWork localPVs hypoFix hypoPlan
                           if not
                             ( planDeltaHolds
@@ -550,13 +558,14 @@ depsPlanProgress mh key eco =
 
 -- | Present-PV content-fix list (legacy wrapper). Missing PVs are excluded.
 contentFixPVs ::
+  InTree ->
   DepsPlanOps ->
   EcosystemSpec ->
   UpdateSource ->
   [Ebuild] ->
   RuntimeLanePlan ->
   IO [EbuildVersion]
-contentFixPVs _depsOps eco _src locals plan = do
+contentFixPVs tree _depsOps eco _src locals plan = do
   let pn =
         case locals of
           (e : _) -> ebuildPackage e
@@ -565,7 +574,7 @@ contentFixPVs _depsOps eco _src locals plan = do
         case locals of
           (e : _) -> mkPackageKey (ebuildCategory e) (ebuildPackage e)
           [] -> PackageKey ""
-  assessed <- assessOverlayContent eco key pn locals plan
+  assessed <- assessOverlayContent tree eco key pn locals plan
   pure $ case assessed of
     Left _ -> []
     Right (ca, _, _) ->
@@ -578,6 +587,7 @@ contentFixPVs _depsOps eco _src locals plan = do
 -- | Shared overlay content assessment: canonical same-PV selection, planned
 -- requirement snapshots, no upstream fetch.
 assessOverlayContent ::
+  InTree ->
   EcosystemSpec ->
   PackageKey ->
   Text ->
@@ -591,7 +601,7 @@ assessOverlayContent ::
           Maybe FilePath
         )
     )
-assessOverlayContent eco key pn locals plan = do
+assessOverlayContent tree eco key pn locals plan = do
   let inv = map inventoryFromEbuild locals
   case selectHighestNonLive inv of
     Left err -> pure (Left err)
@@ -607,7 +617,7 @@ assessOverlayContent eco key pn locals plan = do
           manExists <- doesFileExist manPath
           mMan <-
             if manExists
-              then Just <$> TIO.readFile manPath
+              then Just <$> TIO.readFile manPath -- allow-non-ebuild: Manifest
               else pure Nothing
           mFallbackFloor <- templateFloor mFallback
           facts <-
@@ -628,13 +638,13 @@ assessOverlayContent eco key pn locals plan = do
       exists <- doesFileExist (invPath f)
       if not exists
         then pure Nothing
-        else parseRustMinVerFromEbuild <$> TIO.readFile (invPath f)
+        else parseRustMinVerFromEbuild <$> readEbuild tree (invPath f)
     mkFacts mMan mFallbackFloor (pe, mSame) = do
       mContent <- case mSame of
         Nothing -> pure Nothing
         Just f -> do
           exists <- doesFileExist (invPath f)
-          if exists then Just <$> TIO.readFile (invPath f) else pure Nothing
+          if exists then Just <$> readEbuild tree (invPath f) else pure Nothing
       let mTag =
             case eco of
               Cargo {} -> fromMaybe Nothing (lookupDirectTagFloor plan (pePV pe))
@@ -726,7 +736,7 @@ gitMvNeedsLive ::
   IO Bool
 gitMvNeedsLive cache entry locals src = do
   let ebuilds = if null locals then syntheticLocals entry else locals
-  fp <- computeFingerprint src ebuilds
+  fp <- withNewTreeLock $ \tree -> computeFingerprint tree src ebuilds
   mCached <- lookupLatest cache (peKey entry) fp
   pure (isNothing mCached)
 
@@ -741,8 +751,10 @@ depsNeedsLive ::
 depsNeedsLive cache overlayRoot entry locals src eco = do
   let tech = DepsAndAssets eco
       localPVs = localNonLivePVs locals
-  fp <- computeFingerprint src locals
-  mProvFp <- computeOverlayProviderFingerprint overlayRoot tech
+  fp <- withNewTreeLock $ \tree -> computeFingerprint tree src locals
+  mProvFp <-
+    withNewTreeLock $ \tree ->
+      computeOverlayProviderFingerprint tree overlayRoot tech
   mCached <-
     case (overlayCeilingProvider tech, mProvFp) of
       (Just _, Nothing) -> pure Nothing
@@ -752,7 +764,8 @@ depsNeedsLive cache overlayRoot entry locals src eco = do
     Just plan
       | cachedCargoPlanUsable eco src plan -> do
           assessed <-
-            assessOverlayContent eco (peKey entry) (pePN entry) locals plan
+            withNewTreeLock $ \tree ->
+              assessOverlayContent tree eco (peKey entry) (pePN entry) locals plan
           pure $ case assessed of
             Left _ -> True
             Right (ca, _, _) ->
@@ -779,7 +792,9 @@ providerLatestMiss cache overlayRoot providerKey =
       if not exists
         then pure False
         else do
-          fp <- computeFingerprintFromDir (policySource policy) dir pn
+          fp <-
+            withNewTreeLock $ \tree ->
+              computeFingerprintFromDir tree (policySource policy) dir pn
           mCached <- lookupLatest cache providerKey fp
           pure (isNothing mCached)
     _ -> pure False

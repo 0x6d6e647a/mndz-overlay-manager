@@ -235,6 +235,7 @@ import Update.Md5Cache
     readCacheMd5Field,
   )
 import Update.Npm.Cache (productionNpmCacheOps)
+import Update.OverlayTree (newTreeLock, withNewTreeLock)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
@@ -302,6 +303,7 @@ mkTestApplyEnv ::
   MVar () ->
   IO ApplyEnv
 mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLock overlayLock = do
+  treeLock <- newTreeLock
   depsBase <- productionDepsPlanOps (Just "tok") 1 Nothing
   tempRun <- openRunRoot
   let depsOps =
@@ -331,6 +333,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeAssetsRepo = "mndz-overlay-assets",
         aeAssetsLock = assetsLock,
         aeOverlayLock = overlayLock,
+        aeTreeLock = treeLock,
         aeJobs = 1,
         aeMulti = noopMultiHandle,
         aePlanOps = planOps,
@@ -347,7 +350,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
 -- | Write a matching md5-dict cache file for one ebuild.
 writeMatchingCacheFile :: FilePath -> T.Text -> T.Text -> T.Text -> FilePath -> IO ()
 writeMatchingCacheFile overlayRoot category pn verText ebuildPath = do
-  md5 <- ebuildFileMd5 ebuildPath
+  md5 <- withNewTreeLock $ \tree -> ebuildFileMd5 tree ebuildPath
   let cpath = cacheFilePath overlayRoot category pn verText
   createDirectoryIfMissing True (takeDirectory cpath)
   TIO.writeFile cpath ("_md5_=" <> md5 <> "\nDESCRIPTION=test\n")
@@ -357,7 +360,7 @@ writeMatchingCacheFile overlayRoot category pn verText ebuildPath = do
 -- | Matching cache for every non-live ebuild under a package directory.
 writeMatchingCachesForPackage :: FilePath -> T.Text -> T.Text -> FilePath -> IO ()
 writeMatchingCachesForPackage overlayRoot category pn pkgDir = do
-  vers <- listNonLiveEbuildVersions pkgDir pn
+  vers <- withNewTreeLock $ \tree -> listNonLiveEbuildVersions tree pkgDir pn
   mapM_ (uncurry (writeMatchingCacheFile overlayRoot category pn)) vers
 
 -- | Mock egencache: rewrite matching cache entries for requested atoms.

@@ -99,6 +99,7 @@ import Update.Go.Lanes
 import Update.Go.Plan (PlanProgress (..), localNonLivePVs)
 import Update.Hardcoded (lookupLaneArches, lookupPolicy)
 import Update.Manifest.Dist (exactDistSize)
+import Update.OverlayTree (ObserveOverlay)
 import Update.OverlayWaves
   ( OverlayCeilingPlan (..),
     bunBinPackageKey,
@@ -193,7 +194,9 @@ data PlanEnv = PlanEnv
     peJobs :: Int,
     peMulti :: MultiHandle,
     -- | Full @update@ selection (for unselected-provider plan-delta).
-    peSelectedKeys :: [PackageKey]
+    peSelectedKeys :: [PackageKey],
+    -- | Fresh lock per ebuild observation. Not the apply lock.
+    peObserveTree :: ObserveOverlay
   }
 
 -- | Concurrent plan over selected packages with multi-progress.
@@ -203,10 +206,11 @@ planPackages ::
   DepsPlanOps ->
   CheckCacheHandle ->
   Int ->
+  ObserveOverlay ->
   [PackageEntry] ->
   Map.Map PackageKey [Ebuild] ->
   IO [PackagePlanResult]
-planPackages pcfg fetch depsOps cache jobs selected byPkg =
+planPackages pcfg fetch depsOps cache jobs observe selected byPkg =
   withMultiProgress pcfg "Planning packages" (length selected) $ \mh ->
     let env =
           PlanEnv
@@ -215,7 +219,8 @@ planPackages pcfg fetch depsOps cache jobs selected byPkg =
               peCheckCache = cache,
               peJobs = jobs,
               peMulti = mh,
-              peSelectedKeys = map peKey selected
+              peSelectedKeys = map peKey selected,
+              peObserveTree = observe
             }
      in mapConcurrentlyN jobs (planPackageTracked env byPkg) selected
 
@@ -303,10 +308,12 @@ planDeps env entry locals src eco = do
   if useHypo
     then planDepsHypo env entry locals src eco localPVs
     else do
-      fp <- computeFingerprint src locals
+      fp <- peObserveTree env $ \tree -> computeFingerprint tree src locals
       mProvFp <-
         case dpoOverlayRoot depsOps of
-          Just overlayRoot -> computeOverlayProviderFingerprint overlayRoot tech
+          Just overlayRoot ->
+            peObserveTree env $ \tree ->
+              computeOverlayProviderFingerprint tree overlayRoot tech
           Nothing -> pure Nothing
       let requireProv = overlayCeilingProvider tech
           lookupProv =
@@ -345,7 +352,9 @@ planDeps env entry locals src eco = do
           case mCached of
             Nothing -> storeDeps cache key fp mProvFp plan
             Just _ -> pure ()
-          assessed <- assessOverlayContent eco key (pePN entry) locals plan
+          assessed <-
+            peObserveTree env $ \tree ->
+              assessOverlayContent tree eco key (pePN entry) locals plan
           case assessed of
             Left err -> pure $ PlanHardFail key err
             Right (ca, _, _) -> do
@@ -386,13 +395,14 @@ selectedProviderNeedsWork ::
 selectedProviderNeedsWork env overlayRoot provider = do
   eRemote <-
     fetchOverlayProviderLatest
+      (peObserveTree env)
       (peFetcher env)
       (peCheckCache env)
       overlayRoot
       provider
   eMetas <-
     if provider == bunBinPackageKey
-      then discoverBunBinMetas overlayRoot
+      then peObserveTree env $ \tree -> discoverBunBinMetas tree overlayRoot
       else pure (Left "no overlay metas")
   pure $ case (eRemote, eMetas) of
     (Right remote, Right metas) ->
@@ -418,11 +428,12 @@ planDepsHypo env entry locals src eco localPVs =
           progress = planProgress (peMulti env) key eco
       eRemote <-
         fetchOverlayProviderLatest
+          (peObserveTree env)
           (peFetcher env)
           (peCheckCache env)
           overlayRoot
           provider
-      eMetas <- discoverBunBinMetas overlayRoot
+      eMetas <- peObserveTree env $ \tree -> discoverBunBinMetas tree overlayRoot
       case (eRemote, eMetas) of
         (Right remote, Right metas) -> do
           recordFetch (peCheckCache env)
@@ -444,7 +455,9 @@ planDepsHypo env entry locals src eco localPVs =
                   ("runtime-lane plan failed: " <> planErrorMessage err)
             Right hypoPlan -> do
               -- Hypothetical-ceiling plans are not stored (check-cache option A).
-              contentFix <- contentFixPVs depsOps eco src locals hypoPlan
+              contentFix <-
+                peObserveTree env $ \tree ->
+                  contentFixPVs tree depsOps eco src locals hypoPlan
               let hypoNeed = planNeedsWork localPVs contentFix hypoPlan
               if not hypoNeed
                 then pure $ PlanSoftSkip key "already matches runtime-lane plan"
@@ -496,7 +509,9 @@ planDepsOnDiskFallback env entry locals src eco localPVs = do
           key
           ("runtime-lane plan failed: " <> planErrorMessage err)
     Right plan -> do
-      contentFix <- contentFixPVs depsOps eco src locals plan
+      contentFix <-
+        peObserveTree env $ \tree ->
+          contentFixPVs tree depsOps eco src locals plan
       let need = planNeedsWork localPVs contentFix plan
       if not need
         then pure $ PlanSoftSkip key "already matches runtime-lane plan"
@@ -539,6 +554,7 @@ refuseUnselectedProvider env key eco src localPVs locals onDiskPlan onDiskNeed =
             Just overlayRoot -> do
               eRemote <-
                 fetchOverlayProviderLatest
+                  (peObserveTree env)
                   (peFetcher env)
                   (peCheckCache env)
                   overlayRoot
@@ -547,7 +563,7 @@ refuseUnselectedProvider env key eco src localPVs locals onDiskPlan onDiskNeed =
                 Left _ ->
                   pure $ Just (overlayFailClosedMessage provider)
                 Right remote -> do
-                  eMetas <- discoverBunBinMetas overlayRoot
+                  eMetas <- peObserveTree env $ \tree -> discoverBunBinMetas tree overlayRoot
                   case eMetas of
                     Left _ ->
                       pure $ Just (overlayFailClosedMessage provider)
@@ -570,12 +586,14 @@ refuseUnselectedProvider env key eco src localPVs locals onDiskPlan onDiskNeed =
                               pure $ Just (overlayFailClosedMessage provider)
                             Right hypoPlan -> do
                               hypoFix <-
-                                contentFixPVs
-                                  (peDepsPlanOps env)
-                                  eco
-                                  src
-                                  locals
-                                  hypoPlan
+                                peObserveTree env $ \tree ->
+                                  contentFixPVs
+                                    tree
+                                    (peDepsPlanOps env)
+                                    eco
+                                    src
+                                    locals
+                                    hypoPlan
                               let hypoNeed = planNeedsWork localPVs hypoFix hypoPlan
                               if planDeltaHolds
                                 (glpUniquePVs onDiskPlan)

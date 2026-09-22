@@ -107,6 +107,7 @@ import Update.Materialize.Sidecar
     sidecarDockerfilePath,
     sidecarImageJsonPath,
   )
+import Update.OverlayTree (InTree, TreeLock, withOverlayTreeChecked)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -225,20 +226,20 @@ defaultMaterializeSidecarDir = do
 hostMachineArch :: IO String
 hostMachineArch = machine <$> getSystemID
 
-readOverlayBunFloor :: FilePath -> IO (Maybe Text)
-readOverlayBunFloor overlayRoot = do
-  metas <- loadBunMetas overlayRoot
-  pure (overlayBunFloorFromMetas metas)
+readOverlayBunFloor :: InTree -> FilePath -> IO (Either Text (Maybe Text))
+readOverlayBunFloor tree overlayRoot = do
+  eMetas <- loadBunMetas tree overlayRoot
+  pure $ overlayBunFloorFromMetas <$> eMetas
 
-readOverlayQlotFloor :: FilePath -> IO (Maybe Text)
-readOverlayQlotFloor overlayRoot = do
-  metas <- loadQlotMetas overlayRoot
-  pure (overlayBunFloorFromMetas metas)
+readOverlayQlotFloor :: InTree -> FilePath -> IO (Either Text (Maybe Text))
+readOverlayQlotFloor tree overlayRoot = do
+  eMetas <- loadQlotMetas tree overlayRoot
+  pure $ overlayBunFloorFromMetas <$> eMetas
 
-readOverlayNodeGypFloor :: FilePath -> IO (Maybe Text)
-readOverlayNodeGypFloor overlayRoot = do
-  metas <- loadNodeGypMetas overlayRoot
-  pure (overlayBunFloorFromMetas metas)
+readOverlayNodeGypFloor :: InTree -> FilePath -> IO (Either Text (Maybe Text))
+readOverlayNodeGypFloor tree overlayRoot = do
+  eMetas <- loadNodeGypMetas tree overlayRoot
+  pure $ overlayBunFloorFromMetas <$> eMetas
 
 -- | Missing package dir (including @-bin@) is an empty meta list, not a fail.
 loadGentooToolchainMetas :: FilePath -> IO GentooToolchainMetas
@@ -253,26 +254,24 @@ loadGentooToolchainMetas gentooRoot =
     <*> metasOrEmpty (sbclPackageDir gentooRoot) (Just "sbcl-")
     <*> metasOrEmpty (sbclBinPackageDir gentooRoot) (Just "sbcl-bin-")
 
-loadBunMetas :: FilePath -> IO [RuntimeEbuildMeta]
-loadBunMetas overlayRoot = do
-  eMetas <- discoverBunBinMetas overlayRoot
-  pure $ case eMetas of
-    Left _ -> []
-    Right metas -> metas
+loadBunMetas :: InTree -> FilePath -> IO (Either Text [RuntimeEbuildMeta])
+loadBunMetas tree overlayRoot =
+  tolerateMissingDir <$> discoverBunBinMetas tree overlayRoot
 
-loadQlotMetas :: FilePath -> IO [RuntimeEbuildMeta]
-loadQlotMetas overlayRoot = do
-  eMetas <- discoverQlotMetas overlayRoot
-  pure $ case eMetas of
-    Left _ -> []
-    Right metas -> metas
+loadQlotMetas :: InTree -> FilePath -> IO (Either Text [RuntimeEbuildMeta])
+loadQlotMetas tree overlayRoot =
+  tolerateMissingDir <$> discoverQlotMetas tree overlayRoot
 
-loadNodeGypMetas :: FilePath -> IO [RuntimeEbuildMeta]
-loadNodeGypMetas overlayRoot = do
-  eMetas <- discoverNodeGypMetas overlayRoot
-  pure $ case eMetas of
-    Left _ -> []
-    Right metas -> metas
+loadNodeGypMetas :: InTree -> FilePath -> IO (Either Text [RuntimeEbuildMeta])
+loadNodeGypMetas tree overlayRoot =
+  tolerateMissingDir <$> discoverNodeGypMetas tree overlayRoot
+
+-- | A missing package directory is an empty meta list. An unreadable ebuild is not.
+tolerateMissingDir :: Either Text [a] -> Either Text [a]
+tolerateMissingDir (Left err)
+  | "directory not found:" `T.isPrefixOf` err = Right []
+  | otherwise = Left err
+tolerateMissingDir other = other
 
 metasOrEmpty ::
   FilePath ->
@@ -287,15 +286,16 @@ metasOrEmpty pkgDir mPrefix = do
 -- | Inspect/satisfy or generate+build the default tag. Override tags are
 -- inspect-only (never built or deleted).
 ensureMaterializeImage ::
+  TreeLock ->
   EnsureConfig ->
   NeededFloors ->
   IO (Either Text EnsureOutcome)
-ensureMaterializeImage cfg needed
+ensureMaterializeImage lock cfg needed
   | floorsIsEmpty needed = pure (Right EnsureSkipped)
   | otherwise =
       case ecOverrideTag cfg of
         Just tag -> inspectOnly cfg tag needed
-        Nothing -> ensureDefault cfg needed
+        Nothing -> ensureDefault lock cfg needed
 
 inspectOnly ::
   EnsureConfig ->
@@ -318,10 +318,11 @@ inspectOnly cfg tag needed = do
         Nothing -> pure (Right EnsureSkipped)
 
 ensureDefault ::
+  TreeLock ->
   EnsureConfig ->
   NeededFloors ->
   IO (Either Text EnsureOutcome)
-ensureDefault cfg needed = do
+ensureDefault lock cfg needed = do
   let tag = defaultMaterializeImage
       sidecarDir = ecSidecarDir cfg
   eId <- inspectImageId (ecRun cfg) tag
@@ -346,20 +347,27 @@ ensureDefault cfg needed = do
               pure (Left (ensureFailedMessage err))
             Right gentooRoot -> do
               metas <- loadGentooToolchainMetas gentooRoot
-              bunMetas <- loadBunMetas (ecOverlayRoot cfg)
-              qlotMetas <- loadQlotMetas (ecOverlayRoot cfg)
-              nodeGypMetas <- loadNodeGypMetas (ecOverlayRoot cfg)
-              case resolveNeededInstalls (raKeywords arch) unioned metas bunMetas qlotMetas nodeGypMetas of
-                Left err ->
-                  pure (Left (ensureFailedMessage err))
-                Right installs -> do
-                  eDisk <- imageDiskGate cfg (isFirstImage mSide eId)
-                  case eDisk of
-                    Left err -> pure (Left (ensureFailedMessage err))
-                    Right () ->
-                      buildAndRecord cfg tag oldId unioned arch installs
+              eOverlay <-
+                withOverlayTreeChecked lock $ \tree -> do
+                  bun <- loadBunMetas tree (ecOverlayRoot cfg)
+                  qlot <- loadQlotMetas tree (ecOverlayRoot cfg)
+                  nodeGyp <- loadNodeGypMetas tree (ecOverlayRoot cfg)
+                  pure ((,,) <$> bun <*> qlot <*> nodeGyp)
+              case eOverlay of
+                Left err -> pure (Left (ensureFailedMessage err))
+                Right (Left err) -> pure (Left (ensureFailedMessage err))
+                Right (Right (bunMetas, qlotMetas, nodeGypMetas)) ->
+                  case resolveNeededInstalls (raKeywords arch) unioned metas bunMetas qlotMetas nodeGypMetas of
+                    Left err ->
+                      pure (Left (ensureFailedMessage err))
+                    Right installs -> do
+                      eDisk <- imageDiskGate cfg (isFirstImage mSide eId)
+                      case eDisk of
+                        Left err -> pure (Left (ensureFailedMessage err))
+                        Right () ->
+                          buildAndRecord cfg tag oldId unioned arch installs
   where
-    isFirstImage mSide eId = case (eId, mSide) of
+    isFirstImage mSide' eId' = case (eId', mSide') of
       (Right _, Just _) -> False
       _ -> True
 

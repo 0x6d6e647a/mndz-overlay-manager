@@ -235,6 +235,7 @@ import Update.Md5Cache
     readCacheMd5Field,
   )
 import Update.Npm.Cache (productionNpmCacheOps)
+import Update.OverlayTree (withNewTreeLock)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
@@ -338,14 +339,14 @@ testMd5CacheMatchMismatchMissing =
         ebuildPath = pkgDir </> "haskell-9.4.5.ebuild"
     createDirectoryIfMissing True pkgDir
     TIO.writeFile ebuildPath "EAPI=8\nDESCRIPTION=test\n"
-    missing <- classifyVersionCache tmp cat pn ver ebuildPath
+    missing <- withNewTreeLock $ \tree -> classifyVersionCache tree tmp cat pn ver ebuildPath
     assertEq "missing" VersionCacheMissing missing
     writeMatchingCacheFile tmp cat pn ver ebuildPath
-    match <- classifyVersionCache tmp cat pn ver ebuildPath
+    match <- withNewTreeLock $ \tree -> classifyVersionCache tree tmp cat pn ver ebuildPath
     assertEq "match" VersionCacheMatch match
     let cpath = cacheFilePath tmp cat pn ver
     TIO.writeFile cpath "_md5_=00000000000000000000000000000000\n"
-    mismatch <- classifyVersionCache tmp cat pn ver ebuildPath
+    mismatch <- withNewTreeLock $ \tree -> classifyVersionCache tree tmp cat pn ver ebuildPath
     assertEq "mismatch" VersionCacheMismatch mismatch
     mField <- readCacheMd5Field cpath
     assertEq "read field" (Just "00000000000000000000000000000000") mField
@@ -368,11 +369,11 @@ testMd5CacheMultiVersionCompleteness =
     TIO.writeFile (pkgDir </> "crush-0.82.0.ebuild") "EAPI=8\nv1\n"
     TIO.writeFile (pkgDir </> "crush-0.84.0.ebuild") "EAPI=8\nv2\n"
     TIO.writeFile (pkgDir </> "crush-9999.ebuild") "EAPI=8\nlive\n"
-    vers <- listNonLiveEbuildVersions pkgDir pn
+    vers <- withNewTreeLock $ \tree -> listNonLiveEbuildVersions tree pkgDir pn
     assertEq "two non-live" 2 (length vers)
     -- Only one cache entry
     writeMatchingCacheFile tmp cat pn "0.82.0" (pkgDir </> "crush-0.82.0.ebuild")
-    inspected <- inspectPackageCache tmp cat pn pkgDir
+    inspected <- withNewTreeLock $ \tree -> inspectPackageCache tree tmp cat pn pkgDir
     case inspected of
       Left (PackageCacheMissing ms) ->
         assertTrue "missing sibling" ("0.84.0" `elem` ms)
@@ -380,7 +381,7 @@ testMd5CacheMultiVersionCompleteness =
         hPutStrLn stderr ("expected PackageCacheMissing, got " <> show other)
         exitFailure
     writeMatchingCacheFile tmp cat pn "0.84.0" (pkgDir </> "crush-0.84.0.ebuild")
-    ok <- inspectPackageCache tmp cat pn pkgDir
+    ok <- withNewTreeLock $ \tree -> inspectPackageCache tree tmp cat pn pkgDir
     assertRight "complete" ok
     pure ()
 

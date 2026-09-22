@@ -245,6 +245,7 @@ import Update.Md5Cache
     readCacheMd5Field,
   )
 import Update.Npm.Cache (productionNpmCacheOps)
+import Update.OverlayTree (withNewTreeLock)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
@@ -1865,7 +1866,8 @@ testRuntimeCeilingDiscoverResidual =
       (Just (parseEbuildVersion "22.0.0"))
       (acTilde (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch nodeC)))
     bunC <-
-      assertRight "bun ceilings" =<< discoverBunBinCeilings overlay
+      assertRight "bun ceilings"
+        =<< withNewTreeLock (`discoverBunBinCeilings` overlay)
     assertEq
       "bun tilde only"
       (Just (parseEbuildVersion "1.1.0"))

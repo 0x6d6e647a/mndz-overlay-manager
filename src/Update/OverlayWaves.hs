@@ -53,6 +53,7 @@ import Update.CheckCache
     storeLatest,
   )
 import Update.Hardcoded (lookupPolicy)
+import Update.OverlayTree (InTree, ObserveOverlay)
 import Update.Runtime.Ceilings
   ( RuntimeCeilings,
     RuntimeEbuildMeta (..),
@@ -287,10 +288,11 @@ dirtyPreflightStepLabel = "Checking overlay git status"
 
 -- | Fingerprint of the overlay ceiling-provider tree, when the technique has one.
 computeOverlayProviderFingerprint ::
+  InTree ->
   FilePath ->
   UpdateTechnique ->
   IO (Maybe CacheFingerprint)
-computeOverlayProviderFingerprint overlayRoot tech =
+computeOverlayProviderFingerprint tree overlayRoot tech =
   case overlayCeilingProvider tech of
     Nothing -> pure Nothing
     Just providerKey ->
@@ -302,7 +304,7 @@ computeOverlayProviderFingerprint overlayRoot tech =
             then pure Nothing
             else
               Just
-                <$> computeFingerprintFromDir (policySource policy) dir pn
+                <$> computeFingerprintFromDir tree (policySource policy) dir pn
         _ -> pure Nothing
 
 -- | Operator-facing blocked-on fragment for @outdated@ lines.
@@ -312,12 +314,13 @@ blockedOnLabel provider =
 
 -- | GitMv latest for an overlay ceiling provider (check-cache latest allowed).
 fetchOverlayProviderLatest ::
+  ObserveOverlay ->
   Fetcher ->
   CheckCacheHandle ->
   FilePath ->
   PackageKey ->
   IO (Either Text EbuildVersion)
-fetchOverlayProviderLatest fetch cache overlayRoot providerKey =
+fetchOverlayProviderLatest observe fetch cache overlayRoot providerKey =
   case (splitPackageKey providerKey, lookupPolicy providerKey) of
     (Just (cat, pn), Just policy) -> do
       let dir = overlayRoot </> T.unpack cat </> T.unpack pn
@@ -331,7 +334,9 @@ fetchOverlayProviderLatest fetch cache overlayRoot providerKey =
                   <> " directory not found"
               )
         else do
-          fp <- computeFingerprintFromDir (policySource policy) dir pn
+          fp <-
+            observe $ \tree ->
+              computeFingerprintFromDir tree (policySource policy) dir pn
           mCached <- lookupLatest cache providerKey fp
           case mCached of
             Just remote -> do

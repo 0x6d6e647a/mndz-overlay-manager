@@ -80,6 +80,13 @@ import Update.Materialize
   )
 import Update.Md5Cache (EgencacheRunner)
 import Update.Npm.Cache (mkNpmCacheOps)
+import Update.OverlayTree
+  ( InTree,
+    TreeLock,
+    newTreeLock,
+    withNewTreeLock,
+    withOverlayTree,
+  )
 import Update.OverlayWaves
   ( AdmitSets (..),
     OverlayPlanKind (..),
@@ -142,7 +149,7 @@ data UpdateSpineDeps = UpdateSpineDeps
     usdEgencacheRunner :: EgencacheRunner,
     usdPreflightTools :: AssetsPreflight -> IO (Either Text ()),
     -- | Ensure the materialize image for these floors (fake in tests).
-    usdEnsureImage :: NeededFloors -> IO (Either Text EnsureOutcome),
+    usdEnsureImage :: TreeLock -> NeededFloors -> IO (Either Text EnsureOutcome),
     -- | After mutate: rmi previous default-tag id if unused, then prune -f.
     usdPruneMaterialize :: IO (),
     -- | Best-effort leftover materialize-session sweep (no-op in tests).
@@ -236,6 +243,7 @@ runUpdatePhases deps entries allEbuilds selected = do
       (usdDepsPlanOps deps)
       cache
       jobs
+      withNewTreeLock
       selected
       byPkg
   mPlanAbort <- peekGitHubLatch (usdGitHubLatch deps)
@@ -333,221 +341,224 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
             Left err -> pure (Left err)
             Right (DiskGateOk warns) -> do
               t0EnsureOutcome <- newIORef (Nothing :: Maybe (Either Text ()))
-              bunFloor <- bunFloorForEnsure overlayRoot planResults'
-              qlotFloor <- qlotFloorForEnsure overlayRoot planResults'
-              nodeGypFloor <- nodeGypFloorForEnsure overlayRoot
-              let t0Floors =
-                    neededFloorsFromClassified
-                      classifyResults
-                      planResults'
-                      bunFloor
-                      qlotFloor
-                      nodeGypFloor
-                  bunNeedsGitMv =
-                    any
-                      ( \case
-                          PlanNeedsWork k PlannedGitMv {} ->
-                            k == bunBinPackageKey
-                          _ -> False
-                      )
-                      planResults'
-                  qlotNeedsGitMv =
-                    any
-                      ( \case
-                          PlanNeedsWork k PlannedGitMv {} ->
-                            k == qlotPackageKey
-                          _ -> False
-                      )
-                      planResults'
-                  nodeGypNeedsWork =
-                    any
-                      ( \case
-                          PlanNeedsWork k _ ->
-                            k == nodeGypPackageKey
-                          _ -> False
-                      )
-                      planResults'
-                  willEnsure = not (null t0FullKeys)
-                  delayCommit =
-                    if willEnsure && bunNeedsGitMv
-                      then Just bunBinPackageKey
-                      else Nothing
-                  gateEnsure =
-                    [ k
-                    | (True, k) <-
-                        [ ( willEnsure && bunNeedsGitMv && isJust (nfBun t0Floors),
-                            bunBinPackageKey
-                          ),
-                          ( willEnsure && qlotNeedsGitMv && isJust (nfSbcl t0Floors),
-                            qlotPackageKey
-                          ),
-                          ( willEnsure && nodeGypNeedsWork && isJust (nfNodeGyp t0Floors),
-                            nodeGypPackageKey
+              ePrefloors <-
+                withNewTreeLock $ \tree -> do
+                  eBun <- bunFloorForEnsure tree overlayRoot planResults'
+                  eQlot <- qlotFloorForEnsure tree overlayRoot planResults'
+                  eNode <- nodeGypFloorForEnsure tree overlayRoot
+                  pure ((,,) <$> eBun <*> eQlot <*> eNode)
+              case ePrefloors of
+                Left err -> pure (Left err)
+                Right (bunFloor, qlotFloor, nodeGypFloor) -> do
+                  treeLock <- newTreeLock
+                  let t0Floors =
+                        neededFloorsFromClassified
+                          classifyResults
+                          planResults'
+                          bunFloor
+                          qlotFloor
+                          nodeGypFloor
+                      bunNeedsGitMv =
+                        any
+                          ( \case
+                              PlanNeedsWork k PlannedGitMv {} ->
+                                k == bunBinPackageKey
+                              _ -> False
                           )
+                          planResults'
+                      qlotNeedsGitMv =
+                        any
+                          ( \case
+                              PlanNeedsWork k PlannedGitMv {} ->
+                                k == qlotPackageKey
+                              _ -> False
+                          )
+                          planResults'
+                      nodeGypNeedsWork =
+                        any
+                          ( \case
+                              PlanNeedsWork k _ ->
+                                k == nodeGypPackageKey
+                              _ -> False
+                          )
+                          planResults'
+                      willEnsure = not (null t0FullKeys)
+                      delayCommit =
+                        if willEnsure && bunNeedsGitMv
+                          then Just bunBinPackageKey
+                          else Nothing
+                      gateEnsure =
+                        [ k
+                        | (True, k) <-
+                            [ ( willEnsure && bunNeedsGitMv && isJust (nfBun t0Floors),
+                                bunBinPackageKey
+                              ),
+                              ( willEnsure && qlotNeedsGitMv && isJust (nfSbcl t0Floors),
+                                qlotPackageKey
+                              ),
+                              ( willEnsure && nodeGypNeedsWork && isJust (nfNodeGyp t0Floors),
+                                nodeGypPackageKey
+                              )
+                            ]
                         ]
-                    ]
-                  recordEnsure outcome = do
-                    writeIORef t0EnsureOutcome (Just outcome)
-                    pure outcome
-                  runEnsure classifyForFloors plansForFloors mh = do
-                    bunFl <- bunFloorForEnsure overlayRoot plansForFloors
-                    qlotFl <- qlotFloorForEnsure overlayRoot plansForFloors
-                    nodeGypFl <- nodeGypFloorForEnsure overlayRoot
-                    let floors =
-                          neededFloorsFromClassified
-                            classifyForFloors
-                            plansForFloors
-                            bunFl
-                            qlotFl
-                            nodeGypFl
-                    if floorsIsEmpty floors
-                      then recordEnsure (Right ())
-                      else do
-                        for_ (fullPathKeysFromClassify classifyForFloors) $ \k ->
-                          mhStatus mh k ensuringMaterializeImageStatus
-                        usdEnsureImage deps floors >>= \case
+                      recordEnsure outcome = do
+                        writeIORef t0EnsureOutcome (Just outcome)
+                        pure outcome
+                      runEnsure classifyForFloors plansForFloors mh = do
+                        eLive <-
+                          withOverlayTree treeLock $ \tree -> do
+                            eBun <- bunFloorForEnsure tree overlayRoot plansForFloors
+                            eQlot <- qlotFloorForEnsure tree overlayRoot plansForFloors
+                            eNode <- nodeGypFloorForEnsure tree overlayRoot
+                            pure ((,,) <$> eBun <*> eQlot <*> eNode)
+                        case eLive of
                           Left err -> recordEnsure (Left err)
-                          Right _ -> recordEnsure (Right ())
-                  diskAfterClassify classifyR planned' = do
-                    gitMvU <-
-                      buildGitMvUnitPlans overlayRoot distDir planned'
-                    let newUnits =
-                          unitPlansFromClassifyResults classifyR gitMvU
-                    if null newUnits
-                      then pure (Right planned')
-                      else do
-                        tempRoot <- resolveTempRoot
-                        mPortage <- lookupPortageDistDir
-                        disk <-
-                          runDiskSpaceGate
-                            (usdDiskProbe deps)
-                            jobs
-                            tempRoot
-                            distDir
-                            mPortage
-                            newUnits
-                        pure $ case disk of
-                          Left err -> Left err
-                          Right (DiskGateOk _) -> Right planned'
-                  prepare _provider consumers mh = do
-                    -- Admit withheld consumers on the t0 hypo plan (no disk re-plan).
-                    let planned =
-                          [ r
-                          | r <- planResults',
-                            planResultKey r `elem` consumers
-                          ]
-                        needWork = [r | r@PlanNeedsWork {} <- planned]
-                    classifyR <-
-                      classifyNeedsWorkPackages
-                        releaseOps
-                        assetsOwner
-                        assetsRepo
-                        overlayRoot
-                        needWork
-                    let planned' = mergeClassifyHardFails planned classifyR
-                        rePf =
-                          (assetsPreflightFromPlan planned' classifyR)
-                            { apNeedAssets = False
-                            }
-                    eReLang <- usdPreflightTools deps rePf
-                    case eReLang of
-                      Left err ->
-                        pure (failNeedsWork err planned')
-                      Right () -> do
-                        mEns <- readIORef t0EnsureOutcome
-                        case mEns of
-                          Just (Left err) ->
+                          Right (bunFl, qlotFl, nodeGypFl) -> do
+                            let floors =
+                                  neededFloorsFromClassified
+                                    classifyForFloors
+                                    plansForFloors
+                                    bunFl
+                                    qlotFl
+                                    nodeGypFl
+                            if floorsIsEmpty floors
+                              then recordEnsure (Right ())
+                              else do
+                                for_ (fullPathKeysFromClassify classifyForFloors) $ \k ->
+                                  mhStatus mh k ensuringMaterializeImageStatus
+                                usdEnsureImage deps treeLock floors >>= \case
+                                  Left err -> recordEnsure (Left err)
+                                  Right _ -> recordEnsure (Right ())
+                      diskAfterClassify classifyR planned' = do
+                        gitMvU <-
+                          buildGitMvUnitPlans overlayRoot distDir planned'
+                        let newUnits =
+                              unitPlansFromClassifyResults classifyR gitMvU
+                        if null newUnits
+                          then pure (Right planned')
+                          else do
+                            tempRoot <- resolveTempRoot
+                            mPortage <- lookupPortageDistDir
+                            disk <-
+                              runDiskSpaceGate
+                                (usdDiskProbe deps)
+                                jobs
+                                tempRoot
+                                distDir
+                                mPortage
+                                newUnits
+                            pure $ case disk of
+                              Left err -> Left err
+                              Right (DiskGateOk _) -> Right planned'
+                      prepare _provider consumers mh = do
+                        -- Admit withheld consumers on the t0 hypo plan (no disk re-plan).
+                        let planned =
+                              [ r
+                              | r <- planResults',
+                                planResultKey r `elem` consumers
+                              ]
+                            needWork = [r | r@PlanNeedsWork {} <- planned]
+                        classifyR <-
+                          classifyNeedsWorkPackages
+                            releaseOps
+                            assetsOwner
+                            assetsRepo
+                            overlayRoot
+                            needWork
+                        let planned' = mergeClassifyHardFails planned classifyR
+                            rePf =
+                              (assetsPreflightFromPlan planned' classifyR)
+                                { apNeedAssets = False
+                                }
+                        eReLang <- usdPreflightTools deps rePf
+                        case eReLang of
+                          Left err ->
                             pure (failNeedsWork err planned')
-                          Just (Right ()) ->
-                            diskAfterClassify classifyR planned' >>= \case
-                              Left err ->
+                          Right () -> do
+                            mEns <- readIORef t0EnsureOutcome
+                            case mEns of
+                              Just (Left err) ->
                                 pure (failNeedsWork err planned')
-                              Right ok -> pure ok
-                          Nothing -> do
-                            eEns <- runEnsure classifyR planned' mh
-                            case eEns of
-                              Left err ->
-                                pure (failNeedsWork err planned')
-                              Right () ->
+                              Just (Right ()) ->
                                 diskAfterClassify classifyR planned' >>= \case
                                   Left err ->
                                     pure (failNeedsWork err planned')
                                   Right ok -> pure ok
-                  runMutate = do
-                    assetsLock <- newMVar ()
-                    overlayLock <- newMVar ()
-                    tempRun <- openRunRoot
-                    unless (null t0FullKeys) $
-                      usdSweepMaterialize deps
-                    mMatDocker <-
-                      case usdMaterializeDockerRunner deps of
-                        Nothing -> pure Nothing
-                        Just inner
-                          | null t0FullKeys -> pure Nothing
-                          | otherwise -> do
-                              cfg <- resolveMaterializeDockerCfg (rrRunId tempRun)
-                              pure (Just (cfg, inner))
-                    let closedRun _ =
-                          pure
-                            ProcessResult
-                              { prExitCode = ExitFailure 127,
-                                prStdout = "",
-                                prStderr = "internal: materialize session not opened"
-                              }
-                        env =
-                          ApplyEnv
-                            { aeFetcher = usdFetcher deps,
-                              aeGitOps = usdGitOps deps,
-                              aeEbuildRunner = usdEbuildRunner deps,
-                              aeEgencacheRunner = usdEgencacheRunner deps,
-                              aeVendorOps = mkVendorOps closedRun,
-                              aeNpmCacheOps = mkNpmCacheOps closedRun,
-                              aeBunCacheOps = mkBunCacheOps closedRun,
-                              aeCargoOps = mkCargoOps closedRun,
-                              aeSbclDepsOps = mkSbclDepsOps closedRun,
-                              aeReleaseOps = releaseOps,
-                              aeAssetsRoot = mAssetsRoot,
-                              aeGitHubToken = resolvedToken,
-                              aeAssetsOwner = assetsOwner,
-                              aeAssetsRepo = assetsRepo,
-                              aeAssetsLock = assetsLock,
-                              aeOverlayLock = overlayLock,
-                              aeJobs = jobs,
-                              aeMulti = noopMultiHandle,
-                              aePlanOps = toGoPlanOps (usdDepsPlanOps deps),
-                              aeDepsPlanOps = usdDepsPlanOps deps,
-                              aeTempRun = tempRun,
-                              aeCheckCache = cache,
-                              aeMaterializeDocker = mMatDocker,
-                              aeAtomClosure = Nothing,
-                              aeGitOperationsHealth = usdGitOperationsHealth deps
-                            }
-                        overlapReady =
-                          [ r
-                          | r@(PlanNeedsWork k _) <- admittedAfter,
-                            k `notElem` t0FullKeys
-                          ]
-                        t0Ensure = runEnsure classifyResults planResults'
-                        emptyMutate =
-                          MutateEnsure
-                            { meFullPathKeys = [],
-                              meImageEnsure = \_ -> pure (Right ()),
-                              meDelayCommit = Nothing,
-                              meGateEnsureOnFiles = [],
-                              meRunEnsure = False
-                            }
-                    if null t0FullKeys
-                      then
-                        applyOverlayFromPlan
-                          pcfg
-                          env
-                          overlayRoot
-                          entries
-                          planResults'
-                          prepare
-                          emptyMutate
-                      else
-                        if not (null overlapReady)
+                              Nothing -> do
+                                eEns <- runEnsure classifyR planned' mh
+                                case eEns of
+                                  Left err ->
+                                    pure (failNeedsWork err planned')
+                                  Right () ->
+                                    diskAfterClassify classifyR planned' >>= \case
+                                      Left err ->
+                                        pure (failNeedsWork err planned')
+                                      Right ok -> pure ok
+                      runMutate = do
+                        assetsLock <- newMVar ()
+                        overlayLock <- newMVar ()
+                        tempRun <- openRunRoot
+                        unless (null t0FullKeys) $
+                          usdSweepMaterialize deps
+                        mMatDocker <-
+                          case usdMaterializeDockerRunner deps of
+                            Nothing -> pure Nothing
+                            Just inner
+                              | null t0FullKeys -> pure Nothing
+                              | otherwise -> do
+                                  cfg <- resolveMaterializeDockerCfg (rrRunId tempRun)
+                                  pure (Just (cfg, inner))
+                        let closedRun _ =
+                              pure
+                                ProcessResult
+                                  { prExitCode = ExitFailure 127,
+                                    prStdout = "",
+                                    prStderr = "internal: materialize session not opened"
+                                  }
+                            env =
+                              ApplyEnv
+                                { aeFetcher = usdFetcher deps,
+                                  aeGitOps = usdGitOps deps,
+                                  aeEbuildRunner = usdEbuildRunner deps,
+                                  aeEgencacheRunner = usdEgencacheRunner deps,
+                                  aeVendorOps = mkVendorOps closedRun,
+                                  aeNpmCacheOps = mkNpmCacheOps closedRun,
+                                  aeBunCacheOps = mkBunCacheOps closedRun,
+                                  aeCargoOps = mkCargoOps closedRun,
+                                  aeSbclDepsOps = mkSbclDepsOps closedRun,
+                                  aeReleaseOps = releaseOps,
+                                  aeAssetsRoot = mAssetsRoot,
+                                  aeGitHubToken = resolvedToken,
+                                  aeAssetsOwner = assetsOwner,
+                                  aeAssetsRepo = assetsRepo,
+                                  aeAssetsLock = assetsLock,
+                                  aeOverlayLock = overlayLock,
+                                  aeTreeLock = treeLock,
+                                  aeJobs = jobs,
+                                  aeMulti = noopMultiHandle,
+                                  aePlanOps = toGoPlanOps (usdDepsPlanOps deps),
+                                  aeDepsPlanOps = usdDepsPlanOps deps,
+                                  aeTempRun = tempRun,
+                                  aeCheckCache = cache,
+                                  aeMaterializeDocker = mMatDocker,
+                                  aeAtomClosure = Nothing,
+                                  aeGitOperationsHealth = usdGitOperationsHealth deps
+                                }
+                            overlapReady =
+                              [ r
+                              | r@(PlanNeedsWork k _) <- admittedAfter,
+                                k `notElem` t0FullKeys
+                              ]
+                            t0Ensure = runEnsure classifyResults planResults'
+                            emptyMutate =
+                              MutateEnsure
+                                { meFullPathKeys = [],
+                                  meImageEnsure = \_ -> pure (Right ()),
+                                  meDelayCommit = Nothing,
+                                  meGateEnsureOnFiles = [],
+                                  meRunEnsure = False
+                                }
+                        if null t0FullKeys
                           then
                             applyOverlayFromPlan
                               pcfg
@@ -556,37 +567,10 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                               entries
                               planResults'
                               prepare
-                              MutateEnsure
-                                { meFullPathKeys = t0FullKeys,
-                                  meImageEnsure = t0Ensure,
-                                  meDelayCommit = delayCommit,
-                                  meGateEnsureOnFiles = gateEnsure,
-                                  meRunEnsure = True
-                                }
-                          else do
-                            eEns <-
-                              if floorsIsEmpty t0Floors
-                                then recordEnsure (Right ()) >> pure (Right EnsureSkipped)
-                                else withStepProgress pcfg 1 $ \step -> do
-                                  shStep step "Ensuring materialize image"
-                                  usdEnsureImage deps t0Floors >>= \case
-                                    Left err -> do
-                                      void (recordEnsure (Left err))
-                                      pure (Left err)
-                                    Right out -> do
-                                      void (recordEnsure (Right ()))
-                                      pure (Right out)
-                            case eEns of
-                              Right _ ->
-                                applyOverlayFromPlan
-                                  pcfg
-                                  env
-                                  overlayRoot
-                                  entries
-                                  planResults'
-                                  prepare
-                                  emptyMutate
-                              Left err ->
+                              emptyMutate
+                          else
+                            if not (null overlapReady)
+                              then
                                 applyOverlayFromPlan
                                   pcfg
                                   env
@@ -596,66 +580,105 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   prepare
                                   MutateEnsure
                                     { meFullPathKeys = t0FullKeys,
-                                      meImageEnsure = \_ -> pure (Left err),
-                                      meDelayCommit = Nothing,
-                                      meGateEnsureOnFiles = [],
+                                      meImageEnsure = t0Ensure,
+                                      meDelayCommit = delayCommit,
+                                      meGateEnsureOnFiles = gateEnsure,
                                       meRunEnsure = True
                                     }
-              eDirtyQlot <-
-                if isJust (nfSbcl t0Floors)
-                  then
-                    runDirtyPreflight
-                      pcfg
-                      (usdGitOps deps)
-                      overlayRoot
-                      [qlotPackageKey]
-                  else pure (Right ())
-              case eDirtyQlot of
-                Left err -> pure (Left err)
-                Right () -> do
-                  eDirtyNodeGyp <-
-                    if isJust (nfNodeGyp t0Floors)
+                              else do
+                                eEns <-
+                                  if floorsIsEmpty t0Floors
+                                    then recordEnsure (Right ()) >> pure (Right EnsureSkipped)
+                                    else withStepProgress pcfg 1 $ \step -> do
+                                      shStep step "Ensuring materialize image"
+                                      preLock <- newTreeLock
+                                      usdEnsureImage deps preLock t0Floors >>= \case
+                                        Left err -> do
+                                          void (recordEnsure (Left err))
+                                          pure (Left err)
+                                        Right out -> do
+                                          void (recordEnsure (Right ()))
+                                          pure (Right out)
+                                case eEns of
+                                  Right _ ->
+                                    applyOverlayFromPlan
+                                      pcfg
+                                      env
+                                      overlayRoot
+                                      entries
+                                      planResults'
+                                      prepare
+                                      emptyMutate
+                                  Left err ->
+                                    applyOverlayFromPlan
+                                      pcfg
+                                      env
+                                      overlayRoot
+                                      entries
+                                      planResults'
+                                      prepare
+                                      MutateEnsure
+                                        { meFullPathKeys = t0FullKeys,
+                                          meImageEnsure = \_ -> pure (Left err),
+                                          meDelayCommit = Nothing,
+                                          meGateEnsureOnFiles = [],
+                                          meRunEnsure = True
+                                        }
+                  eDirtyQlot <-
+                    if isJust (nfSbcl t0Floors)
                       then
                         runDirtyPreflight
                           pcfg
                           (usdGitOps deps)
                           overlayRoot
-                          [nodeGypPackageKey]
+                          [qlotPackageKey]
                       else pure (Right ())
-                  case eDirtyNodeGyp of
+                  case eDirtyQlot of
                     Left err -> pure (Left err)
                     Right () -> do
-                      outcomes <-
-                        if needDeps
+                      eDirtyNodeGyp <-
+                        if isJust (nfNodeGyp t0Floors)
                           then
-                            bracket
-                              (ensureSshAgent (usdSshOps deps))
-                              ( \case
-                                  Left _ -> pure ()
-                                  Right sess -> teardownSshSession (usdSshOps deps) sess
-                              )
-                              ( \case
-                                  Left err ->
-                                    pure
-                                      [ ApplyHardFail
-                                          (PackageKey "")
-                                          ("SSH agent setup failed: " <> err)
-                                          False
-                                          False
-                                      ]
-                                  Right _sess -> runMutate
-                              )
-                          else runMutate
-                      usdPruneMaterialize deps
-                      flushCheckCache cache
-                      mSummary <- cacheSummaryLine cache
-                      pure $
-                        Right
-                          UpdateSpineResult
-                            { usrOutcomes = outcomes,
-                              usrWarnings = warns,
-                              usrCacheSummary = mSummary
-                            }
+                            runDirtyPreflight
+                              pcfg
+                              (usdGitOps deps)
+                              overlayRoot
+                              [nodeGypPackageKey]
+                          else pure (Right ())
+                      case eDirtyNodeGyp of
+                        Left err -> pure (Left err)
+                        Right () -> do
+                          outcomes <-
+                            if needDeps
+                              then
+                                bracket
+                                  (ensureSshAgent (usdSshOps deps))
+                                  ( \case
+                                      Left _ -> pure ()
+                                      Right sess -> teardownSshSession (usdSshOps deps) sess
+                                  )
+                                  ( \case
+                                      Left err ->
+                                        pure
+                                          [ ApplyHardFail
+                                              (PackageKey "")
+                                              ("SSH agent setup failed: " <> err)
+                                              False
+                                              False
+                                          ]
+                                      Right _sess -> runMutate
+                                  )
+                              else runMutate
+                          usdPruneMaterialize deps
+                          flushCheckCache cache
+                          mSummary <- cacheSummaryLine cache
+                          pure $
+                            Right
+                              UpdateSpineResult
+                                { usrOutcomes = outcomes,
+                                  usrWarnings = warns,
+                                  usrCacheSummary = mSummary
+                                }
 
 -- | Promote classify hard-fails into plan results so mutate skips them.
 mergeClassifyHardFails ::
@@ -720,29 +743,37 @@ runDirtyPreflight pcfg gitOps overlayRoot keys =
             Right False -> go ks
 
 -- | Overlay bun floor for ensure: planned bun-bin remote when selected GitMv.
-bunFloorForEnsure :: FilePath -> [PackagePlanResult] -> IO (Maybe Text)
-bunFloorForEnsure overlayRoot =
-  overlayGitMvFloorForEnsure bunBinPackageKey (readOverlayBunFloor overlayRoot)
+bunFloorForEnsure ::
+  InTree ->
+  FilePath ->
+  [PackagePlanResult] ->
+  IO (Either Text (Maybe Text))
+bunFloorForEnsure tree overlayRoot =
+  overlayGitMvFloorForEnsure bunBinPackageKey (readOverlayBunFloor tree overlayRoot)
 
 -- | Overlay qlot floor for ensure: planned qlot remote when selected GitMv.
-qlotFloorForEnsure :: FilePath -> [PackagePlanResult] -> IO (Maybe Text)
-qlotFloorForEnsure overlayRoot =
-  overlayGitMvFloorForEnsure qlotPackageKey (readOverlayQlotFloor overlayRoot)
+qlotFloorForEnsure ::
+  InTree ->
+  FilePath ->
+  [PackagePlanResult] ->
+  IO (Either Text (Maybe Text))
+qlotFloorForEnsure tree overlayRoot =
+  overlayGitMvFloorForEnsure qlotPackageKey (readOverlayQlotFloor tree overlayRoot)
 
 -- | Overlay node-gyp floor for ensure: newest non-live overlay PV (scan after
 -- file work when that work precedes docker).
-nodeGypFloorForEnsure :: FilePath -> IO (Maybe Text)
+nodeGypFloorForEnsure :: InTree -> FilePath -> IO (Either Text (Maybe Text))
 nodeGypFloorForEnsure = readOverlayNodeGypFloor
 
 overlayGitMvFloorForEnsure ::
   PackageKey ->
-  IO (Maybe Text) ->
+  IO (Either Text (Maybe Text)) ->
   [PackagePlanResult] ->
-  IO (Maybe Text)
+  IO (Either Text (Maybe Text))
 overlayGitMvFloorForEnsure key scanOverlay plans =
   case [ renderPV remote
        | PlanNeedsWork k (PlannedGitMv remote) <- plans,
          k == key
        ] of
-    (pv : _) -> pure (Just pv)
+    (pv : _) -> pure (Right (Just pv))
     [] -> scanOverlay

@@ -37,7 +37,9 @@ module Update.AtomClosure
     plannedRemainingFromWork,
     wireAtomClosureSlots,
     recordAtomClosureTerminal,
-    ensureAtomClosedForWrite,
+    AtomClosureObserve (..),
+    observeAtomClosure,
+    awaitAtomProvider,
     guardGitMvRenameAway,
   )
 where
@@ -53,7 +55,6 @@ import Control.Concurrent.MVar
     tryPutMVar,
     tryReadMVar,
   )
-import Control.Exception (IOException, try)
 import Control.Monad (foldM, join, unless, void)
 import Data.Char (isAlphaNum)
 import Data.Containers.ListUtils (nubOrd)
@@ -66,7 +67,6 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.IO qualified as TIO
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Version
   ( EbuildVersion,
@@ -75,10 +75,16 @@ import Overlay.Version
     renderPV,
     samePV,
   )
-import System.Directory (doesDirectoryExist, listDirectory)
+import System.Directory (doesDirectoryExist)
 import System.FilePath ((</>))
 import Update.EbuildEdit (parseEbuildSlot)
 import Update.Go.Plan (isLivePackageVersion)
+import Update.OverlayTree
+  ( InTree,
+    listEbuildNames,
+    readEbuildEither,
+    tryEbuild,
+  )
 import Update.Types
   ( PackageKey (..),
     mkPackageKey,
@@ -761,150 +767,194 @@ validCatPkg cat pkgVer =
 -- Overlay tree IO
 ------------------------------------------------------------------------
 
-listOverlayPackageKeys :: FilePath -> IO (Either Text (Set PackageKey))
-listOverlayPackageKeys overlayRoot = do
+listOverlayPackageKeys :: InTree -> FilePath -> IO (Either Text (Set PackageKey))
+listOverlayPackageKeys tree overlayRoot = do
   exists <- doesDirectoryExist overlayRoot
   if not exists
     then pure (Right Set.empty)
     else do
-      entries <- listDirectory overlayRoot
-      keys <- concat <$> mapM (categoryKeys overlayRoot) entries
-      pure (Right (Set.fromList keys))
+      eEntries <- tryEbuild overlayRoot (listEbuildNames tree overlayRoot)
+      case eEntries of
+        Left err -> pure (Left err)
+        Right entries -> do
+          eKeys <- mapM (categoryKeys tree overlayRoot) entries
+          pure $ case sequence eKeys of
+            Left err -> Left err
+            Right keys -> Right (Set.fromList (concat keys))
 
-categoryKeys :: FilePath -> FilePath -> IO [PackageKey]
-categoryKeys overlayRoot cat = do
+categoryKeys :: InTree -> FilePath -> FilePath -> IO (Either Text [PackageKey])
+categoryKeys tree overlayRoot cat = do
   let catPath = overlayRoot </> cat
   isDir <- doesDirectoryExist catPath
   if not isDir || skipRootEntry cat
-    then pure []
+    then pure (Right [])
     else do
-      children <- listDirectory catPath
-      mapMaybeM (packageKeyIfEbuilds overlayRoot cat) children
+      eChildren <- tryEbuild catPath (listEbuildNames tree catPath)
+      case eChildren of
+        Left err -> pure (Left err)
+        Right children -> do
+          eKeys <- mapM (packageKeyIfEbuilds tree overlayRoot cat) children
+          pure $ case sequence eKeys of
+            Left err -> Left err
+            Right keys -> Right (catMaybes keys)
 
 skipRootEntry :: FilePath -> Bool
 skipRootEntry name =
   name `elem` ["metadata", "profiles", "eclass", "licenses", "scripts", ".git"]
 
-packageKeyIfEbuilds :: FilePath -> FilePath -> FilePath -> IO (Maybe PackageKey)
-packageKeyIfEbuilds overlayRoot cat pkg = do
+packageKeyIfEbuilds ::
+  InTree ->
+  FilePath ->
+  FilePath ->
+  FilePath ->
+  IO (Either Text (Maybe PackageKey))
+packageKeyIfEbuilds tree overlayRoot cat pkg = do
   let pkgPath = overlayRoot </> cat </> pkg
   isDir <- doesDirectoryExist pkgPath
   if not isDir
-    then pure Nothing
+    then pure (Right Nothing)
     else do
-      files <- listDirectory pkgPath
-      pure $
-        if any (\f -> ".ebuild" `T.isSuffixOf` T.pack f) files
-          then Just (mkPackageKey (T.pack cat) (T.pack pkg))
-          else Nothing
+      eFiles <- tryEbuild pkgPath (listEbuildNames tree pkgPath)
+      pure $ case eFiles of
+        Left err -> Left err
+        Right files ->
+          Right $
+            if any (\f -> ".ebuild" `T.isSuffixOf` T.pack f) files
+              then Just (mkPackageKey (T.pack cat) (T.pack pkg))
+              else Nothing
 
-mapMaybeM :: (a -> IO (Maybe b)) -> [a] -> IO [b]
-mapMaybeM f = go
-  where
-    go [] = pure []
-    go (x : xs) = do
-      m <- f x
-      rest <- go xs
-      pure $ case m of
-        Just y -> y : rest
-        Nothing -> rest
+listNonLiveProviderPVs ::
+  InTree ->
+  FilePath ->
+  PackageKey ->
+  IO (Either Text [EbuildVersion])
+listNonLiveProviderPVs tree overlayRoot key =
+  fmap (map pvVersion) <$> listNonLiveProviders tree overlayRoot key
 
-listNonLiveProviderPVs :: FilePath -> PackageKey -> IO [EbuildVersion]
-listNonLiveProviderPVs overlayRoot key =
-  map pvVersion <$> listNonLiveProviders overlayRoot key
-
-listNonLiveProviders :: FilePath -> PackageKey -> IO [ProviderVer]
-listNonLiveProviders overlayRoot key =
+listNonLiveProviders ::
+  InTree ->
+  FilePath ->
+  PackageKey ->
+  IO (Either Text [ProviderVer])
+listNonLiveProviders tree overlayRoot key =
   case splitPackageKey key of
-    Nothing -> pure []
+    Nothing -> pure (Right [])
     Just (cat, pn) -> do
       let pkgDir = overlayRoot </> T.unpack cat </> T.unpack pn
       exists <- doesDirectoryExist pkgDir
       if not exists
-        then pure []
+        then pure (Right [])
         else do
-          names <- listDirectory pkgDir
-          catMaybes
-            <$> mapM
-              ( \n ->
-                  case parseEbuildFileName n of
-                    Just (pkg, verStr)
-                      | T.pack pkg == pn -> do
-                          let v = parseEbuildVersion (T.pack verStr)
-                          if isLivePackageVersion v
-                            then pure Nothing
-                            else do
-                              eBody <-
-                                try (TIO.readFile (pkgDir </> n)) ::
-                                  IO (Either IOException Text)
-                              pure $
-                                case eBody of
-                                  Left _ -> Nothing
-                                  Right body ->
-                                    Just (ProviderVer v (parseEbuildSlot body == "0"))
-                    _ -> pure Nothing
-              )
-              names
+          eNames <- tryEbuild pkgDir (listEbuildNames tree pkgDir)
+          case eNames of
+            Left err -> pure (Left err)
+            Right names -> foldProviderNames tree pkgDir pn [] names
+
+foldProviderNames ::
+  InTree ->
+  FilePath ->
+  Text ->
+  [ProviderVer] ->
+  [FilePath] ->
+  IO (Either Text [ProviderVer])
+foldProviderNames _ _ _ acc [] = pure (Right (reverse acc))
+foldProviderNames tree pkgDir pn acc (n : ns) =
+  case parseEbuildFileName n of
+    Just (pkg, verStr)
+      | T.pack pkg == pn -> do
+          let v = parseEbuildVersion (T.pack verStr)
+          if isLivePackageVersion v
+            then foldProviderNames tree pkgDir pn acc ns
+            else do
+              eBody <- readEbuildEither tree (pkgDir </> n)
+              case eBody of
+                Left err -> pure (Left err)
+                Right body ->
+                  foldProviderNames
+                    tree
+                    pkgDir
+                    pn
+                    (ProviderVer v (parseEbuildSlot body == "0") : acc)
+                    ns
+    _ -> foldProviderNames tree pkgDir pn acc ns
 
 readPackageEbuildBodies ::
+  InTree ->
   FilePath ->
   PackageKey ->
   [EbuildVersion] ->
-  IO [(EbuildVersion, Text)]
-readPackageEbuildBodies overlayRoot key wanted =
+  IO (Either Text [(EbuildVersion, Text)])
+readPackageEbuildBodies tree overlayRoot key wanted =
   case splitPackageKey key of
-    Nothing -> pure []
+    Nothing -> pure (Right [])
     Just (cat, pn) -> do
       let pkgDir = overlayRoot </> T.unpack cat </> T.unpack pn
       exists <- doesDirectoryExist pkgDir
       if not exists
-        then pure []
+        then pure (Right [])
         else do
-          names <- listDirectory pkgDir
-          let wantedSet = wanted
-          pairs <-
-            mapM
-              ( \n ->
-                  case parseEbuildFileName n of
-                    Just (pkg, verStr)
-                      | T.pack pkg == pn -> do
-                          let v = parseEbuildVersion (T.pack verStr)
-                          if any (samePV v) wantedSet && not (isLivePackageVersion v)
-                            then do
-                              body <- TIO.readFile (pkgDir </> n)
-                              pure (Just (v, body))
-                            else pure Nothing
-                    _ -> pure Nothing
-              )
-              names
-          pure (catMaybes pairs)
+          eNames <- tryEbuild pkgDir (listEbuildNames tree pkgDir)
+          case eNames of
+            Left err -> pure (Left err)
+            Right names -> foldBodies tree pkgDir pn wanted [] names
+
+foldBodies ::
+  InTree ->
+  FilePath ->
+  Text ->
+  [EbuildVersion] ->
+  [(EbuildVersion, Text)] ->
+  [FilePath] ->
+  IO (Either Text [(EbuildVersion, Text)])
+foldBodies _ _ _ _ acc [] = pure (Right (reverse acc))
+foldBodies tree pkgDir pn wanted acc (n : ns) =
+  case parseEbuildFileName n of
+    Just (pkg, verStr)
+      | T.pack pkg == pn -> do
+          let v = parseEbuildVersion (T.pack verStr)
+          if any (samePV v) wanted && not (isLivePackageVersion v)
+            then do
+              eBody <- readEbuildEither tree (pkgDir </> n)
+              case eBody of
+                Left err -> pure (Left err)
+                Right body -> foldBodies tree pkgDir pn wanted ((v, body) : acc) ns
+            else foldBodies tree pkgDir pn wanted acc ns
+    _ -> foldBodies tree pkgDir pn wanted acc ns
 
 -- | Remaining consumer ebuild bodies: selected packages use planned remaining
 -- PVs (on-disk files only); unselected packages use on-disk non-live ebuilds.
 remainingConsumerBodies ::
   Maybe AtomClosureSession ->
+  InTree ->
   FilePath ->
   Set PackageKey ->
   PackageKey ->
-  IO [(PackageKey, Text)]
-remainingConsumerBodies mSession overlayRoot overlayKeys self = do
+  IO (Either Text [(PackageKey, Text)])
+remainingConsumerBodies mSession tree overlayRoot overlayKeys self = do
   let others = Set.toList (Set.delete self overlayKeys)
-  concat <$> mapM (bodiesFor overlayRoot mSession) others
+  eAll <- mapM (bodiesFor tree overlayRoot mSession) others
+  pure $ concat <$> sequence eAll
 
 bodiesFor ::
+  InTree ->
   FilePath ->
   Maybe AtomClosureSession ->
   PackageKey ->
-  IO [(PackageKey, Text)]
-bodiesFor overlayRoot mSession key = do
-  disk <- listNonLiveProviderPVs overlayRoot key
-  let remaining = case mSession of
-        Just s -> Map.findWithDefault disk key (acsPlannedRemaining s)
-        Nothing -> disk
-      -- Only PVs that exist on disk (do not invent).
-      onDiskRemaining = [p | p <- remaining, any (samePV p) disk]
-  pairs <- readPackageEbuildBodies overlayRoot key onDiskRemaining
-  pure [(key, body) | (_, body) <- pairs]
+  IO (Either Text [(PackageKey, Text)])
+bodiesFor tree overlayRoot mSession key = do
+  eDisk <- listNonLiveProviderPVs tree overlayRoot key
+  case eDisk of
+    Left err -> pure (Left err)
+    Right disk -> do
+      let remaining = case mSession of
+            Just s -> Map.findWithDefault disk key (acsPlannedRemaining s)
+            Nothing -> disk
+          -- Only PVs that exist on disk (do not invent).
+          onDiskRemaining = [p | p <- remaining, any (samePV p) disk]
+      ePairs <- readPackageEbuildBodies tree overlayRoot key onDiskRemaining
+      pure $ case ePairs of
+        Left err -> Left err
+        Right pairs -> Right [(key, body) | (_, body) <- pairs]
 
 parseBodiesNeeds ::
   Set PackageKey ->
@@ -917,71 +967,104 @@ parseBodiesNeeds overlayKeys = fmap concat . mapM one
 -- | Reverse-dep keep-set for a provider after successful planned-PV apply.
 keepPVsForProvider ::
   Maybe AtomClosureSession ->
+  InTree ->
   FilePath ->
   PackageKey ->
   [EbuildVersion] ->
   IO (Either Text [EbuildVersion])
-keepPVsForProvider mSession overlayRoot provider unique = do
-  eKeys <- listOverlayPackageKeys overlayRoot
+keepPVsForProvider mSession tree overlayRoot provider unique = do
+  eKeys <- listOverlayPackageKeys tree overlayRoot
   case eKeys of
     Left err -> pure (Left err)
     Right overlayKeys -> do
-      diskP <- listNonLiveProviders overlayRoot provider
-      bodies <- remainingConsumerBodies mSession overlayRoot overlayKeys provider
-      case parseBodiesNeeds overlayKeys bodies of
+      eDiskP <- listNonLiveProviders tree overlayRoot provider
+      case eDiskP of
         Left err -> pure (Left err)
-        Right needs -> do
-          otherPvs <- currentPvs overlayRoot overlayKeys
-          let pvsOf k =
-                case mSession of
-                  Just s | Just ps <- Map.lookup k (acsPlannedRemaining s) -> asSlotZero ps
-                  _ -> otherPvs k
-          pure (Right (keepProviderPVs provider unique diskP pvsOf needs))
+        Right diskP -> do
+          eBodies <-
+            remainingConsumerBodies mSession tree overlayRoot overlayKeys provider
+          case eBodies of
+            Left err -> pure (Left err)
+            Right bodies ->
+              case parseBodiesNeeds overlayKeys bodies of
+                Left err -> pure (Left err)
+                Right needs -> do
+                  eOther <- currentPvs tree overlayRoot overlayKeys
+                  case eOther of
+                    Left err -> pure (Left err)
+                    Right otherPvs -> do
+                      let pvsOf k =
+                            case mSession of
+                              Just s
+                                | Just ps <- Map.lookup k (acsPlannedRemaining s) ->
+                                    asSlotZero ps
+                              _ -> otherPvs k
+                      pure (Right (keepProviderPVs provider unique diskP pvsOf needs))
 
 ------------------------------------------------------------------------
 -- Session / wait
 ------------------------------------------------------------------------
 
 plannedRemainingFromWork ::
+  InTree ->
   FilePath ->
   PackageKey ->
   EbuildVersion ->
   -- | @Left@ unique PVs (DepsAndAssets) or @Right@ GitMv remote.
   Either [EbuildVersion] EbuildVersion ->
-  IO [EbuildVersion]
-plannedRemainingFromWork overlayRoot key local = \case
-  Left unique -> pure unique
+  IO (Either Text [EbuildVersion])
+plannedRemainingFromWork tree overlayRoot key local = \case
+  Left unique -> pure (Right unique)
   Right remote -> do
-    disk <- listNonLiveProviderPVs overlayRoot key
-    let siblings = [p | p <- disk, not (samePV p local)]
-    keepOld <- bunBinWouldKeepPin overlayRoot key local remote
-    let kept = [local | keepOld]
-    pure (nubOrd (siblings ++ kept ++ [remote]))
+    eDisk <- listNonLiveProviderPVs tree overlayRoot key
+    case eDisk of
+      Left err -> pure (Left err)
+      Right disk -> do
+        eKeep <- bunBinWouldKeepPin tree overlayRoot key local remote
+        case eKeep of
+          Left err -> pure (Left err)
+          Right keepOld ->
+            let siblings = [p | p <- disk, not (samePV p local)]
+                kept = [local | keepOld]
+             in pure (Right (nubOrd (siblings ++ kept ++ [remote])))
 
--- | Best-effort: bun-bin exact pin on Old means GitMv will add-keep, so Old remains.
+-- | Best-effort parse: bun-bin exact pin on Old means GitMv will add-keep.
+-- An unreadable ebuild is 'Left' and names the path.
 bunBinWouldKeepPin ::
+  InTree ->
   FilePath ->
   PackageKey ->
   EbuildVersion ->
   EbuildVersion ->
-  IO Bool
-bunBinWouldKeepPin overlayRoot provider old new
-  | provider /= bunBinKey = pure False
-  | otherwise = do
-      eKeys <- listOverlayPackageKeys overlayRoot
-      case eKeys of
-        Left _ -> pure False
-        Right overlayKeys -> do
-          disk <- listNonLiveProviders overlayRoot provider
-          bodies <- remainingConsumerBodies Nothing overlayRoot overlayKeys provider
-          case parseBodiesNeeds overlayKeys bodies of
-            Left _ -> pure False
-            Right needs -> do
-              otherPvs <- currentPvs overlayRoot overlayKeys
-              pure $
-                case renameAwayUnsatisfied provider disk old new otherPvs needs of
-                  Just atom -> isExactBunBinPin provider old atom
-                  Nothing -> False
+  IO (Either Text Bool)
+bunBinWouldKeepPin _ _ provider _ _
+  | provider /= bunBinKey = pure (Right False)
+bunBinWouldKeepPin tree overlayRoot provider old new = do
+  eKeys <- listOverlayPackageKeys tree overlayRoot
+  case eKeys of
+    Left err -> pure (Left err)
+    Right overlayKeys -> do
+      eDisk <- listNonLiveProviders tree overlayRoot provider
+      case eDisk of
+        Left err -> pure (Left err)
+        Right disk -> do
+          eBodies <-
+            remainingConsumerBodies Nothing tree overlayRoot overlayKeys provider
+          case eBodies of
+            Left err -> pure (Left err)
+            Right bodies ->
+              case parseBodiesNeeds overlayKeys bodies of
+                Left _ -> pure (Right False)
+                Right needs -> do
+                  eOther <- currentPvs tree overlayRoot overlayKeys
+                  case eOther of
+                    Left err -> pure (Left err)
+                    Right otherPvs ->
+                      pure $
+                        Right $
+                          case renameAwayUnsatisfied provider disk old new otherPvs needs of
+                            Just atom -> isExactBunBinPin provider old atom
+                            Nothing -> False
 
 mkAtomClosureSession ::
   Map PackageKey [EbuildVersion] ->
@@ -1026,48 +1109,53 @@ recordAtomClosureTerminal (Just session) key term =
     Nothing -> pure ()
     Just gate -> void (tryPutMVar gate term)
 
-ensureAtomClosedForWrite ::
+-- | One closure observation. Does not wait and does not publish.
+data AtomClosureObserve
+  = AtomClosureSatisfied
+  | AtomClosureWait PackageKey
+  | AtomClosureRefuse Text
+  deriving (Eq, Show)
+
+observeAtomClosure ::
+  InTree ->
   Maybe AtomClosureSession ->
-  MultiHandle ->
   FilePath ->
   PackageKey ->
   Text ->
-  IO (Either Text ())
-ensureAtomClosedForWrite mSession mh overlayRoot consumer body = do
-  eKeys <- listOverlayPackageKeys overlayRoot
+  Set PackageKey ->
+  IO (Either Text AtomClosureObserve)
+observeAtomClosure tree mSession overlayRoot consumer body waited = do
+  eKeys <- listOverlayPackageKeys tree overlayRoot
   case eKeys of
     Left err -> pure (Left (atomClosureParseMessage consumer err))
     Right overlayKeys ->
       case parseConsumerNeeds overlayKeys consumer body of
         Left err -> pure (Left err)
-        Right needs -> closeNeeds mSession mh overlayRoot overlayKeys consumer needs
+        Right needs -> do
+          ePvs <- currentPvs tree overlayRoot overlayKeys
+          case ePvs of
+            Left err -> pure (Left err)
+            Right pvs ->
+              pure $
+                Right $
+                  case find (not . pvsSatisfyNeed pvs) needs of
+                    Nothing -> AtomClosureSatisfied
+                    Just need ->
+                      case waitableAtom mSession waited need of
+                        WaitRefuse atom ->
+                          AtomClosureRefuse (atomClosureRefuseMessage consumer atom)
+                        WaitProvider p -> AtomClosureWait p
+                        WaitAlreadyDone atom ->
+                          AtomClosureRefuse (atomClosureRefuseMessage consumer atom)
 
-closeNeeds ::
+-- | Wait outside the ebuild exclusion and outside the overlay git lock.
+awaitAtomProvider ::
   Maybe AtomClosureSession ->
   MultiHandle ->
-  FilePath ->
-  Set PackageKey ->
   PackageKey ->
-  [DepNeed] ->
+  PackageKey ->
   IO (Either Text ())
-closeNeeds mSession mh overlayRoot overlayKeys consumer needs = go Set.empty
-  where
-    go waited = do
-      pvs <- currentPvs overlayRoot overlayKeys
-      case find (not . pvsSatisfyNeed pvs) needs of
-        Nothing -> pure (Right ())
-        Just need -> decideWait waited need
-    decideWait waited need =
-      case waitableAtom mSession waited need of
-        WaitRefuse atom ->
-          pure (Left (atomClosureRefuseMessage consumer atom))
-        WaitProvider p -> do
-          waitedRes <- waitForProvider mSession mh consumer p
-          case waitedRes of
-            Left err -> pure (Left err)
-            Right () -> go (Set.insert p waited)
-        WaitAlreadyDone atom ->
-          pure (Left (atomClosureRefuseMessage consumer atom))
+awaitAtomProvider = waitForProvider
 
 data WaitChoice
   = WaitProvider PackageKey
@@ -1114,14 +1202,24 @@ atomWaitChoice (Just session) waited atom =
             then WaitAlreadyDone atom
             else WaitProvider provider
 
-currentPvs :: FilePath -> Set PackageKey -> IO (PackageKey -> [ProviderVer])
-currentPvs overlayRoot overlayKeys = do
-  pairs <-
+currentPvs ::
+  InTree ->
+  FilePath ->
+  Set PackageKey ->
+  IO (Either Text (PackageKey -> [ProviderVer]))
+currentPvs tree overlayRoot overlayKeys = do
+  ePairs <-
     mapM
-      (\k -> (k,) <$> listNonLiveProviders overlayRoot k)
+      ( \k -> do
+          eVers <- listNonLiveProviders tree overlayRoot k
+          pure $ (k,) <$> eVers
+      )
       (Set.toList overlayKeys)
-  let m = Map.fromList pairs
-  pure (\k -> Map.findWithDefault [] k m)
+  pure $ case sequence ePairs of
+    Left err -> Left err
+    Right pairs ->
+      let m = Map.fromList pairs
+       in Right (\k -> Map.findWithDefault [] k m)
 
 waitForProvider ::
   Maybe AtomClosureSession ->
@@ -1189,36 +1287,49 @@ failCycle session keys msg =
 ------------------------------------------------------------------------
 
 guardGitMvRenameAway ::
+  InTree ->
   Maybe AtomClosureSession ->
   FilePath ->
   PackageKey ->
   EbuildVersion ->
   EbuildVersion ->
   IO (Either Text GitMvRenamePlan)
-guardGitMvRenameAway mSession overlayRoot provider old new = do
-  eKeys <- listOverlayPackageKeys overlayRoot
+guardGitMvRenameAway tree mSession overlayRoot provider old new = do
+  eKeys <- listOverlayPackageKeys tree overlayRoot
   case eKeys of
     Left err -> pure (Left err)
     Right overlayKeys -> do
-      disk <- listNonLiveProviders overlayRoot provider
-      bodies <- remainingConsumerBodies mSession overlayRoot overlayKeys provider
-      case parseBodiesNeeds overlayKeys bodies of
+      eDisk <- listNonLiveProviders tree overlayRoot provider
+      case eDisk of
         Left err -> pure (Left err)
-        Right needs -> do
-          otherPvs <- currentPvs overlayRoot overlayKeys
-          -- Selected packages: planned remaining overrides current disk.
-          let pvsOf k =
-                case mSession of
-                  Just s | Just ps <- Map.lookup k (acsPlannedRemaining s) -> asSlotZero ps
-                  _ -> otherPvs k
-          pure $
-            case renameAwayUnsatisfied provider disk old new pvsOf needs of
-              Nothing -> Right GitMvRenameNewest
-              Just atom
-                | isExactBunBinPin provider old atom -> Right GitMvAddKeepPin
-                | otherwise ->
-                    Left $
-                      packageKeyText provider
-                        <> ": GitMv rename-away would leave overlay-internal atom "
-                        <> prettyOverlayAtom atom
-                        <> " unsatisfied; not renaming"
+        Right disk -> do
+          eBodies <-
+            remainingConsumerBodies mSession tree overlayRoot overlayKeys provider
+          case eBodies of
+            Left err -> pure (Left err)
+            Right bodies ->
+              case parseBodiesNeeds overlayKeys bodies of
+                Left err -> pure (Left err)
+                Right needs -> do
+                  eOther <- currentPvs tree overlayRoot overlayKeys
+                  case eOther of
+                    Left err -> pure (Left err)
+                    Right otherPvs -> do
+                      -- Selected packages: planned remaining overrides current disk.
+                      let pvsOf k =
+                            case mSession of
+                              Just s
+                                | Just ps <- Map.lookup k (acsPlannedRemaining s) ->
+                                    asSlotZero ps
+                              _ -> otherPvs k
+                      pure $
+                        case renameAwayUnsatisfied provider disk old new pvsOf needs of
+                          Nothing -> Right GitMvRenameNewest
+                          Just atom
+                            | isExactBunBinPin provider old atom -> Right GitMvAddKeepPin
+                            | otherwise ->
+                                Left $
+                                  packageKeyText provider
+                                    <> ": GitMv rename-away would leave overlay-internal atom "
+                                    <> prettyOverlayAtom atom
+                                    <> " unsatisfied; not renaming"

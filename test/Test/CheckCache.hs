@@ -47,6 +47,7 @@ import Update.Go.Lanes
     CargoTagFloorSnapshot (..),
     RuntimeLanePlan (..),
   )
+import Update.OverlayTree (withNewTreeLock)
 import Update.Types
   ( CargoSource (..),
     EcosystemSpec (..),
@@ -155,7 +156,7 @@ testRoundTripLatest =
     now <- getCurrentTime
     clock <- newIORef now
     (h, _) <- openAt (readIORef clock) cacheDir (CacheTtl (5 * 60)) False overlay
-    fp <- computeFingerprintFromDir src pkgDir "foo"
+    fp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "foo"
     storeLatest h key fp remote
     flushCheckCache h
     (h2, warn) <- openAt (readIORef clock) cacheDir (CacheTtl (5 * 60)) False overlay
@@ -175,7 +176,7 @@ testTtlExpiry =
     now <- getCurrentTime
     clock <- newIORef now
     (h, _) <- openAt (readIORef clock) cacheDir (CacheTtl 30) False overlay
-    fp <- computeFingerprintFromDir src pkgDir "foo"
+    fp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "foo"
     storeLatest h key fp remote
     flushCheckCache h
     writeIORef clock (addUTCTime 60 now)
@@ -194,11 +195,11 @@ testFingerprintMiss =
     pkgDir <- setupPkg overlay
     now <- getCurrentTime
     (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
-    fp0 <- computeFingerprintFromDir src pkgDir "foo"
+    fp0 <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "foo"
     storeLatest h key fp0 remote
     flushCheckCache h
     TIO.writeFile (pkgDir </> "foo-1.0.0.ebuild") "EAPI=8\n# changed\n"
-    fp1 <- computeFingerprintFromDir src pkgDir "foo"
+    fp1 <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "foo"
     assertTrue "fingerprint changed" (fp0 /= fp1)
     (h2, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
     m <- lookupLatest h2 key fp1
@@ -214,7 +215,7 @@ testDisabledNoWrite =
     pkgDir <- setupPkg overlay
     now <- getCurrentTime
     (h, _) <- openAt (pure now) cacheDir CacheDisabled False overlay
-    fp <- computeFingerprintFromDir src pkgDir "foo"
+    fp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "foo"
     storeLatest h key fp (parseEbuildVersion "9.9.9")
     flushCheckCache h
     exists <- doesDirectoryExist cacheDir
@@ -231,7 +232,7 @@ testAtomicReplace =
     pkgDir <- setupPkg overlay
     now <- getCurrentTime
     (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
-    fp <- computeFingerprintFromDir src pkgDir "foo"
+    fp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "foo"
     storeLatest h key fp (parseEbuildVersion "1.0.0")
     flushCheckCache h
     storeLatest h key fp (parseEbuildVersion "1.1.0")
@@ -295,8 +296,8 @@ testOverlayProviderMiss =
     bunDir <- setupBunBin overlay
     now <- getCurrentTime
     (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
-    consumerFp <- computeFingerprintFromDir src ralphDir "ralph-tui"
-    bunFp0 <- computeFingerprintFromDir bunSrc bunDir "bun-bin"
+    consumerFp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src ralphDir "ralph-tui"
+    bunFp0 <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree bunSrc bunDir "bun-bin"
     storeDeps h key consumerFp (Just bunFp0) emptyDepsPlan
     flushCheckCache h
     hit <- lookupDeps h key consumerFp (Just bunFp0)
@@ -304,7 +305,7 @@ testOverlayProviderMiss =
     TIO.writeFile
       (bunDir </> "bun-bin-1.1.0.ebuild")
       "EAPI=8\nKEYWORDS=\"~amd64\"\n# bumped\n"
-    bunFp1 <- computeFingerprintFromDir bunSrc bunDir "bun-bin"
+    bunFp1 <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree bunSrc bunDir "bun-bin"
     assertTrue "bun fingerprint changed" (bunFp0 /= bunFp1)
     (h2, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
     miss <- lookupDeps h2 key consumerFp (Just bunFp1)
@@ -321,7 +322,7 @@ testLatestNoProviderField =
     pkgDir <- setupPkg overlay
     now <- getCurrentTime
     (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
-    fp <- computeFingerprintFromDir src pkgDir "foo"
+    fp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "foo"
     storeLatest h key fp remote
     hit <- lookupLatest h key fp
     assertEq "latest still hits without overlay provider" (Just remote) hit
@@ -346,7 +347,7 @@ testMissingOverlayProviderMiss =
       pure d
     now <- getCurrentTime
     (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
-    consumerFp <- computeFingerprintFromDir src ralphDir "ralph-tui"
+    consumerFp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src ralphDir "ralph-tui"
     -- Old-schema deps entry: no overlay-provider field.
     storeDeps h key consumerFp Nothing emptyDepsPlan
     miss <- lookupDeps h key consumerFp (Just dummyProv)
@@ -413,7 +414,7 @@ testCargoV2SnapshotRoundTrip =
       pure d
     now <- getCurrentTime
     (h, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
-    fp <- computeFingerprintFromDir src pkgDir "usage"
+    fp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "usage"
     storeDeps h key fp Nothing cargoV2Plan
     flushCheckCache h
     hit <- lookupDeps h key fp Nothing

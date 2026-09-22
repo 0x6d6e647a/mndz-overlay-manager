@@ -387,7 +387,7 @@ runUpdate rt refresh pkgArgs = do
                           usdEbuildRunner = productionEbuildRunner distDir,
                           usdEgencacheRunner = productionEgencacheRunner,
                           usdPreflightTools = preflightUpdateTools,
-                          usdEnsureImage = ensureMaterializeImage ensureCfg,
+                          usdEnsureImage = (`ensureMaterializeImage` ensureCfg),
                           usdPruneMaterialize =
                             prunePreviousMaterializeImage ensureCfg,
                           usdSweepMaterialize =

@@ -69,11 +69,12 @@ import Overlay.Version
     parseEbuildVersion,
     prettyVersion,
   )
-import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
+import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute, removeFile)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Process (callProcess)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Support
   ( dualArchGoCeilings,
@@ -325,6 +326,7 @@ integrationTests =
       testCase "Atom-closure: wait cycle hard-fails both" testAtomClosureWaitCycle,
       testCase "Atom-closure: bun-bin compile pin add-keeps latest" testAtomClosureBunBinAddKeepPin,
       testCase "Atom-closure: GitMv rename-away usage exact pin fails" testAtomClosureRenameAwayPin,
+      testCase "Atom-closure: unreadable consumer ebuild hard-fails" testAtomClosureUnreadableConsumer,
       testCase "Atom-closure: GitMv rename-away >= succeeds" testAtomClosureRenameAwayGe
     ]
 
@@ -2511,6 +2513,45 @@ testAtomClosureRenameAwayPin =
       doesFileExist (overlayRoot </> "dev-util" </> "usage" </> "usage-6.8.0.ebuild")
     assertTrue "old PV remains" oldStill
     assertTrue "not renamed" (not newExists)
+
+testAtomClosureUnreadableConsumer :: IO ()
+testAtomClosureUnreadableConsumer =
+  withSystemTempDirectory "mndz-atom-unreadable-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+    usagePath <-
+      seedPkgEbuild overlayRoot "dev-util" "usage" "6.6.1" "EAPI=8\n"
+    hkPath <-
+      seedPkgEbuild
+        overlayRoot
+        "dev-util"
+        "hk"
+        "1.0.0"
+        "EAPI=8\nRDEPEND=\"dev-util/usage\"\n"
+    removeFile hkPath
+    callProcess "ln" ["-s", hkPath <> ".missing", hkPath]
+    overlayLock <- newMVar ()
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
+            }
+    env <- mkClosureEnv gitOps noopMultiHandle 1 overlayLock
+    let entries = [entryOf usageKeyA "usage" "6.6.1" usagePath]
+        plans = [PlanNeedsWork usageKeyA (PlannedGitMv (parseEbuildVersion "6.8.0"))]
+    outcomes <- runClosureApply env overlayRoot entries plans
+    case [m | ApplyHardFail k m _ _ <- outcomes, k == usageKeyA] of
+      (msg : _) ->
+        assertTrue "hard-fail names the missing ebuild" (T.pack hkPath `T.isInfixOf` msg)
+      [] -> do
+        hPutStrLn stderr ("expected usage hard-fail, got " <> show outcomes)
+        exitFailure
+    oldStill <- doesFileExist usagePath
+    newExists <-
+      doesFileExist (overlayRoot </> "dev-util" </> "usage" </> "usage-6.8.0.ebuild")
+    assertTrue "provider ebuild not renamed" (oldStill && not newExists)
 
 testAtomClosureRenameAwayGe :: IO ()
 testAtomClosureRenameAwayGe =

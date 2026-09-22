@@ -114,6 +114,7 @@ library
       , Update.Md5Cache
       , Update.Npm
       , Update.Npm.Cache
+      , Update.OverlayTree
       , Update.OverlayWaves
       , Update.Pack.XzTar
       , Update.Preflight
@@ -252,6 +253,7 @@ test-suite mndz-overlay-manager-test
         Test.Materialize
         Test.Md5Cache
         Test.Overlay
+        Test.OverlayTree
         Test.OverlayWaves
         Test.Policy
         Test.Preflight
