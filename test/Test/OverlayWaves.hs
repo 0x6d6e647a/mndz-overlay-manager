@@ -12,10 +12,12 @@ import Test.Tasty.HUnit (testCase)
 import Update.Go.Lanes (RuntimeLanePlan (..))
 import Update.OverlayWaves
   ( AdmitSets (..),
+    OverlayCeilingPlan (..),
     OverlayPlanKind (..),
     bunBinPackageKey,
     classifyAdmit,
     hypotheticalCeilings,
+    overlayCeilingPlan,
     overlayCeilingProvider,
     overlayCeilingProviderForKey,
     overlayDirtyPreflightMessage,
@@ -51,6 +53,7 @@ tests =
       testCase "Admit: provider already current does not withhold" testAdmitProviderSkip,
       testCase "Waiting keys are not in the ready/job set" testWaitingNotReady,
       testCase "Hypothetical ceilings replace newest PV keep KEYWORDS" testHypotheticalCeilings,
+      testCase "Equal newest-PV replacement skips hypo ceilings" testOverlayCeilingPlan,
       testCase "Plan-delta on unique PVs and needs-work" testPlanDelta,
       testCase "Dirty preflight message names path and package" testDirtyPreflightMessage,
       testCase "Provider PV mismatch names both PVs" testProviderPvMismatchMessage
@@ -201,6 +204,30 @@ testHypotheticalCeilings = do
     "hypo amd64 tilde is 1.2.0"
     (Just v12)
     (ceilingFor hypo (CeilingLane "amd64" Tilde))
+
+testOverlayCeilingPlan :: IO ()
+testOverlayCeilingPlan = do
+  let v11 = parseEbuildVersion "1.1.0"
+      v12 = parseEbuildVersion "1.2.0"
+      old =
+        RuntimeEbuildMeta
+          { remPV = v11,
+            remKeywords = kwAmd64
+          }
+      older =
+        RuntimeEbuildMeta
+          { remPV = parseEbuildVersion "1.0.0",
+            remKeywords = ["~arm64"]
+          }
+      metas = [older, old]
+  assertEq
+    "equal newest-PV replacement is unchanged"
+    CeilingsUnchanged
+    (overlayCeilingPlan metas v11)
+  assertEq
+    "remote that raises a ceiling is changed"
+    (CeilingsChanged (hypotheticalCeilings metas v12))
+    (overlayCeilingPlan metas v12)
 
 testPlanDelta :: IO ()
 testPlanDelta = do

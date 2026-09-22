@@ -10,11 +10,13 @@ module Update.Deps.Plan
     planDepsPackageWithProgressFor,
     planDepsPackageWithCeilingsFor,
     toGoPlanOps,
+    withListVersionsSuccessCache,
+    withBunEnginesSuccessCache,
   )
 where
 
 import CLI.Jobs (WorkBudget, newWorkBudget, withWorkSlot)
-import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
 import Control.Exception (SomeException, catch)
 import Data.ByteString.Lazy qualified as BL
 import Data.List (sortBy)
@@ -124,6 +126,43 @@ toGoPlanOps d =
       poCeilingsCache = dpoGoCeilingsCache d
     }
 
+-- | Process-lifetime memo of successful version lists. Failures are not stored.
+--
+-- The cache lock is not held across the network fetch on miss. First successful
+-- insert wins on same-key races.
+withListVersionsSuccessCache ::
+  (UpdateSource -> IO (Either Text [EbuildVersion])) ->
+  IO (UpdateSource -> IO (Either Text [EbuildVersion]))
+withListVersionsSuccessCache = withSuccessCache
+
+-- | Process-lifetime memo of successful bun engine probes. Failures are not stored.
+withBunEnginesSuccessCache ::
+  (Text -> Text -> Text -> Text -> IO (Either Text BunProbe)) ->
+  IO (Text -> Text -> Text -> Text -> IO (Either Text BunProbe))
+withBunEnginesSuccessCache base = do
+  cached <- withSuccessCache $ \(owner, repo, prefix, pv) -> base owner repo prefix pv
+  pure $ \owner repo prefix pv -> cached (owner, repo, prefix, pv)
+
+withSuccessCache ::
+  (Ord k) =>
+  (k -> IO (Either Text v)) ->
+  IO (k -> IO (Either Text v))
+withSuccessCache base = do
+  cacheVar <- newMVar Map.empty
+  pure $ \key -> do
+    mHit <- withMVar cacheVar (pure . Map.lookup key)
+    case mHit of
+      Just hit -> pure (Right hit)
+      Nothing -> do
+        result <- base key
+        case result of
+          Left err -> pure (Left err)
+          Right val ->
+            modifyMVar cacheVar $ \cache ->
+              case Map.lookup key cache of
+                Just hit -> pure (cache, Right hit)
+                Nothing -> pure (Map.insert key val cache, Right val)
+
 productionDepsPlanOps :: Maybe Text -> Int -> Maybe FilePath -> IO DepsPlanOps
 productionDepsPlanOps mToken jobs mOverlay = do
   latch <- newGitHubLatch
@@ -139,6 +178,12 @@ productionDepsPlanOpsWithLatch latch mToken jobs mOverlay = do
   mgr <- newManager tlsManagerSettings
   baseMod <- productionGoModFetcher mToken
   cachedMod <- withGoModCache baseMod
+  cachedList <-
+    withListVersionsSuccessCache $ \src -> case src of
+      GitHub {} -> listGitHubVersionsWithLatch latch mgr mToken src
+      Npm pkg -> listNpmVersions mgr pkg
+      _ -> pure (Left "unsupported update source for deps planning")
+  cachedBun <- withBunEnginesSuccessCache (fetchBunEnginesAtTag mgr mToken)
   budget <- newWorkBudget jobs
   goCache <- newMVar Nothing
   nodeCache <- newMVar Nothing
@@ -148,13 +193,10 @@ productionDepsPlanOpsWithLatch latch mToken jobs mOverlay = do
   pure
     DepsPlanOps
       { dpoPortageq = productionPortageqRunner,
-        dpoListVersions = \src -> case src of
-          GitHub {} -> listGitHubVersionsWithLatch latch mgr mToken src
-          Npm pkg -> listNpmVersions mgr pkg
-          _ -> pure (Left "unsupported update source for deps planning"),
+        dpoListVersions = cachedList,
         dpoFetchGoMod = cachedMod,
         dpoFetchNpmEngines = fetchNpmEnginesNode mgr,
-        dpoFetchBunEngines = fetchBunEnginesAtTag mgr mToken,
+        dpoFetchBunEngines = cachedBun,
         dpoFetchCargoToml = fetchCargoTomlAtTag mgr mToken,
         dpoFetchRustToolchain = fetchRustToolchainAtTag mgr mToken,
         dpoFetchSbclVersion = fetchSbclVersionAtTag mgr mToken,

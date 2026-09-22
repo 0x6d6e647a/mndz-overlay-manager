@@ -44,7 +44,7 @@ data UpdateSource
       { httpPrimary :: Text,
         httpFallback :: Maybe Text
       }
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 -- | @category/package@ key.
 newtype PackageKey = PackageKey {unPackageKey :: Text}

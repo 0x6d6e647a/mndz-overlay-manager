@@ -98,10 +98,11 @@ import Update.Hardcoded (lookupLaneArches, lookupPolicy)
 import Update.Http (fetchHttpWith)
 import Update.Npm (fetchNpmWith)
 import Update.OverlayWaves
-  ( blockedOnLabel,
+  ( OverlayCeilingPlan (..),
+    blockedOnLabel,
     computeOverlayProviderFingerprint,
     fetchOverlayProviderLatest,
-    hypotheticalCeilings,
+    overlayCeilingPlan,
     overlayCeilingProvider,
     overlayFailClosedMessage,
     planDeltaHolds,
@@ -442,37 +443,40 @@ applyOverlayBlockIndication mh fetch depsOps cache eco src entry locals localPVs
                     base
                       { reportStatus = FetchError (overlayFailClosedMessage provider)
                       }
-                Right metas -> do
-                  let hypoCeil = hypotheticalCeilings metas remote
-                  hypoResult <-
-                    planDepsPackageWithCeilingsFor
-                      depsOps
-                      (depsPlanProgress mh (peKey entry) eco)
-                      eco
-                      src
-                      localPVs
-                      hypoCeil
-                      (lookupLaneArches (peKey entry))
-                  case hypoResult of
-                    Left _ ->
-                      pure
-                        base
-                          { reportStatus = FetchError (overlayFailClosedMessage provider)
-                          }
-                    Right hypoPlan -> do
-                      hypoFix <- contentFixPVs depsOps eco src locals hypoPlan
-                      let hypoNeed = planNeedsWork localPVs hypoFix hypoPlan
-                      if not
-                        ( planDeltaHolds
-                            (glpUniquePVs onDiskPlan)
-                            onDiskNeed
-                            (glpUniquePVs hypoPlan)
-                            hypoNeed
-                        )
-                        then pure base
-                        else
-                          pure $
-                            annotateBlockedOn provider hypoPlan localPVs base
+                Right metas ->
+                  case overlayCeilingPlan metas remote of
+                    CeilingsUnchanged ->
+                      pure base
+                    CeilingsChanged hypoCeil -> do
+                      hypoResult <-
+                        planDepsPackageWithCeilingsFor
+                          depsOps
+                          (depsPlanProgress mh (peKey entry) eco)
+                          eco
+                          src
+                          localPVs
+                          hypoCeil
+                          (lookupLaneArches (peKey entry))
+                      case hypoResult of
+                        Left _ ->
+                          pure
+                            base
+                              { reportStatus = FetchError (overlayFailClosedMessage provider)
+                              }
+                        Right hypoPlan -> do
+                          hypoFix <- contentFixPVs depsOps eco src locals hypoPlan
+                          let hypoNeed = planNeedsWork localPVs hypoFix hypoPlan
+                          if not
+                            ( planDeltaHolds
+                                (glpUniquePVs onDiskPlan)
+                                onDiskNeed
+                                (glpUniquePVs hypoPlan)
+                                hypoNeed
+                            )
+                            then pure base
+                            else
+                              pure $
+                                annotateBlockedOn provider hypoPlan localPVs base
 
 annotateBlockedOn ::
   PackageKey ->

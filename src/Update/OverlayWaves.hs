@@ -17,6 +17,8 @@ module Update.OverlayWaves
     classifyAdmit,
     replaceNewestNonLivePv,
     hypotheticalCeilings,
+    OverlayCeilingPlan (..),
+    overlayCeilingPlan,
     planDeltaHolds,
     overlayRefuseMessage,
     overlayFailClosedMessage,
@@ -179,6 +181,21 @@ pickNewest (x : xs) = Just (foldl' newerMeta x xs)
 hypotheticalCeilings :: [RuntimeEbuildMeta] -> EbuildVersion -> RuntimeCeilings
 hypotheticalCeilings metas remote =
   computeCeilings bunBinRuntimeAtom (replaceNewestNonLivePv metas remote)
+
+-- | On-disk vs hypothetical overlay ceilings for plan-delta evaluation.
+data OverlayCeilingPlan
+  = CeilingsUnchanged
+  | CeilingsChanged RuntimeCeilings
+  deriving (Eq, Show)
+
+-- | Skip hypo planning when replacing newest overlay PV with @remote@ does not change ceilings.
+overlayCeilingPlan :: [RuntimeEbuildMeta] -> EbuildVersion -> OverlayCeilingPlan
+overlayCeilingPlan metas remote =
+  let onDisk = computeCeilings bunBinRuntimeAtom metas
+      hypo = hypotheticalCeilings metas remote
+   in if onDisk == hypo
+        then CeilingsUnchanged
+        else CeilingsChanged hypo
 
 -- | Sorted unique planned PVs (structural 'Eq').
 uniquePvSet :: [EbuildVersion] -> [EbuildVersion]

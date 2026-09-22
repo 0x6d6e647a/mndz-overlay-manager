@@ -5,10 +5,10 @@
 module Test.CheckPlan (unitTests, integrationTests) where
 
 import CLI.Jobs (newWorkBudget)
-import CLI.Progress (noopMultiHandle)
+import CLI.Progress (MultiHandle (..), noopMultiHandle)
 import Config.Types (CheckCacheTtl (..))
 import Control.Concurrent.MVar (modifyMVar_, newMVar)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -44,6 +44,8 @@ import Update.Deps.Plan
     minimumBunProbe,
     planDepsPackageWithProgress,
     toGoPlanOps,
+    withBunEnginesSuccessCache,
+    withListVersionsSuccessCache,
   )
 import Update.Go.Lanes
   ( CargoTagFloorSnapshot (..),
@@ -110,7 +112,13 @@ unitTests =
           testCase "no-delta still plans on-disk" testNoPlanDeltaAllowsOnDisk,
           testCase "provider fetch fail-closed" testRefuseFailClosed,
           testCase "ralph refuses, mise still plans" testRefuseRalphStillPlansMise,
-          testCase "selected bun-bin uses hypo working plan" testSelectedBunBinHypoWorkingPlan
+          testCase "selected bun-bin uses hypo working plan" testSelectedBunBinHypoWorkingPlan,
+          testCase "equal ceilings do not refuse and skip hypo list/probe" testRefuseEqualCeilingsSkip
+        ],
+      testGroup
+        "deps plan success memos"
+        [ testCase "successful list is cached; Left is retried" testListVersionsSuccessCache,
+          testCase "successful bun probe is cached; Left is retried" testBunEnginesSuccessCache
         ]
     ]
 
@@ -132,7 +140,8 @@ integrationTests =
       testCase "checkPackageDeps Sbcl outdated floor" testCheckPackageDepsSbclOutdated,
       testCase "outdated ralph blocked on bun-bin" testOutdatedBlockedOn,
       testCase "outdated fail-closed when bun-bin latest missing" testOutdatedFailClosed,
-      testCase "outdated bun-bin still has its own line" testOutdatedBunBinOwnLine
+      testCase "outdated bun-bin still has its own line" testOutdatedBunBinOwnLine,
+      testCase "equal ceilings skip blocked-on and second list/probe" testOutdatedEqualCeilingsSkip
     ]
 
 ------------------------------------------------------------------------
@@ -1506,6 +1515,33 @@ liveBunOps overlay listVers fetchBun = do
   modifyMVar_ (dpoBunCeilingsCache ops) (\_ -> pure Nothing)
   pure ops
 
+countingLiveBunOps ::
+  FilePath ->
+  [T.Text] ->
+  IO (DepsPlanOps, IORef Int, IORef Int)
+countingLiveBunOps overlay vers = do
+  lists <- newIORef (0 :: Int)
+  probes <- newIORef (0 :: Int)
+  ops <-
+    liveBunOps
+      overlay
+      ( \src -> do
+          atomicModifyIORef' lists (\n -> (n + 1, ()))
+          listFixed vers src
+      )
+      ( \o r p pv -> do
+          atomicModifyIORef' probes (\n -> (n + 1, ()))
+          bunEnginesForDelta o r p pv
+      )
+  pure (ops, lists, probes)
+
+recordingListStatuses :: IORef [T.Text] -> MultiHandle
+recordingListStatuses events =
+  noopMultiHandle
+    { mhStatus = \_ name ->
+        atomicModifyIORef' events (\es -> (name : es, ()))
+    }
+
 bunEnginesForDelta ::
   T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)
 bunEnginesForDelta _o _r _p pv =
@@ -1543,11 +1579,7 @@ testRefusePlanDelta =
     let overlay = tmp </> "ov"
     bunPath <- seedBunBin overlay "1.1.0"
     ralphPath <- seedRalph overlay "1.0.0"
-    ops <-
-      liveBunOps
-        overlay
-        (listFixed ["1.5.0", "1.0.0"])
-        bunEnginesForDelta
+    (ops, lists, _) <- countingLiveBunOps overlay ["1.5.0", "1.0.0"]
     cache <- disabledCache
     let fetch src = case src of
           GitHub "oven-sh" "bun" _ ->
@@ -1571,6 +1603,8 @@ testRefusePlanDelta =
         assertTrue "names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` msg)
         assertTrue "mentions update" ("update" `T.isInfixOf` msg)
       other -> assertFailure $ "expected refuse hard-fail, got " <> show other
+    listN <- readIORef lists
+    assertEq "hypo still lists a second time when ceilings differ" 2 listN
 
 testNoPlanDeltaAllowsOnDisk :: IO ()
 testNoPlanDeltaAllowsOnDisk =
@@ -1748,11 +1782,7 @@ testOutdatedBlockedOn =
     let overlay = tmp </> "ov"
     _ <- seedBunBin overlay "1.1.0"
     ralphPath <- seedRalph overlay "1.0.0"
-    ops <-
-      liveBunOps
-        overlay
-        (listFixed ["1.5.0", "1.0.0"])
-        bunEnginesForDelta
+    (ops, lists, _) <- countingLiveBunOps overlay ["1.5.0", "1.0.0"]
     cache <- disabledCache
     let fetchBun src0 = case src0 of
           GitHub "oven-sh" "bun" _ ->
@@ -1785,6 +1815,8 @@ testOutdatedBlockedOn =
       other ->
         assertFailure $
           "expected outdated blocked-on, got " <> show other
+    listN <- readIORef lists
+    assertEq "hypo still lists a second time when ceilings differ" 2 listN
 
 testOutdatedFailClosed :: IO ()
 testOutdatedFailClosed =
@@ -1878,3 +1910,124 @@ testOutdatedBunBinOwnLine =
           other ->
             assertFailure $ "expected ralph blocked-on, got " <> show other
       _ -> assertFailure "expected ralph report"
+
+testOutdatedEqualCeilingsSkip :: IO ()
+testOutdatedEqualCeilingsSkip =
+  withSystemTempDirectory "om-outdated-eq-ceil" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    (ops, lists, probes) <- countingLiveBunOps overlay ["1.5.0", "1.0.0"]
+    statuses <- newIORef []
+    cache <- disabledCache
+    let fetchBun src0 = case src0 of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.1.0"))
+          _ -> pure (Left "unexpected")
+        e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "ralph-tui",
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "1.0.0"]
+        src = GitHub "subsy" "ralph-tui" "v"
+    report <-
+      checkPackageDeps
+        (recordingListStatuses statuses)
+        fetchBun
+        ops
+        cache
+        e
+        locals
+        src
+        Bun
+    case reportStatus report of
+      Outdated lines_ ->
+        let blob = T.unwords (map (fromMaybe "" . olLabel) lines_)
+         in assertTrue
+              "must not indicate blocked-on"
+              (not ("blocked on" `T.isInfixOf` blob))
+      FetchError msg ->
+        assertFailure $ "equal ceilings must not fail-close: " <> T.unpack msg
+      _ -> pure ()
+    listN <- readIORef lists
+    probeN <- readIORef probes
+    evs <- readIORef statuses
+    let listingStatuses = length [s | s <- evs, s == "listing versions"]
+    assertEq "on-disk list only" 1 listN
+    assertTrue "probed on-disk candidates" (probeN > 0)
+    assertEq "one listing versions status" 1 listingStatuses
+
+testRefuseEqualCeilingsSkip :: IO ()
+testRefuseEqualCeilingsSkip =
+  withSystemTempDirectory "om-refuse-eq-ceil" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    (ops, lists, probes) <- countingLiveBunOps overlay ["1.5.0", "1.0.0"]
+    cache <- disabledCache
+    let fetch src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.1.0"))
+          _ -> pure (Left "unexpected source")
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+        e =
+          PackageEntry
+            { peKey = ralphKey,
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "1.0.0"]
+        env = mkRalphPlanEnv fetch ops cache [ralphKey]
+    result <- planPackage env (groupByPackage locals) e
+    case result of
+      PlanHardFail _ msg ->
+        assertFailure $ "equal ceilings must not refuse: " <> T.unpack msg
+      PlanSoftSkip k _ -> assertEq "ralph on-disk skip" ralphKey k
+      PlanNeedsWork k _ -> assertEq "ralph on-disk needs-work" ralphKey k
+    listN <- readIORef lists
+    probeN <- readIORef probes
+    assertEq "on-disk list only" 1 listN
+    assertTrue "probed on-disk candidates" (probeN > 0)
+
+testListVersionsSuccessCache :: IO ()
+testListVersionsSuccessCache = do
+  fetchCount <- newIORef (0 :: Int)
+  let src = GitHub "o" "r" "v"
+      vers = [parseEbuildVersion "1.0.0"]
+      base _ = do
+        n <- atomicModifyIORef' fetchCount (\c -> (c + 1, c + 1))
+        if n == 1
+          then pure (Left "transient")
+          else pure (Right vers)
+  cached <- withListVersionsSuccessCache base
+  r1 <- cached src
+  r2 <- cached src
+  r3 <- cached src
+  fetches <- readIORef fetchCount
+  assertEq "Left is not stored" (Left "transient") r1
+  assertEq "retry succeeds" (Right vers) r2
+  assertEq "success is reused" (Right vers) r3
+  assertEq "one retry after Left then cache hit" 2 fetches
+
+testBunEnginesSuccessCache :: IO ()
+testBunEnginesSuccessCache = do
+  fetchCount <- newIORef (0 :: Int)
+  let probe = minimumBunProbe "1.2.0"
+      base _o _r _p _pv = do
+        n <- atomicModifyIORef' fetchCount (\c -> (c + 1, c + 1))
+        if n == 1
+          then pure (Left "transient")
+          else pure (Right probe)
+  cached <- withBunEnginesSuccessCache base
+  r1 <- cached "o" "r" "v" "1.0.0"
+  r2 <- cached "o" "r" "v" "1.0.0"
+  r3 <- cached "o" "r" "v" "1.0.0"
+  fetches <- readIORef fetchCount
+  assertEq "Left is not stored" (Left "transient") r1
+  assertEq "retry succeeds" (Right probe) r2
+  assertEq "success is reused" (Right probe) r3
+  assertEq "one retry after Left then cache hit" 2 fetches

@@ -100,11 +100,13 @@ import Update.Go.Plan (PlanProgress (..), localNonLivePVs)
 import Update.Hardcoded (lookupLaneArches, lookupPolicy)
 import Update.Manifest.Dist (exactDistSize)
 import Update.OverlayWaves
-  ( bunBinPackageKey,
+  ( OverlayCeilingPlan (..),
+    bunBinPackageKey,
     computeOverlayProviderFingerprint,
     fetchOverlayProviderLatest,
     hypotheticalCeilings,
     newestNonLivePv,
+    overlayCeilingPlan,
     overlayCeilingProvider,
     overlayFailClosedMessage,
     overlayRefuseMessage,
@@ -549,36 +551,39 @@ refuseUnselectedProvider env key eco src localPVs locals onDiskPlan onDiskNeed =
                   case eMetas of
                     Left _ ->
                       pure $ Just (overlayFailClosedMessage provider)
-                    Right metas -> do
-                      let hypoCeil = hypotheticalCeilings metas remote
-                      hypoResult <-
-                        planDepsPackageWithCeilingsFor
-                          (peDepsPlanOps env)
-                          (planProgress (peMulti env) key eco)
-                          eco
-                          src
-                          localPVs
-                          hypoCeil
-                          (lookupLaneArches key)
-                      case hypoResult of
-                        Left _ ->
-                          pure $ Just (overlayFailClosedMessage provider)
-                        Right hypoPlan -> do
-                          hypoFix <-
-                            contentFixPVs
+                    Right metas ->
+                      case overlayCeilingPlan metas remote of
+                        CeilingsUnchanged ->
+                          pure Nothing
+                        CeilingsChanged hypoCeil -> do
+                          hypoResult <-
+                            planDepsPackageWithCeilingsFor
                               (peDepsPlanOps env)
+                              (planProgress (peMulti env) key eco)
                               eco
                               src
-                              locals
-                              hypoPlan
-                          let hypoNeed = planNeedsWork localPVs hypoFix hypoPlan
-                          if planDeltaHolds
-                            (glpUniquePVs onDiskPlan)
-                            onDiskNeed
-                            (glpUniquePVs hypoPlan)
-                            hypoNeed
-                            then pure $ Just (overlayRefuseMessage provider)
-                            else pure Nothing
+                              localPVs
+                              hypoCeil
+                              (lookupLaneArches key)
+                          case hypoResult of
+                            Left _ ->
+                              pure $ Just (overlayFailClosedMessage provider)
+                            Right hypoPlan -> do
+                              hypoFix <-
+                                contentFixPVs
+                                  (peDepsPlanOps env)
+                                  eco
+                                  src
+                                  locals
+                                  hypoPlan
+                              let hypoNeed = planNeedsWork localPVs hypoFix hypoPlan
+                              if planDeltaHolds
+                                (glpUniquePVs onDiskPlan)
+                                onDiskNeed
+                                (glpUniquePVs hypoPlan)
+                                hypoNeed
+                                then pure $ Just (overlayRefuseMessage provider)
+                                else pure Nothing
 
 planProgress :: MultiHandle -> PackageKey -> EcosystemSpec -> PlanProgress
 planProgress mh key eco =
