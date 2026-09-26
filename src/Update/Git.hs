@@ -15,7 +15,6 @@ where
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (makeAbsolute)
-import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (makeRelative, normalise)
 import System.Process
@@ -27,8 +26,7 @@ import System.Process
 import Update.GpgAgent
   ( GpgHandle,
     ensureGpgReady,
-    lookupControllingTty,
-    pinentryChildEnv,
+    signingChildEnv,
   )
 
 -- | Injectable git operations for tests.
@@ -99,10 +97,8 @@ gitAddAndSignedCommit gpg overlayRoot relPaths message = do
       if codeAdd /= ExitSuccess
         then pure $ Left ("git add failed: " <> T.pack errAdd)
         else do
-          mTty <- lookupControllingTty gpg
-          env0 <- getEnvironment
-          let env1 = pinentryChildEnv mTty env0
-              cp =
+          env1 <- signingChildEnv gpg
+          let cp =
                 ( proc
                     "git"
                     [ "-C",

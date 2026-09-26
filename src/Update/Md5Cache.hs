@@ -515,8 +515,11 @@ gencachePackages ::
   [PackageKey] ->
   Bool ->
   Maybe Int ->
+  -- | Unlock the session agent immediately before the signed commit.
+  -- Not called when the tree has nothing to commit.
+  IO (Either Text ()) ->
   IO (Either Text (Maybe [FilePath]))
-gencachePackages runner gitOps overlayRoot keys force mJobs = do
+gencachePackages runner gitOps overlayRoot keys force mJobs prepare = do
   beforeAll <- listAllMd5CacheRelPaths overlayRoot
   let go [] = pure (Right ())
       go (key : rest) =
@@ -561,11 +564,15 @@ gencachePackages runner gitOps overlayRoot keys force mJobs = do
             Left err -> pure (Left err)
             Right False -> pure (Right Nothing)
             Right True -> do
-              committed <-
-                goAddAndCommit gitOps overlayRoot pathspecs gencacheCommitMessage
-              pure $ case committed of
-                Left err -> Left err
-                Right () -> Right (Just pathspecs)
+              prepared <- prepare
+              case prepared of
+                Left err -> pure (Left err)
+                Right () -> do
+                  committed <-
+                    goAddAndCommit gitOps overlayRoot pathspecs gencacheCommitMessage
+                  pure $ case committed of
+                    Left err -> Left err
+                    Right () -> Right (Just pathspecs)
 
 -- | All relative paths currently under @metadata/md5-cache/@.
 listAllMd5CacheRelPaths :: FilePath -> IO [FilePath]

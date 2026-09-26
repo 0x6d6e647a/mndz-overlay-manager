@@ -348,19 +348,25 @@ When activity indicators were shown for a phase, the program SHALL emit success 
 - **WHEN** indicators are enabled and a package is soft-skipped during phase 1
 - **THEN** the package remains on the multi-progress panel in a non-success state until clear, after which the warning is logged
 
-### Requirement: GPG readiness teardown on update exit
+### Requirement: Session-agent teardown on update exit
 
-When `update` runs package work that may create GPG-signed commits, the program SHALL retain process-lifetime state for any signing keygrips this run warmed and SHALL clear those keygrips from gpg-agent on process exit (success or failure), as specified by gpg-sign-readiness. Teardown SHALL run even when some packages hard-failed after an unlock. The program SHALL NOT clear keygrips that this process did not warm.
+When `update` runs package work that may create GPG-signed commits, the program SHALL use the session agent specified by `gpg-sign-readiness` and SHALL terminate that agent on process exit (success or failure) when this run started one. Teardown SHALL run even when some packages hard-failed after an unlock. Teardown SHALL also terminate the session agent if the `update` process is killed after the agent has started. The program SHALL NOT clear passphrases in the desktop agent and SHALL NOT reload the desktop agent.
 
-#### Scenario: Clear warmed key after update finishes
+#### Scenario: Exit stops the session agent
 
-- **WHEN** `update` unlocked a cold signing keygrip during signed commits and then finishes
-- **THEN** the program clears that keygrip’s agent cache on exit
+- **WHEN** `update` unlocked the session agent and then finishes
+- **THEN** the program terminates that agent on exit
+- **AND** the desktop agent's cached passphrases are unchanged by this run
 
-#### Scenario: Exit after failure still clears what we warmed
+#### Scenario: Exit after failure still stops the session agent
 
-- **WHEN** `update` unlocked GPG then a later package hard-fails
-- **THEN** process exit still clears keygrips this process warmed
+- **WHEN** `update` unlocked the session agent and a later package hard-fails
+- **THEN** process exit still terminates the session agent
+
+#### Scenario: Killed update does not leave the session agent
+
+- **WHEN** `update` has started the session agent and the `update` process is then killed
+- **THEN** the session agent is terminated
 
 ### Requirement: Update preflight requires usable manager distfiles directory
 

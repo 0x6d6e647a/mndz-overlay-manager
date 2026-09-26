@@ -38,14 +38,15 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forever, unless, void)
+import Control.Monad (forever, unless, void, when)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
+import Data.Bits ((.&.))
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isNothing)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -69,12 +70,23 @@ import Overlay.Version
     parseEbuildVersion,
     prettyVersion,
   )
-import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
+import System.Directory
+  ( createDirectoryIfMissing,
+    doesDirectoryExist,
+    doesFileExist,
+    listDirectory,
+    makeAbsolute,
+    pathIsSymbolicLink,
+  )
+import System.Environment (getEnvironment, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Posix.Files (fileMode, getFileStatus, setFileMode)
+import System.Process (readProcessWithExitCode)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
+import Test.Support (writeMatchingCachesForPackage)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
 import Update.Apply
@@ -82,6 +94,7 @@ import Update.Apply
     EbuildRunner,
     applyPackagePhase1Tracked,
     foldExitHardFail,
+    mkEbuildRunner,
   )
 import Update.Apply.Errors
   ( ApplyUnitError (..),
@@ -202,12 +215,21 @@ import Update.Go.Version
 import Update.GpgAgent
   ( GpgAgentOps (..),
     Keygrip (..),
+    Supervisor (..),
+    armGpgSession,
+    buildGpgSessionHome,
     ensureGpgReady,
+    gpgHomeUnder,
     mkGpgAgentOps,
     newGpgHandle,
+    noopSupervisor,
     parseKeyinfoCached,
     parseSignCapableKeygrip,
     pinentryChildEnv,
+    prepareSigningSession,
+    removeGpgSessionHome,
+    signingChildEnv,
+    spawnGpgSessionSupervisorIn,
     teardownGpgHandle,
   )
 import Update.Hardcoded (lookupHardcoded, lookupPolicy)
@@ -225,6 +247,7 @@ import Update.Md5Cache
     gencachePackages,
     inspectPackageCache,
     listNonLiveEbuildVersions,
+    mkEgencacheRunner,
     packageCacheGateError,
     readCacheMd5Field,
   )
@@ -293,7 +316,15 @@ tests =
       testCase "Per Repo Keygrips" testPerRepoKeygrips,
       testCase "Worktree State Reused" testWorktreeStateReused,
       testCase "Gpg mk CommandRunner success edges" testGpgMkCommandRunnerSuccess,
-      testCase "Gpg mk CommandRunner failure edges" testGpgMkCommandRunnerFailures
+      testCase "Gpg mk CommandRunner failure edges" testGpgMkCommandRunnerFailures,
+      testCase "Session home signs without the desktop agent" testSessionHomeSigns,
+      testCase "Distinct keygrips unlock once or twice" testDistinctKeygrips,
+      testCase "Supervisor signal kills the session agent" testSupervisorSignalKills,
+      testCase "Supervisor start failure skips warm-up" testSupervisorStartFailure,
+      testCase "Signing children carry the session home" testSigningChildrenEnv,
+      testCase "gencache signs through the session home" testGencacheSessionHome,
+      testCase "unchanged gencache does not prompt" testGencacheUnchangedSkips,
+      testCase "failed gencache drops gpg-home" testGencacheFailureDropsHome
     ]
 
 testParseSignCapableKeygrip :: IO ()
@@ -367,28 +398,37 @@ testParseKeyinfoCached = do
 testPinentryChildEnv :: IO ()
 testPinentryChildEnv = do
   let parent = [("DISPLAY", ":0"), ("HOME", "/home/u"), ("GPG_TTY", "old")]
-      env' = pinentryChildEnv (Just "/dev/tty") parent
+      env' = pinentryChildEnv (Just "/dev/tty") (Just "/sess") parent
   assertEq "GPG_TTY set" (Just "/dev/tty") (lookup "GPG_TTY" env')
+  assertEq "GNUPGHOME set" (Just "/sess") (lookup "GNUPGHOME" env')
   assertEq "DISPLAY cleared" Nothing (lookup "DISPLAY" env')
   assertEq "HOME kept" (Just "/home/u") (lookup "HOME" env')
-  let envNone = pinentryChildEnv Nothing parent
+  let envNone = pinentryChildEnv Nothing Nothing parent
   assertEq "no GPG_TTY when no tty" Nothing (lookup "GPG_TTY" envNone)
+  assertEq "no GNUPGHOME when no session" Nothing (lookup "GNUPGHOME" envNone)
   assertEq "DISPLAY still cleared" Nothing (lookup "DISPLAY" envNone)
-  let envEmpty = pinentryChildEnv (Just "") parent
+  let envEmpty = pinentryChildEnv (Just "") (Just "") parent
   assertEq "empty tty path omits GPG_TTY" Nothing (lookup "GPG_TTY" envEmpty)
+  assertEq "empty home omits GNUPGHOME" Nothing (lookup "GNUPGHOME" envEmpty)
 
 baseFakeOps :: GpgAgentOps
 baseFakeOps =
   GpgAgentOps
     { gaoGetSigningKey = \_ -> pure (Right "KEY1"),
       gaoResolveKeygrip = \_ -> pure (Right (Keygrip "GRIP1")),
-      gaoKeyinfoCached = \_ -> pure (Right True),
+      gaoKeyinfoCached = \_ _ -> pure (Right True),
       gaoReadyPrompt = pure (Left "should not prompt"),
-      gaoWarmKey = \_ -> pure (Left "should not warm"),
-      gaoClearPassphrase = \_ -> pure (),
+      gaoWarmKey = \_ _ _ -> pure (Left "should not warm"),
       gaoControllingTty = pure (Just "/dev/tty"),
       gaoPauseUi = pure (),
-      gaoResumeUi = pure ()
+      gaoResumeUi = pure (),
+      gaoBuildSessionHome = \_ dest _ -> do
+        createDirectoryIfMissing True dest
+        pure (Right ()),
+      gaoKillSessionAgent = \_ -> pure (),
+      gaoStartSupervisor = \_ -> pure (Right noopSupervisor),
+      gaoReapSupervisor = \_ -> pure (),
+      gaoRemoveSessionHome = removeGpgSessionHome
     }
 
 testMissingSigningKeyFails :: IO ()
@@ -408,7 +448,7 @@ testWarmCacheSkipsPrompt = do
   promptRef <- newIORef (0 :: Int)
   let ops =
         baseFakeOps
-          { gaoKeyinfoCached = \_ -> pure (Right True),
+          { gaoKeyinfoCached = \_ _ -> pure (Right True),
             gaoReadyPrompt = do
               atomicModifyIORef' promptRef (\n -> (n + 1, ()))
               pure (Right ())
@@ -428,11 +468,11 @@ testColdCacheReadyThenWarm = do
   resumeRef <- newIORef (0 :: Int)
   let ops =
         baseFakeOps
-          { gaoKeyinfoCached = \_ -> pure (Right False),
+          { gaoKeyinfoCached = \_ _ -> pure (Right False),
             gaoReadyPrompt = do
               atomicModifyIORef' promptRef (\n -> (n + 1, ()))
               pure (Right ()),
-            gaoWarmKey = \_ -> do
+            gaoWarmKey = \_ _ _ -> do
               atomicModifyIORef' warmRef (\n -> (n + 1, ()))
               pure (Right ()),
             gaoPauseUi = atomicModifyIORef' pauseRef (\n -> (n + 1, ())),
@@ -455,7 +495,7 @@ testNoTtyWhenColdFails :: IO ()
 testNoTtyWhenColdFails = do
   let ops =
         baseFakeOps
-          { gaoKeyinfoCached = \_ -> pure (Right False),
+          { gaoKeyinfoCached = \_ _ -> pure (Right False),
             gaoControllingTty = pure Nothing
           }
   h <- newGpgHandle ops
@@ -465,34 +505,29 @@ testNoTtyWhenColdFails = do
   teardownGpgHandle h
 
 testClearOnlyIfWarmed :: IO ()
-testClearOnlyIfWarmed = do
-  clearedRef <- newIORef ([] :: [T.Text])
-  let opsWarm =
-        baseFakeOps
-          { gaoKeyinfoCached = \_ -> pure (Right False),
-            gaoReadyPrompt = pure (Right ()),
-            gaoWarmKey = \_ -> pure (Right ()),
-            gaoClearPassphrase = \(Keygrip g) ->
-              atomicModifyIORef' clearedRef (\xs -> (xs <> [g], ()))
-          }
-  h1 <- newGpgHandle opsWarm
-  void $ assertRight "warm path" =<< ensureGpgReady h1 "/tmp/overlay-repo"
-  teardownGpgHandle h1
-  cleared1 <- readIORef clearedRef
-  assertEq "cleared after we warmed" ["GRIP1"] cleared1
+testClearOnlyIfWarmed =
+  withSystemTempDirectory "mndz-gpg-teardown-" $ \tmp -> do
+    let home = gpgHomeUnder tmp
+    killed <- newIORef ([] :: [FilePath])
+    let ops =
+          baseFakeOps
+            { gaoKillSessionAgent = \path ->
+                atomicModifyIORef' killed (\xs -> (xs <> [path], ()))
+            }
+    hNone <- newGpgHandle ops
+    teardownGpgHandle hNone
+    none <- readIORef killed
+    assertEq "no kill without a session" [] none
 
-  clearedRef2 <- newIORef ([] :: [T.Text])
-  let opsAlreadyWarm =
-        baseFakeOps
-          { gaoKeyinfoCached = \_ -> pure (Right True),
-            gaoClearPassphrase = \(Keygrip g) ->
-              atomicModifyIORef' clearedRef2 (\xs -> (xs <> [g], ()))
-          }
-  h2 <- newGpgHandle opsAlreadyWarm
-  void $ assertRight "already warm" =<< ensureGpgReady h2 "/tmp/overlay-repo"
-  teardownGpgHandle h2
-  cleared2 <- readIORef clearedRef2
-  assertEq "no clear when we did not warm" [] cleared2
+    writeIORef killed []
+    hSess <- newGpgHandle ops
+    createDirectoryIfMissing True home
+    armGpgSession hSess home noopSupervisor
+    teardownGpgHandle hSess
+    kills <- readIORef killed
+    assertEq "session kill" [home] kills
+    gone <- doesDirectoryExist home
+    assertTrue "session home removed" (not gone)
 
 testPerRepoKeygrips :: IO ()
 testPerRepoKeygrips = do
@@ -510,7 +545,7 @@ testPerRepoKeygrips = do
                 Right $
                   Keygrip $
                     if k == "KEY-ASSETS" then "GRIP-A" else "GRIP-O",
-            gaoKeyinfoCached = \_ -> pure (Right True)
+            gaoKeyinfoCached = \_ _ -> pure (Right True)
           }
   h <- newGpgHandle ops
   void $ assertRight "overlay" =<< ensureGpgReady h "/tmp/overlay-repo"
@@ -537,7 +572,7 @@ testKeyinfoFailPropagates :: IO ()
 testKeyinfoFailPropagates = do
   let ops =
         baseFakeOps
-          { gaoKeyinfoCached = \_ -> pure (Left "KEYINFO failed")
+          { gaoKeyinfoCached = \_ _ -> pure (Left "KEYINFO failed")
           }
   h <- newGpgHandle ops
   err <- assertLeft "keyinfo" =<< ensureGpgReady h "/tmp/overlay-repo"
@@ -549,9 +584,9 @@ testColdReadyPromptFails = do
   warmRef <- newIORef (0 :: Int)
   let ops =
         baseFakeOps
-          { gaoKeyinfoCached = \_ -> pure (Right False),
+          { gaoKeyinfoCached = \_ _ -> pure (Right False),
             gaoReadyPrompt = pure (Left "prompt aborted"),
-            gaoWarmKey = \_ -> do
+            gaoWarmKey = \_ _ _ -> do
               atomicModifyIORef' warmRef (\n -> (n + 1, ()))
               pure (Right ())
           }
@@ -566,9 +601,9 @@ testColdWarmKeyFails :: IO ()
 testColdWarmKeyFails = do
   let ops =
         baseFakeOps
-          { gaoKeyinfoCached = \_ -> pure (Right False),
+          { gaoKeyinfoCached = \_ _ -> pure (Right False),
             gaoReadyPrompt = pure (Right ()),
-            gaoWarmKey = \_ -> pure (Left "clearsign failed")
+            gaoWarmKey = \_ _ _ -> pure (Left "clearsign failed")
           }
   h <- newGpgHandle ops
   err <- assertLeft "warm fail" =<< ensureGpgReady h "/tmp/overlay-repo"
@@ -587,7 +622,7 @@ testWorktreeStateReused = do
             gaoResolveKeygrip = \_ -> do
               atomicModifyIORef' resolveRef (\n -> (n + 1, ()))
               pure (Right (Keygrip "GRIP1")),
-            gaoKeyinfoCached = \_ -> pure (Right True)
+            gaoKeyinfoCached = \_ _ -> pure (Right True)
           }
   h <- newGpgHandle ops
   void $ assertRight "first" =<< ensureGpgReady h "/tmp/reuse-repo"
@@ -641,65 +676,85 @@ keyinfoColdOut :: String
 keyinfoColdOut =
   "S KEYINFO 6FD5C82CED9AF42C796A9C275BF5CD4082063513 D - - - P - - -\nOK\n"
 
--- Warm-cache path only uses process helpers (no TTY/pinentry).
+-- Session KEYINFO, not the desktop agent. Teardown kills that session.
 testGpgMkCommandRunnerSuccess :: IO ()
 testGpgMkCommandRunnerSuccess =
   withSystemTempDirectory "mndz-gpg-mk-" $ \tmp -> do
-    clearRef <- newIORef ([] :: [T.Text])
+    let home = gpgHomeUnder tmp
+    desktopRef <- newIORef (0 :: Int)
+    clearRef <- newIORef ([] :: [String])
+    killRef <- newIORef ([] :: [String])
     let successRun req = case execCmd req of
           Just ("git", "-C" : _root : "config" : "--get" : "user.signingkey" : _) ->
             pure (okResult "KEY1\n")
           Just ("gpg", "--list-secret-keys" : _) -> pure (okResult signKeyColonOut)
-          Just ("gpg-connect-agent", []) ->
+          Just ("gpg-connect-agent", args) ->
             case prStdin req of
               s
-                | "KEYINFO" `T.isInfixOf` T.pack s ->
-                    pure (okResult keyinfoWarmOut)
                 | "CLEAR_PASSPHRASE" `T.isInfixOf` T.pack s -> do
-                    atomicModifyIORef' clearRef (\xs -> (xs <> ["cleared"], ()))
+                    atomicModifyIORef' clearRef (\xs -> (xs <> [s], ()))
                     pure (okResult "OK\n")
+                | "KEYINFO" `T.isInfixOf` T.pack s ->
+                    if "--homedir" `elem` args
+                      then pure (okResult keyinfoWarmOut)
+                      else do
+                        atomicModifyIORef' desktopRef (\n -> (n + 1, ()))
+                        pure (okResult keyinfoWarmOut)
                 | otherwise -> pure (failResult ("unexpected agent stdin: " <> s))
+          Just ("gpgconf", args) -> do
+            atomicModifyIORef' killRef (\xs -> (xs <> [unwords args], ()))
+            pure (okResult "")
           _ -> pure (failResult ("unexpected: " <> show (prMode req)))
         ops = mkGpgAgentOps successRun (pure ()) (pure ())
     h <- newGpgHandle ops
+    armGpgSession h home noopSupervisor
     void $ assertRight "mk warm ready" =<< ensureGpgReady h tmp
-    -- Second call reuses worktree state; KEYINFO still via runner
     void $ assertRight "mk warm again" =<< ensureGpgReady h tmp
     teardownGpgHandle h
     clears <- readIORef clearRef
-    -- warm cache path does not mark as warmed-by-us → no CLEAR
-    assertEq "no clear when we did not warm" [] clears
+    kills <- readIORef killRef
+    desktop <- readIORef desktopRef
+    assertEq "no desktop CLEAR_PASSPHRASE" [] clears
+    assertEq "no desktop KEYINFO" 0 desktop
+    assertTrue "session kill recorded" (any ("--kill" `isInfixOf`) kills)
+    assertTrue "kill names the session home" (any (home `isInfixOf`) kills)
 
-    -- Direct warm + clear: cold KEYINFO overridden with TTY-free fakes for
-    -- interactive fields, process warm/clear still via runner
-    clearRef2 <- newIORef ([] :: [String])
+    promptRef <- newIORef (0 :: Int)
+    killRef2 <- newIORef ([] :: [String])
     let warmRun req = case execCmd req of
           Just ("git", "-C" : _ : "config" : _) -> pure (okResult "KEY1\n")
-          Just ("gpg", "--list-secret-keys" : _) -> pure (okResult signKeyColonOut)
-          Just ("gpg-connect-agent", []) ->
+          Just ("gpg", args)
+            | "--list-secret-keys" `elem` args -> pure (okResult signKeyColonOut)
+            | "--local-user" `elem` args ->
+                pure (okResult "-----BEGIN PGP SIGNED MESSAGE-----\n")
+            | otherwise -> pure (failResult ("unexpected gpg: " <> show args))
+          Just ("gpg-connect-agent", args) ->
             case prStdin req of
               s
-                | "KEYINFO" `T.isInfixOf` T.pack s ->
+                | "CLEAR_PASSPHRASE" `T.isInfixOf` T.pack s ->
+                    pure (failResult "desktop CLEAR_PASSPHRASE")
+                | "KEYINFO" `T.isInfixOf` T.pack s && "--homedir" `elem` args ->
                     pure (okResult keyinfoColdOut)
-                | "CLEAR_PASSPHRASE" `T.isInfixOf` T.pack s -> do
-                    atomicModifyIORef' clearRef2 (\xs -> (xs <> [s], ()))
-                    pure (okResult "OK\n")
                 | otherwise -> pure (failResult ("unexpected agent stdin: " <> s))
-          Just ("gpg", "--local-user" : _) -> pure (okResult "-----BEGIN PGP SIGNED MESSAGE-----\n")
+          Just ("gpgconf", args) -> do
+            atomicModifyIORef' killRef2 (\xs -> (xs <> [unwords args], ()))
+            pure (okResult "")
           _ -> pure (failResult ("unexpected warm: " <> show (prMode req)))
         opsWarm =
           (mkGpgAgentOps warmRun (pure ()) (pure ()))
             { gaoControllingTty = pure (Just "/dev/tty"),
-              gaoReadyPrompt = pure (Right ())
+              gaoReadyPrompt = do
+                atomicModifyIORef' promptRef (\n -> (n + 1, ()))
+                pure (Right ())
             }
     h2 <- newGpgHandle opsWarm
+    armGpgSession h2 home noopSupervisor
     void $ assertRight "mk cold warm" =<< ensureGpgReady h2 tmp
     teardownGpgHandle h2
-    clears2 <- readIORef clearRef2
-    assertTrue "clear after warm" (not (null clears2))
-    assertTrue
-      "clear grip"
-      (any ("6FD5C82CED9AF42C796A9C275BF5CD4082063513" `isInfixOf`) clears2)
+    prompts <- readIORef promptRef
+    kills2 <- readIORef killRef2
+    assertEq "cold session prompts" 1 prompts
+    assertTrue "cold path kills the session" (not (null kills2))
 
 testGpgMkCommandRunnerFailures :: IO ()
 testGpgMkCommandRunnerFailures =
@@ -746,24 +801,450 @@ testGpgMkCommandRunnerFailures =
 
     let keyinfoFailRun req = case execCmd req of
           Just ("git", _) -> pure (okResult "KEY1\n")
-          Just ("gpg", "--list-secret-keys" : _) -> pure (okResult signKeyColonOut)
-          Just ("gpg-connect-agent", []) -> pure (failResult "agent down")
+          Just ("gpg", args)
+            | "--list-secret-keys" `elem` args -> pure (okResult signKeyColonOut)
+          Just ("gpg-connect-agent", _) -> pure (failResult "agent down")
           _ -> pure (failResult "should not run")
         opsKi = mkGpgAgentOps keyinfoFailRun (pure ()) (pure ())
     hKi <- newGpgHandle opsKi
+    armGpgSession hKi (gpgHomeUnder tmp) noopSupervisor
     errKi <- assertLeft "keyinfo fail" =<< ensureGpgReady hKi tmp
     assertTrue "KEYINFO failed" ("KEYINFO failed" `T.isInfixOf` errKi)
     teardownGpgHandle hKi
 
     -- warm (clearsign) failure via production gaoWarmKey
     let warmFailRun req = case execCmd req of
-          Just ("gpg", "--local-user" : _) -> pure (failResult "pinentry cancelled")
+          Just ("gpg", args)
+            | "--local-user" `elem` args -> pure (failResult "pinentry cancelled")
           _ -> pure (failResult ("unexpected: " <> show (prMode req)))
         opsWarmFail = mkGpgAgentOps warmFailRun (pure ()) (pure ())
-    errWarm <- gaoWarmKey opsWarmFail "KEY1"
+    errWarm <- gaoWarmKey opsWarmFail Nothing Nothing "KEY1"
     case errWarm of
       Left msg ->
         assertTrue "clearsign fail" ("clearsign warm" `T.isInfixOf` msg)
       Right () -> do
         hPutStrLn stderr "expected warm failure"
         exitFailure
+
+------------------------------------------------------------------------
+-- Session home, supervisor, signing children, gencache
+------------------------------------------------------------------------
+
+runGpgCmd :: FilePath -> [String] -> String -> IO (ExitCode, String, String)
+runGpgCmd home args =
+  readProcessWithExitCode
+    "gpg"
+    (["--homedir", home, "--batch", "--pinentry-mode", "loopback", "--passphrase", ""] <> args)
+
+killAgent :: FilePath -> IO ()
+killAgent home =
+  void $
+    readProcessWithExitCode "gpgconf" ["--homedir", home, "--kill", "gpg-agent"] ""
+
+testSessionHomeSigns :: IO ()
+testSessionHomeSigns =
+  withSystemTempDirectory "mndz-gpg-home-" $ \tmp -> do
+    let src = tmp </> "source"
+        sess = gpgHomeUnder tmp
+    createDirectoryIfMissing True src
+    setFileMode src 0o700
+    gen1 <-
+      runGpgCmd
+        src
+        ["--quick-gen-key", "tester <t@example.test>", "ed25519", "sign", "never"]
+        ""
+    assertEq "gen tester" ExitSuccess (fst3 gen1)
+    gen2 <-
+      runGpgCmd
+        src
+        ["--quick-gen-key", "other <o@example.test>", "ed25519", "sign", "never"]
+        ""
+    assertEq "gen other" ExitSuccess (fst3 gen2)
+    listed <-
+      readProcessWithExitCode
+        "gpg"
+        [ "--homedir",
+          src,
+          "--list-secret-keys",
+          "--with-colons",
+          "--with-keygrip",
+          "tester <t@example.test>"
+        ]
+        ""
+    grip <-
+      case listed of
+        (ExitSuccess, out, _) ->
+          case parseSignCapableKeygrip out of
+            Right (Keygrip g) -> pure (T.unpack g)
+            Left err -> do
+              hPutStrLn stderr (T.unpack err)
+              exitFailure
+        (_, _, err) -> do
+          hPutStrLn stderr err
+          exitFailure
+    let srcKey = src </> "private-keys-v1.d" </> grip <> ".key"
+    built <- buildGpgSessionHome src sess ["tester <t@example.test>"]
+    void $ assertRight "session home" built
+    st <- getFileStatus sess
+    assertEq "mode 700" 0o700 (fileMode st .&. 0o777)
+    conf <- readFile (sess </> "gpg-agent.conf")
+    assertTrue "default-cache-ttl" ("default-cache-ttl 28800" `isInfixOf` conf)
+    assertTrue "max-cache-ttl" ("max-cache-ttl 28800" `isInfixOf` conf)
+    assertTrue "pinentry-tty" ("pinentry-program /usr/bin/pinentry-tty" `isInfixOf` conf)
+    commonThere <- doesFileExist (sess </> "common.conf")
+    when commonThere $ do
+      common <- readFile (sess </> "common.conf")
+      assertTrue "use-keyboxd off" (not ("use-keyboxd" `isInfixOf` common))
+    keys <- listDirectory (sess </> "private-keys-v1.d")
+    assertEq "only the sign-capable key" [grip <> ".key"] keys
+    linked <- pathIsSymbolicLink (sess </> "private-keys-v1.d" </> grip <> ".key")
+    assertTrue "secret key is a symlink" linked
+    signed <-
+      readProcessWithExitCode
+        "gpg"
+        [ "--homedir",
+          sess,
+          "--batch",
+          "--pinentry-mode",
+          "loopback",
+          "--passphrase",
+          "",
+          "--local-user",
+          "tester <t@example.test>",
+          "--clearsign",
+          "--output",
+          "-",
+          "--yes"
+        ]
+        "hello\n"
+    case signed of
+      (ExitSuccess, out, _) ->
+        assertTrue "clearsign" ("BEGIN PGP SIGNED MESSAGE" `isInfixOf` out)
+      (_, _, err) -> do
+        hPutStrLn stderr err
+        exitFailure
+    (sockCode, sock, _) <-
+      readProcessWithExitCode
+        "gpgconf"
+        ["--homedir", sess, "--list-dirs", "agent-socket"]
+        ""
+    assertEq "socket lookup" ExitSuccess sockCode
+    assertTrue "session socket is not the desktop socket" ("/gnupg/d." `isInfixOf` sock)
+    killAgent src
+    killAgent sess
+    removeGpgSessionHome sess
+    srcStill <- doesFileExist srcKey
+    assertTrue "source key survives" srcStill
+    sessGone <- doesDirectoryExist sess
+    assertTrue "session home removed" (not sessGone)
+
+fst3 :: (a, b, c) -> a
+fst3 (a, _, _) = a
+
+testDistinctKeygrips :: IO ()
+testDistinctKeygrips =
+  withSystemTempDirectory "mndz-gpg-grips-" $ \tmp -> do
+    let once = do
+          warms <- newIORef (0 :: Int)
+          prompts <- newIORef (0 :: Int)
+          let ops =
+                baseFakeOps
+                  { gaoKeyinfoCached = \_ _ -> pure (Right False),
+                    gaoReadyPrompt = do
+                      atomicModifyIORef' prompts (\n -> (n + 1, ()))
+                      pure (Right ()),
+                    gaoWarmKey = \_ _ _ -> do
+                      atomicModifyIORef' warms (\n -> (n + 1, ()))
+                      pure (Right ()),
+                    gaoGetSigningKey = \_ -> pure (Right "KEY"),
+                    gaoResolveKeygrip = \_ -> pure (Right (Keygrip "SAME"))
+                  }
+          h <- newGpgHandle ops
+          void $
+            assertRight "same grip"
+              =<< prepareSigningSession
+                h
+                (tmp </> "run-same")
+                [tmp </> "overlay", tmp </> "assets"]
+          w <- readIORef warms
+          p <- readIORef prompts
+          teardownGpgHandle h
+          pure (w, p)
+    (w1, p1) <- once
+    assertEq "one warm when grips match" 1 w1
+    assertEq "one prompt when grips match" 1 p1
+    warms2 <- newIORef (0 :: Int)
+    prompts2 <- newIORef (0 :: Int)
+    let ops2 =
+          baseFakeOps
+            { gaoKeyinfoCached = \_ _ -> pure (Right False),
+              gaoReadyPrompt = do
+                atomicModifyIORef' prompts2 (\n -> (n + 1, ()))
+                pure (Right ()),
+              gaoWarmKey = \_ _ _ -> do
+                atomicModifyIORef' warms2 (\n -> (n + 1, ()))
+                pure (Right ()),
+              gaoGetSigningKey = \root ->
+                pure $
+                  if "assets" `isInfixOf` root
+                    then Right "KEY-A"
+                    else Right "KEY-O",
+              gaoResolveKeygrip = \k ->
+                pure $
+                  Right $
+                    Keygrip $
+                      if k == "KEY-A" then "GRIP-A" else "GRIP-O"
+            }
+    h2 <- newGpgHandle ops2
+    void $
+      assertRight "two grips"
+        =<< prepareSigningSession h2 (tmp </> "run2") [tmp </> "overlay", tmp </> "assets"]
+    w2 <- readIORef warms2
+    p2 <- readIORef prompts2
+    teardownGpgHandle h2
+    assertEq "two warms when grips differ" 2 w2
+    assertEq "two prompts when grips differ" 2 p2
+
+testSupervisorSignalKills :: IO ()
+testSupervisorSignalKills =
+  withSystemTempDirectory "mndz-gpg-sup-" $ \tmp -> do
+    let bin = tmp </> "bin"
+        record = tmp </> "gpgconf-args"
+        home = gpgHomeUnder tmp
+    createDirectoryIfMissing True bin
+    createDirectoryIfMissing True home
+    writeFile (bin </> "gpgconf") $
+      unlines
+        [ "#!/bin/sh",
+          "printf '%s\\n' \"$*\" > " <> show record
+        ]
+    setFileMode (bin </> "gpgconf") 0o755
+    env0 <- getEnvironment
+    let env1 =
+          ("PATH", bin <> ":" <> fromMaybe "" (lookup "PATH" env0))
+            : filter (\(k, _) -> k /= "PATH") env0
+    started <- spawnGpgSessionSupervisorIn env1 home
+    sup <- assertRight "supervisor started" started
+    supReap sup
+    body <- readFile record
+    assertTrue "kill uses the session home" (home `isInfixOf` body)
+    assertTrue "gpgconf --kill" ("--kill" `isInfixOf` body)
+    assertTrue "kills gpg-agent" ("gpg-agent" `isInfixOf` body)
+
+testSupervisorStartFailure :: IO ()
+testSupervisorStartFailure =
+  withSystemTempDirectory "mndz-gpg-sup-fail-" $ \tmp -> do
+    warms <- newIORef (0 :: Int)
+    let ops =
+          baseFakeOps
+            { gaoStartSupervisor = \_ -> pure (Left "supervisor unavailable"),
+              gaoReadyPrompt = pure (Right ()),
+              gaoWarmKey = \_ _ _ -> do
+                atomicModifyIORef' warms (\n -> (n + 1, ()))
+                pure (Right ()),
+              gaoKeyinfoCached = \_ _ -> pure (Right False)
+            }
+    h <- newGpgHandle ops
+    err <-
+      assertLeft "supervisor fail"
+        =<< prepareSigningSession h (tmp </> "run") [tmp </> "overlay"]
+    assertTrue "names supervisor" ("supervisor" `T.isInfixOf` err)
+    n <- readIORef warms
+    assertEq "no warm-up" 0 n
+    teardownGpgHandle h
+    gone <- doesDirectoryExist (gpgHomeUnder (tmp </> "run"))
+    assertTrue "home removed after supervisor failure" (not gone)
+
+testSigningChildrenEnv :: IO ()
+testSigningChildrenEnv =
+  withSystemTempDirectory "mndz-gpg-env-" $ \tmp -> do
+    let session = gpgHomeUnder tmp
+    parentBefore <- lookupEnv "GNUPGHOME"
+    captured <- newIORef ([] :: [ProcessRequest])
+    let run req = do
+          atomicModifyIORef' captured (\xs -> (xs <> [req], ()))
+          pure (okResult "signed\n")
+        ops =
+          (mkGpgAgentOps run (pure ()) (pure ()))
+            { gaoControllingTty = pure (Just "/dev/tty"),
+              gaoKeyinfoCached = \_ _ -> pure (Right True)
+            }
+    void $ assertRight "warm" =<< gaoWarmKey ops (Just session) (Just "/dev/tty") "KEY1"
+    reqs <- readIORef captured
+    case reqs of
+      (req : _) -> do
+        let env = fromMaybe [] (prEnv req)
+        assertEq "warm GNUPGHOME" (Just session) (lookup "GNUPGHOME" env)
+        assertEq "warm GPG_TTY" (Just "/dev/tty") (lookup "GPG_TTY" env)
+      [] -> do
+        hPutStrLn stderr "warm-up did not run"
+        exitFailure
+    parentAfterWarm <- lookupEnv "GNUPGHOME"
+    assertEq "parent unchanged by warm-up" parentBefore parentAfterWarm
+    h <- newGpgHandle ops
+    armGpgSession h session noopSupervisor
+    commitEnv <- signingChildEnv h
+    assertEq "commit GNUPGHOME" (Just session) (lookup "GNUPGHOME" commitEnv)
+    assertEq "commit GPG_TTY" (Just "/dev/tty") (lookup "GPG_TTY" commitEnv)
+    parentAfterCommit <- lookupEnv "GNUPGHOME"
+    assertEq "parent unchanged by commit env" parentBefore parentAfterCommit
+    ebRef <- newIORef (Nothing :: Maybe ProcessRequest)
+    let ebRun req = do
+          writeIORef ebRef (Just req)
+          pure (okResult "")
+    void $ mkEbuildRunner (tmp </> "dist") ebRun (tmp </> "pkg") "foo.ebuild"
+    eb <- readIORef ebRef
+    case eb of
+      Just req -> do
+        let env = fromMaybe [] (prEnv req)
+        assertEq "ebuild keeps the parent home" parentBefore (lookup "GNUPGHOME" env)
+        assertTrue "ebuild misses session" (lookup "GNUPGHOME" env /= Just session)
+      Nothing -> do
+        hPutStrLn stderr "ebuild did not run"
+        exitFailure
+    egRef <- newIORef (Nothing :: Maybe ProcessRequest)
+    createDirectoryIfMissing True (tmp </> "gentoo")
+    let egRun req = case execCmd req of
+          Just ("portageq", _) -> pure (okResult (tmp </> "gentoo"))
+          Just ("egencache", _) -> do
+            writeIORef egRef (Just req)
+            pure (okResult "")
+          _ -> pure (failResult "unexpected")
+    eg <-
+      mkEgencacheRunner egRun $
+        EgencacheRequest
+          { erOverlayRoot = tmp,
+            erAtoms = ["dev-lang/haskell"],
+            erJobs = Nothing
+          }
+    void $ assertRight "egencache" eg
+    egReq <- readIORef egRef
+    case egReq of
+      Just req ->
+        assertEq "egencache does not get a session env" Nothing (prEnv req)
+      Nothing -> do
+        hPutStrLn stderr "egencache did not run"
+        exitFailure
+    teardownGpgHandle h
+
+gitOpsFor :: Bool -> ([FilePath] -> IO (Either T.Text ())) -> GitOps
+gitOpsFor dirty commit =
+  GitOps
+    { goIsWorkTree = \_ -> pure True,
+      goPathsDirty = \_ _ -> pure (Right dirty),
+      goAddAndCommit = \_ paths _ -> commit paths,
+      goPush = \_ -> pure (Right ()),
+      goRevParseHead = \_ -> pure (Right "abc")
+    }
+
+seedHaskell :: FilePath -> IO ()
+seedHaskell overlay = do
+  let pkg = overlay </> "dev-lang" </> "haskell"
+  createDirectoryIfMissing True pkg
+  writeFile (pkg </> "haskell-1.0.ebuild") "EAPI=8\n"
+
+testGencacheUnchangedSkips :: IO ()
+testGencacheUnchangedSkips =
+  withSystemTempDirectory "mndz-gc-skip-" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    seedHaskell overlay
+    writeMatchingCachesForPackage overlay "dev-lang" "haskell" (overlay </> "dev-lang" </> "haskell")
+    prompts <- newIORef (0 :: Int)
+    let prepare = do
+          atomicModifyIORef' prompts (\n -> (n + 1, ()))
+          pure (Right ())
+    result <-
+      gencachePackages
+        (\_ -> pure (Right ()))
+        (gitOpsFor False (\_ -> pure (Right ())))
+        overlay
+        [mkPackageKey "dev-lang" "haskell"]
+        False
+        Nothing
+        prepare
+    assertEq "no commit" (Right Nothing) result
+    n <- readIORef prompts
+    assertEq "unchanged tree does not prompt" 0 n
+
+testGencacheSessionHome :: IO ()
+testGencacheSessionHome =
+  withSystemTempDirectory "mndz-gc-sign-" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        run = tmp </> "run"
+        home = gpgHomeUnder run
+    seedHaskell overlay
+    seen <- newIORef (Nothing :: Maybe FilePath)
+    let ops =
+          baseFakeOps
+            { gaoControllingTty = pure (Just "/dev/tty"),
+              gaoKeyinfoCached = \_ _ -> pure (Right True)
+            }
+    h <- newGpgHandle ops
+    let prepare = do
+          createDirectoryIfMissing True home
+          armGpgSession h home noopSupervisor
+          pure (Right ())
+        commit _paths = do
+          env <- signingChildEnv h
+          writeIORef seen (lookup "GNUPGHOME" env)
+          pure (Right ())
+        runner _ = do
+          let cacheDir = overlay </> "metadata" </> "md5-cache" </> "dev-lang"
+          createDirectoryIfMissing True cacheDir
+          writeFile (cacheDir </> "haskell-1.0") "_md5_=zz\n"
+          pure (Right ())
+    result <-
+      gencachePackages
+        runner
+        (gitOpsFor True commit)
+        overlay
+        [mkPackageKey "dev-lang" "haskell"]
+        False
+        Nothing
+        prepare
+    case result of
+      Right (Just _) -> pure ()
+      other -> do
+        hPutStrLn stderr ("expected signed cache commit, got " <> show other)
+        exitFailure
+    got <- readIORef seen
+    assertEq "commit uses session home" (Just home) got
+    teardownGpgHandle h
+
+testGencacheFailureDropsHome :: IO ()
+testGencacheFailureDropsHome =
+  withSystemTempDirectory "mndz-gc-fail-" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        run = tmp </> "run"
+        home = gpgHomeUnder run
+    seedHaskell overlay
+    let ops = baseFakeOps
+    h <- newGpgHandle ops
+    let prepare = do
+          createDirectoryIfMissing True run
+          createDirectoryIfMissing True home
+          writeFile (home </> "agent.conf") "x\n"
+          writeFile (run </> "kept.txt") "scratch\n"
+          armGpgSession h home noopSupervisor
+          pure (Right ())
+        runner _ = do
+          let cacheDir = overlay </> "metadata" </> "md5-cache" </> "dev-lang"
+          createDirectoryIfMissing True cacheDir
+          writeFile (cacheDir </> "haskell-1.0") "_md5_=zz\n"
+          pure (Right ())
+    result <-
+      gencachePackages
+        runner
+        (gitOpsFor True (\_ -> pure (Left "commit failed")))
+        overlay
+        [mkPackageKey "dev-lang" "haskell"]
+        False
+        Nothing
+        prepare
+    err <- assertLeft "commit failed" result
+    assertTrue "commit error" ("commit failed" `T.isInfixOf` err)
+    teardownGpgHandle h
+    gone <- doesDirectoryExist home
+    assertTrue "gpg-home removed" (not gone)
+    kept <- doesFileExist (run </> "kept.txt")
+    assertTrue "other scratch retained" kept

@@ -1,5 +1,6 @@
 module Main (main) where
 
+import Control.Monad (unless)
 import Test.Apply qualified as Apply
 import Test.Assets qualified as Assets
 import Test.AtomClosure qualified as AtomClosure
@@ -30,6 +31,7 @@ import Test.Targets qualified as Targets
 import Test.Tasty (defaultMain, testGroup)
 import Test.TempWorkspace qualified as TempWorkspace
 import Test.Waves qualified as Waves
+import Update.GpgAgent (takeGpgSessionSupervisor)
 
 -- Test taxonomy (Unit vs Integration) — design D3 / CONTRIBUTING.
 --
@@ -46,51 +48,53 @@ import Test.Waves qualified as Waves
 -- (and likewise for Integration / full suite for Overall).
 
 main :: IO ()
-main =
-  defaultMain $
-    testGroup
-      "mndz-overlay-manager"
-      [ testGroup
-          "Unit"
-          [ Overlay.tests,
-            OverlayTree.tests,
-            OverlayWaves.tests,
-            AtomClosure.unitTests,
-            Config.tests,
-            CheckCache.tests,
-            Distfiles.tests,
-            DiskSpace.tests,
-            TempWorkspace.tests,
-            Policy.tests,
-            Targets.tests,
-            Preflight.tests,
-            Assets.tests,
-            EbuildEdit.tests,
-            Ssh.tests,
-            Gpg.tests,
-            Git.tests,
-            GitHubResilience.unitTests,
-            CLI.tests,
-            Lanes.unitTests,
-            Progress.unitTests,
-            Apply.unitTests,
-            Materialize.unitTests,
-            Ensure.unitTests,
-            Md5Cache.unitTests,
-            Ecosystems.unitTests,
-            CheckPlan.unitTests,
-            Properties.tests
-          ],
-        testGroup
-          "Integration"
-          [ Lanes.integrationTests,
-            Progress.integrationTests,
-            Apply.integrationTests,
-            Materialize.integrationTests,
-            Md5Cache.integrationTests,
-            Ecosystems.integrationTests,
-            CheckPlan.integrationTests,
-            GitHubResilience.integrationTests,
-            Waves.integrationTests
-          ]
-      ]
+main = do
+  took <- takeGpgSessionSupervisor
+  unless took $
+    defaultMain $
+      testGroup
+        "mndz-overlay-manager"
+        [ testGroup
+            "Unit"
+            [ Overlay.tests,
+              OverlayTree.tests,
+              OverlayWaves.tests,
+              AtomClosure.unitTests,
+              Config.tests,
+              CheckCache.tests,
+              Distfiles.tests,
+              DiskSpace.tests,
+              TempWorkspace.tests,
+              Policy.tests,
+              Targets.tests,
+              Preflight.tests,
+              Assets.tests,
+              EbuildEdit.tests,
+              Ssh.tests,
+              Gpg.tests,
+              Git.tests,
+              GitHubResilience.unitTests,
+              CLI.tests,
+              Lanes.unitTests,
+              Progress.unitTests,
+              Apply.unitTests,
+              Materialize.unitTests,
+              Ensure.unitTests,
+              Md5Cache.unitTests,
+              Ecosystems.unitTests,
+              CheckPlan.unitTests,
+              Properties.tests
+            ],
+          testGroup
+            "Integration"
+            [ Lanes.integrationTests,
+              Progress.integrationTests,
+              Apply.integrationTests,
+              Materialize.integrationTests,
+              Md5Cache.integrationTests,
+              Ecosystems.integrationTests,
+              CheckPlan.integrationTests,
+              GitHubResilience.integrationTests,
+              Waves.integrationTests
+            ]
+        ]

@@ -20,6 +20,7 @@ import Control.Concurrent.MVar
 import Control.Monad (when)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (elemIndex)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -28,7 +29,12 @@ import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion, parseEbuildVersion, prettyVersion)
-import System.Directory (createDirectoryIfMissing, doesFileExist, renameFile)
+import System.Directory
+  ( createDirectoryIfMissing,
+    doesDirectoryExist,
+    doesFileExist,
+    renameFile,
+  )
 import System.FilePath (takeBaseName, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (callProcess)
@@ -58,6 +64,15 @@ import Update.Deps.Plan (BunProbe, DepsPlanOps (..), minimumBunProbe)
 import Update.DiskSpace (DiskSpaceProbe (..))
 import Update.Git (GitOps (..))
 import Update.GitHub (newGitHubLatch)
+import Update.GpgAgent
+  ( GpgAgentOps (..),
+    Keygrip (..),
+    ensureGpgReady,
+    newGpgHandle,
+    noopSupervisor,
+    prepareSigningSession,
+    teardownGpgHandle,
+  )
 import Update.Materialize (EnsureOutcome (..), NeededFloors (..))
 import Update.OverlayTree (TreeLock, withNewTreeLock)
 import Update.Preflight (AssetsPreflight (..))
@@ -128,6 +143,12 @@ integrationTests =
       testCase
         "grok-build-bin may overlap ensure"
         testGrokBuildBinOverlapsEnsure,
+      testCase
+        "overlap commit during ensure does not prompt again"
+        testOverlapCommitSkipsPrompt,
+      testCase
+        "nothing to sign skips the session agent"
+        testNothingToSignSkipsSession,
       testCase
         "t0 ensure bun floor is hypo remote"
         testT0EnsureHypoBunFloor,
@@ -401,7 +422,9 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
         usdSweepMaterialize = pure (),
         usdMaterializeDockerRunner = Nothing,
         usdGitHubLatch = latch,
-        usdGitOperationsHealth = pure (Right ())
+        usdGitOperationsHealth = pure (Right ()),
+        usdPrepareSigning = \_ _ _ _ -> pure (Right ()),
+        usdReleaseSigning = pure ()
       }
 
 outcomeKey :: ApplyOutcome -> PackageKey
@@ -1338,3 +1361,170 @@ testDirtyNodeGypFailsRalph =
     assertEq "no ensure after dirty node-gyp" 0 n
     still <- doesFileExist ralphPath
     assertTrue "ralph not mutated" still
+
+sessionOps :: IORef Bool -> IORef [T.Text] -> GpgAgentOps
+sessionOps warmed events =
+  let logEv t = atomicModifyIORef' events (\xs -> (xs <> [t], ()))
+   in GpgAgentOps
+        { gaoGetSigningKey = \_ -> pure (Right "KEY"),
+          gaoResolveKeygrip = \_ -> pure (Right (Keygrip "GRIP")),
+          gaoKeyinfoCached = \_ _ -> do
+            warm <- readIORef warmed
+            pure (Right warm),
+          gaoReadyPrompt = logEv "prompt" >> pure (Right ()),
+          gaoWarmKey = \_ _ _ -> do
+            logEv "warm"
+            writeIORef warmed True
+            pure (Right ()),
+          gaoControllingTty = pure (Just "/dev/tty"),
+          gaoPauseUi = pure (),
+          gaoResumeUi = pure (),
+          gaoBuildSessionHome = \_ dest _ -> do
+            createDirectoryIfMissing True dest
+            pure (Right ()),
+          gaoKillSessionAgent = \_ -> pure (),
+          gaoStartSupervisor = \_ -> logEv "supervisor" >> pure (Right noopSupervisor),
+          gaoReapSupervisor = \_ -> pure (),
+          gaoRemoveSessionHome = removeDirectoryIfPresent
+        }
+
+removeDirectoryIfPresent :: FilePath -> IO ()
+removeDirectoryIfPresent path = do
+  exists <- doesDirectoryExist path
+  when exists $ callProcess "rm" ["-rf", path]
+
+testOverlapCommitSkipsPrompt :: IO ()
+testOverlapCommitSkipsPrompt =
+  withSystemTempDirectory "om-wave-gpg-overlap" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    grokPath <- seedGrok overlay "0.2.99"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    events <- newIORef ([] :: [T.Text])
+    warmed <- newIORef False
+    ensureGo <- newEmptyMVar
+    grokCommitted <- newEmptyMVar
+    let ops = sessionOps warmed events
+    h <- newGpgHandle ops
+    let logEv t = atomicModifyIORef' events (\xs -> (xs <> [t], ()))
+        commit _root paths _msg = do
+          ready <- ensureGpgReady h overlay
+          case ready of
+            Left err -> pure (Left err)
+            Right () -> do
+              let label
+                    | any (\p -> "grok-build-bin" `T.isInfixOf` T.pack p) paths = "commit-grok"
+                    | any (\p -> "bun-bin" `T.isInfixOf` T.pack p) paths = "commit-bun"
+                    | otherwise = "commit-other"
+              when (label == "commit-grok") $ do
+                takeMVar ensureGo
+                logEv label
+                putMVar grokCommitted ()
+              when (label /= "commit-grok") $
+                logEv label
+              pure (Right ())
+        gitOps = cleanGit {goAddAndCommit = commit}
+        overlappingEnsure _ _ = do
+          logEv "ensure-start"
+          putMVar ensureGo ()
+          takeMVar grokCommitted
+          logEv "ensure-end"
+          pure (Right EnsureSkipped)
+        fetchMix src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          Http {} ->
+            pure (Right (parseEbuildVersion "0.2.101"))
+          _ ->
+            pure (Left "unexpected fetch")
+        ebuilds =
+          [ Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath,
+            Ebuild "dev-util" "ralph-tui" "1.0.0" ralphPath,
+            Ebuild "dev-util" "grok-build-bin" "0.2.99" grokPath
+          ]
+        entries = groupNewest ebuilds
+    deps0 <-
+      baseSpine overlay assets dist gitOps releaseMissing 2 preflightOk
+    let deps =
+          deps0
+            { usdFetcher = fetchMix,
+              usdEnsureImage = overlappingEnsure,
+              usdPrepareSigning = \runRoot mayAssets ov mAssets -> do
+                logEv "prepare"
+                let trees =
+                      ov
+                        : [ a
+                          | mayAssets,
+                            Just a <- [mAssets]
+                          ]
+                prepareSigningSession h runRoot trees
+            }
+    raced <-
+      race
+        (threadDelay 15_000_000)
+        (runUpdatePhases deps entries ebuilds entries)
+    teardownGpgHandle h
+    case raced of
+      Left () ->
+        assertFailure "deadlock: overlap commit and ensure did not meet"
+      Right (Left err) ->
+        assertFailure $ "spine failed: " <> T.unpack err
+      Right (Right _) -> do
+        evs <- readIORef events
+        let at label =
+              case elemIndex label evs of
+                Just i -> pure i
+                Nothing ->
+                  assertFailure $
+                    "missing " <> T.unpack label <> " in " <> show evs
+        promptAt <- at "prompt"
+        supAt <- at "supervisor"
+        ensureAt <- at "ensure-start"
+        grokAt <- at "commit-grok"
+        endAt <- at "ensure-end"
+        bunAt <- at "commit-bun"
+        assertTrue "one prompt" (length (filter (== "prompt") evs) == 1)
+        assertTrue "prompt before the image build" (promptAt < ensureAt)
+        assertTrue "supervisor before the image build" (supAt < ensureAt)
+        assertTrue "grok commit during ensure" (ensureAt < grokAt && grokAt < endAt)
+        assertTrue "bun-bin commit after ensure" (endAt < bunAt)
+
+testNothingToSignSkipsSession :: IO ()
+testNothingToSignSkipsSession =
+  withSystemTempDirectory "om-wave-gpg-skip" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.2.0"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    prompts <- newIORef (0 :: Int)
+    supers <- newIORef (0 :: Int)
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.2.0" bunPath]
+        entries = groupNewest ebuilds
+        fetchLatest src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.2.0"))
+          _ -> pure (Left "unexpected fetch")
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseMissing 1 preflightNoDocker
+    let deps =
+          deps0
+            { usdFetcher = fetchLatest,
+              usdPrepareSigning = \_ _ _ _ -> do
+                atomicModifyIORef' prompts (\n -> (n + 1, ()))
+                atomicModifyIORef' supers (\n -> (n + 1, ()))
+                pure (Right ())
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right _ -> do
+        nPrompt <- readIORef prompts
+        nSup <- readIORef supers
+        assertEq "no prompt when nothing signs" 0 nPrompt
+        assertEq "no supervisor when nothing signs" 0 nSup

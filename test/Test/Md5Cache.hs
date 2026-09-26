@@ -552,6 +552,7 @@ testGencacheForceAndMismatch =
         [key]
         False
         (Just 1)
+        (pure (Right ()))
     case r1 of
       Right (Just _) -> pure ()
       other -> do
@@ -570,6 +571,7 @@ testGencacheForceAndMismatch =
         [key]
         False
         Nothing
+        (pure (Right ()))
     assertEq "no commit when match" (Right Nothing) r2
     nEg2 <- readIORef egCalls
     assertEq "skipped egencache when match" 0 nEg2
@@ -584,6 +586,7 @@ testGencacheForceAndMismatch =
         [key]
         False
         Nothing
+        (pure (Right ()))
     case r3 of
       Left msg -> assertTrue "mismatch force" ("--force" `T.isInfixOf` msg)
       Right _ -> do
@@ -599,6 +602,7 @@ testGencacheForceAndMismatch =
         [key]
         True
         Nothing
+        (pure (Right ()))
     case r4 of
       Right (Just _) -> pure ()
       other -> do
@@ -619,6 +623,7 @@ testGencacheForceAndMismatch =
         [key]
         True
         (Just 2)
+        (pure (Right ()))
     reqs <- readIORef reqRef
     case reqs of
       (r : _) -> do

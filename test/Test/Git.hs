@@ -28,6 +28,7 @@ import Update.GpgAgent
     Keygrip (..),
     ensureGpgReady,
     newGpgHandle,
+    noopSupervisor,
     teardownGpgHandle,
   )
 
@@ -135,13 +136,17 @@ fakeGpgOps =
   GpgAgentOps
     { gaoGetSigningKey = \_ -> pure (Right "TESTKEY"),
       gaoResolveKeygrip = \_ -> pure (Right (Keygrip "GRIP")),
-      gaoKeyinfoCached = \_ -> pure (Right True),
+      gaoKeyinfoCached = \_ _ -> pure (Right True),
       gaoReadyPrompt = pure (Right ()),
-      gaoWarmKey = \_ -> pure (Right ()),
-      gaoClearPassphrase = \_ -> pure (),
+      gaoWarmKey = \_ _ _ -> pure (Right ()),
       gaoControllingTty = pure Nothing,
       gaoPauseUi = pure (),
-      gaoResumeUi = pure ()
+      gaoResumeUi = pure (),
+      gaoBuildSessionHome = \_ _ _ -> pure (Right ()),
+      gaoKillSessionAgent = \_ -> pure (),
+      gaoStartSupervisor = \_ -> pure (Right noopSupervisor),
+      gaoReapSupervisor = \_ -> pure (),
+      gaoRemoveSessionHome = \_ -> pure ()
     }
 
 testGitAddCommitGpgNotReady :: IO ()

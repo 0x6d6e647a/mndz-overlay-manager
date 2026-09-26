@@ -105,5 +105,7 @@ data ApplyEnv = ApplyEnv
     -- run. @Nothing@ checks current disk only (no wait).
     aeAtomClosure :: Maybe AtomClosureSession,
     -- | Git Operations Statuspage check immediately before assets @git push@.
-    aeGitOperationsHealth :: IO (Either Text ())
+    aeGitOperationsHealth :: IO (Either Text ()),
+    -- | Kill the session agent before a successful run root is deleted.
+    aeReleaseSigningSession :: IO ()
   }

@@ -176,6 +176,7 @@ nonEbuildAllowlist =
     "src/Update/DiskSpace.hs",
     "src/Update/Distfiles.hs",
     "src/Update/GitHubToken.hs",
+    "src/Update/GpgAgent.hs",
     "src/Update/Go/Vendor.hs",
     "src/Update/Materialize/Ensure.hs",
     "src/Update/Npm/Cache.hs",

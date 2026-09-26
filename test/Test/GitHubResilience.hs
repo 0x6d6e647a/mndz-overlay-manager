@@ -566,6 +566,7 @@ testGencacheNoHealthHttp =
         [mkPackageKey "dev-lang" "haskell"]
         True
         (Just 1)
+        (pure (Right ()))
     -- gencache never GETs Statuspage or /rate_limit; this path has no HTTP.
     _ <- assertRight "gencache" result
     pure ()

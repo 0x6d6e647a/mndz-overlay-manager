@@ -134,7 +134,8 @@ applyOverlay pcfg env overlayRoot entries mFilter = do
                 (applyPackagePhase1Tracked env' overlayRoot)
                 selected
       let outcomes = concat nested
-      unless (any outcomeIsHardFail outcomes) $
+      unless (any outcomeIsHardFail outcomes) $ do
+        aeReleaseSigningSession env
         cleanupRunSuccess (aeTempRun env)
       pure outcomes
 
@@ -284,7 +285,8 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare mutate = d
                       byEntry
                       prepare
           let outcomes = carried <> setupOutcomes <> cascadeFails <> nested
-          unless (any outcomeIsHardFail outcomes) $
+          unless (any outcomeIsHardFail outcomes) $ do
+            aeReleaseSigningSession env
             cleanupRunSuccess (aeTempRun env)
           pure outcomes
 

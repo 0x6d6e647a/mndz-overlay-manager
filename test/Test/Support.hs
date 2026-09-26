@@ -342,7 +342,8 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeCheckCache = cache,
         aeMaterializeDocker = Nothing,
         aeAtomClosure = Nothing,
-        aeGitOperationsHealth = pure (Right ())
+        aeGitOperationsHealth = pure (Right ()),
+        aeReleaseSigningSession = pure ()
       }
 
 -- | Write a matching md5-dict cache file for one ebuild.

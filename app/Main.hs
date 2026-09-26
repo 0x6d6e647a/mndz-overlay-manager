@@ -87,7 +87,9 @@ import Update.GitHubToken
   )
 import Update.GpgAgent
   ( newGpgHandle,
+    prepareSigningSession,
     productionGpgAgentOps,
+    takeGpgSessionSupervisor,
     teardownGpgHandle,
   )
 import Update.Materialize
@@ -122,6 +124,7 @@ import Update.Spine
   )
 import Update.SshAgent (productionSshAgentOps)
 import Update.Targets (resolveTargets, targetErrorMessage)
+import Update.TempWorkspace (openRunRoot, rrPath)
 import Update.Types
   ( ApplyOutcome (..),
     OutdatedLine (..),
@@ -144,6 +147,11 @@ data Runtime = Runtime
 
 main :: IO ()
 main = do
+  took <- takeGpgSessionSupervisor
+  unless took runProgram
+
+runProgram :: IO ()
+runProgram = do
   opts <- execParser parserInfo
   color <- resolveColorMode (optNoColor opts)
   jobs <- resolveJobs (optJobs opts)
@@ -397,7 +405,19 @@ runUpdate rt refresh pkgArgs = do
                           usdMaterializeDockerRunner =
                             Just productionCommandRunner,
                           usdGitHubLatch = latch,
-                          usdGitOperationsHealth = productionGitOperationsHealth
+                          usdGitOperationsHealth = productionGitOperationsHealth,
+                          usdPrepareSigning =
+                            \runRoot mayAssets overlay mAssets ->
+                              prepareSigningSession
+                                gpg
+                                runRoot
+                                ( overlay
+                                    : [ assets
+                                      | mayAssets,
+                                        Just assets <- [mAssets]
+                                      ]
+                                ),
+                          usdReleaseSigning = teardownGpgHandle gpg
                         }
                 runUpdatePhases deps entries ebuilds selected
             )
@@ -560,6 +580,10 @@ runGencache rt pkgArgs force = do
                   keys
                   force
                   (Just (rtJobs rt))
+                  ( do
+                      runRoot <- openRunRoot
+                      prepareSigningSession gpg (rrPath runRoot) [overlayPath]
+                  )
             )
       case result of
         Left err -> dieError (T.unpack err)

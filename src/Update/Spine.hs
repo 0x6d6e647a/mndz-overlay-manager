@@ -159,7 +159,18 @@ data UpdateSpineDeps = UpdateSpineDeps
     usdMaterializeDockerRunner :: Maybe CommandRunner,
     usdGitHubLatch :: GitHubLatch,
     -- | Git Operations Statuspage check before assets @git push@ (no-op when unused).
-    usdGitOperationsHealth :: IO (Either Text ())
+    usdGitOperationsHealth :: IO (Either Text ()),
+    -- | Before workers and the image build, when a selected unit may sign.
+    -- Arguments: run root, whether this run may publish assets, overlay root,
+    -- assets worktree.
+    usdPrepareSigning ::
+      FilePath ->
+      Bool ->
+      FilePath ->
+      Maybe FilePath ->
+      IO (Either Text ()),
+    -- | Kill the session agent before a successful run root is removed.
+    usdReleaseSigning :: IO ()
   }
 
 data UpdateSpineResult = UpdateSpineResult
@@ -494,10 +505,46 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                       Left err ->
                                         pure (failNeedsWork err planned')
                                       Right ok -> pure ok
+                      maySign =
+                        any
+                          ( \case
+                              PlanNeedsWork _ _ -> True
+                              _ -> False
+                          )
+                          planResults'
+                      mayPublishAssets =
+                        any
+                          ( \case
+                              PlanNeedsWork _ PlannedDeps {} -> True
+                              _ -> False
+                          )
+                          planResults'
                       runMutate = do
                         assetsLock <- newMVar ()
                         overlayLock <- newMVar ()
                         tempRun <- openRunRoot
+                        eSign <-
+                          if maySign
+                            then
+                              usdPrepareSigning
+                                deps
+                                (rrPath tempRun)
+                                mayPublishAssets
+                                overlayRoot
+                                mAssetsRoot
+                            else pure (Right ())
+                        case eSign of
+                          Left err ->
+                            pure
+                              [ ApplyHardFail
+                                  (PackageKey "")
+                                  err
+                                  False
+                                  False
+                              ]
+                          Right () ->
+                            mutateSigned assetsLock overlayLock tempRun
+                      mutateSigned assetsLock overlayLock tempRun = do
                         unless (null t0FullKeys) $
                           usdSweepMaterialize deps
                         mMatDocker <-
@@ -542,7 +589,8 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   aeCheckCache = cache,
                                   aeMaterializeDocker = mMatDocker,
                                   aeAtomClosure = Nothing,
-                                  aeGitOperationsHealth = usdGitOperationsHealth deps
+                                  aeGitOperationsHealth = usdGitOperationsHealth deps,
+                                  aeReleaseSigningSession = usdReleaseSigning deps
                                 }
                             overlapReady =
                               [ r
