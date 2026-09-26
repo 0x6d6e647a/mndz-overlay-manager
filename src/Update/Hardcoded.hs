@@ -74,6 +74,11 @@ hardcodedPolicies =
         "dev-util/rulesync"
         (Npm "rulesync")
         (DepsAndAssets NpmEco),
+      policyArches
+        "dev-util/claude-agent-acp"
+        (Npm "@agentclientprotocol/claude-agent-acp")
+        (DepsAndAssets NpmEco)
+        ["amd64"],
       policy
         "dev-util/ralph-tui"
         (GitHub "subsy" "ralph-tui" "v")

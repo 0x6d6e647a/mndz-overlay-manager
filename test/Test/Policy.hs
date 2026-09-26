@@ -466,6 +466,17 @@ testPolicyClassification = do
     other -> do
       hPutStrLn stderr $ "rulesync technique: " <> show other
       exitFailure
+  case lookupPolicy (PackageKey "dev-util/claude-agent-acp") of
+    Just
+      ( PackagePolicy
+          (Npm "@agentclientprotocol/claude-agent-acp")
+          (DepsAndAssets NpmEco)
+          ["amd64"]
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "claude-agent-acp technique: " <> show other
+      exitFailure
   case lookupPolicy (PackageKey "dev-util/ralph-tui") of
     Just (PackagePolicy _ (DepsAndAssets Bun) []) -> pure ()
     other -> do
