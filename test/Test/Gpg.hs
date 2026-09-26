@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 
-module Test.Gpg (tests) where
+module Test.Gpg (takeGpgTtyProbe, tests) where
 
 import CLI.Jobs
   ( mapConcurrentlyN,
@@ -37,7 +37,7 @@ import Config.Types (OverlayConfig (..))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
-import Control.Exception (SomeException, throwIO, try)
+import Control.Exception (IOException, SomeException, bracket, finally, throwIO, try)
 import Control.Monad (forever, unless, void, when)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
@@ -77,14 +77,41 @@ import System.Directory
     listDirectory,
     makeAbsolute,
     pathIsSymbolicLink,
+    removeFile,
   )
-import System.Environment (getEnvironment, lookupEnv)
+import System.Environment (getEnvironment, getExecutablePath, lookupEnv, unsetEnv)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, (</>))
-import System.IO (hPutStrLn, stderr)
+import System.IO
+  ( BufferMode (LineBuffering),
+    hClose,
+    hFlush,
+    hGetLine,
+    hPutStrLn,
+    hSetBuffering,
+    openTempFile,
+    stderr,
+    stdout,
+  )
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (fileMode, getFileStatus, setFileMode)
-import System.Process (readProcessWithExitCode)
+import System.Posix.IO
+  ( OpenFileFlags (noctty),
+    OpenMode (ReadWrite),
+    closeFd,
+    defaultFileFlags,
+    openFd,
+  )
+import System.Posix.Terminal (getSlaveTerminalName, openPseudoTerminal)
+import System.Process
+  ( CreateProcess (..),
+    StdStream (CreatePipe, NoStream),
+    createProcess,
+    proc,
+    readProcessWithExitCode,
+    terminateProcess,
+    waitForProcess,
+  )
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Support (writeMatchingCachesForPackage)
 import Test.Tasty (TestTree, testGroup)
@@ -227,6 +254,7 @@ import Update.GpgAgent
     parseSignCapableKeygrip,
     pinentryChildEnv,
     prepareSigningSession,
+    productionGpgAgentOps,
     removeGpgSessionHome,
     signingChildEnv,
     spawnGpgSessionSupervisorIn,
@@ -304,6 +332,7 @@ tests =
     [ testCase "Parse Sign Capable Keygrip" testParseSignCapableKeygrip,
       testCase "Parse Keyinfo Cached" testParseKeyinfoCached,
       testCase "Pinentry Child Env" testPinentryChildEnv,
+      testCase "Controlling tty is the slave device node" testControllingTtyDeviceNode,
       testCase "Missing Signing Key Fails" testMissingSigningKeyFails,
       testCase "Resolve Keygrip Fails" testResolveKeygripFails,
       testCase "Keyinfo Fail Propagates" testKeyinfoFailPropagates,
@@ -398,8 +427,8 @@ testParseKeyinfoCached = do
 testPinentryChildEnv :: IO ()
 testPinentryChildEnv = do
   let parent = [("DISPLAY", ":0"), ("HOME", "/home/u"), ("GPG_TTY", "old")]
-      env' = pinentryChildEnv (Just "/dev/tty") (Just "/sess") parent
-  assertEq "GPG_TTY set" (Just "/dev/tty") (lookup "GPG_TTY" env')
+      env' = pinentryChildEnv (Just "/dev/pts/7") (Just "/sess") parent
+  assertEq "GPG_TTY set" (Just "/dev/pts/7") (lookup "GPG_TTY" env')
   assertEq "GNUPGHOME set" (Just "/sess") (lookup "GNUPGHOME" env')
   assertEq "DISPLAY cleared" Nothing (lookup "DISPLAY" env')
   assertEq "HOME kept" (Just "/home/u") (lookup "HOME" env')
@@ -411,6 +440,80 @@ testPinentryChildEnv = do
   assertEq "empty tty path omits GPG_TTY" Nothing (lookup "GPG_TTY" envEmpty)
   assertEq "empty home omits GNUPGHOME" Nothing (lookup "GNUPGHOME" envEmpty)
 
+-- | Set on the pty-probe child. The value is the slave path to open.
+gpgTtyProbeEnv :: String
+gpgTtyProbeEnv = "MNDZ_OVERLAY_MANAGER_GPG_TTY_PROBE"
+
+-- | When 'gpgTtyProbeEnv' is set, open that slave without @O_NOCTTY@, print
+-- the production controlling-tty device node, and skip tasty.
+takeGpgTtyProbe :: IO Bool
+takeGpgTtyProbe = do
+  mSlave <- lookupEnv gpgTtyProbeEnv
+  case mSlave of
+    Nothing -> pure False
+    Just slave -> do
+      unsetEnv gpgTtyProbeEnv
+      bracket (openFd slave ReadWrite defaultFileFlags {noctty = False}) closeFd $
+        \_ -> do
+          mPath <- gaoControllingTty (productionGpgAgentOps (pure ()) (pure ()))
+          hSetBuffering stdout LineBuffering
+          putStrLn (fromMaybe "" mPath)
+          hFlush stdout
+      pure True
+
+testControllingTtyDeviceNode :: IO ()
+testControllingTtyDeviceNode =
+  bracket openPseudoTerminal closePty $ \(master, _slaveFd) -> do
+    slavePath <- getSlaveTerminalName master
+    exe <- getExecutablePath
+    env0 <- getEnvironment
+    -- A private tix path so this child does not rewrite the suite's .tix.
+    (tixPath, tixH) <- openTempFile "/tmp" "mndz-gpg-tty-probe.tix"
+    hClose tixH
+    removeFile tixPath
+    let env1 =
+          (gpgTtyProbeEnv, slavePath)
+            : ("HPCTIXFILE", tixPath)
+            : filter
+              (\(k, _) -> k /= gpgTtyProbeEnv && k /= "HPCTIXFILE")
+              env0
+    started <-
+      createProcess
+        (proc exe [])
+          { env = Just env1,
+            std_in = NoStream,
+            std_out = CreatePipe,
+            new_session = True
+          }
+    case started of
+      (Nothing, Just outH, Nothing, ph) -> do
+        reaped <- newIORef False
+        flip finally (cleanup ph outH reaped >> void (try @IOException (removeFile tixPath))) $ do
+          ready <- race (threadDelay 60_000_000) (try @IOException (hGetLine outH))
+          case ready of
+            Right (Right got) -> do
+              ec <- waitForProcess ph
+              writeIORef reaped True
+              assertEq "probe exit" ExitSuccess ec
+              assertEq "device node" slavePath got
+            Right (Left err) -> do
+              hPutStrLn stderr ("pty probe stdout closed: " <> show err)
+              exitFailure
+            Left () -> do
+              hPutStrLn stderr "pty probe timed out"
+              exitFailure
+      _ -> do
+        hPutStrLn stderr "pty probe did not return a stdout pipe"
+        exitFailure
+  where
+    closePty (master, slaveFd) = closeFd master >> closeFd slaveFd
+    cleanup ph outH reaped = do
+      done <- readIORef reaped
+      unless done $ do
+        void (try @SomeException (terminateProcess ph))
+        void (try @SomeException (waitForProcess ph))
+      void (try @SomeException (hClose outH))
+
 baseFakeOps :: GpgAgentOps
 baseFakeOps =
   GpgAgentOps
@@ -419,7 +522,7 @@ baseFakeOps =
       gaoKeyinfoCached = \_ _ -> pure (Right True),
       gaoReadyPrompt = pure (Left "should not prompt"),
       gaoWarmKey = \_ _ _ -> pure (Left "should not warm"),
-      gaoControllingTty = pure (Just "/dev/tty"),
+      gaoControllingTty = pure (Just "/dev/pts/7"),
       gaoPauseUi = pure (),
       gaoResumeUi = pure (),
       gaoBuildSessionHome = \_ dest _ -> do
@@ -742,7 +845,7 @@ testGpgMkCommandRunnerSuccess =
           _ -> pure (failResult ("unexpected warm: " <> show (prMode req)))
         opsWarm =
           (mkGpgAgentOps warmRun (pure ()) (pure ()))
-            { gaoControllingTty = pure (Just "/dev/tty"),
+            { gaoControllingTty = pure (Just "/dev/pts/7"),
               gaoReadyPrompt = do
                 atomicModifyIORef' promptRef (\n -> (n + 1, ()))
                 pure (Right ())
@@ -1066,16 +1169,16 @@ testSigningChildrenEnv =
           pure (okResult "signed\n")
         ops =
           (mkGpgAgentOps run (pure ()) (pure ()))
-            { gaoControllingTty = pure (Just "/dev/tty"),
+            { gaoControllingTty = pure (Just "/dev/pts/7"),
               gaoKeyinfoCached = \_ _ -> pure (Right True)
             }
-    void $ assertRight "warm" =<< gaoWarmKey ops (Just session) (Just "/dev/tty") "KEY1"
+    void $ assertRight "warm" =<< gaoWarmKey ops (Just session) (Just "/dev/pts/7") "KEY1"
     reqs <- readIORef captured
     case reqs of
       (req : _) -> do
         let env = fromMaybe [] (prEnv req)
         assertEq "warm GNUPGHOME" (Just session) (lookup "GNUPGHOME" env)
-        assertEq "warm GPG_TTY" (Just "/dev/tty") (lookup "GPG_TTY" env)
+        assertEq "warm GPG_TTY" (Just "/dev/pts/7") (lookup "GPG_TTY" env)
       [] -> do
         hPutStrLn stderr "warm-up did not run"
         exitFailure
@@ -1085,7 +1188,7 @@ testSigningChildrenEnv =
     armGpgSession h session noopSupervisor
     commitEnv <- signingChildEnv h
     assertEq "commit GNUPGHOME" (Just session) (lookup "GNUPGHOME" commitEnv)
-    assertEq "commit GPG_TTY" (Just "/dev/tty") (lookup "GPG_TTY" commitEnv)
+    assertEq "commit GPG_TTY" (Just "/dev/pts/7") (lookup "GPG_TTY" commitEnv)
     parentAfterCommit <- lookupEnv "GNUPGHOME"
     assertEq "parent unchanged by commit env" parentBefore parentAfterCommit
     ebRef <- newIORef (Nothing :: Maybe ProcessRequest)
@@ -1176,7 +1279,7 @@ testGencacheSessionHome =
     seen <- newIORef (Nothing :: Maybe FilePath)
     let ops =
           baseFakeOps
-            { gaoControllingTty = pure (Just "/dev/tty"),
+            { gaoControllingTty = pure (Just "/dev/pts/7"),
               gaoKeyinfoCached = \_ _ -> pure (Right True)
             }
     h <- newGpgHandle ops

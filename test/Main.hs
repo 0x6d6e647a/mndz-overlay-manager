@@ -50,7 +50,8 @@ import Update.GpgAgent (takeGpgSessionSupervisor)
 main :: IO ()
 main = do
   took <- takeGpgSessionSupervisor
-  unless took $
+  probed <- Gpg.takeGpgTtyProbe
+  unless (took || probed) $
     defaultMain $
       testGroup
         "mndz-overlay-manager"

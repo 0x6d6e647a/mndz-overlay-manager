@@ -1376,7 +1376,7 @@ sessionOps warmed events =
             logEv "warm"
             writeIORef warmed True
             pure (Right ()),
-          gaoControllingTty = pure (Just "/dev/tty"),
+          gaoControllingTty = pure (Just "/dev/pts/7"),
           gaoPauseUi = pure (),
           gaoResumeUi = pure (),
           gaoBuildSessionHome = \_ dest _ -> do

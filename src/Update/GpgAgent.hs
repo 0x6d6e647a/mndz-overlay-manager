@@ -41,8 +41,9 @@ import Control.Concurrent.MVar
     tryPutMVar,
     withMVar,
   )
-import Control.Exception (IOException, bracket_, try)
-import Control.Monad (void, when)
+import Control.Exception (IOException, bracket, bracket_, try)
+import Control.Monad (unless, void, when)
+import Data.Bits (shiftR, (.&.), (.|.))
 import Data.Containers.ListUtils (nubOrd)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -51,7 +52,12 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Foreign.C.Types (CInt (..), CLong (..))
+import Data.Word (Word32)
+import Foreign.C.Error (throwErrnoIfMinus1_)
+import Foreign.C.Types (CInt (..), CLong (..), CUInt (..), CULong (..))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (peek, poke)
 import System.Directory
   ( copyFile,
     createDirectoryIfMissing,
@@ -70,7 +76,6 @@ import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO
   ( BufferMode (LineBuffering),
-    Handle,
     IOMode (ReadWriteMode),
     hClose,
     hFlush,
@@ -81,10 +86,19 @@ import System.IO
     stdout,
     withFile,
   )
-import System.Posix.Files (setFileMode)
+import System.Posix.Files (getFileStatus, setFileMode, specialDeviceID)
+import System.Posix.IO
+  ( OpenFileFlags (noctty),
+    OpenMode (ReadWrite),
+    closeFd,
+    defaultFileFlags,
+    openFd,
+  )
 import System.Posix.Process (getParentProcessID)
 import System.Posix.Signals (installHandler, sigTERM)
 import System.Posix.Signals qualified as Signals
+import System.Posix.Terminal (getTerminalName)
+import System.Posix.Types (CDev (..), Fd (..))
 import System.Process
   ( CreateProcess (..),
     StdStream (CreatePipe, NoStream),
@@ -120,6 +134,13 @@ prSetPdeathsig = 1
 
 foreign import ccall unsafe "prctl"
   c_prctl :: CInt -> CLong -> CLong -> CLong -> CLong -> IO CInt
+
+-- | Linux @TIOCGDEV@, @_IOR('T', 0x32, unsigned int)@.
+tiocgdevReq :: CULong
+tiocgdevReq = 2147767346
+
+foreign import ccall unsafe "ioctl"
+  c_ioctl :: CInt -> CULong -> Ptr CUInt -> IO CInt
 
 -- | GPG keygrip (hex string).
 newtype Keygrip = Keygrip {unKeygrip :: Text}
@@ -168,7 +189,7 @@ data GpgAgentOps = GpgAgentOps
     gaoReadyPrompt :: IO (Either Text ()),
     -- | Dummy warm (clearsign). Home and controlling tty are passed in.
     gaoWarmKey :: Maybe FilePath -> Maybe FilePath -> Text -> IO (Either Text ()),
-    -- | Controlling tty path if available (e.g. @\/dev\/tty@).
+    -- | Controlling tty device node if available (e.g. @\/dev\/pts\/N@).
     gaoControllingTty :: IO (Maybe FilePath),
     -- | Pause activity indicators (clear panel) before interactive unlock.
     gaoPauseUi :: IO (),
@@ -593,13 +614,25 @@ runGpgSessionSupervisor home = do
       killSessionAgentDirect home
 
 killSessionAgentDirect :: FilePath -> IO ()
-killSessionAgentDirect home =
-  void $
-    try @IOException $
-      readProcessWithExitCode
-        "gpgconf"
-        ["--homedir", home, "--kill", "gpg-agent"]
-        ""
+killSessionAgentDirect home = go (3 :: Int)
+  where
+    go n = do
+      result <-
+        try @IOException $
+          readProcessWithExitCode
+            "gpgconf"
+            ["--homedir", home, "--kill", "gpg-agent"]
+            ""
+      case result of
+        -- A just-written helper can be ETXTBSY for a moment on Linux.
+        Left e
+          | n > 1 && isTextBusy e -> do
+              threadDelay 20_000
+              go (n - 1)
+        _ -> pure ()
+    isTextBusy e =
+      let msg = T.pack (show e)
+       in "Text file busy" `T.isInfixOf` msg || "resource busy" `T.isInfixOf` msg
 
 ------------------------------------------------------------------------
 -- Unlock
@@ -909,18 +942,53 @@ killSessionAgent run home = do
         }
   pure ()
 
+-- | Device node of the controlling terminal.
+--
+-- @ttyname@ of an fd opened from @\/dev\/tty@ is the string @\/dev\/tty@ on
+-- glibc, because @readlink@ of @\/proc\/self\/fd@ reports the path that was
+-- opened. That alias is not published. @TIOCGDEV@ names the underlying device,
+-- and the result is @ttyname@ of that node (for example @\/dev\/pts\/N@).
+-- An open failure, an empty name, or a name of @\/dev\/tty@ yields Nothing.
 controllingTtyPath :: IO (Maybe FilePath)
 controllingTtyPath = do
-  ok <- doesFileExist "/dev/tty"
-  if not ok
-    then pure Nothing
-    else do
-      opened <- try openOk
-      pure $ case opened of
-        Left (_ :: IOException) -> Nothing
-        Right () -> Just "/dev/tty"
+  named <- try @IOException discover
+  pure $ case named of
+    Left _ -> Nothing
+    Right path -> publishableTty path
   where
-    openOk = withFile "/dev/tty" ReadWriteMode $ \(_ :: Handle) -> pure ()
+    discover =
+      bracket (openFd "/dev/tty" ReadWrite defaultFileFlags) closeFd $ \fd -> do
+        named <- try @IOException (getTerminalName fd)
+        case named of
+          Right path
+            | Just node <- publishableTty path -> pure node
+          _ -> ttynameOfUnderlying fd
+
+publishableTty :: FilePath -> Maybe FilePath
+publishableTty path
+  | null path || path == "/dev/tty" = Nothing
+  | otherwise = Just path
+
+ttynameOfUnderlying :: Fd -> IO FilePath
+ttynameOfUnderlying (Fd fd) = do
+  dev <- alloca $ \ptr -> do
+    poke ptr (0 :: CUInt)
+    throwErrnoIfMinus1_ "TIOCGDEV" (c_ioctl fd tiocgdevReq ptr)
+    peek ptr
+  let path = "/dev/pts/" <> show (gnuDevMinor dev)
+  st <- getFileStatus path
+  unless (specialDeviceID st == CDev (fromIntegral dev)) $
+    ioError (userError "controlling tty device node mismatch")
+  bracket
+    (openFd path ReadWrite defaultFileFlags {noctty = True})
+    closeFd
+    getTerminalName
+
+-- | glibc @gnu_dev_minor@.
+gnuDevMinor :: CUInt -> Word32
+gnuDevMinor dev =
+  let d = fromIntegral dev :: Word32
+   in (d .&. 0xff) .|. (shiftR d 12 .&. 0xfff00)
 
 nullSuffix :: String -> Text
 nullSuffix err =
