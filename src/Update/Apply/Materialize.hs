@@ -49,6 +49,7 @@ import System.FilePath (takeDirectory, takeFileName, (</>))
 import Update.Adequacy
   ( cargoReuseWriteFloor,
     lookupDirectTagFloor,
+    plannedRuntimeReq,
     requiredAssetBasenames,
   )
 import Update.Apply.Commit (egencacheAndSignedCommit, pruneCommitMessage)
@@ -116,7 +117,8 @@ import Update.CheckCache
   )
 import Update.Deps.Plan
   ( DepsPlanOps (..),
-    planDepsPackageWithProgressFor,
+    planDepsPackageWithProgressDonor,
+    readNpmDonorBody,
   )
 import Update.DiskSpace
   ( checkTempNeedAtAdmit,
@@ -140,6 +142,7 @@ import Update.Git (GitOps (..), relativeOverlayPath)
 import Update.Go.Lanes
   ( GapLine (..),
     LaneTarget (..),
+    PlanError (..),
     PlannedEbuild (..),
     RuntimeLanePlan (..),
     buildGapLines,
@@ -246,13 +249,18 @@ applyDepsAndAssets env overlayRoot entry src eco = do
               pure (Right plan)
         _ -> do
           recordFetch cache
-          planDepsPackageWithProgressFor
-            (aeDepsPlanOps env)
-            progress
-            eco
-            src
-            localPVs
-            (lookupLaneArches key)
+          eDonor <- npmPlanDonor env eco key pn pkgDir
+          case eDonor of
+            Left err -> pure (Left (PlanFailed err))
+            Right mDonor ->
+              planDepsPackageWithProgressDonor
+                (aeDepsPlanOps env)
+                progress
+                eco
+                src
+                localPVs
+                (lookupLaneArches key)
+                mDonor
       case planResult of
         Left err ->
           pure
@@ -849,6 +857,26 @@ pruneExtras env overlayRoot entry plan = do
 underTree :: ApplyEnv -> (InTree -> IO a) -> IO (Either Text a)
 underTree env = withOverlayTreeChecked (aeTreeLock env)
 
+-- | Highest non-live ebuild body for npm donor-floor planning.
+npmPlanDonor ::
+  ApplyEnv ->
+  EcosystemSpec ->
+  PackageKey ->
+  Text ->
+  FilePath ->
+  IO (Either Text (Maybe Text))
+npmPlanDonor env eco key pn pkgDir =
+  case eco of
+    NpmEco -> do
+      locals <- listLocalEbuilds key pn pkgDir
+      nested <-
+        underTree env $ \tree ->
+          readNpmDonorBody locals (readEbuild tree)
+      pure $ case nested of
+        Left err -> Left err
+        Right inner -> inner
+    _ -> pure (Right Nothing)
+
 -- | Template path and body. 'Left' path means the file is absent.
 readDonorEbuild ::
   ApplyEnv ->
@@ -1326,8 +1354,10 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
         Right VendorResult {vrTarballPath = p, vrGoModVersion = mGo} ->
           Right (p, mGo, Nothing)
     (NpmEco, Npm npmPkg) -> do
-      -- Require engines for host gate: fetch first
-      eng <- dpoFetchNpmEngines (aeDepsPlanOps env) npmPkg pvNoRev
+      -- Lane selection already resolved engines.node or the donor atom.
+      eng <- case plannedRuntimeReq plan (parseEbuildVersion pvNoRev) of
+        Just req -> pure (Right req)
+        Nothing -> dpoFetchNpmEngines (aeDepsPlanOps env) npmPkg pvNoRev
       case eng of
         Left err -> pure (Left err)
         Right nodeReq -> do
@@ -1793,7 +1823,12 @@ reuseDepsReleaseAsset
                           Left _ -> Nothing
                   _ -> pure (Right Nothing)
               _ -> do
-                mAtom <- fetchRequiredBdependAtom env eco src key pvNoRev
+                mAtom <- case eco of
+                  NpmEco ->
+                    case plannedRuntimeReq plan (parseEbuildVersion pvNoRev) of
+                      Just ver -> pure (Just (nodejsBdependAtom ver))
+                      Nothing -> fetchRequiredBdependAtom env eco src key pvNoRev
+                  _ -> fetchRequiredBdependAtom env eco src key pvNoRev
                 pure $
                   Right $
                     case mAtom of

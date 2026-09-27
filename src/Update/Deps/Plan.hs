@@ -8,7 +8,9 @@ module Update.Deps.Plan
     productionDepsPlanOpsWithLatch,
     planDepsPackageWithProgress,
     planDepsPackageWithProgressFor,
+    planDepsPackageWithProgressDonor,
     planDepsPackageWithCeilingsFor,
+    readNpmDonorBody,
     toGoPlanOps,
     withListVersionsSuccessCache,
     withBunEnginesSuccessCache,
@@ -37,7 +39,9 @@ import Network.HTTP.Client
   )
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
+import Overlay.Types (Ebuild)
 import Overlay.Version (EbuildVersion (..), comparePV, renderPVNoRev, samePV)
+import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import Update.Bun.Cache
   ( BunProbe (..),
@@ -50,6 +54,11 @@ import Update.Cargo.Msrv
     applyRustToolchainFloor,
     cargoFloorPolicyKey,
     probePolicyTagFloor,
+  )
+import Update.EbuildSelection
+  ( InventoryFile (..),
+    inventoryFromEbuild,
+    selectHighestNonLive,
   )
 import Update.GitHub (GitHubLatch, listGitHubVersionsWithLatch, newGitHubLatch)
 import Update.Go.Lanes
@@ -78,7 +87,11 @@ import Update.Go.Plan
     PlanProgress (..),
   )
 import Update.Go.Vendor (versionTag)
-import Update.Npm.Cache (fetchNpmEnginesNode, listNpmVersions)
+import Update.Npm.Cache
+  ( fetchNpmEnginesNode,
+    listNpmVersions,
+    resolveNpmNodeRequirement,
+  )
 import Update.OverlayTree (withNewTreeLock)
 import Update.Runtime.Ceilings
   ( PortageqRunner,
@@ -231,9 +244,23 @@ planDepsPackageWithProgressFor ::
   [Text] ->
   IO (Either PlanError RuntimeLanePlan)
 planDepsPackageWithProgressFor ops progress eco src locals allowlist =
+  planDepsPackageWithProgressDonor ops progress eco src locals allowlist Nothing
+
+-- | Like 'planDepsPackageWithProgressFor' with the highest non-live ebuild
+-- body. Npm planning uses that body when @engines.node@ is omitted.
+planDepsPackageWithProgressDonor ::
+  DepsPlanOps ->
+  PlanProgress ->
+  EcosystemSpec ->
+  UpdateSource ->
+  [EbuildVersion] ->
+  [Text] ->
+  Maybe Text ->
+  IO (Either PlanError RuntimeLanePlan)
+planDepsPackageWithProgressDonor ops progress eco src locals allowlist mDonor =
   case eco of
     Go mSub -> planGo ops progress src mSub locals allowlist
-    NpmEco -> planNpm ops progress src locals allowlist
+    NpmEco -> planNpm ops progress src locals allowlist mDonor
     Bun -> planBun ops progress src locals Nothing allowlist
     Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals allowlist
     Sbcl -> planSbcl ops progress src locals allowlist
@@ -254,7 +281,7 @@ planDepsPackageWithCeilingsFor ops progress eco src locals ceilings allowlist =
   case eco of
     Bun -> planBun ops progress src locals (Just ceilings) allowlist
     Go mSub -> planGo ops progress src mSub locals allowlist
-    NpmEco -> planNpm ops progress src locals allowlist
+    NpmEco -> planNpm ops progress src locals allowlist Nothing
     Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals allowlist
     Sbcl -> planSbcl ops progress src locals allowlist
 
@@ -306,8 +333,10 @@ planNpm ::
   UpdateSource ->
   [EbuildVersion] ->
   [Text] ->
+  -- | Highest non-live ebuild body. Used only when @engines.node@ is omitted.
+  Maybe Text ->
   IO (Either PlanError RuntimeLanePlan)
-planNpm ops progress src locals allowlist =
+planNpm ops progress src locals allowlist mDonor =
   case src of
     Npm npmPkg ->
       planWith
@@ -322,11 +351,26 @@ planNpm ops progress src locals allowlist =
         )
         ( \pv -> do
             eres <- dpoFetchNpmEngines ops npmPkg (renderPVNoRev pv)
-            pure $ case eres of
+            pure $ case resolveNpmNodeRequirement eres mDonor of
               Left err -> Left (PlanProbeFailed err)
               Right ver -> Right (Just ver)
         )
     _ -> pure (Left (PlanFailed "DepsAndAssets Npm requires an Npm update source"))
+
+-- | Body of the highest non-live local ebuild, when that file exists.
+readNpmDonorBody ::
+  [Ebuild] ->
+  (FilePath -> IO Text) ->
+  IO (Either Text (Maybe Text))
+readNpmDonorBody ebuilds readBody =
+  case selectHighestNonLive (map inventoryFromEbuild ebuilds) of
+    Left err -> pure (Left err)
+    Right Nothing -> pure (Right Nothing)
+    Right (Just f) -> do
+      exists <- doesFileExist (invPath f)
+      if exists
+        then Right . Just <$> readBody (invPath f)
+        else pure (Right Nothing)
 
 ------------------------------------------------------------------------
 -- Bun

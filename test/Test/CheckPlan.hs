@@ -43,10 +43,13 @@ import Update.Deps.Plan
     DepsPlanOps (..),
     minimumBunProbe,
     planDepsPackageWithProgress,
+    planDepsPackageWithProgressDonor,
+    readNpmDonorBody,
     toGoPlanOps,
     withBunEnginesSuccessCache,
     withListVersionsSuccessCache,
   )
+import Update.EbuildEdit (ensureNodejsBdepend, nodejsBdependMatches)
 import Update.Go.Lanes
   ( CargoTagFloorSnapshot (..),
     LaneTarget (..),
@@ -105,7 +108,9 @@ unitTests =
           testCase "empty local PVs" testPlanNoNonLiveLocal,
           testCase "list versions failure" testPlanListVersionsFailed,
           testCase "zero planned PVs" testPlanZeroPlannedPVs,
-          testCase "npm probe failure" testPlanNpmProbeFailed
+          testCase "npm probe failure" testPlanNpmProbeFailed,
+          testCase "npm absent engines uses donor" testPlanNpmAbsentEnginesUsesDonor,
+          testCase "npm donor body is highest non-live" testReadNpmDonorHighest
         ],
       testGroup
         "overlay plan-delta refuse"
@@ -850,6 +855,83 @@ testPlanNpmProbeFailed = do
     PlanProbeFailed msg ->
       assertTrue "probe err" ("engines.node" `T.isInfixOf` msg)
     other -> assertFailure $ "expected PlanProbeFailed, got " <> show other
+
+testPlanNpmAbsentEnginesUsesDonor :: IO ()
+testPlanNpmAbsentEnginesUsesDonor = do
+  let donor =
+        T.unlines
+          [ "EAPI=8",
+            "inherit npm",
+            "BDEPEND=\">=net-libs/nodejs-22[npm]\""
+          ]
+  ops <-
+    mkDepsPlanOps
+      (listFixed ["2.0.0", "1.0.0"])
+      unusedGoMod
+      (\_ _ -> pure (Left "missing engines.node for pkg@2.0.0"))
+      unusedBun
+      unusedCargo
+      Nothing
+  plan <-
+    assertRight "donor plan"
+      =<< planDepsPackageWithProgressDonor
+        ops
+        noopPlanProgress
+        NpmEco
+        (Npm "@scope/pkg")
+        [parseEbuildVersion "1.0.0"]
+        []
+        (Just donor)
+  let reqs =
+        [ req
+        | lane <- glpLanes plan,
+          ltPackagePV lane == Just (parseEbuildVersion "2.0.0"),
+          Just req <- [ltGoReq lane]
+        ]
+  assertTrue "planned some lane" (not (null reqs))
+  assertTrue "planned node requirement is donor" (all (== "22") reqs)
+  fixed <- assertRight "rewrite" (ensureNodejsBdepend "22" donor)
+  assertTrue "atom kept" (nodejsBdependMatches "22" fixed)
+  assertEq
+    "single [npm]"
+    1
+    (T.count "[npm]" fixed)
+  err <-
+    assertLeftPlan
+      =<< planDepsPackageWithProgressDonor
+        ops
+        noopPlanProgress
+        NpmEco
+        (Npm "@scope/pkg")
+        [parseEbuildVersion "1.0.0"]
+        []
+        (Just "DESCRIPTION=\"no nodejs\"\n")
+  case err of
+    PlanProbeFailed msg ->
+      assertTrue "missing atom named" ("net-libs/nodejs" `T.isInfixOf` msg)
+    other -> assertFailure $ "expected PlanProbeFailed, got " <> show other
+
+testReadNpmDonorHighest :: IO ()
+testReadNpmDonorHighest =
+  withSystemTempDirectory "npm-donor" $ \dir -> do
+    let writeBody name = TIO.writeFile (dir </> name)
+    writeBody "pkg-1.0.0.ebuild" "BDEPEND=\">=net-libs/nodejs-18[npm]\""
+    writeBody "pkg-1.13.0.ebuild" "BDEPEND=\">=net-libs/nodejs-22[npm]\""
+    writeBody "pkg-9999.ebuild" "BDEPEND=\">=net-libs/nodejs-99[npm]\""
+    let mk ver name =
+          Ebuild "dev-util" "pkg" ver (dir </> name)
+    got <-
+      assertRight "highest"
+        =<< readNpmDonorBody
+          [ mk "1.0.0" "pkg-1.0.0.ebuild",
+            mk "9999" "pkg-9999.ebuild",
+            mk "1.13.0" "pkg-1.13.0.ebuild"
+          ]
+          TIO.readFile
+    assertEq
+      "donor is 1.13.0"
+      (Just "BDEPEND=\">=net-libs/nodejs-22[npm]\"")
+      got
 
 assertLeftPlan :: Either PlanError a -> IO PlanError
 assertLeftPlan = \case

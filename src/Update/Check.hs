@@ -64,7 +64,8 @@ import Update.CheckCache
 import Update.Deps.Plan
   ( DepsPlanOps (..),
     planDepsPackageWithCeilingsFor,
-    planDepsPackageWithProgressFor,
+    planDepsPackageWithProgressDonor,
+    readNpmDonorBody,
   )
 import Update.EbuildEdit (defaultAssetsHost)
 import Update.EbuildSelection
@@ -308,24 +309,43 @@ checkPackageDeps mh fetch depsOps cache entry locals src eco = do
           reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan
     _ -> do
       recordFetch cache
-      planResult <-
-        planDepsPackageWithProgressFor
-          depsOps
-          progress
-          eco
-          src
-          localPVs
-          (lookupLaneArches key)
-      case planResult of
+      eDonor <- npmDonorBody eco locals
+      case eDonor of
         Left err ->
           pure
             UpdateReport
               { reportKey = key,
-                reportStatus = FetchError (planErrorMessage err)
+                reportStatus = FetchError err
               }
-        Right plan -> do
-          storeDeps cache key fp mProvFp plan
-          reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan
+        Right mDonor -> do
+          planResult <-
+            planDepsPackageWithProgressDonor
+              depsOps
+              progress
+              eco
+              src
+              localPVs
+              (lookupLaneArches key)
+              mDonor
+          case planResult of
+            Left err ->
+              pure
+                UpdateReport
+                  { reportKey = key,
+                    reportStatus = FetchError (planErrorMessage err)
+                  }
+            Right plan -> do
+              storeDeps cache key fp mProvFp plan
+              reportFromDepsPlan mh fetch depsOps cache eco src entry locals localPVs plan
+
+-- | Donor ebuild body for npm planning. Other ecosystems skip the read.
+npmDonorBody :: EcosystemSpec -> [Ebuild] -> IO (Either Text (Maybe Text))
+npmDonorBody eco locals =
+  case eco of
+    NpmEco ->
+      withNewTreeLock $ \tree ->
+        readNpmDonorBody locals (readEbuild tree)
+    _ -> pure (Right Nothing)
 
 reportFromDepsPlan ::
   MultiHandle ->

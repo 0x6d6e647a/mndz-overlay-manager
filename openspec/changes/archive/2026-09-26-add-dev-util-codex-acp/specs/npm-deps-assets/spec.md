@@ -1,46 +1,6 @@
-## Purpose
+# Spec Delta
 
-Npm registry-only deps cache tarball build, `engines.node` probing, nodejs BDEPEND with `[npm]` USE, host Node gate, and `dev-util/openspec` / `dev-util/rulesync` / `dev-util/claude-agent-acp` / `dev-util/codex-acp` enablement under `DepsAndAssets Npm`.
-
-## Requirements
-
-### Requirement: Registry-only npm cache tarball
-
-For `DepsAndAssets Npm` full-path materialization of PV, the program SHALL, in the unit directories under the product temporary workspace defined by `temp-workspace` without requiring a git clone of the package source: (1) run `npm pack` for the configured npm package at that version (specifier `{npmPackage}@{pv}`) into the unit work area; (2) populate an `npm-cache/` directory under the unit work area via `npm --cache <npm-cache-path> install` of the produced tarball using an empty userconfig (not the operator `~/.npmrc`); (3) create `{pn}-{pv}-deps.tar.xz` under the unit `out/` whose top-level entry is `npm-cache/`, omitting `npm-cache/_logs/` and `npm-cache/_update-notifier*` members, packing with the hermetic tar/xz rules specified by `hermetic-asset-materialize`; (4) after writing the final deps tarball path, verify that the file is an xz-compressed stream and hard-fail if it is plain tar or otherwise not xz. Full-path npm pack/install/tar SHALL run in the materialize container. The program SHALL implement this in-process/Haskell orchestration and SHALL NOT invoke overlay Python helper scripts. Unit temporary trees SHALL follow the `temp-workspace` lifecycle.
-
-#### Scenario: Tarball layout for openspec
-
-- **WHEN** npm cache construction succeeds for PN `openspec` at PV `1.4.2`
-- **THEN** the output file is named `openspec-1.4.2-deps.tar.xz` and unpacking yields a top-level `npm-cache` directory
-
-#### Scenario: Scoped registry package
-
-- **WHEN** the npm source package is `@fission-ai/openspec` and PV is `1.4.2`
-- **THEN** `npm pack` uses `@fission-ai/openspec@1.4.2` while the deps distfile basename uses PN `openspec`
-
-#### Scenario: Npm deps pack uses extreme multi-thread xz
-
-- **WHEN** the manager packs an npm deps tarball
-- **THEN** the pack process uses `XZ_OPT` containing `-T1` and `-9e` (single-thread extreme; hermetic-asset-materialize)
-
-#### Scenario: Npm deps pack rejects non-xz body
-
-- **WHEN** the final `{pn}-{pv}-deps.tar.xz` path is not an xz-compressed stream after pack
-- **THEN** materialize hard-fails before assets publish treats the file as successful
-
-#### Scenario: Packed cache omits logs
-
-- **WHEN** npm cache construction packs the deps tarball
-- **THEN** the archive has no `npm-cache/_logs/` members
-
-### Requirement: Npm source and technique pairing
-
-Apply for `DepsAndAssets Npm` SHALL require `UpdateSource` to be `Npm`. If the technique is `DepsAndAssets Npm` but the source is not `Npm`, apply SHALL hard-fail without publishing assets.
-
-#### Scenario: Wrong source type
-
-- **WHEN** technique is `DepsAndAssets Npm` and source is `GitHub`
-- **THEN** apply hard-fails before materialization
+## MODIFIED Requirements
 
 ### Requirement: engines.node requirement probe
 
@@ -127,47 +87,7 @@ Replacement SHALL consume the full prior Portage atom tail for that package (ver
 - **WHEN** the candidate omits `engines.node` and the donor ebuild contains `>=net-libs/nodejs-22[npm]`
 - **THEN** after overlay rewrite the ebuild contains `>=net-libs/nodejs-22[npm]` with a single `[npm]` USE dependency
 
-### Requirement: Host Node gate on full path
-
-After determining the node requirement for a PV on the full materialize path, the program SHALL compare the materialize-image `node` version to that requirement. If the image is strictly older, the program SHALL hard-fail that PV before `npm pack`/cache population and SHALL NOT publish assets or mutate the overlay for that attempt. The reuse path SHALL NOT apply this gate. The program SHALL NOT require a host `node` binary for this gate.
-
-#### Scenario: Host too old
-
-- **WHEN** engines require `20.19.0` and the materialize image Node is older
-- **THEN** full-path materialize hard-fails without publishing assets
-
-### Requirement: openspec enabled end-to-end
-
-`dev-util/openspec` SHALL use runtime lanes against gentoo `net-libs/nodejs`, npm registry candidates under the shared candidate rule, deps asset publish/reuse, and overlay apply as specified for `DepsAndAssets Npm`. The package SHALL NOT soft-skip solely because npm deps assets are required.
-
-#### Scenario: No longer unsupported
-
-- **WHEN** policy is resolved and apply runs for an outdated `dev-util/openspec`
-- **THEN** the program does not soft-skip with reason unsupported deps assets
-
-### Requirement: rulesync enabled end-to-end
-
-`dev-util/rulesync` SHALL use runtime lanes against gentoo `net-libs/nodejs`, npm registry candidates under the shared candidate rule, deps asset publish/reuse, and overlay apply as specified for `DepsAndAssets Npm`. The package SHALL NOT soft-skip solely because npm deps assets are required.
-
-#### Scenario: No longer unsupported
-
-- **WHEN** policy is resolved and apply runs for an outdated `dev-util/rulesync`
-- **THEN** the program does not soft-skip with reason unsupported deps assets
-
-### Requirement: claude-agent-acp enabled end-to-end
-
-`dev-util/claude-agent-acp` SHALL use runtime lanes against gentoo `net-libs/nodejs`, npm registry candidates for `@agentclientprotocol/claude-agent-acp` under the shared candidate rule, deps asset publish/reuse, and overlay apply as specified for `DepsAndAssets Npm`. The package SHALL NOT soft-skip solely because npm deps assets are required. The hardcoded policy source SHALL be npm package `@agentclientprotocol/claude-agent-acp`.
-
-#### Scenario: No longer unsupported
-
-- **WHEN** policy is resolved and apply runs for an outdated `dev-util/claude-agent-acp`
-- **THEN** the program does not soft-skip with reason unsupported deps assets
-
-#### Scenario: Scoped registry package
-
-- **WHEN** full-path materialize packs a PV for this package
-- **THEN** `npm pack` uses `@agentclientprotocol/claude-agent-acp` at that PV
-- **AND** the deps distfile basename uses PN `claude-agent-acp`
+## ADDED Requirements
 
 ### Requirement: codex-acp enabled end-to-end
 

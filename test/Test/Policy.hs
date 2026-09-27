@@ -254,6 +254,7 @@ import Update.Npm.Cache
   ( fetchNpmEnginesNodeHttpLbs,
     listNpmVersionsHttpLbs,
     productionNpmCacheOps,
+    resolveNpmNodeRequirement,
   )
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
@@ -325,6 +326,7 @@ tests =
       testCase "GitHub Auth Header" testGitHubAuthHeader,
       testCase "List Npm Versions With Fake" testListNpmVersionsWithFake,
       testCase "Fetch Npm Engines With Fake" testFetchNpmEnginesWithFake,
+      testCase "Npm engines donor fallback" testNpmEnginesDonorFallback,
       testCase "Fetch GoMod At Tag With Fake" testFetchGoModAtTagWithFake,
       testCase "Types Helper Predicates" testTypesHelperPredicates
     ]
@@ -476,6 +478,17 @@ testPolicyClassification = do
         pure ()
     other -> do
       hPutStrLn stderr $ "claude-agent-acp technique: " <> show other
+      exitFailure
+  case lookupPolicy (PackageKey "dev-util/codex-acp") of
+    Just
+      ( PackagePolicy
+          (Npm "@agentclientprotocol/codex-acp")
+          (DepsAndAssets NpmEco)
+          ["amd64"]
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "codex-acp technique: " <> show other
       exitFailure
   case lookupPolicy (PackageKey "dev-util/ralph-tui") of
     Just (PackagePolicy _ (DepsAndAssets Bun) []) -> pure ()
@@ -993,6 +1006,64 @@ testFetchNpmEnginesWithFake = do
     assertLeft "bad json"
       =<< fetchNpmEnginesNodeHttpLbs httpBadJson "pkg" "1.0.0"
   assertTrue "decode" (not (T.null errJson))
+
+donorNode22 :: T.Text
+donorNode22 =
+  T.unlines
+    [ "EAPI=8",
+      "inherit npm",
+      "",
+      "BDEPEND=\">=net-libs/nodejs-22[npm]\"",
+      "KEYWORDS=\"-* ~amd64\""
+    ]
+
+testNpmEnginesDonorFallback :: IO ()
+testNpmEnginesDonorFallback = do
+  let omitted = Left "missing engines.node for pkg@1.13.1"
+      star = Left "unparseable engines.node for pkg@1.13.1: *"
+      present = Right "20.19.0"
+  ver <-
+    assertRight
+      "omitted uses donor"
+      (resolveNpmNodeRequirement omitted (Just donorNode22))
+  assertEq "donor version" "22" ver
+  let cand =
+        VersionCandidate
+          { vcPV = parseEbuildVersion "1.13.1",
+            vcGoReq = Just ver
+          }
+  assertEq
+    "eligible under ceiling 22"
+    (Just (parseEbuildVersion "1.13.1", "22"))
+    (maxVersionUnder (parseEbuildVersion "22.22.2") [cand])
+  errNoDonor <-
+    assertLeft
+      "no donor ebuild"
+      (resolveNpmNodeRequirement omitted Nothing)
+  assertTrue "names nodejs atom" ("net-libs/nodejs" `T.isInfixOf` errNoDonor)
+  errNoAtom <-
+    assertLeft
+      "donor without atom"
+      (resolveNpmNodeRequirement omitted (Just "DESCRIPTION=\"x\"\n"))
+  assertTrue "names missing atom" ("net-libs/nodejs" `T.isInfixOf` errNoAtom)
+  errStar <-
+    assertLeft
+      "star ignores donor"
+      (resolveNpmNodeRequirement star (Just donorNode22))
+  assertTrue "unparseable kept" ("unparseable engines.node" `T.isInfixOf` errStar)
+  presentVer <-
+    assertRight
+      "present engines win"
+      (resolveNpmNodeRequirement present (Just donorNode22))
+  assertEq "probed minimum" "20.19.0" presentVer
+  fixed <-
+    assertRight
+      "bdepend rewrite"
+      (ensureNodejsBdepend ver donorNode22)
+  assertTrue "donor atom kept" (nodejsBdependMatches "22" fixed)
+  let depLines = [ln | ln <- T.lines fixed, "nodejs" `T.isInfixOf` ln]
+  assertEq "single [npm]" 1 (sum (map (T.count "[npm]") depLines))
+  assertTrue "no mangled use" (not ("[npm]npm]" `T.isInfixOf` fixed))
 
 ------------------------------------------------------------------------
 -- Update.Go.ModFetch Fake-HTTP

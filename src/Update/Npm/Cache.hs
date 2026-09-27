@@ -8,6 +8,7 @@ module Update.Npm.Cache
     buildNpmDepsTarball,
     fetchNpmEnginesNode,
     fetchNpmEnginesNodeHttpLbs,
+    resolveNpmNodeRequirement,
     listNpmVersions,
     listNpmVersionsHttpLbs,
     hostNodeVersion,
@@ -280,6 +281,44 @@ parseEnginesNode =
       Nothing -> fail "no engines"
       Just eng ->
         withObject "engines" (.: "node") eng
+
+-- | Probe omitted @engines.node@ (the field is absent). Unparseable values
+-- and transport errors use a different message and must not match.
+isNpmEnginesOmitted :: Text -> Bool
+isNpmEnginesOmitted = T.isPrefixOf "missing engines.node"
+
+-- | Node requirement for one PV.
+--
+-- A present parseable probe wins. When registry metadata omits
+-- @engines.node@, use the donor ebuild's
+-- @>=net-libs/nodejs-<version>[npm]@ atom. A present unparseable value
+-- does not fall back to the donor.
+resolveNpmNodeRequirement :: Either Text Text -> Maybe Text -> Either Text Text
+resolveNpmNodeRequirement (Right ver) _ = Right ver
+resolveNpmNodeRequirement (Left err) mDonor
+  | isNpmEnginesOmitted err =
+      case mDonor >>= parseDonorNodejsVersion of
+        Just ver -> Right ver
+        Nothing ->
+          Left "missing donor atom >=net-libs/nodejs-<version>[npm]"
+  | otherwise = Left err
+
+-- | Version token from the first @>=net-libs/nodejs-<version>[npm]@ atom.
+parseDonorNodejsVersion :: Text -> Maybe Text
+parseDonorNodejsVersion = go
+  where
+    marker = ">=net-libs/nodejs-"
+    go t =
+      case T.breakOn marker t of
+        (_, rest)
+          | T.null rest -> Nothing
+          | otherwise ->
+              let after = T.drop (T.length marker) rest
+                  ver = T.takeWhile (\c -> isDigit c || c == '.') after
+                  restAfter = T.drop (T.length ver) after
+               in if not (T.null ver) && "[npm]" `T.isPrefixOf` restAfter
+                    then Just ver
+                    else go (T.drop 1 rest)
 
 -- | Fetch engines.node for a package version from the npm registry.
 fetchNpmEnginesNode :: Manager -> Text -> Text -> IO (Either Text Text)

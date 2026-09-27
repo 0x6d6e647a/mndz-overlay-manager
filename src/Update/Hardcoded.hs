@@ -79,6 +79,11 @@ hardcodedPolicies =
         (Npm "@agentclientprotocol/claude-agent-acp")
         (DepsAndAssets NpmEco)
         ["amd64"],
+      policyArches
+        "dev-util/codex-acp"
+        (Npm "@agentclientprotocol/codex-acp")
+        (DepsAndAssets NpmEco)
+        ["amd64"],
       policy
         "dev-util/ralph-tui"
         (GitHub "subsy" "ralph-tui" "v")

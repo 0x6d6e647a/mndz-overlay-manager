@@ -79,7 +79,8 @@ import Update.CheckCache
 import Update.Deps.Plan
   ( DepsPlanOps (..),
     planDepsPackageWithCeilingsFor,
-    planDepsPackageWithProgressFor,
+    planDepsPackageWithProgressDonor,
+    readNpmDonorBody,
   )
 import Update.DiskSpace
   ( MaterializeClass (..),
@@ -91,7 +92,8 @@ import Update.DiskSpace
     readManifestMaybe,
   )
 import Update.Go.Lanes
-  ( RuntimeLanePlan (..),
+  ( PlanError (..),
+    RuntimeLanePlan (..),
     missingTargets,
     planErrorMessage,
     planNeedsWork,
@@ -99,7 +101,7 @@ import Update.Go.Lanes
 import Update.Go.Plan (PlanProgress (..), localNonLivePVs)
 import Update.Hardcoded (lookupLaneArches, lookupPolicy)
 import Update.Manifest.Dist (exactDistSize)
-import Update.OverlayTree (ObserveOverlay)
+import Update.OverlayTree (ObserveOverlay, readEbuild)
 import Update.OverlayWaves
   ( OverlayCeilingPlan (..),
     bunBinPackageKey,
@@ -335,13 +337,18 @@ planDeps env entry locals src eco = do
               pure (Right plan)
         _ -> do
           recordFetch cache
-          planDepsPackageWithProgressFor
-            depsOps
-            progress
-            eco
-            src
-            localPVs
-            (lookupLaneArches key)
+          eDonor <- loadNpmDonor env eco locals
+          case eDonor of
+            Left err -> pure (Left (PlanFailed err))
+            Right mDonor ->
+              planDepsPackageWithProgressDonor
+                depsOps
+                progress
+                eco
+                src
+                localPVs
+                (lookupLaneArches key)
+                mDonor
       case planResult of
         Left err ->
           pure $
@@ -480,6 +487,19 @@ planDepsHypo env entry locals src eco localPVs =
           planDepsOnDiskFallback env entry locals src eco localPVs
     _ -> planDepsOnDiskFallback env entry locals src eco localPVs
 
+-- | Highest non-live ebuild body for npm donor-floor planning.
+loadNpmDonor ::
+  PlanEnv ->
+  EcosystemSpec ->
+  [Ebuild] ->
+  IO (Either Text (Maybe Text))
+loadNpmDonor env eco locals =
+  case eco of
+    NpmEco ->
+      peObserveTree env $ \tree ->
+        readNpmDonorBody locals (readEbuild tree)
+    _ -> pure (Right Nothing)
+
 -- | On-disk plan without cache store (hypo-path fallback only).
 planDepsOnDiskFallback ::
   PlanEnv ->
@@ -494,14 +514,18 @@ planDepsOnDiskFallback env entry locals src eco localPVs = do
       depsOps = peDepsPlanOps env
       progress = planProgress (peMulti env) key eco
   recordFetch (peCheckCache env)
-  planResult <-
-    planDepsPackageWithProgressFor
-      depsOps
-      progress
-      eco
-      src
-      localPVs
-      (lookupLaneArches key)
+  eDonor <- loadNpmDonor env eco locals
+  planResult <- case eDonor of
+    Left err -> pure (Left (PlanFailed err))
+    Right mDonor ->
+      planDepsPackageWithProgressDonor
+        depsOps
+        progress
+        eco
+        src
+        localPVs
+        (lookupLaneArches key)
+        mDonor
   case planResult of
     Left err ->
       pure $
