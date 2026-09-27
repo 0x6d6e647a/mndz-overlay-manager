@@ -10,7 +10,7 @@ Portage `IUSE=test` + `RESTRICT="!test? ( test )"` convention for non-prebuilt m
 
 Every non-prebuilt mndz-overlay package that exposes a Portage test phase SHALL declare `test` in `IUSE` and SHALL set `RESTRICT` to include `!test? ( test )` (merged with any other RESTRICT tokens) so Portage skips the test phase when `USE=-test` even if `FEATURES` includes `test`.
 
-Prebuilt packages (`dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`) are exempt from this requirement.
+Prebuilt packages (`dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, `dev-util/grok-bot-bin`) are exempt from this requirement.
 
 #### Scenario: Compliant package has both tokens
 
@@ -23,6 +23,12 @@ Prebuilt packages (`dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build
 - **WHEN** `dev-db/badger` is inspected
 - **THEN** it satisfies the convention (`IUSE` includes `test`, `RESTRICT` includes `!test? ( test )`, and `src_test` runs Go tests)
 - **AND** a content-only revbump is not required solely to restate that compliance
+
+#### Scenario: Grok Bot is prebuilt
+
+- **WHEN** `dev-util/grok-bot-bin` is inspected
+- **THEN** it is exempt from the `IUSE=test` convention
+- **AND** its `IUSE` does not include `test`
 
 ### Requirement: Mandatory revision bump for non-version ebuild content edits
 

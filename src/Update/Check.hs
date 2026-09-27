@@ -96,7 +96,7 @@ import Update.Go.Plan
     localNonLivePVs,
   )
 import Update.Hardcoded (lookupLaneArches, lookupPolicy)
-import Update.Http (fetchHttpWith)
+import Update.Http (fetchHttpJsonWith, fetchHttpWith)
 import Update.Npm (fetchNpmWith)
 import Update.OverlayTree (InTree, readEbuild, withNewTreeLock)
 import Update.OverlayWaves
@@ -710,6 +710,7 @@ productionFetcherWithLatch latch mToken = do
   mgr <- newManager tlsManagerSettings
   pure $ \src -> case src of
     Http {} -> fetchHttpWith mgr src
+    HttpJson {} -> fetchHttpJsonWith mgr src
     GitHub {} -> fetchGitHubWithLatch latch mgr mToken src
     Npm {} -> fetchNpmWith mgr src
 

@@ -43,6 +43,17 @@ hardcodedPolicies =
         )
         GitMvAndManifest,
       policy
+        "dev-util/grok-bot-bin"
+        ( HttpJson
+            { httpJsonUrls =
+                [ "https://api2.cursor.sh/updates/api/download/stable/linux-x64/sand",
+                  "https://api2.cursor.sh/updates/api/download/stable/linux-arm64/sand"
+                ],
+              httpJsonField = "version"
+            }
+        )
+        GitMvAndManifest,
+      policy
         "dev-lisp/qlot"
         (GitHub "fukamachi" "qlot" "")
         GitMvAndManifest,

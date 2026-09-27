@@ -28,6 +28,7 @@ import Update.Distfiles
 import Update.Git (GitOps)
 import Update.Go.Plan (PlanOps)
 import Update.Go.Vendor (VendorOps)
+import Update.Http (HttpLbs)
 import Update.Md5Cache (EgencacheRunner)
 import Update.Npm.Cache (NpmCacheOps)
 import Update.OverlayTree (TreeLock)
@@ -71,6 +72,8 @@ productionEbuildRunner distDir = mkEbuildRunner distDir productionCommandRunner
 
 data ApplyEnv = ApplyEnv
   { aeFetcher :: Fetcher,
+    -- | Raw HTTP for apply-time feed reads (grok-bot commit pin). Tests inject this.
+    aeHttpLbs :: HttpLbs,
     aeGitOps :: GitOps,
     aeEbuildRunner :: EbuildRunner,
     aeEgencacheRunner :: EgencacheRunner,

@@ -46,6 +46,7 @@ module Update.EbuildEdit
     ensureSbclAtom,
     ensureRustMinVer,
     parseQuotedAssignment,
+    replaceQuotedAssignment,
     ensureQuotedAssignment,
     ensureCodexV8Overlay,
     ensureCodexV8OverlayFor,
@@ -842,6 +843,16 @@ parseQuotedAssignment key content =
     [] -> Nothing
   where
     prefix = key <> "="
+
+-- | Replace the single @KEY=\"...\"@ assignment. Missing or repeated keys fail.
+replaceQuotedAssignment :: Text -> Text -> Text -> Either Text Text
+replaceQuotedAssignment key value content =
+  case filter isKey (T.lines content) of
+    [_] -> Right (ensureQuotedAssignment key value content)
+    [] -> Left ("ebuild has no " <> key <> " assignment")
+    _ -> Left ("ebuild has multiple " <> key <> " assignments")
+  where
+    isKey ln = (key <> "=") `T.isPrefixOf` T.stripStart ln
 
 -- | Replace or insert @KEY=\"value\"@. Inserts after an existing @RUSTY_V8_VER@,
 -- else @RUST_MIN_VER@, else last @inherit@, else at the end.

@@ -195,6 +195,8 @@ updateSourceId = \case
   GitHub owner repo _prefix -> "github:" <> owner <> "/" <> repo
   Npm pkg -> "npm:" <> pkg
   Http primary _fb -> "http:" <> primary
+  HttpJson urls field ->
+    "httpjson:" <> field <> ":" <> T.intercalate "," urls
 
 data CacheFingerprint = CacheFingerprint
   { cfLocalPvs :: [Text],

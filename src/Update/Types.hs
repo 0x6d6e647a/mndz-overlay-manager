@@ -44,6 +44,11 @@ data UpdateSource
       { httpPrimary :: Text,
         httpFallback :: Maybe Text
       }
+  | -- | JSON object body. Every URL must yield the same version field.
+    HttpJson
+      { httpJsonUrls :: [Text],
+        httpJsonField :: Text
+      }
   deriving (Eq, Ord, Show)
 
 -- | @category/package@ key.

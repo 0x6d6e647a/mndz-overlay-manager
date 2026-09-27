@@ -318,6 +318,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
   pure
     ApplyEnv
       { aeFetcher = \_ -> pure (Left "unused"),
+        aeHttpLbs = \_ -> pure (Left "unused http"),
         aeGitOps = gitOps,
         aeEbuildRunner = ebuildRun,
         aeEgencacheRunner = mockEgencacheWriteMatching,

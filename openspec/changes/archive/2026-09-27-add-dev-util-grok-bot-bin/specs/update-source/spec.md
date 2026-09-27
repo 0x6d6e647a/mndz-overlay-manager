@@ -1,10 +1,6 @@
-# update-source Specification
+# Spec Delta
 
-## Purpose
-
-Define how packages obtain upstream version information: the update-source model (GitHub, npm, Http, HttpJson), hardcoded package-to-source mapping, fetching latest version, and listing comparable GitHub versions for runtime-lane planning.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Update source model
 
@@ -94,17 +90,3 @@ For `dev-util/grok-bot-bin`, the comparable version SHALL be the version from th
 
 - **WHEN** fetch for one package fails with an HTTP error
 - **THEN** that package is reported as an error outcome and other packages continue to be checked
-
-### Requirement: List comparable GitHub versions
-
-For a GitHub update source, the library SHALL be able to list comparable package versions by retrieving repository tags and/or releases (with pagination as needed), stripping the configured tag prefix, parsing ebuild-style numeric versions, and returning the set of comparable versions ordered by PV comparison. This list capability SHALL be available to the Go tree-lane planner in addition to the existing single “latest” fetch. Non-comparable or empty-after-strip tags SHALL be omitted. Optional `GITHUB_TOKEN` MAY authenticate requests as for latest fetch.
-
-#### Scenario: Multiple versions returned
-
-- **WHEN** a GitHub repository has tags `v0.80.0`, `v0.82.0`, and `v0.84.0` with prefix `v`
-- **THEN** the version list includes numeric PVs `0.80.0`, `0.82.0`, and `0.84.0`
-
-#### Scenario: Prefix strip on list
-
-- **WHEN** tags use prefix `bun-v` and a tag is `bun-v1.2.3`
-- **THEN** the listed version parses as PV `1.2.3`

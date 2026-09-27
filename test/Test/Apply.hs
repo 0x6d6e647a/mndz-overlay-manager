@@ -42,6 +42,8 @@ import Control.Monad (forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BSC
+import Data.ByteString.Lazy qualified as LBS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
@@ -56,6 +58,7 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
+import Network.HTTP.Client (path)
 import Overlay.Discovery
   ( DiscoveryError (..),
     collectEbuilds,
@@ -76,6 +79,7 @@ import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (callProcess)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
+import Test.HttpFake (fakeResponse)
 import Test.Support
   ( dualArchGoCeilings,
     mkTestApplyEnv,
@@ -311,6 +315,7 @@ integrationTests =
     [ testCase "Content Fix Manifest" testContentFixManifest,
       testCase "Reuse Vs Full Publish" testReuseVsFullPublish,
       testCase "Git Mv Commits On Success" testGitMvCommitsOnSuccess,
+      testCase "Grok Bot GitMv Commit Rewrite" testGrokBotGitMvCommitRewrite,
       testCase "Go Multi Pv Sequential Commits" testGoMultiPvSequentialCommits,
       testCase "Go Multi Pv Stop On Hard Fail" testGoMultiPvStopOnHardFail,
       testCase "Full Path Apply Progress Sequence" testFullPathApplyProgressSequence,
@@ -804,7 +809,198 @@ testGitMvCommitsOnSuccess =
         hPutStrLn stderr ("expected single ApplySuccess, got: " <> show other)
         exitFailure
 
--- | Two Go PVs: commit after first; second dirty check sees clean tree; two commits.
+grokBotIuse :: T.Text
+grokBotIuse = "IUSE=\"+wayland +pulseaudio +libnotify suid apparmor\""
+
+grokBotEbuild :: Maybe T.Text -> T.Text
+grokBotEbuild mCommit =
+  T.unlines $
+    ["EAPI=8"]
+      <> [ "GROK_BOT_COMMIT=\"" <> commit <> "\""
+         | Just commit <- [mCommit]
+         ]
+      <> [ "SRC_URI=\"amd64? ( https://downloads.cursor.com/grokbot/stable/${GROK_BOT_COMMIT}/linux/x64/grok-bot_${PV}_amd64.deb )\"",
+           grokBotIuse,
+           "src_install() {",
+           "\t# install /opt/Grok Bot",
+           "}"
+         ]
+
+grokBotFeed :: T.Text -> T.Text -> T.Text -> T.Text -> LBS.ByteString
+grokBotFeed ver commit linux debArch =
+  let deb =
+        "https://downloads.cursor.com/grokbot/stable/"
+          <> commit
+          <> "/linux/"
+          <> linux
+          <> "/grok-bot_"
+          <> ver
+          <> "_"
+          <> debArch
+          <> ".deb"
+      obj =
+        "{\"version\":\""
+          <> ver
+          <> "\",\"commitSha\":\""
+          <> commit
+          <> "\",\"debUrl\":\""
+          <> deb
+          <> "\"}"
+   in LBS.fromStrict (encodeUtf8 obj)
+
+-- | Bump grok-bot-bin and report whether manifest ran and the ebuild was renamed.
+runGrokBotGitMv ::
+  String ->
+  T.Text ->
+  LBS.ByteString ->
+  LBS.ByteString ->
+  IO (ApplyOutcome, Int, Bool, Bool, T.Text)
+runGrokBotGitMv label body x64Body armBody =
+  withSystemTempDirectory label $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        pkgDir = overlayRoot </> "dev-util" </> "grok-bot-bin"
+        oldName = "grok-bot-bin-0.61.0.ebuild"
+        newName = "grok-bot-bin-0.62.0.ebuild"
+        oldPath = pkgDir </> oldName
+        newPath = pkgDir </> newName
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "grok-bot-bin",
+              pePN = "grok-bot-bin",
+              peLocal = parseEbuildVersion "0.61.0",
+              pePath = oldPath
+            }
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile oldPath body
+    TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+    writeMatchingCachesForPackage overlayRoot "dev-util" "grok-bot-bin" pkgDir
+    manifests <- newIORef (0 :: Int)
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
+            }
+        ebuildRun dir name = do
+          atomicModifyIORef' manifests (\n -> (n + 1, ()))
+          TIO.writeFile (dir </> "Manifest") ("DIST " <> T.pack name <> " 1\n")
+          pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Left "unused"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+        http req =
+          let p = path req
+              feed
+                | "linux-arm64" `BSC.isInfixOf` p = armBody
+                | "linux-x64" `BSC.isInfixOf` p = x64Body
+                | otherwise = "{}"
+           in pure (Right (fakeResponse 200 feed))
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 1
+    ceilingsCache <- newMVar Nothing
+    env0 <-
+      mkTestApplyEnv
+        gitOps
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        ebuildRun
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let env =
+          env0
+            { aeFetcher = \_ -> pure (Right (parseEbuildVersion "0.62.0")),
+              aeHttpLbs = http
+            }
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    nMan <- readIORef manifests
+    oldExists <- doesFileExist oldPath
+    newExists <- doesFileExist newPath
+    newBody <- if newExists then TIO.readFile newPath else pure ""
+    outcome <- case outcomes of
+      [one] -> pure one
+      other -> do
+        hPutStrLn stderr ("expected one grok-bot outcome, got: " <> show other)
+        exitFailure
+    pure (outcome, nMan, oldExists, newExists, newBody)
+
+testGrokBotGitMvCommitRewrite :: IO ()
+testGrokBotGitMvCommitRewrite = do
+  let okX = grokBotFeed "0.62.0" "abc123" "x64" "amd64"
+      okA = grokBotFeed "0.62.0" "abc123" "arm64" "arm64"
+  (ok, nOk, oldOk, newOk, body) <-
+    runGrokBotGitMv
+      "mndz-grok-bot-ok-"
+      (grokBotEbuild (Just "oldsha"))
+      okX
+      okA
+  case ok of
+    ApplySuccess {} -> pure ()
+    other -> do
+      hPutStrLn stderr ("expected grok-bot success, got: " <> show other)
+      exitFailure
+  assertEq "manifest ran" 1 nOk
+  assertTrue "old ebuild renamed away" (not oldOk)
+  assertTrue "new ebuild exists" newOk
+  assertTrue "commit abc123" ("GROK_BOT_COMMIT=\"abc123\"" `T.isInfixOf` body)
+  assertTrue "IUSE preserved" (grokBotIuse `T.isInfixOf` body)
+  assertTrue "install layout preserved" ("/opt/Grok Bot" `T.isInfixOf` body)
+  assertTrue "old commit replaced" (not ("oldsha" `T.isInfixOf` body))
+  let mismatchX = grokBotFeed "0.63.0" "abc123" "x64" "amd64"
+      mismatchA = grokBotFeed "0.63.0" "abc123" "arm64" "arm64"
+  (mismatch, nMis, oldMis, newMis, _) <-
+    runGrokBotGitMv
+      "mndz-grok-bot-ver-"
+      (grokBotEbuild (Just "oldsha"))
+      mismatchX
+      mismatchA
+  assertHardNoRename "feed version" mismatch nMis oldMis newMis
+  let badUrl = LBS.fromStrict (encodeUtf8 "{\"version\":\"0.62.0\",\"commitSha\":\"abc123\",\"debUrl\":\"https://example.invalid/grok.deb\"}")
+  (drift, nDrift, oldDrift, newDrift, _) <-
+    runGrokBotGitMv
+      "mndz-grok-bot-url-"
+      (grokBotEbuild (Just "oldsha"))
+      badUrl
+      badUrl
+  assertHardNoRename "debUrl" drift nDrift oldDrift newDrift
+  assertEq "debUrl does not run manifest" 0 nDrift
+  let commitX = grokBotFeed "0.62.0" "abc123" "x64" "amd64"
+      commitA = grokBotFeed "0.62.0" "def456" "arm64" "arm64"
+  (split, nSplit, oldSplit, newSplit, _) <-
+    runGrokBotGitMv
+      "mndz-grok-bot-commit-"
+      (grokBotEbuild (Just "oldsha"))
+      commitX
+      commitA
+  assertHardNoRename "unequal commits" split nSplit oldSplit newSplit
+  (missing, nMissing, oldMissing, newMissing, _) <-
+    runGrokBotGitMv
+      "mndz-grok-bot-assign-"
+      (grokBotEbuild Nothing)
+      okX
+      okA
+  assertHardNoRename "missing assignment" missing nMissing oldMissing newMissing
+  assertEq "missing assignment skips manifest" 0 nMissing
+
+assertHardNoRename :: String -> ApplyOutcome -> Int -> Bool -> Bool -> IO ()
+assertHardNoRename label outcome nMan oldExists newExists = do
+  case outcome of
+    ApplyHardFail _ _ half _ ->
+      assertTrue (label <> " is not half-applied") (not half)
+    other -> do
+      hPutStrLn stderr (label <> " expected hard fail, got: " <> show other)
+      exitFailure
+  assertEq (label <> " does not run manifest") 0 nMan
+  assertTrue (label <> " does not rename") (oldExists && not newExists)
 
 -- | Two Go PVs: commit after first; second dirty check sees clean tree; two commits.
 testGoMultiPvSequentialCommits :: IO ()

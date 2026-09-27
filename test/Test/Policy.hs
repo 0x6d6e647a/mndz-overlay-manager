@@ -231,7 +231,7 @@ import Update.GpgAgent
     teardownGpgHandle,
   )
 import Update.Hardcoded (lookupHardcoded, lookupPolicy)
-import Update.Http (fetchHttpWith, fetchHttpWithHttp, tryHttp)
+import Update.Http (fetchHttpJsonWithHttp, fetchHttpWith, fetchHttpWithHttp, tryHttp)
 import Update.Md5Cache
   ( EgencacheRequest (..),
     GencacheAction (..),
@@ -309,6 +309,7 @@ tests =
   testGroup
     "Policy"
     [ testCase "Hardcoded Grok" testHardcodedGrok,
+      testCase "Hardcoded Grok Bot" testHardcodedGrokBot,
       testCase "Policy Classification" testPolicyClassification,
       testCase "Resolve Map Only" testResolveMapOnly,
       testCase "Group Newest" testGroupNewest,
@@ -318,6 +319,8 @@ tests =
       testCase "Try Http" testTryHttp,
       testCase "Fetch Http Wrong Source" testFetchHttpWrongSource,
       testCase "Fetch Http With Fake" testFetchHttpWithFake,
+      testCase "Fetch HttpJson With Fake" testFetchHttpJsonWithFake,
+      testCase "Fetch Grok Bot Feeds Agree" testFetchGrokBotFeedsAgree,
       testCase "Fetch Npm Wrong Source" testFetchNpmWrongSource,
       testCase "Fetch Npm With Fake" testFetchNpmWithFake,
       testCase "Fetch GitHub With Fake" testFetchGitHubWithFake,
@@ -344,6 +347,19 @@ testHardcodedGrok = do
       assertTrue "fallback mentions gcs" ("storage.googleapis.com" `T.isInfixOf` fb)
     other -> do
       hPutStrLn stderr $ "expected hardcoded Http, got " <> show other
+      exitFailure
+  assertEq "resolve map only" (lookupHardcoded key) (resolveSource key)
+
+testHardcodedGrokBot :: IO ()
+testHardcodedGrokBot = do
+  let key = PackageKey "dev-util/grok-bot-bin"
+      x64 = "https://api2.cursor.sh/updates/api/download/stable/linux-x64/sand"
+      arm = "https://api2.cursor.sh/updates/api/download/stable/linux-arm64/sand"
+  case lookupPolicy key of
+    Just (PackagePolicy (HttpJson urls "version") GitMvAndManifest []) ->
+      assertEq "feeds" [x64, arm] urls
+    other -> do
+      hPutStrLn stderr $ "grok-bot policy: " <> show other
       exitFailure
   assertEq "resolve map only" (lookupHardcoded key) (resolveSource key)
 
@@ -702,6 +718,56 @@ testFetchHttpWithFake = do
     assertLeft "no fallback"
       =<< fetchHttpWithHttp httpOnce (Http "https://example.com/v" Nothing)
   assertTrue "500" ("HTTP 500" `T.isInfixOf` errOnly)
+
+testFetchHttpJsonWithFake :: IO ()
+testFetchHttpJsonWithFake = do
+  let body =
+        "{\"version\":\"0.61.0\",\"commitSha\":\"47a9d1df3a7d37aaa53d206ab2d1f9159a336223\"}"
+      http _ = pure (Right (fakeResponse 200 body))
+      src = HttpJson ["https://example.com/feed"] "version"
+  ver <- assertRight "httpjson" =<< fetchHttpJsonWithHttp http src
+  assertEq "pv" (parseEbuildVersion "0.61.0") ver
+  plain <-
+    assertRight "plain http"
+      =<< fetchHttpWithHttp http (Http "https://example.com/feed" Nothing)
+  assertTrue "plain body is not PV 0.61.0" (plain /= parseEbuildVersion "0.61.0")
+  let httpMissing _ = pure (Right (fakeResponse 200 "{\"commitSha\":\"abc\"}"))
+      httpArray _ = pure (Right (fakeResponse 200 "[]"))
+      httpNum _ = pure (Right (fakeResponse 200 "{\"version\":1}"))
+      httpText _ = pure (Right (fakeResponse 200 "{\"version\":\"nope\"}"))
+  errMiss <- assertLeft "missing" =<< fetchHttpJsonWithHttp httpMissing src
+  assertTrue "missing field" ("missing field" `T.isInfixOf` errMiss)
+  errArr <- assertLeft "array" =<< fetchHttpJsonWithHttp httpArray src
+  assertTrue "not object" ("not a JSON object" `T.isInfixOf` errArr)
+  errNum <- assertLeft "number" =<< fetchHttpJsonWithHttp httpNum src
+  assertTrue "number is not a version" ("not a version string" `T.isInfixOf` errNum)
+  errText <- assertLeft "text" =<< fetchHttpJsonWithHttp httpText src
+  assertTrue "text is not a version" ("not a version string" `T.isInfixOf` errText)
+
+testFetchGrokBotFeedsAgree :: IO ()
+testFetchGrokBotFeedsAgree = do
+  let key = PackageKey "dev-util/grok-bot-bin"
+  src <- case lookupHardcoded key of
+    Just s@HttpJson {} -> pure s
+    other -> do
+      hPutStrLn stderr $ "expected grok-bot HttpJson, got " <> show other
+      exitFailure
+  let http bodies req =
+        let p = path req
+            body
+              | "linux-arm64" `BSC.isInfixOf` p = snd bodies
+              | "linux-x64" `BSC.isInfixOf` p = fst bodies
+              | otherwise = "{}"
+         in pure (Right (fakeResponse 200 body))
+      json v = "{\"version\":\"" <> v <> "\",\"commitSha\":\"abc\"}"
+  ver <-
+    assertRight "agree"
+      =<< fetchHttpJsonWithHttp (http (json "0.62.0", json "0.62.0")) src
+  assertEq "shared pv" (parseEbuildVersion "0.62.0") ver
+  err <-
+    assertLeft "disagree"
+      =<< fetchHttpJsonWithHttp (http (json "0.62.0", json "0.61.0")) src
+  assertTrue "versions disagree" ("disagree" `T.isInfixOf` err)
 
 testFetchNpmWrongSource :: IO ()
 testFetchNpmWrongSource = do

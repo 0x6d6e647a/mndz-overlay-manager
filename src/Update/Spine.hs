@@ -24,6 +24,8 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Text (Text)
+import Network.HTTP.Client (newManager)
+import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild)
 import Overlay.Version (renderPV)
 import System.Exit (ExitCode (..))
@@ -67,6 +69,7 @@ import Update.Git (GitOps (..))
 import Update.GitHub (GitHubLatch, gitHubAbortLog, parseGitHubOrigin, peekGitHubLatch)
 import Update.Go.Vendor (mkVendorOps)
 import Update.Hardcoded (lookupPolicy)
+import Update.Http (httpLbsEither)
 import Update.Materialize
   ( EnsureOutcome (..),
     NeededFloors (..),
@@ -555,6 +558,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                               | otherwise -> do
                                   cfg <- resolveMaterializeDockerCfg (rrRunId tempRun)
                                   pure (Just (cfg, inner))
+                        httpMgr <- newManager tlsManagerSettings
                         let closedRun _ =
                               pure
                                 ProcessResult
@@ -565,6 +569,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                             env =
                               ApplyEnv
                                 { aeFetcher = usdFetcher deps,
+                                  aeHttpLbs = httpLbsEither httpMgr,
                                   aeGitOps = usdGitOps deps,
                                   aeEbuildRunner = usdEbuildRunner deps,
                                   aeEgencacheRunner = usdEgencacheRunner deps,

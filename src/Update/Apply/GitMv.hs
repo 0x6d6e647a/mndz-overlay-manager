@@ -13,6 +13,7 @@ module Update.Apply.GitMv
 where
 
 import CLI.Progress (MultiHandle (..))
+import Control.Monad (when)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -45,8 +46,9 @@ import Update.CheckCache
     recordHit,
     storeLatest,
   )
-import Update.EbuildEdit (setSlotField)
+import Update.EbuildEdit (replaceQuotedAssignment, setSlotField)
 import Update.Git (GitOps (..), relativeOverlayPath)
+import Update.Http (resolveGrokBotCommit)
 import Update.Md5Cache (inspectPackageCache)
 import Update.OverlayTree
   ( InTree,
@@ -172,7 +174,7 @@ applyGitMvFilesWithRemote env overlayRoot entry src remote = do
   case comparePV local remote of
     Just LT -> do
       mhStatus mh key "applying"
-      result <- gitMvFiles env key local remote oldPath pkgDir pn overlayRoot
+      result <- gitMvFiles env key local remote oldPath pkgDir pn overlayRoot src
       case result of
         Right pending -> do
           eFp' <-
@@ -236,8 +238,9 @@ gitMvFiles ::
   FilePath ->
   Text ->
   FilePath ->
+  UpdateSource ->
   IO (Either ApplyOutcome PendingGitMvCommit)
-gitMvFiles env key local remote oldPath pkgDir pn overlayRoot = do
+gitMvFiles env key local remote oldPath pkgDir pn overlayRoot src = do
   let gitOps = aeGitOps env
   eGate <-
     withOverlayTreeChecked (aeTreeLock env) $ \tree ->
@@ -257,7 +260,7 @@ gitMvFiles env key local remote oldPath pkgDir pn overlayRoot = do
         Right True ->
           pure $ Left $ applyUnitHardFail key ApplyDirtyInvolvedPaths False False
         Right False ->
-          publishGitMv env key local remote oldPath pkgDir pn overlayRoot ebuildRel Set.empty
+          publishGitMv env key local remote oldPath pkgDir pn overlayRoot ebuildRel src Set.empty
 
 -- | Observation plus the ebuild rename or add-keep writes, then manifest outside the lock.
 publishGitMv ::
@@ -270,100 +273,129 @@ publishGitMv ::
   Text ->
   FilePath ->
   FilePath ->
+  UpdateSource ->
   Set PackageKey ->
   IO (Either ApplyOutcome PendingGitMvCommit)
-publishGitMv env key local remote oldPath pkgDir pn overlayRoot ebuildRel waited = do
-  let mh = aeMulti env
-      newName = newEbuildFileName pn remote
-      newPath = pkgDir </> newName
-  eStep <-
-    withOverlayTreeChecked (aeTreeLock env) $ \tree -> do
-      existsNew <- doesFileExist newPath
-      if existsNew && takeFileName oldPath /= newName
-        then
-          pure $
-            GitMvTreePlainFail ("target ebuild already exists: " <> T.pack newName)
-        else do
-          ePlan <-
-            guardGitMvRenameAway
-              tree
-              (aeAtomClosure env)
-              overlayRoot
-              key
-              local
-              remote
-          case ePlan of
-            Left err -> pure (GitMvTreeAtomFail err)
-            Right plan -> do
-              eBody <- readEbuildEither tree oldPath
-              case eBody of
-                Left err -> pure (GitMvTreePlainFail err)
-                Right body -> do
-                  eObs <-
-                    observeAtomClosure
-                      tree
-                      (aeAtomClosure env)
-                      overlayRoot
-                      key
-                      body
-                      waited
-                  case eObs of
-                    Left err -> pure (GitMvTreeAtomFail err)
-                    Right (AtomClosureRefuse msg) -> pure (GitMvTreeAtomFail msg)
-                    Right (AtomClosureWait provider) -> pure (GitMvTreeWait provider)
-                    Right AtomClosureSatisfied ->
-                      case plan of
-                        GitMvRenameNewest -> do
-                          includeOld <-
-                            if takeFileName oldPath == newName
-                              then pure False
-                              else do
-                                renameEbuild tree oldPath newPath
-                                pure True
-                          pure $
-                            GitMvTreeWrote
-                              GitMvWrote
-                                { gwIncludeOld = includeOld,
-                                  gwNewName = newName,
-                                  gwNewPath = newPath
-                                }
-                        GitMvAddKeepPin -> do
-                          let pinSlot = renderPVNoRev local
-                          writeEbuild tree newPath (setSlotField "0" body)
-                          writeEbuild tree oldPath (setSlotField pinSlot body)
-                          pure $
-                            GitMvTreeWrote
-                              GitMvWrote
-                                { gwIncludeOld = True,
-                                  gwNewName = newName,
-                                  gwNewPath = newPath
-                                }
-  case eStep of
-    Left err ->
-      pure $ Left $ ApplyHardFail key err True False
-    Right (GitMvTreePlainFail msg) ->
-      pure $ Left $ ApplyHardFail key msg False False
-    Right (GitMvTreeAtomFail msg) ->
-      pure $ Left $ applyUnitHardFail key (ApplyAtomClosure msg) False False
-    Right (GitMvTreeWait provider) -> do
-      waitedRes <- awaitAtomProvider (aeAtomClosure env) mh key provider
-      case waitedRes of
+publishGitMv env key local remote oldPath pkgDir pn overlayRoot ebuildRel src waited = do
+  -- Re-read the feeds at apply time so a cached version cannot choose the commit.
+  eCommit <- grokBotCommitForApply env key src remote
+  case eCommit of
+    Left err -> pure (Left (ApplyHardFail key err False False))
+    Right mCommit -> do
+      let mh = aeMulti env
+          newName = newEbuildFileName pn remote
+          newPath = pkgDir </> newName
+      eStep <-
+        withOverlayTreeChecked (aeTreeLock env) $ \tree -> do
+          existsNew <- doesFileExist newPath
+          if existsNew && takeFileName oldPath /= newName
+            then
+              pure $
+                GitMvTreePlainFail ("target ebuild already exists: " <> T.pack newName)
+            else do
+              ePlan <-
+                guardGitMvRenameAway
+                  tree
+                  (aeAtomClosure env)
+                  overlayRoot
+                  key
+                  local
+                  remote
+              case ePlan of
+                Left err -> pure (GitMvTreeAtomFail err)
+                Right plan -> do
+                  eBody <- readEbuildEither tree oldPath
+                  case eBody of
+                    Left err -> pure (GitMvTreePlainFail err)
+                    Right body ->
+                      case prepareGrokBotBody mCommit body of
+                        Left err -> pure (GitMvTreePlainFail err)
+                        Right body' -> do
+                          eObs <-
+                            observeAtomClosure
+                              tree
+                              (aeAtomClosure env)
+                              overlayRoot
+                              key
+                              body
+                              waited
+                          case eObs of
+                            Left err -> pure (GitMvTreeAtomFail err)
+                            Right (AtomClosureRefuse msg) -> pure (GitMvTreeAtomFail msg)
+                            Right (AtomClosureWait provider) -> pure (GitMvTreeWait provider)
+                            Right AtomClosureSatisfied ->
+                              case plan of
+                                GitMvRenameNewest -> do
+                                  includeOld <-
+                                    if takeFileName oldPath == newName
+                                      then pure False
+                                      else do
+                                        renameEbuild tree oldPath newPath
+                                        pure True
+                                  when (body' /= body) (writeEbuild tree newPath body')
+                                  pure $
+                                    GitMvTreeWrote
+                                      GitMvWrote
+                                        { gwIncludeOld = includeOld,
+                                          gwNewName = newName,
+                                          gwNewPath = newPath
+                                        }
+                                GitMvAddKeepPin -> do
+                                  let pinSlot = renderPVNoRev local
+                                  writeEbuild tree newPath (setSlotField "0" body')
+                                  writeEbuild tree oldPath (setSlotField pinSlot body)
+                                  pure $
+                                    GitMvTreeWrote
+                                      GitMvWrote
+                                        { gwIncludeOld = True,
+                                          gwNewName = newName,
+                                          gwNewPath = newPath
+                                        }
+      case eStep of
         Left err ->
-          pure $ Left $ applyUnitHardFail key (ApplyAtomClosure err) False False
-        Right () ->
-          publishGitMv
-            env
-            key
-            local
-            remote
-            oldPath
-            pkgDir
-            pn
-            overlayRoot
-            ebuildRel
-            (Set.insert provider waited)
-    Right (GitMvTreeWrote wrote) ->
-      finishGitMvManifest env key local remote pkgDir overlayRoot ebuildRel wrote
+          pure $ Left $ ApplyHardFail key err True False
+        Right (GitMvTreePlainFail msg) ->
+          pure $ Left $ ApplyHardFail key msg False False
+        Right (GitMvTreeAtomFail msg) ->
+          pure $ Left $ applyUnitHardFail key (ApplyAtomClosure msg) False False
+        Right (GitMvTreeWait provider) -> do
+          waitedRes <- awaitAtomProvider (aeAtomClosure env) mh key provider
+          case waitedRes of
+            Left err ->
+              pure $ Left $ applyUnitHardFail key (ApplyAtomClosure err) False False
+            Right () ->
+              publishGitMv
+                env
+                key
+                local
+                remote
+                oldPath
+                pkgDir
+                pn
+                overlayRoot
+                ebuildRel
+                src
+                (Set.insert provider waited)
+        Right (GitMvTreeWrote wrote) ->
+          finishGitMvManifest env key local remote pkgDir overlayRoot ebuildRel wrote
+
+-- | @Just@ commit for grok-bot-bin; @Nothing@ leaves every other GitMv body unchanged.
+grokBotCommitForApply ::
+  ApplyEnv ->
+  PackageKey ->
+  UpdateSource ->
+  EbuildVersion ->
+  IO (Either Text (Maybe Text))
+grokBotCommitForApply env key src remote =
+  case splitPackageKey key of
+    Just ("dev-util", "grok-bot-bin") ->
+      fmap Just <$> resolveGrokBotCommit (aeHttpLbs env) src remote
+    _ -> pure (Right Nothing)
+
+prepareGrokBotBody :: Maybe Text -> Text -> Either Text Text
+prepareGrokBotBody Nothing body = Right body
+prepareGrokBotBody (Just commit) body =
+  replaceQuotedAssignment "GROK_BOT_COMMIT" commit body
 
 data GitMvTreeStep
   = GitMvTreeWait PackageKey
