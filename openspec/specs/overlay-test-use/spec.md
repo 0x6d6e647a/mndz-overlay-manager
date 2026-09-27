@@ -69,7 +69,7 @@ The mndz-overlay package `dev-util/ralph-tui` SHALL declare `IUSE` including `te
 
 ### Requirement: Go packages with existing suites are USE-gated
 
-`dev-db/dolt`, `dev-util/beads`, and `dev-util/crush` SHALL each declare `IUSE` including `test`, set `RESTRICT` including `!test? ( test )`, retain a `src_test` that runs the package Go tests (`ego test` or equivalent), and publish content-only gate fixes as revision bumps.
+`dev-db/dolt`, `dev-util/beads`, `dev-util/crush`, and `dev-util/gastown` SHALL each declare `IUSE` including `test`, set `RESTRICT` including `!test? ( test )`, retain a `src_test` that runs the package Go tests (`ego test` or equivalent), and publish content-only gate fixes as revision bumps. For `dev-util/gastown`, `src_test` SHALL run the Go tests in short mode.
 
 #### Scenario: dolt gated
 
@@ -82,6 +82,13 @@ The mndz-overlay package `dev-util/ralph-tui` SHALL declare `IUSE` including `te
 
 - **WHEN** the live beads and crush ebuilds are inspected
 - **THEN** each satisfies the same IUSE, RESTRICT, `src_test`, and revision rules as dolt
+
+#### Scenario: gastown gated
+
+- **WHEN** the live gastown ebuild is inspected
+- **THEN** it includes `test` in `IUSE` and `!test? ( test )` in `RESTRICT`
+- **AND** `src_test` runs the Go tests in short mode
+- **AND** an initial ebuild that already contains the gate is compliant without a revision bump solely for that gate
 
 ### Requirement: Cargo packages gate inherited cargo_src_test
 

@@ -175,6 +175,7 @@ nonEbuildAllowlist =
     "src/Update/Cargo/Msrv.hs",
     "src/Update/DiskSpace.hs",
     "src/Update/Distfiles.hs",
+    "src/Update/Gastown/Gates.hs",
     "src/Update/GitHubToken.hs",
     "src/Update/GpgAgent.hs",
     "src/Update/Go/Vendor.hs",

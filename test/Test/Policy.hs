@@ -476,6 +476,17 @@ testPolicyClassification = do
     other -> do
       hPutStrLn stderr $ "beads technique: " <> show other
       exitFailure
+  case lookupPolicy (PackageKey "dev-util/gastown") of
+    Just
+      ( PackagePolicy
+          (GitHub "gastownhall" "gastown" "v")
+          (DepsAndAssets (Go Nothing))
+          []
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "gastown technique: " <> show other
+      exitFailure
   case lookupPolicy (PackageKey "dev-db/badger") of
     Just
       ( PackagePolicy

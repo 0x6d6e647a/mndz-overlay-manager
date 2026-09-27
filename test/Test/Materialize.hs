@@ -539,6 +539,7 @@ testMissingTemplateHardFail =
         (Just "1.26.5")
         Nothing
         Nothing
+        Nothing
     case outcome of
       ApplyHardFail k msg _ _ -> do
         assertEq "hard-fail key" key k

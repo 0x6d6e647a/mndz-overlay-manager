@@ -86,6 +86,10 @@ hardcodedPolicies =
         (GitHub "dgraph-io" "badger" "v")
         (DepsAndAssets (Go Nothing)),
       policy
+        "dev-util/gastown"
+        (GitHub "gastownhall" "gastown" "v")
+        (DepsAndAssets (Go Nothing)),
+      policy
         "dev-util/openspec"
         (Npm "@fission-ai/openspec")
         (DepsAndAssets NpmEco),

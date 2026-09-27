@@ -138,6 +138,7 @@ import Update.EbuildEdit
     sbclBdependAtom,
     writeVersionForPlannedPV,
   )
+import Update.Gastown.Gates (isGastownKey)
 import Update.Git (GitOps (..), relativeOverlayPath)
 import Update.Go.Lanes
   ( GapLine (..),
@@ -157,9 +158,11 @@ import Update.Go.Plan
     isLivePackageVersion,
   )
 import Update.Go.Vendor
-  ( VendorProgress (..),
+  ( VendorOps (..),
+    VendorProgress (..),
     VendorResult (..),
     buildVendorTarball,
+    githubCloneUrl,
     mkVendorOps,
     versionTag,
   )
@@ -1258,6 +1261,7 @@ fullDepsPublishAndOverlay
                             mReqVer
                             mEbuildBody
                             mCodexV8
+                            (gastownCheckout key (udWork unit </> "src"))
                         case outcome of
                           ApplySuccess {} -> do
                             markMaterializeStep stepsDoneRef mh key "regenerating manifest"
@@ -1860,34 +1864,45 @@ reuseDepsReleaseAsset
               Right mReq -> do
                 markMaterializeStep stepsDoneRef mh key verifyLabel
                 mhStatus mh key "regenerating manifest"
-                outcome <-
-                  overlayAfterAssets
-                    env
-                    overlayRoot
-                    entry
-                    eco
-                    keywords
-                    reusedLines
-                    targetVer
-                    distDigests
-                    mReq
-                    Nothing
-                    Nothing
-                case outcome of
-                  ApplySuccess k sls paths -> do
-                    markMaterializeStep stepsDoneRef mh key "regenerating manifest"
-                    deleteUnit unit
-                    pure (ApplySuccess k sls paths)
-                  ApplySoftSkip k reason -> do
-                    deleteUnit unit
-                    pure (ApplySoftSkip k reason)
-                  ApplyHardFail k failMsg half assetsPub ->
+                eCheckout <- gastownReuseCheckout env src key pvNoRev (udWork unit)
+                case eCheckout of
+                  Left err ->
                     pure $
                       ApplyHardFail
-                        k
-                        (retainUnitError unit failMsg)
-                        half
-                        assetsPub
+                        key
+                        (retainUnitError unit err)
+                        False
+                        True
+                  Right mCheckout -> do
+                    outcome <-
+                      overlayAfterAssets
+                        env
+                        overlayRoot
+                        entry
+                        eco
+                        keywords
+                        reusedLines
+                        targetVer
+                        distDigests
+                        mReq
+                        Nothing
+                        Nothing
+                        mCheckout
+                    case outcome of
+                      ApplySuccess k sls paths -> do
+                        markMaterializeStep stepsDoneRef mh key "regenerating manifest"
+                        deleteUnit unit
+                        pure (ApplySuccess k sls paths)
+                      ApplySoftSkip k reason -> do
+                        deleteUnit unit
+                        pure (ApplySoftSkip k reason)
+                      ApplyHardFail k failMsg half assetsPub ->
+                        pure $
+                          ApplyHardFail
+                            k
+                            (retainUnitError unit failMsg)
+                            half
+                            assetsPub
 
 downloadNamedAssets ::
   ReleaseOps ->
@@ -1957,6 +1972,43 @@ checkSidecarSha512IfPresent assetsRoot category pn tarballName expectedSha = do
               ( "could not parse assets-repo SHA512 sidecar for "
                   <> T.pack tarballName
               )
+
+-- | Full-path Gas Town already cloned under unit @work/src@.
+gastownCheckout :: PackageKey -> FilePath -> Maybe FilePath
+gastownCheckout key dir
+  | isGastownKey key = Just dir
+  | otherwise = Nothing
+
+-- | Reuse path has no vendor clone. Gas Town still needs the tag tree.
+gastownReuseCheckout ::
+  ApplyEnv ->
+  UpdateSource ->
+  PackageKey ->
+  Text ->
+  FilePath ->
+  IO (Either Text (Maybe FilePath))
+gastownReuseCheckout env src key pv workDir
+  | not (isGastownKey key) = pure (Right Nothing)
+  | otherwise =
+      case src of
+        GitHub owner repo prefix -> do
+          let dest = workDir </> "gate"
+          cloned <-
+            voClone (aeVendorOps env) (githubCloneUrl owner repo) (versionTag prefix pv) dest
+          pure $ case cloned of
+            Left err ->
+              Left
+                ( "dev-util/gastown: could not check out "
+                    <> versionTag prefix pv
+                    <> " to read dependency gates: "
+                    <> err
+                )
+            Right () -> Right (Just dest)
+        _ ->
+          pure
+            ( Left
+                "dev-util/gastown: GitHub source is required to read MinDoltVersion and the Beads version gate"
+            )
 
 -- | go.mod @go@ directive for BDEPEND without a vendor clone (reuse path).
 fetchGoModVersion ::

@@ -19,6 +19,7 @@ import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Version (EbuildVersion, comparePV, parseEbuildVersion, renderPV)
 import System.Directory (doesFileExist)
 import System.FilePath (takeDirectory, takeFileName, (</>))
+import System.IO (stdout)
 import Update.Apply.Commit (egencacheAndSignedCommit, unitCommitMessage)
 import Update.Apply.Env (ApplyEnv (..), EbuildRunner)
 import Update.Apply.Errors
@@ -54,6 +55,7 @@ import Update.EbuildSelection
   ( InventoryFile (..),
     selectCanonicalSamePV,
   )
+import Update.Gastown.Gates (isGastownKey, prepareGastownEbuild)
 import Update.Git (GitOps (..), relativeOverlayPath)
 import Update.Manifest.Dist (exactDistSHA512)
 import Update.OverlayTree
@@ -101,8 +103,10 @@ overlayAfterAssets ::
   Maybe Text ->
   -- | Codex rusty_v8 pin write; 'Nothing' for every other package.
   Maybe CodexV8Overlay ->
+  -- | Gas Town tag checkout. Required for @dev-util/gastown@; ignored otherwise.
+  Maybe FilePath ->
   IO ApplyOutcome
-overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDigests mReqVer mEbuildBody mCodexV8 = do
+overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDigests mReqVer mEbuildBody mCodexV8 mGastownSrc = do
   let key = peKey entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
@@ -161,6 +165,7 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
                     mReqVer
                     mEbuildBody
                     mCodexV8
+                    mGastownSrc
                     templateContent
                     ebuildRun
                     gitOps
@@ -183,6 +188,7 @@ publishPrepared ::
   Maybe Text ->
   Maybe Text ->
   Maybe CodexV8Overlay ->
+  Maybe FilePath ->
   Text ->
   EbuildRunner ->
   GitOps ->
@@ -204,6 +210,7 @@ publishPrepared
   mReqVer
   mEbuildBody
   mCodexV8
+  mGastownSrc
   templateContent
   ebuildRun
   _gitOps = do
@@ -264,22 +271,44 @@ publishPrepared
             pure (Left "could not obtain sbcl.version floor for SBCL atom alignment")
         case contentFixed of
           Left err -> pure $ ApplyHardFail key err False orphan
-          Right fixed ->
-            publishOverlayBody
-              env
-              overlayRoot
-              key
-              pn
-              pkgDir
-              templatePath
-              ebuildRel
-              orphan
-              lines_
-              targetVer
-              distDigests
-              fixed
-              ebuildRun
-              Set.empty
+          Right fixed -> do
+            gated <- applyGastownIfNeeded key mGastownSrc fixed
+            case gated of
+              Left err -> pure $ ApplyHardFail key err False orphan
+              Right (body, mNotice) ->
+                publishOverlayBody
+                  env
+                  overlayRoot
+                  key
+                  pn
+                  pkgDir
+                  templatePath
+                  ebuildRel
+                  orphan
+                  lines_
+                  targetVer
+                  distDigests
+                  body
+                  mNotice
+                  ebuildRun
+                  Set.empty
+
+-- | Rewrite Gas Town's Dolt atom and Beads window before any overlay write.
+applyGastownIfNeeded ::
+  PackageKey ->
+  Maybe FilePath ->
+  Text ->
+  IO (Either Text (Text, Maybe Text))
+applyGastownIfNeeded key mSrc body
+  | not (isGastownKey key) = pure (Right (body, Nothing))
+  | otherwise =
+      case mSrc of
+        Nothing ->
+          pure
+            ( Left
+                "dev-util/gastown: tag checkout is required to read MinDoltVersion and the Beads version gate"
+            )
+        Just src -> prepareGastownEbuild src body
 
 publishOverlayBody ::
   ApplyEnv ->
@@ -294,6 +323,8 @@ publishOverlayBody ::
   EbuildVersion ->
   [(FilePath, FileDigests)] ->
   Text ->
+  -- | Beads window notice, printed only after the signed commit succeeds.
+  Maybe Text ->
   EbuildRunner ->
   Set PackageKey ->
   IO ApplyOutcome
@@ -310,6 +341,7 @@ publishOverlayBody
   targetVer
   distDigests
   fixed
+  mNotice
   ebuildRun
   waited = do
     let newName = ebuildFileNameWithRev pn targetVer
@@ -357,6 +389,7 @@ publishOverlayBody
               targetVer
               distDigests
               fixed
+              mNotice
               ebuildRun
               (Set.insert provider waited)
       Right (Right (Right removedTemplate)) -> do
@@ -382,9 +415,11 @@ publishOverlayBody
                     key
                     unitPaths
                     msg
-                pure $ case committed of
-                  Right paths -> ApplySuccess key lines_ paths
-                  Left err -> ApplyHardFail key err True orphan
+                case committed of
+                  Right paths -> do
+                    mapM_ (TIO.hPutStrLn stdout) mNotice
+                    pure (ApplySuccess key lines_ paths)
+                  Left err -> pure (ApplyHardFail key err True orphan)
 
 removeTemplateIfTarget ::
   InTree ->

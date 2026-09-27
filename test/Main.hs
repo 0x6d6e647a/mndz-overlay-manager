@@ -13,6 +13,7 @@ import Test.Distfiles qualified as Distfiles
 import Test.EbuildEdit qualified as EbuildEdit
 import Test.Ecosystems qualified as Ecosystems
 import Test.Ensure qualified as Ensure
+import Test.Gastown qualified as Gastown
 import Test.Git qualified as Git
 import Test.GitHubResilience qualified as GitHubResilience
 import Test.Gpg qualified as Gpg
@@ -71,6 +72,7 @@ main = do
               Preflight.tests,
               Assets.tests,
               EbuildEdit.tests,
+              Gastown.tests,
               Ssh.tests,
               Gpg.tests,
               Git.tests,

@@ -98,6 +98,7 @@ library
       , Update.Distfiles
       , Update.EbuildEdit
       , Update.Engines
+      , Update.Gastown.Gates
       , Update.Git
       , Update.GitHub
       , Update.GitHubHealth
@@ -245,6 +246,7 @@ test-suite mndz-overlay-manager-test
         Test.EbuildEdit
         Test.Ensure
         Test.Ecosystems
+        Test.Gastown
         Test.Git
         Test.GitHubResilience
         Test.Gpg
