@@ -54,6 +54,14 @@ hardcodedPolicies =
         )
         GitMvAndManifest,
       policy
+        "net-analyzer/witen-warden-bin"
+        ( Http
+            { httpPrimary = "https://www.witenlabs.com/api/releases/warden/version",
+              httpFallback = Nothing
+            }
+        )
+        GitMvAndManifest,
+      policy
         "dev-lisp/qlot"
         (GitHub "fukamachi" "qlot" "")
         GitMvAndManifest,

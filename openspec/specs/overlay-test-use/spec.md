@@ -10,7 +10,7 @@ Portage `IUSE=test` + `RESTRICT="!test? ( test )"` convention for non-prebuilt m
 
 Every non-prebuilt mndz-overlay package that exposes a Portage test phase SHALL declare `test` in `IUSE` and SHALL set `RESTRICT` to include `!test? ( test )` (merged with any other RESTRICT tokens) so Portage skips the test phase when `USE=-test` even if `FEATURES` includes `test`.
 
-Prebuilt packages (`dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, `dev-util/grok-bot-bin`) are exempt from this requirement.
+Prebuilt packages (`dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, `dev-util/grok-bot-bin`, `net-analyzer/witen-warden-bin`) are exempt from this requirement.
 
 #### Scenario: Compliant package has both tokens
 
@@ -27,6 +27,12 @@ Prebuilt packages (`dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build
 #### Scenario: Grok Bot is prebuilt
 
 - **WHEN** `dev-util/grok-bot-bin` is inspected
+- **THEN** it is exempt from the `IUSE=test` convention
+- **AND** its `IUSE` does not include `test`
+
+#### Scenario: Warden is prebuilt
+
+- **WHEN** `net-analyzer/witen-warden-bin` is inspected
 - **THEN** it is exempt from the `IUSE=test` convention
 - **AND** its `IUSE` does not include `test`
 

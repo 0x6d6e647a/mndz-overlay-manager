@@ -28,7 +28,7 @@ The library SHALL model an update source as one of: GitHub (owner, repository, t
 
 ### Requirement: Hardcoded source overrides
 
-The library SHALL provide a hardcoded map from package key `category/package` to update source as part of each package’s policy entry. Resolution of an update source SHALL use only this hardcoded map. At minimum, `dev-util/grok-build-bin` SHALL map to an Http source for the grok-build stable channel (primary `https://x.ai/cli/stable` with the known GCS fallback). `dev-util/grok-bot-bin` SHALL map to the Cursor stable download feeds `https://api2.cursor.sh/updates/api/download/stable/linux-x64/sand` and `https://api2.cursor.sh/updates/api/download/stable/linux-arm64/sand`, each an HttpJson source whose version field is `version`. The map SHALL also include explicit sources for all other packages known in the mndz overlay policy set (GitHub, npm, Http, or HttpJson as appropriate).
+The library SHALL provide a hardcoded map from package key `category/package` to update source as part of each package’s policy entry. Resolution of an update source SHALL use only this hardcoded map. At minimum, `dev-util/grok-build-bin` SHALL map to an Http source for the grok-build stable channel (primary `https://x.ai/cli/stable` with the known GCS fallback). `dev-util/grok-bot-bin` SHALL map to the Cursor stable download feeds `https://api2.cursor.sh/updates/api/download/stable/linux-x64/sand` and `https://api2.cursor.sh/updates/api/download/stable/linux-arm64/sand`, each an HttpJson source whose version field is `version`. `net-analyzer/witen-warden-bin` SHALL map to an Http source whose primary URL is `https://www.witenlabs.com/api/releases/warden/version` and which has no fallback URL. The map SHALL also include explicit sources for all other packages known in the mndz overlay policy set (GitHub, npm, Http, or HttpJson as appropriate).
 
 #### Scenario: Grok-build uses hardcoded Http
 
@@ -40,6 +40,12 @@ The library SHALL provide a hardcoded map from package key `category/package` to
 - **WHEN** resolving an update source for `dev-util/grok-bot-bin`
 - **THEN** the linux-x64 and linux-arm64 stable download feeds are used
 - **AND** each feed's version is the JSON field `version`
+
+#### Scenario: Warden uses the version feed
+
+- **WHEN** resolving an update source for `net-analyzer/witen-warden-bin`
+- **THEN** the Http source primary URL is `https://www.witenlabs.com/api/releases/warden/version`
+- **AND** that source has no fallback URL
 
 #### Scenario: Mapped GitHub package
 

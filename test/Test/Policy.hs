@@ -310,6 +310,7 @@ tests =
     "Policy"
     [ testCase "Hardcoded Grok" testHardcodedGrok,
       testCase "Hardcoded Grok Bot" testHardcodedGrokBot,
+      testCase "Hardcoded Warden" testHardcodedWarden,
       testCase "Policy Classification" testPolicyClassification,
       testCase "Resolve Map Only" testResolveMapOnly,
       testCase "Group Newest" testGroupNewest,
@@ -360,6 +361,18 @@ testHardcodedGrokBot = do
       assertEq "feeds" [x64, arm] urls
     other -> do
       hPutStrLn stderr $ "grok-bot policy: " <> show other
+      exitFailure
+  assertEq "resolve map only" (lookupHardcoded key) (resolveSource key)
+
+testHardcodedWarden :: IO ()
+testHardcodedWarden = do
+  let key = PackageKey "net-analyzer/witen-warden-bin"
+      primary = "https://www.witenlabs.com/api/releases/warden/version"
+  case lookupPolicy key of
+    Just (PackagePolicy (Http url Nothing) GitMvAndManifest []) ->
+      assertEq "primary" primary url
+    other -> do
+      hPutStrLn stderr $ "warden policy: " <> show other
       exitFailure
   assertEq "resolve map only" (lookupHardcoded key) (resolveSource key)
 

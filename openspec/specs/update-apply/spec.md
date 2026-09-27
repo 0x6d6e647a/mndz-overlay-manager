@@ -40,6 +40,7 @@ The program SHALL model a package policy that binds a package key `category/pack
 The hardcoded policy map SHALL include an entry for every package known to ship in the mndz overlay that this manager automates, each with both a source and a technique. At minimum:
 
 - `dev-lang/bun-bin`, `dev-lang/deno-bin`, `dev-util/grok-build-bin`, and `dev-util/grok-bot-bin` SHALL use `GitMvAndManifest`
+- `net-analyzer/witen-warden-bin` SHALL use `GitMvAndManifest` with Http source `https://www.witenlabs.com/api/releases/warden/version`
 - `dev-lisp/qlot` SHALL use `GitMvAndManifest` with GitHub source `fukamachi/qlot` and an empty tag prefix
 - `dev-build/node-gyp` SHALL use `DepsAndAssets Npm` with npm source `node-gyp`
 - `dev-db/dolt` (go.mod subdir `go`), `dev-util/beads` (root), `dev-util/crush` (root), and `dev-db/badger` (root) SHALL use `DepsAndAssets` with ecosystem `Go` and their existing GitHub sources (`dolthub/dolt`, `gastownhall/beads`, `charmbracelet/crush`, `dgraph-io/badger` with tag prefix `v`)
@@ -48,7 +49,7 @@ The hardcoded policy map SHALL include an entry for every package known to ship 
 - `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets Cargo` with GitHub sources (`jdx` / respective repos / tag prefix `v`); `usage` SHALL use package subdirectory `cli` when required for package metadata
 - `dev-util/autolith` SHALL use `DepsAndAssets Sbcl` with GitHub source `luciusmagn/autolith` and tag prefix `v`
 
-The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone. `dev-lisp/qlot` SHALL NOT be an overlay wait-edge provider for Autolith or other packages. `dev-build/node-gyp` SHALL NOT be an overlay wait-edge provider for opencode, ralph-tui, or other packages. `dev-util/grok-bot-bin` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
+The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone. `dev-lisp/qlot` SHALL NOT be an overlay wait-edge provider for Autolith or other packages. `dev-build/node-gyp` SHALL NOT be an overlay wait-edge provider for opencode, ralph-tui, or other packages. `dev-util/grok-bot-bin` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image. `net-analyzer/witen-warden-bin` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
 
 #### Scenario: Simple binary package is GitMvAndManifest
 
@@ -59,6 +60,12 @@ The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for c
 
 - **WHEN** policy is resolved for `dev-util/grok-bot-bin`
 - **THEN** the technique is `GitMvAndManifest`
+
+#### Scenario: Warden is GitMvAndManifest
+
+- **WHEN** policy is resolved for `net-analyzer/witen-warden-bin`
+- **THEN** the technique is `GitMvAndManifest`
+- **AND** the source is Http `https://www.witenlabs.com/api/releases/warden/version`
 
 #### Scenario: Go package is DepsAndAssets Go
 
@@ -256,6 +263,17 @@ Apply SHALL hard-fail the package without overlay mutation when any of the follo
 - **WHEN** a feed's `debUrl` does not end in `grok-bot_<version>_<arch>.deb` under that feed's `commitSha`
 - **THEN** that package hard-fails
 - **AND** `ebuild manifest` does not run for it
+
+### Requirement: Warden GitMv preserves the ebuild body
+
+A `GitMvAndManifest` apply for `net-analyzer/witen-warden-bin` SHALL rename the newest ebuild to the remote PV and SHALL NOT rewrite the ebuild body. Both `SRC_URI` shapes, `IUSE`, dependencies, and the install layout SHALL be unchanged aside from `${PV}` expansion at build time.
+
+#### Scenario: Bump from 0.1.17 keeps the distfile templates
+
+- **WHEN** apply bumps `witen-warden-bin` from `0.1.17` to `0.1.19`
+- **THEN** the new ebuild is `witen-warden-bin-0.1.19.ebuild`
+- **AND** its body still contains `witen-warden-${PV}-linux-amd64-glibc.tar.gz` and `witen-warden_${PV}-1_amd64.deb`
+- **AND** `IUSE` and the `/usr/bin/warden` install layout are unchanged
 
 ### Requirement: Dirty involved paths block package update
 
