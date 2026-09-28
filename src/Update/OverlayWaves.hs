@@ -32,7 +32,6 @@ module Update.OverlayWaves
     dirtyPreflightStepLabel,
     computeOverlayProviderFingerprint,
     fetchOverlayProviderLatest,
-    blockedOnLabel,
   )
 where
 
@@ -306,11 +305,6 @@ computeOverlayProviderFingerprint tree overlayRoot tech =
               Just
                 <$> computeFingerprintFromDir tree (policySource policy) dir pn
         _ -> pure Nothing
-
--- | Operator-facing blocked-on fragment for @outdated@ lines.
-blockedOnLabel :: PackageKey -> Text
-blockedOnLabel provider =
-  "blocked on " <> packageKeyText provider
 
 -- | GitMv latest for an overlay ceiling provider (check-cache latest allowed).
 fetchOverlayProviderLatest ::

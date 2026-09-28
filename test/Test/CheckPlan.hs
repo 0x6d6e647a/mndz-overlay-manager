@@ -9,7 +9,8 @@ import CLI.Progress (MultiHandle (..), noopMultiHandle)
 import Config.Types (CheckCacheTtl (..))
 import Control.Concurrent.MVar (modifyMVar_, newMVar)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (isNothing)
+import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (newManager)
@@ -60,7 +61,7 @@ import Update.Go.Lanes
 import Update.Go.ModFetch (GoModKey (..))
 import Update.Go.Plan (noopPlanProgress)
 import Update.OverlayTree (withNewTreeLock)
-import Update.OverlayWaves (bunBinPackageKey)
+import Update.OverlayWaves (bunBinPackageKey, overlayRefuseMessage)
 import Update.Runtime.Ceilings (RuntimeCeilings (..))
 import Update.Types
   ( CargoSource (..),
@@ -70,6 +71,7 @@ import Update.Types
     UpdateReport (..),
     UpdateSource (..),
     UpdateStatus (..),
+    formatOutdatedLine,
     mkPackageKey,
   )
 
@@ -78,6 +80,9 @@ unitTests =
   testGroup
     "CheckPlan"
     [ testGroup
+        "formatOutdatedLine"
+        [testCase "gap, removal, and note" testFormatOutdatedLine],
+      testGroup
         "checkPackage GitMvAndManifest"
         [ testCase "outdated" testCheckPackageOutdated,
           testCase "ok" testCheckPackageOk,
@@ -147,7 +152,15 @@ integrationTests =
       testCase "outdated ralph blocked on bun-bin" testOutdatedBlockedOn,
       testCase "outdated fail-closed when bun-bin latest missing" testOutdatedFailClosed,
       testCase "outdated bun-bin still has its own line" testOutdatedBunBinOwnLine,
-      testCase "equal ceilings skip blocked-on and second list/probe" testOutdatedEqualCeilingsSkip
+      testCase "equal ceilings skip blocked-on and second list/probe" testOutdatedEqualCeilingsSkip,
+      testCase "two hypothetical lanes stay two lines" testOutdatedTwoHypoLanes,
+      testCase "satisfied hypothetical plan prints nothing" testOutdatedSatisfiedHypoSilent,
+      testCase "left-out plan-delta with nothing to print still refuses" testOutdatedLeftOutRefuseOnly,
+      testCase "provider not GitMv-outdated keeps on-disk lines" testOutdatedProviderNotOutdated,
+      testCase "prune-only package prints removal lines" testOutdatedPruneOnly,
+      testCase "pinned PV is not reported removed" testOutdatedPinnedNotRemoved,
+      testCase "keep-set failure does not guess a removal" testOutdatedKeepFailure,
+      testCase "GitMv bun-bin does not use removal lines" testOutdatedGitMvNoRemoval
     ]
 
 ------------------------------------------------------------------------
@@ -354,7 +367,7 @@ testCheckPackageDepsGoOutdated = do
       src = GitHub "gastownhall" "beads" "v"
   cache <- disabledCache
   report <-
-    checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src (Go Nothing)
+    checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src (Go Nothing) Set.empty
   assertTrue "outdated gaps" (isOutdated (reportStatus report))
   assertEq "key" (PackageKey "dev-util/beads") (reportKey report)
 
@@ -385,16 +398,17 @@ testCheckPackageDepsSbclOutdated = do
       src = GitHub "luciusmagn" "autolith" "v"
   cache <- disabledCache
   report <-
-    checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src Sbcl
+    checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src Sbcl Set.empty
   case reportStatus report of
     Outdated lines_ -> do
-      assertTrue "has gaps" (not (null lines_))
+      let gaps = [ol | ol@OutdatedLine {} <- lines_]
+      assertTrue "has gaps" (not (null gaps))
       assertTrue
         "sbcl label"
-        (any (maybe False ("dev-lisp/sbcl" `T.isInfixOf`) . olLabel) lines_)
+        (any (maybe False ("dev-lisp/sbcl" `T.isInfixOf`) . olLabel) gaps)
       assertTrue
         "targets 0.18.0"
-        (any (\l -> olTo l == parseEbuildVersion "0.18.0") lines_)
+        (any (\l -> olTo l == parseEbuildVersion "0.18.0") gaps)
     other -> assertFailure $ "expected Outdated, got " <> show other
 
 testCheckPackageDepsPlanFail :: IO ()
@@ -412,7 +426,7 @@ testCheckPackageDepsPlanFail = do
       src = Npm "@fission-ai/openspec"
   cache <- disabledCache
   report <-
-    checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src NpmEco
+    checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src NpmEco Set.empty
   case reportStatus report of
     FetchError msg ->
       assertTrue
@@ -1046,10 +1060,12 @@ assertContentOnlyReusable :: String -> UpdateStatus -> IO ()
 assertContentOnlyReusable label status =
   case status of
     Outdated lines_ -> do
-      assertTrue (label <> " non-empty gaps") (not (null lines_))
+      let gaps = [ol | ol@OutdatedLine {} <- lines_]
+      assertEq (label <> " gap lines only") (length lines_) (length gaps)
+      assertTrue (label <> " non-empty gaps") (not (null gaps))
       assertTrue
         (label <> " all content-only reusable")
-        (all olAssetsReusable lines_)
+        (all olAssetsReusable gaps)
     other ->
       assertFailure $ label <> ": expected Outdated reusable, got " <> show other
 
@@ -1098,14 +1114,14 @@ testContentFixGoReusable =
         src = GitHub "charmbracelet" "crush" "v"
     cache <- disabledCache
     report <-
-      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src (Go Nothing)
+      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src (Go Nothing) Set.empty
     assertContentOnlyReusable "go content-fix" (reportStatus report)
     -- Complete Manifest + good BDEPEND → Ok
     TIO.writeFile
       (pkgDir </> "Manifest")
       "DIST crush-0.84.0-vendor.tar.xz 1 BLAKE2B aa SHA512 abcdef0123456789\n"
     reportOk <-
-      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src (Go Nothing)
+      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src (Go Nothing) Set.empty
     assertOkStatus "go content ok" (reportStatus reportOk)
 
 -- | Npm: wrong nodejs BDEPEND on present PV → content-only reusable.
@@ -1147,7 +1163,7 @@ testContentFixNpmReusable =
         src = Npm "@fission-ai/openspec"
     cache <- disabledCache
     report <-
-      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src NpmEco
+      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src NpmEco Set.empty
     assertContentOnlyReusable "npm content-fix" (reportStatus report)
     TIO.writeFile
       ebuildPath
@@ -1157,7 +1173,7 @@ testContentFixNpmReusable =
           body
       )
     reportOk <-
-      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src NpmEco
+      checkPackageDeps noopMultiHandle unusedFetch ops cache e locals src NpmEco Set.empty
     assertOkStatus "npm content ok" (reportStatus reportOk)
 
 -- | Bun: missing Manifest deps DIST on present PV → content-only reusable.
@@ -1202,13 +1218,13 @@ testContentFixBunReusable =
             pure (Right (parseEbuildVersion "1.2.0"))
           _ -> unusedFetch src0
     report <-
-      checkPackageDeps noopMultiHandle fetchBunLatest ops cache e locals src Bun
+      checkPackageDeps noopMultiHandle fetchBunLatest ops cache e locals src Bun Set.empty
     assertContentOnlyReusable "bun content-fix" (reportStatus report)
     TIO.writeFile
       (pkgDir </> "Manifest")
       "DIST ralph-tui-1.5.0-deps.tar.xz 1 SHA512 deadbeef\n"
     reportOk <-
-      checkPackageDeps noopMultiHandle fetchBunLatest ops cache e locals src Bun
+      checkPackageDeps noopMultiHandle fetchBunLatest ops cache e locals src Bun Set.empty
     assertOkStatus "bun content ok" (reportStatus reportOk)
 
 -- | Cargo: wrong RUST_MIN_VER on present PV → content-only reusable.
@@ -1268,6 +1284,7 @@ testContentFixCargoReusable =
         locals
         src
         (Cargo Nothing Nothing CargoGitTag)
+        Set.empty
     assertContentOnlyReusable "cargo content-fix" (reportStatus report)
     TIO.writeFile ebuildPath bodyOk
     reportOk <-
@@ -1280,6 +1297,7 @@ testContentFixCargoReusable =
         locals
         src
         (Cargo Nothing Nothing CargoGitTag)
+        Set.empty
     assertOkStatus "cargo content ok" (reportStatus reportOk)
 
 -- | usage-style: written 1.95 vs tag 1.91 is adequate (too-low-only).
@@ -1337,6 +1355,7 @@ testCargoWrittenAboveTagAdequate =
         locals
         src
         (Cargo Nothing (Just "cli") CargoGitTag)
+        Set.empty
     assertOkStatus "usage 1.85 vs tag 1.80" (reportStatus report)
 
 -- | Codex-shaped two-URL SRC_URI at the present PV is Ok, not 0.153.4 -> 0.153.4.
@@ -1410,6 +1429,7 @@ testCodexRustyV8UrlAdequate =
         locals
         src
         (Cargo (Just "codex-rs") (Just "codex-rs/cli") CargoGitTag)
+        Set.empty
     assertOkStatus "codex 0.153.4 two-url body" (reportStatus report)
 
 -- | usage-style path closure: benches/xtask 1.99 must not raise T above 1.91.
@@ -1487,6 +1507,7 @@ testUsagePathClosureAdequacy =
         locals
         src
         (Cargo Nothing (Just "cli") CargoGitTag)
+        Set.empty
     assertOkStatus "usage path-closure 1.91" (reportStatus report)
 
 -- | Incomplete newest tag is not reported as a 0.0.0 TO.
@@ -1548,14 +1569,18 @@ testIncompleteNotZeroFloorGap =
         locals
         src
         (Cargo Nothing Nothing CargoGitTag)
+        Set.empty
     case reportStatus report of
       Ok _ -> pure ()
       Outdated lines_ ->
         assertTrue
           "incomplete newest is not a TO"
-          (not (any (\l -> olTo l == parseEbuildVersion "0.50.0") lines_))
+          (not (any isIncompleteTo lines_))
       other ->
         assertFailure ("expected Ok or no 0.50.0 TO, got " <> show other)
+  where
+    isIncompleteTo OutdatedLine {olTo = to} = to == parseEbuildVersion "0.50.0"
+    isIncompleteTo _ = False
 
 ------------------------------------------------------------------------
 -- Overlay wait-edge plan-delta / outdated blocked-on
@@ -1891,14 +1916,36 @@ testOutdatedBlockedOn =
         locals
         src
         Bun
+        Set.empty
     case reportStatus report of
       Outdated lines_ -> do
-        let blob = T.unwords (map (fromMaybe "" . olLabel) lines_)
-        assertTrue "blocked indication" ("blocked on" `T.isInfixOf` blob)
-        assertTrue "names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` blob)
+        assertEq
+          "successful check, not a package error"
+          Nothing
+          (reportWarning report)
+        let text = formattedReport report
+            gaps = [ol | ol@OutdatedLine {} <- lines_]
+            notes = [ol | ol@OutdatedNote {} <- lines_]
+            refuse = overlayRefuseMessage bunBinPackageKey
+        assertTrue "hypothetical gaps" (not (null gaps))
+        assertTrue
+          "gaps target 1.5.0"
+          (all ((== parseEbuildVersion "1.5.0") . olTo) gaps)
+        assertTrue
+          "lane names bun-bin"
+          (all (maybe False ("dev-lang/bun-bin" `T.isInfixOf`) . olLabel) gaps)
+        assertTrue
+          "no blocked on"
+          (not (any ("blocked on" `T.isInfixOf`) text))
+        assertEq "one refuse note" [OutdatedNote refuse] notes
+        assertEq
+          "one formatted refuse line"
+          1
+          (length (filter ("dev-util/ralph-tui:" `T.isPrefixOf`) text))
+        assertRemovalOrder "gaps, then removal, then refuse" text
       other ->
         assertFailure $
-          "expected outdated blocked-on, got " <> show other
+          "expected outdated hypo lines plus refuse, got " <> show other
     listN <- readIORef lists
     assertEq "hypo still lists a second time when ceilings differ" 2 listN
 
@@ -1934,6 +1981,7 @@ testOutdatedFailClosed =
         locals
         src
         Bun
+        Set.empty
     case reportStatus report of
       FetchError msg -> do
         assertTrue "names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` msg)
@@ -1977,22 +2025,33 @@ testOutdatedBunBinOwnLine =
     case bunRep of
       [r] ->
         case reportStatus r of
-          Outdated lines_ ->
+          Outdated lines_ -> do
+            let text = formattedReport r
             assertTrue
               "bun-bin unlabeled latest line"
-              (any (isNothing . olLabel) lines_)
+              (any (isNothing . olLabel) [ol | ol@OutdatedLine {} <- lines_])
+            assertTrue
+              "gitmv has no removal line"
+              (not (any ("-> removed" `T.isInfixOf`) text))
           other ->
             assertFailure $ "expected bun-bin outdated, got " <> show other
       _ -> assertFailure "expected bun-bin report"
     case ralphRep of
       [r] ->
         case reportStatus r of
-          Outdated lines_ ->
+          Outdated _ -> do
+            let text = formattedReport r
             assertTrue
-              "ralph blocked-on"
-              (any (maybe False ("blocked on" `T.isInfixOf`) . olLabel) lines_)
+              "hypothetical ralph gap"
+              (any ("-> 1.5.0" `T.isInfixOf`) text)
+            assertTrue
+              "no blocked on"
+              (not (any ("blocked on" `T.isInfixOf`) text))
+            assertTrue
+              "no refuse line"
+              (not (any ("dev-util/ralph-tui:" `T.isPrefixOf`) text))
           other ->
-            assertFailure $ "expected ralph blocked-on, got " <> show other
+            assertFailure $ "expected ralph hypothetical gaps, got " <> show other
       _ -> assertFailure "expected ralph report"
 
 testOutdatedEqualCeilingsSkip :: IO ()
@@ -2027,12 +2086,16 @@ testOutdatedEqualCeilingsSkip =
         locals
         src
         Bun
+        Set.empty
     case reportStatus report of
-      Outdated lines_ ->
-        let blob = T.unwords (map (fromMaybe "" . olLabel) lines_)
-         in assertTrue
-              "must not indicate blocked-on"
-              (not ("blocked on" `T.isInfixOf` blob))
+      Outdated _ -> do
+        let text = formattedReport report
+        assertTrue
+          "must not indicate blocked-on"
+          (not (any ("blocked on" `T.isInfixOf`) text))
+        assertTrue
+          "no provider-refuse line"
+          (not (any ("dev-util/ralph-tui:" `T.isPrefixOf`) text))
       FetchError msg ->
         assertFailure $ "equal ceilings must not fail-close: " <> T.unpack msg
       _ -> pure ()
@@ -2076,6 +2139,533 @@ testRefuseEqualCeilingsSkip =
     probeN <- readIORef probes
     assertEq "on-disk list only" 1 listN
     assertTrue "probed on-disk candidates" (probeN > 0)
+
+formattedReport :: UpdateReport -> [T.Text]
+formattedReport report =
+  case reportStatus report of
+    Outdated lines_ -> map (formatOutdatedLine (reportKey report)) lines_
+    _ -> []
+
+assertRemovalOrder :: String -> [T.Text] -> IO ()
+assertRemovalOrder label text = do
+  let idxs p = [i | (i, t) <- zip [0 :: Int ..] text, p t]
+      gaps = idxs (\t -> "->" `T.isInfixOf` t && not ("removed" `T.isInfixOf` t))
+      removals = idxs ("-> removed" `T.isInfixOf`)
+      refuses = idxs ("dev-util/ralph-tui:" `T.isPrefixOf`)
+  assertTrue (label <> ": has a gap") (not (null gaps))
+  assertTrue (label <> ": has a removal") (not (null removals))
+  assertTrue (label <> ": has a refuse") (not (null refuses))
+  assertTrue (label <> ": removal after gaps") (maximum gaps < minimum removals)
+  assertTrue (label <> ": refuse after removal") (maximum removals < minimum refuses)
+
+testFormatOutdatedLine :: IO ()
+testFormatOutdatedLine = do
+  let gitKey = mkPackageKey "dev-lang" "deno-bin"
+      ralphKey = mkPackageKey "dev-util" "ralph-tui"
+      crushKey = mkPackageKey "dev-util" "crush"
+      gap =
+        OutdatedLine
+          { olFrom = parseEbuildVersion "0.1.0",
+            olTo = parseEbuildVersion "0.2.0",
+            olLabel = Nothing,
+            olAssetsReusable = False
+          }
+      labeled =
+        OutdatedLine
+          { olFrom = parseEbuildVersion "1.0.0",
+            olTo = parseEbuildVersion "1.5.0",
+            olLabel = Just "(dev-lang/bun-bin ~amd64)",
+            olAssetsReusable = True
+          }
+  assertEq
+    "gitmv unlabeled LOCAL -> REMOTE"
+    "dev-lang/deno-bin 0.1.0 -> 0.2.0"
+    (formatOutdatedLine gitKey gap)
+  assertEq
+    "lane gap with assets marker"
+    "dev-util/ralph-tui 1.0.0 -> 1.5.0 (dev-lang/bun-bin ~amd64) [assets reusable]"
+    (formatOutdatedLine ralphKey labeled)
+  assertEq
+    "removal strips revision and has no lane label"
+    "dev-util/crush 6.6.1 -> removed"
+    (formatOutdatedLine crushKey (OutdatedRemoval (parseEbuildVersion "6.6.1-r2")))
+  assertEq
+    "note is category/package: message"
+    "dev-util/ralph-tui: overlay ceiling provider dev-lang/bun-bin is not selected"
+    ( formatOutdatedLine
+        ralphKey
+        (OutdatedNote "overlay ceiling provider dev-lang/bun-bin is not selected")
+    )
+
+writeBunEbuild :: FilePath -> T.Text -> T.Text -> IO FilePath
+writeBunEbuild overlay ver keywords = do
+  let pkgDir = overlay </> "dev-lang" </> "bun-bin"
+      name = "bun-bin-" <> T.unpack ver <> ".ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile
+    (pkgDir </> name)
+    ("EAPI=8\nKEYWORDS=\"" <> keywords <> "\"\n")
+  TIO.writeFile (pkgDir </> "Manifest") "DIST bun 1\n"
+  pure (pkgDir </> name)
+
+testOutdatedTwoHypoLanes :: IO ()
+testOutdatedTwoHypoLanes =
+  withSystemTempDirectory "om-two-lanes" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- writeBunEbuild overlay "1.1.0" "amd64"
+    _ <- writeBunEbuild overlay "1.3.0" "~amd64"
+    ralphPath <- seedRalph overlay "0.1.0"
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["2.0.0", "1.0.0"])
+        ( \_o _r _p pv ->
+            pure $
+              Right $
+                minimumBunProbe $
+                  case pv of
+                    "1.0.0" -> "1.1.0"
+                    "2.0.0" -> "1.4.0"
+                    _ -> "9.9.9"
+        )
+    cache <- disabledCache
+    let fetch src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.4.0"))
+          _ -> pure (Left "unexpected")
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+        e =
+          PackageEntry
+            { peKey = ralphKey,
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "0.1.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "0.1.0"]
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        fetch
+        ops
+        cache
+        e
+        locals
+        (GitHub "subsy" "ralph-tui" "v")
+        Bun
+        (Set.fromList [bunBinPackageKey, ralphKey])
+    case reportStatus report of
+      Outdated lines_ -> do
+        let gaps = [ol | ol@OutdatedLine {} <- lines_]
+            text = formattedReport report
+        case gaps of
+          [a, b] ->
+            assertTrue "different target PVs" (olTo a /= olTo b)
+          _ ->
+            assertFailure $ "expected two lane lines, got " <> show (length gaps)
+        assertTrue
+          "no blocked on"
+          (not (any ("blocked on" `T.isInfixOf`) text))
+        assertEq "no refuse note" [] [n | n@OutdatedNote {} <- lines_]
+      other ->
+        assertFailure $ "expected two hypothetical lanes, got " <> show other
+
+ralphAdequate :: T.Text -> T.Text
+ralphAdequate bun =
+  T.unlines
+    [ "EAPI=8",
+      "BDEPEND=\">=dev-lang/bun-bin-" <> bun <> ":0\"",
+      "KEYWORDS=\"~amd64\"",
+      "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/ralph-tui-${PV}/ralph-tui-${PV}-deps.tar.xz\""
+    ]
+
+-- | Plain bun 1.1.0 and tilde bun 1.3.0, with ralph 1.0.0 and 2.0.0 on disk.
+-- A remote bun 1.4.0 selects both ralph PVs; the on-disk ceilings select only 1.0.0.
+seedSplitBunRalph :: FilePath -> IO [Ebuild]
+seedSplitBunRalph overlay = do
+  plain <- writeBunEbuild overlay "1.1.0" "amd64"
+  tilde <- writeBunEbuild overlay "1.3.0" "~amd64"
+  let pkgDir = overlay </> "dev-util" </> "ralph-tui"
+      p10 = pkgDir </> "ralph-tui-1.0.0.ebuild"
+      p20 = pkgDir </> "ralph-tui-2.0.0.ebuild"
+  createDirectoryIfMissing True pkgDir
+  TIO.writeFile p10 (ralphAdequate "1.1.0")
+  TIO.writeFile p20 (ralphAdequate "1.4.0")
+  TIO.writeFile
+    (pkgDir </> "Manifest")
+    ( T.unlines
+        [ "DIST ralph-tui-1.0.0-deps.tar.xz 1 SHA512 deadbeef",
+          "DIST ralph-tui-2.0.0-deps.tar.xz 1 SHA512 deadbeef"
+        ]
+    )
+  pure
+    [ Ebuild "dev-lang" "bun-bin" "1.1.0" plain,
+      Ebuild "dev-lang" "bun-bin" "1.3.0" tilde,
+      ralphEbuild p10 "1.0.0",
+      ralphEbuild p20 "2.0.0"
+    ]
+
+splitBunEngines :: T.Text -> T.Text -> T.Text -> T.Text -> IO (Either T.Text BunProbe)
+splitBunEngines _o _r _p pv =
+  pure $
+    Right $
+      minimumBunProbe $
+        case pv of
+          "1.0.0" -> "1.1.0"
+          "2.0.0" -> "1.4.0"
+          _ -> "9.9.9"
+
+fetchBun14 :: UpdateSource -> IO (Either T.Text EbuildVersion)
+fetchBun14 src = case src of
+  GitHub "oven-sh" "bun" _ ->
+    pure (Right (parseEbuildVersion "1.4.0"))
+  _ -> pure (Left "unexpected")
+
+testOutdatedSatisfiedHypoSilent :: IO ()
+testOutdatedSatisfiedHypoSilent =
+  withSystemTempDirectory "om-hypo-silent" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    ebuilds <- seedSplitBunRalph overlay
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["2.0.0", "1.0.0"])
+        splitBunEngines
+    cache <- disabledCache
+    reports <-
+      checkOverlayWithDepsPlan 2 noopMultiHandle fetchBun14 ops cache ebuilds
+    let bunRep = headReport (mkPackageKey "dev-lang" "bun-bin") reports
+        ralphRep = headReport (mkPackageKey "dev-util" "ralph-tui") reports
+    case reportStatus ralphRep of
+      Ok _ -> pure ()
+      other ->
+        assertFailure $ "satisfied hypo must print nothing, got " <> show other
+    case reportStatus bunRep of
+      Outdated lines_ ->
+        assertTrue
+          "bun-bin unlabeled latest line"
+          (any (isNothing . olLabel) [ol | ol@OutdatedLine {} <- lines_])
+      other ->
+        assertFailure $ "expected bun-bin outdated line, got " <> show other
+
+testOutdatedLeftOutRefuseOnly :: IO ()
+testOutdatedLeftOutRefuseOnly =
+  withSystemTempDirectory "om-refuse-only" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    ebuilds <- seedSplitBunRalph overlay
+    ops <-
+      liveBunOps
+        overlay
+        (listFixed ["2.0.0", "1.0.0"])
+        splitBunEngines
+    cache <- disabledCache
+    let ralphKey = mkPackageKey "dev-util" "ralph-tui"
+        ralphs = [e | e <- ebuilds, ebuildPackage e == "ralph-tui"]
+        ralphPath = case ralphs of
+          (e : _) -> ebuildPath e
+          [] -> overlay
+        entryR =
+          PackageEntry
+            { peKey = ralphKey,
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "2.0.0",
+              pePath = ralphPath
+            }
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        fetchBun14
+        ops
+        cache
+        entryR
+        ralphs
+        (GitHub "subsy" "ralph-tui" "v")
+        Bun
+        Set.empty
+    case reportStatus report of
+      Outdated [OutdatedNote note] -> do
+        assertEq "refuse sentence" (overlayRefuseMessage bunBinPackageKey) note
+        assertEq "no keep warning" Nothing (reportWarning report)
+        assertEq
+          "only the refuse line"
+          ["dev-util/ralph-tui: " <> overlayRefuseMessage bunBinPackageKey]
+          (formattedReport report)
+      other ->
+        assertFailure $ "expected only the refuse line, got " <> show other
+
+testOutdatedProviderNotOutdated :: IO ()
+testOutdatedProviderNotOutdated =
+  withSystemTempDirectory "om-provider-current" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- seedBunBin overlay "1.2.0"
+    ralphPath <- seedRalph overlay "1.0.0"
+    (ops, lists, _) <- countingLiveBunOps overlay ["1.5.0", "1.0.0"]
+    cache <- disabledCache
+    let fetch src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.1.0"))
+          _ -> pure (Left "unexpected")
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+        e =
+          PackageEntry
+            { peKey = ralphKey,
+              pePN = "ralph-tui",
+              peLocal = parseEbuildVersion "1.0.0",
+              pePath = ralphPath
+            }
+        locals = [ralphEbuild ralphPath "1.0.0"]
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        fetch
+        ops
+        cache
+        e
+        locals
+        (GitHub "subsy" "ralph-tui" "v")
+        Bun
+        (Set.fromList [bunBinPackageKey, ralphKey])
+    case reportStatus report of
+      Outdated lines_ -> do
+        let gaps = [ol | ol@OutdatedLine {} <- lines_]
+            text = formattedReport report
+        assertTrue
+          "on-disk gap targets 1.5.0"
+          (any (\ol -> olTo ol == parseEbuildVersion "1.5.0") gaps)
+        assertTrue
+          "no refuse line"
+          (not (any ("dev-util/ralph-tui:" `T.isPrefixOf`) text))
+      other ->
+        assertFailure $ "expected on-disk lines, got " <> show other
+    listN <- readIORef lists
+    assertEq "no hypothetical list" 1 listN
+
+crushOkBody :: T.Text
+crushOkBody =
+  T.unlines
+    [ "EAPI=8",
+      "inherit go-module",
+      "BDEPEND=\">=dev-lang/go-1.26.5:=\"",
+      "KEYWORDS=\"~amd64 ~arm64\"",
+      "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/crush-${PV}/crush-${PV}-vendor.tar.xz\""
+    ]
+
+testOutdatedPruneOnly :: IO ()
+testOutdatedPruneOnly =
+  withSystemTempDirectory "om-prune-only" $ \tmp -> do
+    let pkgDir = tmp </> "dev-util" </> "crush"
+        vers = ["0.84.0", "0.80.0", "0.80.0-r1", "0.70.0"]
+    createDirectoryIfMissing True pkgDir
+    mapM_
+      ( \ver ->
+          TIO.writeFile
+            (pkgDir </> ("crush-" <> T.unpack ver <> ".ebuild"))
+            (if ver == "0.84.0" then crushOkBody else "EAPI=8\n")
+      )
+      vers
+    TIO.writeFile
+      (pkgDir </> "Manifest")
+      "DIST crush-0.84.0-vendor.tar.xz 1 BLAKE2B aa SHA512 abcdef0123456789\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["0.84.0"])
+        (\_ -> pure (Right "module x\ngo 1.26.5\n"))
+        unusedNpm
+        unusedBun
+        unusedCargo
+        (Just tmp)
+    cache <- disabledCache
+    let ebuild ver =
+          Ebuild
+            "dev-util"
+            "crush"
+            ver
+            (pkgDir </> ("crush-" <> T.unpack ver <> ".ebuild"))
+        locals = map ebuild vers
+        e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "crush",
+              pePN = "crush",
+              peLocal = parseEbuildVersion "0.84.0",
+              pePath = ebuildPath (ebuild "0.84.0")
+            }
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        unusedFetch
+        ops
+        cache
+        e
+        locals
+        (GitHub "charmbracelet" "crush" "v")
+        (Go Nothing)
+        Set.empty
+    assertEq
+      "removal lines, package not omitted"
+      [ "dev-util/crush 0.70.0 -> removed",
+        "dev-util/crush 0.80.0 -> removed"
+      ]
+      (formattedReport report)
+
+testOutdatedPinnedNotRemoved :: IO ()
+testOutdatedPinnedNotRemoved =
+  withSystemTempDirectory "om-pinned" $ \tmp -> do
+    let crushDir = tmp </> "dev-util" </> "crush"
+        otherDir = tmp </> "dev-util" </> "needs-crush"
+    createDirectoryIfMissing True crushDir
+    createDirectoryIfMissing True otherDir
+    TIO.writeFile (crushDir </> "crush-0.84.0.ebuild") crushOkBody
+    TIO.writeFile (crushDir </> "crush-0.80.0.ebuild") "EAPI=8\n"
+    TIO.writeFile
+      (crushDir </> "Manifest")
+      "DIST crush-0.84.0-vendor.tar.xz 1 BLAKE2B aa SHA512 abcdef0123456789\n"
+    TIO.writeFile
+      (otherDir </> "needs-crush-1.0.0.ebuild")
+      "EAPI=8\nDEPEND=\"=dev-util/crush-0.80.0\"\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["0.84.0"])
+        (\_ -> pure (Right "module x\ngo 1.26.5\n"))
+        unusedNpm
+        unusedBun
+        unusedCargo
+        (Just tmp)
+    cache <- disabledCache
+    let locals =
+          [ Ebuild "dev-util" "crush" "0.84.0" (crushDir </> "crush-0.84.0.ebuild"),
+            Ebuild "dev-util" "crush" "0.80.0" (crushDir </> "crush-0.80.0.ebuild")
+          ]
+        e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "crush",
+              pePN = "crush",
+              peLocal = parseEbuildVersion "0.84.0",
+              pePath = crushDir </> "crush-0.84.0.ebuild"
+            }
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        unusedFetch
+        ops
+        cache
+        e
+        locals
+        (GitHub "charmbracelet" "crush" "v")
+        (Go Nothing)
+        Set.empty
+    case reportStatus report of
+      Ok _ ->
+        assertTrue
+          "no 0.80.0 removal"
+          (not (any ("0.80.0 -> removed" `T.isInfixOf`) (formattedReport report)))
+      other ->
+        assertFailure $ "pinned extra must not become a removal line, got " <> show other
+
+testOutdatedKeepFailure :: IO ()
+testOutdatedKeepFailure =
+  withSystemTempDirectory "om-keep-fail" $ \tmp -> do
+    let crushDir = tmp </> "dev-util" </> "crush"
+        otherDir = tmp </> "dev-util" </> "needs-crush"
+    createDirectoryIfMissing True crushDir
+    createDirectoryIfMissing True otherDir
+    TIO.writeFile (crushDir </> "crush-0.84.0.ebuild") crushOkBody
+    TIO.writeFile (crushDir </> "crush-0.80.0.ebuild") "EAPI=8\n"
+    TIO.writeFile
+      (crushDir </> "Manifest")
+      "DIST crush-0.84.0-vendor.tar.xz 1 BLAKE2B aa SHA512 abcdef0123456789\n"
+    TIO.writeFile
+      (otherDir </> "needs-crush-1.0.0.ebuild")
+      "EAPI=8\nDEPEND=\"unterminated\n"
+    ops <-
+      mkDepsPlanOps
+        (listFixed ["0.90.0", "0.84.0"])
+        (\_ -> pure (Right "module x\ngo 1.26.5\n"))
+        unusedNpm
+        unusedBun
+        unusedCargo
+        (Just tmp)
+    cache <- disabledCache
+    let locals =
+          [ Ebuild "dev-util" "crush" "0.84.0" (crushDir </> "crush-0.84.0.ebuild"),
+            Ebuild "dev-util" "crush" "0.80.0" (crushDir </> "crush-0.80.0.ebuild")
+          ]
+        e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "crush",
+              pePN = "crush",
+              peLocal = parseEbuildVersion "0.84.0",
+              pePath = crushDir </> "crush-0.84.0.ebuild"
+            }
+    report <-
+      checkPackageDeps
+        noopMultiHandle
+        unusedFetch
+        ops
+        cache
+        e
+        locals
+        (GitHub "charmbracelet" "crush" "v")
+        (Go Nothing)
+        Set.empty
+    case reportStatus report of
+      Outdated lines_ -> do
+        let gaps = [ol | ol@OutdatedLine {} <- lines_]
+        assertTrue
+          "lane gap still emitted"
+          (any (\ol -> olTo ol == parseEbuildVersion "0.90.0") gaps)
+        assertTrue
+          "no guessed removal"
+          (not (any ("-> removed" `T.isInfixOf`) (formattedReport report)))
+        case reportWarning report of
+          Just _ -> pure ()
+          Nothing -> assertFailure "keep failure must be a warning"
+      other ->
+        assertFailure $ "expected gaps plus keep error, got " <> show other
+
+testOutdatedGitMvNoRemoval :: IO ()
+testOutdatedGitMvNoRemoval =
+  withSystemTempDirectory "om-gitmv-pin" $ \tmp -> do
+    newest <- writeBunEbuild tmp "1.2.0" "~amd64 ~arm64"
+    let pkgDir = tmp </> "dev-lang" </> "bun-bin"
+        pin = pkgDir </> "bun-bin-1.1.0.ebuild"
+    TIO.writeFile pin "EAPI=8\nSLOT=\"${PV}\"\nKEYWORDS=\"~amd64\"\n"
+    cache <- disabledCache
+    let locals =
+          [ Ebuild "dev-lang" "bun-bin" "1.2.0" newest,
+            Ebuild "dev-lang" "bun-bin" "1.1.0" pin
+          ]
+        e =
+          PackageEntry
+            { peKey = mkPackageKey "dev-lang" "bun-bin",
+              pePN = "bun-bin",
+              peLocal = parseEbuildVersion "1.2.0",
+              pePath = newest
+            }
+        fetch src = case src of
+          GitHub "oven-sh" "bun" _ ->
+            pure (Right (parseEbuildVersion "1.3.0"))
+          _ -> pure (Left "unexpected")
+    report <- checkPackage fetch cache e locals
+    case reportStatus report of
+      Outdated [line@OutdatedLine {}] -> do
+        assertEq "from" (parseEbuildVersion "1.2.0") (olFrom line)
+        assertEq "to" (parseEbuildVersion "1.3.0") (olTo line)
+        assertEq "unlabeled" Nothing (olLabel line)
+        assertTrue
+          "no removal line"
+          (not (any ("-> removed" `T.isInfixOf`) (formattedReport report)))
+      other ->
+        assertFailure $ "expected unlabeled bun-bin line, got " <> show other
+
+headReport :: PackageKey -> [UpdateReport] -> UpdateReport
+headReport key reports =
+  case [r | r <- reports, reportKey r == key] of
+    (r : _) -> r
+    [] ->
+      UpdateReport
+        { reportKey = key,
+          reportStatus = FetchError "missing report",
+          reportWarning = Nothing
+        }
 
 testListVersionsSuccessCache :: IO ()
 testListVersionsSuccessCache = do

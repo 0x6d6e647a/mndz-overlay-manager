@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.Types
@@ -7,6 +8,7 @@ module Update.Types
     mkPackageKey,
     splitPackageKey,
     OutdatedLine (..),
+    formatOutdatedLine,
     UpdateStatus (..),
     UpdateReport (..),
     Fetcher,
@@ -28,7 +30,7 @@ where
 
 import Data.Text (Text)
 import Data.Text qualified as T
-import Overlay.Version (EbuildVersion)
+import Overlay.Version (EbuildVersion, prettyVersion, renderPVNoRev)
 
 -- | Where to fetch the latest upstream version.
 data UpdateSource
@@ -72,16 +74,47 @@ splitPackageKey (PackageKey t) =
           Just (cat, pkg)
     _ -> Nothing
 
--- | One outdated report line (optional runtime-lane label).
-data OutdatedLine = OutdatedLine
-  { olFrom :: EbuildVersion,
-    olTo :: EbuildVersion,
-    -- | e.g. @Just "(dev-lang/go amd64)"@ for runtime-lane lines.
-    olLabel :: Maybe Text,
-    -- | Same-PV overlay/Manifest content fix (apply may reuse release assets).
-    olAssetsReusable :: Bool
-  }
+-- | One outdated stdout line.
+data OutdatedLine
+  = -- | Version gap. GitMv latest lines leave the label unset.
+    OutdatedLine
+      { olFrom :: EbuildVersion,
+        olTo :: EbuildVersion,
+        -- | e.g. @Just "(dev-lang/go amd64)"@ for runtime-lane lines.
+        olLabel :: Maybe Text,
+        -- | Same-PV overlay/Manifest content fix (apply may reuse release assets).
+        olAssetsReusable :: Bool
+      }
+  | -- | Non-live PV apply would delete. Revision is stripped at format time.
+    OutdatedRemoval
+      { orPV :: EbuildVersion
+      }
+  | -- | Trailing note. The package prefix is added by 'formatOutdatedLine'.
+    OutdatedNote
+      { onNote :: Text
+      }
   deriving (Eq, Show)
+
+-- | Operator stdout for one outdated line.
+formatOutdatedLine :: PackageKey -> OutdatedLine -> Text
+formatOutdatedLine key = \case
+  OutdatedLine {olFrom, olTo, olLabel, olAssetsReusable} ->
+    packageKeyText key
+      <> " "
+      <> prettyVersion olFrom
+      <> " -> "
+      <> prettyVersion olTo
+      <> case olLabel of
+        Nothing -> ""
+        Just lab -> " " <> lab
+      <> if olAssetsReusable then " [assets reusable]" else ""
+  OutdatedRemoval {orPV} ->
+    packageKeyText key
+      <> " "
+      <> renderPVNoRev orPV
+      <> " -> removed"
+  OutdatedNote {onNote} ->
+    packageKeyText key <> ": " <> onNote
 
 data UpdateStatus
   = -- | One or more outdated transitions (non-deps: single unlabeled line).
@@ -95,7 +128,9 @@ data UpdateStatus
 
 data UpdateReport = UpdateReport
   { reportKey :: PackageKey,
-    reportStatus :: UpdateStatus
+    reportStatus :: UpdateStatus,
+    -- | Stderr when stdout lines are still emitted (keep-set failure).
+    reportWarning :: Maybe Text
   }
   deriving (Eq, Show)
 

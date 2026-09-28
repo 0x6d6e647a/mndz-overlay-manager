@@ -281,8 +281,9 @@ planGitMv env entry locals = do
     Ahead _ _ -> PlanSoftSkip key "already at latest upstream version"
     Outdated lines_ ->
       case lines_ of
-        (ol : _) -> PlanNeedsWork key (PlannedGitMv (olTo ol))
-        [] -> PlanSoftSkip key "already at latest upstream version"
+        (OutdatedLine {olTo = to} : _) ->
+          PlanNeedsWork key (PlannedGitMv to)
+        _ -> PlanSoftSkip key "already at latest upstream version"
 
 planDeps ::
   PlanEnv ->

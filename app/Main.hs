@@ -127,10 +127,10 @@ import Update.Targets (resolveTargets, targetErrorMessage)
 import Update.TempWorkspace (openRunRoot, rrPath)
 import Update.Types
   ( ApplyOutcome (..),
-    OutdatedLine (..),
     PackageKey (..),
     SuccessLine (..),
     UpdateReport (..),
+    formatOutdatedLine,
     mkPackageKey,
     packageKeyText,
   )
@@ -648,7 +648,7 @@ loadValidatedEbuildsFull opts = do
     Right ebuilds -> pure (cfg, resolvedOverlay, ebuilds)
 
 emitReport :: (WithLog env Message m, MonadIO m) => UpdateReport -> m ()
-emitReport report =
+emitReport report = do
   case reportStatus report of
     U.Outdated lines_ ->
       liftIO $
@@ -671,18 +671,13 @@ emitReport report =
         packageKeyText (reportKey report)
           <> ": "
           <> err
-
-formatOutdatedLine :: PackageKey -> OutdatedLine -> T.Text
-formatOutdatedLine key ol =
-  packageKeyText key
-    <> " "
-    <> prettyVersion (olFrom ol)
-    <> " -> "
-    <> prettyVersion (olTo ol)
-    <> case olLabel ol of
-      Nothing -> ""
-      Just lab -> " " <> lab
-    <> if olAssetsReusable ol then " [assets reusable]" else ""
+  case reportWarning report of
+    Nothing -> pure ()
+    Just err ->
+      logWarning $
+        packageKeyText (reportKey report)
+          <> ": "
+          <> err
 
 loadConfigOrDie :: (WithLog env Message m, MonadIO m) => Maybe FilePath -> m OverlayConfig
 loadConfigOrDie override = do
