@@ -3,8 +3,11 @@
 #
 # Usage (from repository root):
 #   ./scripts/coverage
+#   COVERAGE_FLAVOR=coverage-release ./scripts/coverage
 #
-# Pipeline position (hk): after non-coverage `cabal build all`, before hlint/stan/weeder.
+# Pipeline position (hk): after the non-coverage release build, before hlint/stan/weeder.
+# Default flavor is coverage-dev (the blocking gate). COVERAGE_FLAVOR selects
+# coverage-dev or coverage-release; scripts/with-flavor owns the Cabal flags.
 #
 # Outputs (gitignored under coverage/):
 #   coverage/html/          human HPC markup (Overall suite)
@@ -24,6 +27,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
+
+FLAVOR="${COVERAGE_FLAVOR:-coverage-dev}"
+case "${FLAVOR}" in
+  coverage-dev | coverage-release) ;;
+  *)
+    echo "error: COVERAGE_FLAVOR must be coverage-dev or coverage-release (got: ${FLAVOR})" >&2
+    exit 1
+    ;;
+esac
+BUILD_ROOT="${ROOT}/dist/${FLAVOR}"
 
 OUT_DIR="${ROOT}/coverage"
 TIX_DIR="${OUT_DIR}/tix"
@@ -76,21 +89,21 @@ rm -rf "${OUT_DIR}"
 mkdir -p "${TIX_DIR}" "${XML_DIR}" "${HTML_DIR}"
 
 find_latest_tix() {
-  # Cabal writes: dist-newstyle/.../t/<suite>/hpc/vanilla/tix/<suite>.tix
+  # Cabal writes: dist/<flavor>/.../t/<suite>/hpc/vanilla/tix/<suite>.tix
   local found
-  found="$(find "${ROOT}/dist-newstyle" -type f -path '*/hpc/vanilla/tix/*.tix' -printf '%T@ %p\n' 2>/dev/null \
+  found="$(find "${BUILD_ROOT}" -type f -path '*/hpc/vanilla/tix/*.tix' -printf '%T@ %p\n' 2>/dev/null \
     | sort -nr \
     | head -n1 \
     | cut -d' ' -f2- || true)"
   if [[ -z "${found}" ]]; then
-    die "no HPC .tix found under dist-newstyle after coverage test run"
+    die "no HPC .tix found under dist/${FLAVOR} after coverage test run"
   fi
   printf '%s\n' "${found}"
 }
 
 collect_hpcdirs() {
   # Parent mix directories containing per-component mix folders.
-  find "${ROOT}/dist-newstyle" -type d -path '*/hpc/vanilla/mix' -print 2>/dev/null | sort -u
+  find "${BUILD_ROOT}" -type d -path '*/hpc/vanilla/mix' -print 2>/dev/null | sort -u
 }
 
 # Discover library package prefix from a tix file (e.g. mndz-overlay-manager-0.1.0.0-inplace).
@@ -168,12 +181,12 @@ run_tests() {
   local label="$1"
   local pattern="${2:-}"
 
-  echo "==== Coverage test run: ${label}${pattern:+ (tasty -p ${pattern})} ===="
+  echo "==== Coverage test run: ${label}${pattern:+ (tasty -p ${pattern})} (${FLAVOR}) ===="
   if [[ -n "${pattern}" ]]; then
-    cabal test all --enable-coverage --test-show-details=direct \
+    "${ROOT}/scripts/with-flavor" "${FLAVOR}" -- test all --test-show-details=direct \
       --test-options="-p ${pattern}"
   else
-    cabal test all --enable-coverage --test-show-details=direct
+    "${ROOT}/scripts/with-flavor" "${FLAVOR}" -- test all --test-show-details=direct
   fi
 
   local tix
@@ -190,7 +203,7 @@ run_tests integration Integration
 
 mapfile -t HPCDIRS < <(collect_hpcdirs)
 if [[ "${#HPCDIRS[@]}" -eq 0 ]]; then
-  die "no hpc/vanilla/mix directories found under dist-newstyle"
+  die "no hpc/vanilla/mix directories found under dist/${FLAVOR}"
 fi
 echo "hpc mix dirs:"
 printf '  %s\n' "${HPCDIRS[@]}"

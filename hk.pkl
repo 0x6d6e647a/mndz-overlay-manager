@@ -36,13 +36,14 @@ local linters = new Mapping<String, Step> {
   ["cabal-build"] {
     exclusive = true
     workspace_indicator = "mndz-overlay-manager.cabal"
-    // Non-coverage build: emits HIE under .hie/{lib,exe,test}/ for stan/weeder.
-    check = "cabal build all"
+    // Non-coverage release build. scripts/with-flavor collects HIE into
+    // dist/release/hie/{lib,exe,test}/ for stan/weeder.
+    check = "scripts/with-flavor release -- build all"
   }
   ["coverage"] {
     exclusive = true
     workspace_indicator = "mndz-overlay-manager.cabal"
-    // Instrumented tests + Overall/Unit/Integration HPC reports (scripts/coverage).
+    // Debug coverage flavor (coverage-dev) + Overall/Unit/Integration reports.
     // Blocking test gate; floors are not enforced in phase 1.
     check = "./scripts/coverage"
   }
@@ -55,13 +56,13 @@ local linters = new Mapping<String, Step> {
     exclusive = true
     workspace_indicator = "mndz-overlay-manager.cabal"
     // Library HIE only (stan analyzes package sources; exe/test are thin Mains).
-    check = "\(stan) --hiedir=.hie/lib"
+    check = "\(stan) --hiedir=dist/release/hie/lib"
   }
   ["weeder"] {
     exclusive = true
     workspace_indicator = "mndz-overlay-manager.cabal"
     // Separate component dirs so app and test Main.hie do not clobber each other.
-    check = "\(weeder) --config=weeder.toml --hie-directory=.hie/lib --hie-directory=.hie/exe --hie-directory=.hie/test"
+    check = "\(weeder) --config=weeder.toml --hie-directory=dist/release/hie/lib --hie-directory=dist/release/hie/exe --hie-directory=dist/release/hie/test"
   }
 }
 

@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# Run Cabal in one build flavor, then collect HIE from dev and release.
+#
+# Usage (from anywhere):
+#   scripts/with-flavor [--dry-run] <flavor> -- <cabal args…>
+#
+# Flavors (flags are owned here; callers do not repeat them):
+#   dev               dist/dev               -O0, debug info, stack provenance
+#   release           dist/release           project default (-O1)
+#   coverage-dev      dist/coverage-dev      dev flags + --enable-coverage
+#   coverage-release  dist/coverage-release  --enable-coverage
+#
+# Stack provenance, one --ghc-options value for every component of dev and
+# coverage-dev: -finfo-table-map -fdistinct-constructor-tables.
+# Does not pass --ignore-project, so cabal.project and cabal.project.local apply.
+#
+# After a successful dev or release command, *.hie files are copied to
+# dist/<flavor>/hie/{lib,exe,test}. Coverage flavors do not collect.
+# `build all` fails if any of those three directories is empty.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT}"
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+dry_run=0
+positionals=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      positionals+=("$1")
+      shift
+      ;;
+  esac
+done
+cabal_args=("$@")
+
+if [[ ${#positionals[@]} -ne 1 ]]; then
+  die "usage: scripts/with-flavor [--dry-run] <flavor> -- <cabal args>"
+fi
+flavor="${positionals[0]}"
+if [[ ${#cabal_args[@]} -eq 0 ]]; then
+  die "missing cabal arguments after --"
+fi
+
+case "${flavor}" in
+  dev | release | coverage-dev | coverage-release) ;;
+  *) die "unknown flavor: ${flavor} (expected dev, release, coverage-dev, or coverage-release)" ;;
+esac
+
+build_root="${ROOT}/dist/${flavor}"
+cmd=(cabal "--builddir=dist/${flavor}")
+case "${flavor}" in
+  dev | coverage-dev)
+    cmd+=(
+      --disable-optimization
+      --enable-debug-info=1
+      --ghc-options="-finfo-table-map -fdistinct-constructor-tables"
+    )
+    ;;
+esac
+case "${flavor}" in
+  coverage-dev | coverage-release)
+    cmd+=(--enable-coverage)
+    ;;
+esac
+cmd+=("${cabal_args[@]}")
+
+if [[ "${dry_run}" -eq 1 ]]; then
+  printf '%q ' "${cmd[@]}"
+  printf '\n'
+  exit 0
+fi
+
+command -v cabal >/dev/null 2>&1 || die "missing required command: cabal"
+
+# Cabal arguments before a run's `--` (that `--` starts the manager argv).
+is_build_all=0
+seen_cmd=""
+for arg in "${cabal_args[@]}"; do
+  [[ "${arg}" == "--" ]] && break
+  [[ "${arg}" == -* ]] && continue
+  if [[ -z "${seen_cmd}" ]]; then
+    seen_cmd="${arg}"
+    continue
+  fi
+  if [[ "${seen_cmd}" == "build" && "${arg}" == "all" ]]; then
+    is_build_all=1
+  fi
+done
+
+"${cmd[@]}"
+
+# HPC mix trees and Cabal's autogen sources are not component HIE.
+# GHC 9.10 writes .hie under extra-compilation-artifacts/hie/, so that tree is kept.
+hie_skipped_artifact() {
+  local path="$1"
+  [[ "${path}" == */hpc/* || "${path}" == */autogen/* ]]
+}
+
+# dev keeps Cabal's noopt/ tree. release keeps the unsuffixed -O1 tree.
+hie_opt_matches() {
+  local path="$1"
+  case "${flavor}" in
+    dev)
+      [[ "${path}" == */noopt/* ]]
+      ;;
+    release)
+      [[ "${path}" != */noopt/* && "${path}" != */opt/* ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Bucket from the component directory Cabal places under the package id:
+# x/ executable, t/ test, build|noopt|opt library.
+hie_bucket() {
+  local path="$1"
+  local rel="${path#"${build_root}/build/"}"
+  local _arch _compiler _pkgid kind
+  IFS='/' read -r _arch _compiler _pkgid kind _ <<<"${rel}"
+  if [[ -z "${kind}" ]]; then
+    die "unexpected HIE path (no component directory): ${path}"
+  fi
+  case "${kind}" in
+    x) printf '%s\n' exe ;;
+    t) printf '%s\n' test ;;
+    b) die "benchmark HIE is not collected: ${path}" ;;
+    build | noopt | opt) printf '%s\n' lib ;;
+    *) die "unclassified HIE file: ${path}" ;;
+  esac
+}
+
+# Module path relative to the component object directory.
+# GHC 9.10 puts .hie under extra-compilation-artifacts/hie/<Module>.hie.
+# Older layouts put it next to .hi, including inside Cabal's <component>-tmp.
+hie_module_rel() {
+  local path="$1"
+  local rel
+  if [[ "${path}" == */extra-compilation-artifacts/hie/* ]]; then
+    rel="${path##*/extra-compilation-artifacts/hie/}"
+  elif [[ "${path}" == *-tmp/* ]]; then
+    rel="${path##*-tmp/}"
+  else
+    rel="${path##*/build/}"
+  fi
+  if [[ -z "${rel}" || "${rel}" == "${path}" || "${rel}" == /* || "/${rel}/" == */../* ]]; then
+    die "could not derive a module path for ${path}"
+  fi
+  printf '%s\n' "${rel}"
+}
+
+hie_dir_empty() {
+  local dir="$1"
+  local found
+  found="$(find "${dir}" -type f -name '*.hie' -print -quit)"
+  [[ -z "${found}" ]]
+}
+
+collect_hie() {
+  local dest="${build_root}/hie"
+  local search="${build_root}/build"
+  rm -rf "${dest}"
+  mkdir -p "${dest}/lib" "${dest}/exe" "${dest}/test"
+
+  if [[ ! -d "${search}" ]]; then
+    if [[ "${is_build_all}" -eq 1 ]]; then
+      die "no Cabal build tree under ${search}; cannot collect HIE"
+    fi
+    return 0
+  fi
+
+  local path bucket rel
+  while IFS= read -r -d '' path; do
+    if hie_skipped_artifact "${path}"; then
+      continue
+    fi
+    if ! hie_opt_matches "${path}"; then
+      continue
+    fi
+    bucket="$(hie_bucket "${path}")"
+    rel="$(hie_module_rel "${path}")"
+    mkdir -p "${dest}/${bucket}/$(dirname -- "${rel}")"
+    cp -f -- "${path}" "${dest}/${bucket}/${rel}"
+  done < <(find "${search}" -type f -name '*.hie' -print0)
+
+  if [[ "${is_build_all}" -eq 1 ]]; then
+    local bucket
+    for bucket in lib exe test; do
+      if hie_dir_empty "${dest}/${bucket}"; then
+        die "HIE collection for ${flavor} produced no files in ${dest}/${bucket} after build all"
+      fi
+    done
+  fi
+}
+
+case "${flavor}" in
+  dev | release) collect_hie ;;
+esac

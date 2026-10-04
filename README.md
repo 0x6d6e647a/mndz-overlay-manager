@@ -8,6 +8,8 @@ Haskell CLI for managing a Gentoo overlay: list ebuilds, check for outdated pack
 
 This project targets **GHC 9.10.x** and needs a matching **cabal-install**. The recommended way to install both is [GHCup](https://www.haskell.org/ghcup/): install GHCup, then select (or install) a 9.10 series GHC and Cabal so `ghc --version` reports 9.10.x before you build.
 
+The documented build and run commands use [just](https://just.systems/) **1.55 or newer** (a system install; the repo does not install it).
+
 ### Runtime requirements
 
 | When | Tools on `PATH` |
@@ -40,12 +42,14 @@ While a **full-path** unit is running, `update` keeps one named Docker container
 
 ## Build and run
 
+Short recipes use the dev build (unoptimized, with debug info).
+
 ```bash
-cabal build all
-cabal run mndz-overlay-manager -- --help
+just build
+just run --help
 ```
 
-Use `cabal run mndz-overlay-manager -- COMMAND --help` for subcommand help. After a successful build you can also run the installed binary name the same way if you have it on `PATH` via Cabal.
+Use `just run COMMAND --help` for subcommand help. Arguments after `just run` are the manager's own arguments, globals before the work command (`just run --jobs 4 outdated crush`).
 
 ## Configuration
 
@@ -128,8 +132,8 @@ Global options apply **before** the subcommand (for example `mndz-overlay-manage
 Inventory every ebuild in the configured overlay. Prints one package atom per line in the form `category/package-version` to standard output. Useful for scripting or a quick check that the overlay path and discovery look right. There are no subcommand-local flags; empty inventory is an error.
 
 ```bash
-cabal run mndz-overlay-manager -- list
-cabal run mndz-overlay-manager -- --overlay-path /path/to/overlay list
+just run list
+just run --overlay-path /path/to/overlay list
 ```
 
 ### `outdated`
@@ -148,15 +152,15 @@ Bun packages whose runtime ceiling comes from overlay `dev-lang/bun-bin` are pre
 
 ```bash
 # All discovered packages
-cabal run mndz-overlay-manager -- outdated
-cabal run mndz-overlay-manager -- -v --jobs 4 outdated
+just run outdated
+just run -v --jobs 4 outdated
 
 # One or more packages
-cabal run mndz-overlay-manager -- outdated dev-util/crush
-cabal run mndz-overlay-manager -- outdated crush dolt
+just run outdated dev-util/crush
+just run outdated crush dolt
 
 # Force live network checks
-cabal run mndz-overlay-manager -- outdated --refresh
+just run outdated --refresh
 ```
 
 ### `update`
@@ -169,16 +173,16 @@ Apply updates for packages that need work: rename or rewrite ebuilds, regenerate
 
 ```bash
 # All packages that need work
-cabal run mndz-overlay-manager -- update
+just run update
 
 # One or more packages
-cabal run mndz-overlay-manager -- update dev-util/crush
-cabal run mndz-overlay-manager -- update crush dolt
+just run update dev-util/crush
+just run update crush dolt
 
 # Common operator flags
-cabal run mndz-overlay-manager -- --jobs 2 -v update
-cabal run mndz-overlay-manager -- --no-progress update category/package
-cabal run mndz-overlay-manager -- update --refresh
+just run --jobs 2 -v update
+just run --no-progress update category/package
+just run update --refresh
 ```
 
 `update` runs a **plan phase** first (using the check cache when enabled, same needs-work rules as `outdated` / apply), then an overlay **dirty preflight** on selected package directories and on overlay atoms the materialize image will emerge (`dev-lang/bun-bin` when the image installs overlay bun-bin, `dev-lisp/qlot` when the image installs overlay qlot, `dev-build/node-gyp` when the image installs overlay node-gyp): dirty, staged, untracked, or deleted paths there hard-fail with exit `1` before mutate or `docker build`. Restore or finish that tree relative to git HEAD (unrelated overlay-root files such as `README.md` do not fail this check). Then conditional assets/token checks for packages that need work, reuse vs full classification, `docker` + materialize-image checks when any unit is full path, the free-space gate, then concurrent mutate/apply. Spine tools (`git`, `ebuild`, `egencache`, `gpg`) and layout / manager-distfiles probes run before plan. When at least one package that needs work will attempt `DepsAndAssets`, it also checks that `assets-path` is a git work tree, that `origin` parses as `github.com/{owner}/{repo}` (SSH or HTTPS), and that a GitHub token can be resolved. GitHub Releases and assets `SRC_URI` use that origin `{owner}/{repo}` (not a hardcoded GitHub owner or repository name). Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
@@ -219,10 +223,10 @@ When `update` will `docker build` the materialize image, it also checks free spa
 
 ```bash
 # Prefer a disk-backed temp root when /tmp is a small tmpfs
-TMPDIR=$HOME/local/tmp cabal run mndz-overlay-manager -- update
+TMPDIR=$HOME/local/tmp just run update
 
 # Or reduce concurrent materialize pressure
-cabal run mndz-overlay-manager -- --jobs 1 update
+just run --jobs 1 update
 ```
 
 If md5-cache is **missing**, hard-fail recovery is `gencache category/package`. If `_md5_` **mismatches**, use `gencache --force category/package`, then retry `update`.
@@ -237,14 +241,14 @@ Generate or repair Portage **md5-dict** cache under `metadata/md5-cache/` via `e
 
 ```bash
 # Full-tree bootstrap / bulk regenerate
-cabal run mndz-overlay-manager -- gencache
+just run gencache
 
 # One package
-cabal run mndz-overlay-manager -- gencache dev-util/crush
+just run gencache dev-util/crush
 
 # Overwrite mismatched or force-refresh after eclass bumps
-cabal run mndz-overlay-manager -- gencache --force
-cabal run mndz-overlay-manager -- gencache --force crush
+just run gencache --force
+just run gencache --force crush
 ```
 
 ### md5-cache bootstrap and recovery
@@ -262,10 +266,10 @@ Requires `assets-path` whose `origin` is a `github.com/{owner}/{repo}` URL. Does
 
 ```bash
 # First store
-cabal run mndz-overlay-manager -- github-token
+just run github-token
 
 # Replace plaintext or rotate the wrapped PAT
-cabal run mndz-overlay-manager -- github-token --force
+just run github-token --force
 ```
 
 Create the PAT on GitHub: **Fine-grained**, resource owner matching the assets repo, **Only select repositories** (that one assets repo), **Contents: write**. GitHub always grants read-only access to public repositories, so `github-token` does **not** fail the probe when you own other public repositories. **Only select repositories** plus Contents: write on the assets origin is operator guidance rather than an extra-repository API check.
@@ -276,10 +280,10 @@ Delete the **manager private distfiles cache** used by `update` for Portage `ebu
 
 ```bash
 # Clean the default (or config) manager distfiles cache
-cabal run mndz-overlay-manager -- eclean
+just run eclean
 
 # Clean an explicit manager cache path
-cabal run mndz-overlay-manager -- --distfiles-path /path/to/private-distfiles eclean
+just run --distfiles-path /path/to/private-distfiles eclean
 ```
 
 ## Development
