@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Product truth for the manually seeded `dev-util/claude-agent-acp` overlay package (frozen PV 0.81.1): scoped npm packaging, offline deps assets, default-off `bundled-claude` (gentoo `dev-util/claude-code` unless the SDK ELF is requested), node floor, `KEYWORDS`, offline `src_test`, and operator smoke acceptance. This is overlay/seed truth, not mndz-overlay-manager runtime behavior.
+Product truth for the manually seeded `dev-util/claude-agent-acp` overlay package (frozen PV 0.81.1): scoped npm packaging, offline deps assets, default-off `bundled-claude` (gentoo `dev-util/claude-code` unless the SDK ELF is requested), default-off `external-claude` (operator-supplied `CLAUDE_CODE_EXECUTABLE` and no `dev-util/claude-code` dependency), node floor, `KEYWORDS`, offline `src_test`, and operator smoke acceptance. This is overlay/seed truth, not mndz-overlay-manager runtime behavior.
 
 ## Requirements
 
@@ -79,26 +79,39 @@ The seed ebuild SHALL set `KEYWORDS="-* ~amd64"`. It SHALL NOT keyword `arm`, `a
 
 ### Requirement: bundled-claude revision of the live PV
 
-The live ebuild for installed PV `0.81.2` SHALL be `claude-agent-acp-0.81.2-r1.ebuild`. The unrevised `claude-agent-acp-0.81.2.ebuild` SHALL NOT remain the live file. `IUSE` SHALL include `bundled-claude` without a default-on `+` prefix. `metadata.xml` SHALL describe `bundled-claude` as installing the Claude CLI bundled in the npm package.
+The live ebuild for installed PV `0.86.0` SHALL be `claude-agent-acp-0.86.0-r1.ebuild`. The unrevised `claude-agent-acp-0.86.0.ebuild` SHALL NOT remain the live file. `IUSE` SHALL include `bundled-claude` and `external-claude`, each without a default-on `+` prefix. `REQUIRED_USE` SHALL be `?? ( bundled-claude external-claude )`. `metadata.xml` SHALL describe `bundled-claude` as installing the Claude CLI bundled in the npm package, and SHALL describe `external-claude` as using a Claude Code executable supplied outside Portage via `CLAUDE_CODE_EXECUTABLE`.
 
 #### Scenario: Revision path
 
-- **WHEN** the harness flag is published
-- **THEN** the live ebuild path is `dev-util/claude-agent-acp/claude-agent-acp-0.81.2-r1.ebuild`
-- **AND** `claude-agent-acp-0.81.2.ebuild` is not a live ebuild
+- **WHEN** the external harness flag is published
+- **THEN** the live ebuild path is `dev-util/claude-agent-acp/claude-agent-acp-0.86.0-r1.ebuild`
+- **AND** `claude-agent-acp-0.86.0.ebuild` is not a live ebuild
 
 #### Scenario: Flag defaults off
 
 - **WHEN** the ebuild `IUSE` is inspected
 - **THEN** `bundled-claude` is present and is not prefixed with `+`
+- **AND** `external-claude` is present and is not prefixed with `+`
+
+#### Scenario: At most one harness flag
+
+- **WHEN** the ebuild `REQUIRED_USE` is inspected
+- **THEN** it is `?? ( bundled-claude external-claude )`
+
+#### Scenario: Both harness flags are rejected
+
+- **WHEN** the package is emerged with `bundled-claude` and `external-claude` both enabled
+- **THEN** Portage rejects the USE combination
 
 ### Requirement: Installed command name
 
 `src_install` SHALL install `/usr/bin/claude-agent-acp` via an offline global npm install from the deps cache into `${ED}/usr`. This package's installed image SHALL NOT contain `/usr/bin/claude` or `/opt/bin/claude`.
 
-When `bundled-claude` is disabled, that install SHALL pass `--omit=optional`, SHALL replace the npm bin with a wrapper that exports `CLAUDE_CODE_EXECUTABLE=/opt/bin/claude` when the variable is unset and then executes the adapter entrypoint, and the ebuild SHALL declare an unversioned `dev-util/claude-code` atom on `RDEPEND` inside `!bundled-claude? ( )`.
+When `bundled-claude` and `external-claude` are both disabled, that install SHALL pass `--omit=optional`, SHALL replace the npm bin with a wrapper that exports `CLAUDE_CODE_EXECUTABLE=/opt/bin/claude` when the variable is unset and then executes the adapter entrypoint, and the ebuild SHALL declare an unversioned `dev-util/claude-code` atom on `RDEPEND` inside `!bundled-claude? ( !external-claude? ( dev-util/claude-code ) )`.
 
 When `bundled-claude` is enabled, that install SHALL NOT pass `--omit=optional`, SHALL leave the npm bin in place, and SHALL NOT declare a dependency on `dev-util/claude-code`.
+
+When `external-claude` is enabled, that install SHALL pass `--omit=optional`, SHALL leave the npm bin in place, SHALL NOT install a wrapper, SHALL NOT export `CLAUDE_CODE_EXECUTABLE`, and SHALL NOT declare a dependency on `dev-util/claude-code`. The installed image SHALL NOT contain the nested Claude CLI.
 
 #### Scenario: Bin name
 
@@ -108,15 +121,23 @@ When `bundled-claude` is enabled, that install SHALL NOT pass `--omit=optional`,
 
 #### Scenario: Default install uses gentoo Claude Code
 
-- **WHEN** the package is emerged with `bundled-claude` disabled
+- **WHEN** the package is emerged with `bundled-claude` and `external-claude` both disabled
 - **THEN** `/usr/bin/claude-agent-acp` is a wrapper that defaults `CLAUDE_CODE_EXECUTABLE` to `/opt/bin/claude`
 - **AND** this package's installed image does not contain `/usr/bin/claude`
-- **AND** `RDEPEND` includes `dev-util/claude-code` only in the `!bundled-claude?` group
+- **AND** `RDEPEND` includes `dev-util/claude-code` only inside `!bundled-claude? ( !external-claude? ( dev-util/claude-code ) )`
 
 #### Scenario: Flag on keeps the npm bin
 
 - **WHEN** the package is emerged with `bundled-claude` enabled
 - **THEN** `/usr/bin/claude-agent-acp` is the npm-installed bin
+- **AND** the ebuild does not depend on `dev-util/claude-code`
+
+#### Scenario: External flag keeps the npm bin and drops the harness
+
+- **WHEN** the package is emerged with `external-claude` enabled and `bundled-claude` disabled
+- **THEN** `/usr/bin/claude-agent-acp` is the npm-installed bin
+- **AND** that bin does not export `CLAUDE_CODE_EXECUTABLE`
+- **AND** the installed image does not contain the nested Claude CLI
 - **AND** the ebuild does not depend on `dev-util/claude-code`
 
 ### Requirement: Prebuilt Claude CLI is not stripped
@@ -149,11 +170,11 @@ The ebuild SHALL NOT inherit `shell-completion` and SHALL NOT declare bash, zsh,
 - **WHEN** the ebuild is inspected
 - **THEN** it does not declare `bash-completion`, `zsh-completion`, or `fish-completion` USE flags
 - **AND** it does not inherit `shell-completion`
-- **AND** `IUSE` contains `bundled-claude` and `test` and no completion flag
+- **AND** `IUSE` contains `bundled-claude`, `external-claude`, and `test` and no completion flag
 
 ### Requirement: Offline src_test version smoke
 
-The ebuild SHALL include `test` in `IUSE` and set `RESTRICT` to include `!test? ( test )`. `src_test` SHALL install the package into a temporary prefix from the offline deps cache, passing `--omit=optional` when `bundled-claude` is disabled, and SHALL run `claude-agent-acp --version` there. The phase SHALL fail unless that command exits 0 and its stdout is the package PV. The test phase SHALL NOT require network access and SHALL NOT treat `--help` as the smoke command. The version check SHALL pass with `bundled-claude` disabled.
+The ebuild SHALL include `test` in `IUSE` and set `RESTRICT` to include `!test? ( test )`. `src_test` SHALL install the package into a temporary prefix from the offline deps cache, passing `--omit=optional` when `bundled-claude` is disabled, and SHALL run `claude-agent-acp --version` there. The phase SHALL fail unless that command exits 0 and its stdout is the package PV. The test phase SHALL NOT require network access and SHALL NOT treat `--help` as the smoke command. The version check SHALL pass with `bundled-claude` disabled, and SHALL pass with `external-claude` enabled and `CLAUDE_CODE_EXECUTABLE` unset.
 
 #### Scenario: Offline version smoke
 
@@ -166,6 +187,12 @@ The ebuild SHALL include `test` in `IUSE` and set `RESTRICT` to include `!test? 
 - **WHEN** `src_test` runs with `bundled-claude` disabled
 - **THEN** the temporary npm install passes `--omit=optional`
 - **AND** `claude-agent-acp --version` still exits 0 with stdout equal to the PV
+
+#### Scenario: External USE omits the optional CLI in src_test
+
+- **WHEN** `src_test` runs with `external-claude` enabled, `bundled-claude` disabled, and `CLAUDE_CODE_EXECUTABLE` unset
+- **THEN** the temporary npm install passes `--omit=optional`
+- **AND** `claude-agent-acp --version` exits 0 with stdout equal to the PV
 
 ### Requirement: Operator smoke acceptance
 
