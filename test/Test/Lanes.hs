@@ -303,6 +303,7 @@ unitTests =
       testCase "Cargo Msrv And Ceilings" testCargoMsrvAndCeilings,
       testCase "Cargo Toml Probe Order" testCargoTomlProbeOrder,
       testCase "Cargo Policy Tag Floor Walker" testPolicyTagFloorWalker,
+      testCase "cargoTargetCfg" testCargoTargetCfg,
       testCase "Canonical Ebuild Revision" testCanonicalEbuildRevision,
       testCase "Go Lane Selection" testGoLaneSelection,
       testCase "Go Lane Collapse" testGoLaneCollapse,
@@ -1135,6 +1136,165 @@ testPolicyTagFloorWalker = do
     TagFloorFailed err ->
       assertTrue "patch escape" ("escapes" `T.isInfixOf` err)
     other -> assertFailure ("patch escape: " <> show other)
+
+-- | target_env and CPU target_arch floors, next to the 1.4 target-table cases.
+testCargoTargetCfg :: IO ()
+testCargoTargetCfg = do
+  musl <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(all(target_os = \"linux\", target_env = \"musl\"))'.dependencies]",
+              "muslcrate = { path = \"muslcrate\" }"
+            ]
+        ),
+        (Just "muslcrate", pkgToml "muslcrate" "1.99")
+      ]
+  case musl of
+    TagFloorComplete (Just v) _ ->
+      assertEq "musl-only path crate ignored" "1.91.0" v
+    other -> assertFailure ("musl: " <> show other)
+  gnu <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(all(target_os = \"linux\", target_env = \"gnu\"))'.dependencies]",
+              "gnucrate = { path = \"gnucrate\" }"
+            ]
+        ),
+        (Just "gnucrate", pkgToml "gnucrate" "1.92")
+      ]
+  case gnu of
+    TagFloorComplete (Just v) _ ->
+      assertEq "gnu path crate is active on linux" "1.92.0" v
+    other -> assertFailure ("gnu: " <> show other)
+  msvc <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(all(target_os = \"windows\", target_env = \"msvc\"))'.dependencies]",
+              "msvccrate = { path = \"msvccrate\" }"
+            ]
+        ),
+        (Just "msvccrate", pkgToml "msvccrate" "1.99")
+      ]
+  case msvc of
+    TagFloorComplete (Just v) _ ->
+      assertEq "msvc-only path crate ignored" "1.91.0" v
+    other -> assertFailure ("msvc: " <> show other)
+  sgx <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(target_env = \"sgx\")'.dependencies]",
+              "sgxcrate = { path = \"sgxcrate\" }"
+            ]
+        ),
+        (Just "sgxcrate", pkgToml "sgxcrate" "1.99")
+      ]
+  case sgx of
+    TagFloorComplete (Just v) _ ->
+      assertEq "unknown target_env ignored" "1.91.0" v
+    other -> assertFailure ("sgx: " <> show other)
+  codex <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(all(target_os = \"linux\", target_env = \"musl\", any(target_arch = \"x86_64\", target_arch = \"aarch64\")))'.dependencies]",
+              "tikv-jemallocator = { path = \"jemalloc\" }"
+            ]
+        ),
+        (Just "jemalloc", pkgToml "tikv-jemallocator" "1.99")
+      ]
+  case codex of
+    TagFloorComplete (Just v) _ ->
+      assertEq "codex musl allocator table ignored" "1.91.0" v
+    other -> assertFailure ("codex musl: " <> show other)
+  x64 <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(target_arch = \"x86_64\")'.dependencies]",
+              "archcrate = { path = \"archcrate\" }"
+            ]
+        ),
+        (Just "archcrate", pkgToml "archcrate" "1.93")
+      ]
+  case x64 of
+    TagFloorComplete (Just v) _ ->
+      assertEq "x86_64 path crate raises the floor" "1.93.0" v
+    other -> assertFailure ("x86_64: " <> show other)
+  wasm <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(target_arch = \"wasm32\")'.dependencies]",
+              "wasmcrate = { path = \"wasmcrate\" }"
+            ]
+        ),
+        (Just "wasmcrate", pkgToml "wasmcrate" "1.99")
+      ]
+  case wasm of
+    TagFloorComplete (Just v) _ ->
+      assertEq "wasm32-only path crate ignored" "1.91.0" v
+    other -> assertFailure ("wasm32: " <> show other)
+  nvptx <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(target_arch = \"nvptx64\")'.dependencies]",
+              "nv = { path = \"nv\" }"
+            ]
+        ),
+        (Just "nv", pkgToml "nv" "1.99")
+      ]
+  case nvptx of
+    TagFloorComplete mFloor _ ->
+      assertFailure
+        ("nvptx64 selected as " <> show mFloor <> ", not requirement 0.0.0")
+    TagFloorIncomplete reasons _ ->
+      assertTrue "nvptx64 unparsed cfg" (any ("nvptx64" `T.isInfixOf`) reasons)
+    other -> assertFailure ("nvptx64: " <> show other)
 
 testCanonicalEbuildRevision :: IO ()
 testCanonicalEbuildRevision = do

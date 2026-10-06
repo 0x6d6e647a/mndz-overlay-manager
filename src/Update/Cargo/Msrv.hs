@@ -1281,9 +1281,35 @@ atomHolds name mVal fam =
     ("target_family", Just "windows") -> Just (fam == FamWindows)
     ("target_family", Just "wasm") -> Just (fam == FamWasm)
     ("target_family", Just _) -> Just False
+    -- gnu is the modeled Linux userspace. msvc is Windows. musl and every
+    -- other env hold for no family, so not(target_env = "…") still evaluates.
+    -- An unlisted target_arch stays unparsed (the wildcard below).
+    ("target_env", Just "gnu") -> Just (fam == FamLinux)
+    ("target_env", Just "msvc") -> Just (fam == FamWindows)
+    ("target_env", Just _) -> Just False
     ("target_arch", Just "wasm32") -> Just (fam == FamWasm)
     ("target_arch", Just "wasm64") -> Just (fam == FamWasm)
+    ("target_arch", Just arch)
+      | arch `elem` cpuTargetArches -> Just (fam /= FamWasm)
     _ -> Nothing
+  where
+    -- Hold on every non-wasm family. wasm32 and wasm64 are handled above.
+    cpuTargetArches =
+      [ "x86_64",
+        "x86",
+        "aarch64",
+        "arm",
+        "loongarch64",
+        "mips",
+        "mips64",
+        "powerpc",
+        "powerpc64",
+        "riscv32",
+        "riscv64",
+        "s390x",
+        "sparc",
+        "sparc64"
+      ]
 
 -- | Dependency names listed only in windows-only (or wasm-only) target tables.
 -- | Dotted @channel@ from @rust-toolchain.toml@. @stable@/@nightly@ and
