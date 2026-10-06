@@ -69,7 +69,7 @@ The mndz-overlay package `dev-util/ralph-tui` SHALL declare `IUSE` including `te
 
 ### Requirement: Go packages with existing suites are USE-gated
 
-`dev-db/dolt`, `dev-util/beads`, `dev-util/crush`, and `dev-util/gastown` SHALL each declare `IUSE` including `test`, set `RESTRICT` including `!test? ( test )`, retain a `src_test` that runs the package Go tests (`ego test` or equivalent), and publish content-only gate fixes as revision bumps. For `dev-util/gastown`, `src_test` SHALL run the Go tests in short mode.
+`dev-db/dolt`, `dev-util/beads`, `dev-util/crush`, `dev-util/gastown`, and `net-analyzer/caddy-analyzer` SHALL each declare `IUSE` including `test`, set `RESTRICT` including `!test? ( test )`, retain a `src_test` that runs the package Go tests (`ego test` or equivalent), and publish content-only gate fixes as revision bumps. For `dev-util/gastown`, `src_test` SHALL run the Go tests in short mode.
 
 #### Scenario: dolt gated
 
@@ -89,6 +89,14 @@ The mndz-overlay package `dev-util/ralph-tui` SHALL declare `IUSE` including `te
 - **THEN** it includes `test` in `IUSE` and `!test? ( test )` in `RESTRICT`
 - **AND** `src_test` runs the Go tests in short mode
 - **AND** an initial ebuild that already contains the gate is compliant without a revision bump solely for that gate
+
+#### Scenario: Caddy analyzer runs its suite without external downloads
+
+- **WHEN** `USE=test` and `FEATURES=test` enable caddy-analyzer's test phase
+- **THEN** `src_test` runs `ego test ./...` with configuration isolated beneath the Portage temporary directory
+- **AND** the interval filtering test does not download GeoIP databases
+- **AND** the missing-GeoIP regression test passes and HTTP contract tests use loopback fixtures
+- **AND** upstream test failures fail the test phase
 
 ### Requirement: Cargo packages gate inherited cargo_src_test
 

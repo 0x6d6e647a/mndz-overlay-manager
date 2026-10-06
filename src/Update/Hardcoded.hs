@@ -139,7 +139,12 @@ hardcodedPolicies =
       policy
         "dev-util/autolith"
         (GitHub "luciusmagn" "autolith" "v")
-        (DepsAndAssets Sbcl)
+        (DepsAndAssets Sbcl),
+      policyArches
+        "net-analyzer/caddy-analyzer"
+        (GitHub "lenny-ts" "caddy-analyzer" "v")
+        (DepsAndAssets (Go Nothing))
+        ["amd64", "arm", "arm64"]
     ]
   where
     policy key src tech = policyArches key src tech []

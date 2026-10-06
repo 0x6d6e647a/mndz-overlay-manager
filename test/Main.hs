@@ -5,6 +5,7 @@ import Test.Apply qualified as Apply
 import Test.Assets qualified as Assets
 import Test.AtomClosure qualified as AtomClosure
 import Test.CLI qualified as CLI
+import Test.CaddyAnalyzer qualified as CaddyAnalyzer
 import Test.CheckCache qualified as CheckCache
 import Test.CheckPlan qualified as CheckPlan
 import Test.Config qualified as Config
@@ -86,6 +87,7 @@ main = do
               Md5Cache.unitTests,
               Ecosystems.unitTests,
               CheckPlan.unitTests,
+              CaddyAnalyzer.unitTests,
               Properties.tests
             ],
           testGroup
@@ -97,6 +99,7 @@ main = do
               Md5Cache.integrationTests,
               Ecosystems.integrationTests,
               CheckPlan.integrationTests,
+              CaddyAnalyzer.integrationTests,
               GitHubResilience.integrationTests,
               Waves.integrationTests
             ]

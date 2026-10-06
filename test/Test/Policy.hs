@@ -230,7 +230,7 @@ import Update.GpgAgent
     pinentryChildEnv,
     teardownGpgHandle,
   )
-import Update.Hardcoded (lookupHardcoded, lookupPolicy)
+import Update.Hardcoded (lookupHardcoded, lookupLaneArches, lookupPolicy)
 import Update.Http (fetchHttpJsonWithHttp, fetchHttpWith, fetchHttpWithHttp, tryHttp)
 import Update.Md5Cache
   ( EgencacheRequest (..),
@@ -498,6 +498,25 @@ testPolicyClassification = do
     other -> do
       hPutStrLn stderr $ "badger technique: " <> show other
       exitFailure
+  case lookupPolicy (PackageKey "net-analyzer/caddy-analyzer") of
+    Just
+      ( PackagePolicy
+          (GitHub "lenny-ts" "caddy-analyzer" "v")
+          (DepsAndAssets (Go Nothing))
+          ["amd64", "arm", "arm64"]
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "caddy-analyzer technique: " <> show other
+      exitFailure
+  assertEq
+    "caddy-analyzer source"
+    (Just (GitHub "lenny-ts" "caddy-analyzer" "v"))
+    (resolveSource (PackageKey "net-analyzer/caddy-analyzer"))
+  assertEq
+    "caddy-analyzer arches"
+    ["amd64", "arm", "arm64"]
+    (lookupLaneArches (PackageKey "net-analyzer/caddy-analyzer"))
   case lookupPolicy (PackageKey "dev-util/openspec") of
     Just (PackagePolicy (Npm "@fission-ai/openspec") (DepsAndAssets NpmEco) []) -> pure ()
     other -> do

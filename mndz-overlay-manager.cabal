@@ -231,6 +231,7 @@ test-suite mndz-overlay-manager-test
         Test.Assert
         Test.AtomClosure
         Test.Assets
+        Test.CaddyAnalyzer
         Test.CheckCache
         Test.CheckPlan
         Test.CLI

@@ -158,6 +158,7 @@ just run -v --jobs 4 outdated
 # One or more packages
 just run outdated dev-util/crush
 just run outdated crush dolt
+just run outdated caddy-analyzer
 
 # Force live network checks
 just run outdated --refresh
@@ -178,6 +179,7 @@ just run update
 # One or more packages
 just run update dev-util/crush
 just run update crush dolt
+just run update net-analyzer/caddy-analyzer
 
 # Common operator flags
 just run --jobs 2 -v update
