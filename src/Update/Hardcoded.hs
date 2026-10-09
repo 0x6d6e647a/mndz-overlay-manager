@@ -144,7 +144,12 @@ hardcodedPolicies =
         "net-analyzer/caddy-analyzer"
         (GitHub "lenny-ts" "caddy-analyzer" "v")
         (DepsAndAssets (Go Nothing))
-        ["amd64", "arm", "arm64"]
+        ["amd64", "arm", "arm64"],
+      policyArches
+        "media-gfx/photocraft"
+        (GitHub "storytold" "photocraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/photocraft") CargoGitTag))
+        ["amd64", "x86", "arm", "arm64", "ppc64", "loong", "riscv", "sparc", "s390"]
     ]
   where
     policy key src tech = policyArches key src tech []

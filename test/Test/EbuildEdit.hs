@@ -319,7 +319,8 @@ tests =
       testCase "Cargo Provenance Coherence" testCargoProvenanceCoherence,
       testCase "Go Keywords Assembly" testGoKeywordsAssembly,
       testCase "Set Keywords" testSetKeywords,
-      testCase "Origin-derived assets SRC_URI" testOriginAssetsSrcUri
+      testCase "Origin-derived assets SRC_URI" testOriginAssetsSrcUri,
+      testCase "Photocraft donor preservation" testPhotocraftDonorPreservation
     ]
 
 testEbuildEdit :: IO ()
@@ -1350,3 +1351,89 @@ testOriginAssetsSrcUri = do
     "default atom check sees frozen package-owned URL"
     True
     (ebuildNeedsContentFixAtom "dolt" ["~amd64"] defaultFrozen Nothing)
+
+-- | A 0.1.1-shaped photocraft donor rewritten the way Cargo apply does:
+-- pycargoebuild replaces the marked crate-license block, then the manager
+-- empties CRATES, parameterizes the assets SRC_URI, and rewrites KEYWORDS
+-- and RUST_MIN_VER. Phases and the extra LICENSE+= stay.
+testPhotocraftDonorPreservation :: IO ()
+testPhotocraftDonorPreservation = do
+  let oldGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tMIT",
+            "\tZLIB",
+            "\""
+          ]
+      newGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tApache-2.0",
+            "\tUnicode-3.0",
+            "\""
+          ]
+      donor =
+        T.unlines
+          [ "EAPI=8",
+            "",
+            "RUST_MIN_VER=\"1.90.0\"",
+            "",
+            "CRATES=\"",
+            "\toldcrate@1.0.0",
+            "\"",
+            "",
+            "inherit cargo",
+            "",
+            "DESCRIPTION=\"Photocraft\"",
+            "HOMEPAGE=\"https://github.com/storytold/photocraft\"",
+            "SRC_URI=\"https://github.com/storytold/photocraft/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/photocraft-0.1.1/photocraft-0.1.1-crates.tar.xz\"",
+            "",
+            "LICENSE=\"MIT OR Apache-2.0\"",
+            oldGen,
+            "LICENSE+=\"OFL-1.1 ISC CC0-1.0 SCOWL\"",
+            "SLOT=\"0\"",
+            "KEYWORDS=\"-* ~amd64 ~x86 ~arm ~arm64 ~ppc64 ~loong ~riscv ~sparc ~s390\"",
+            "IUSE=\"+gui +cli +portal +X +wayland test\"",
+            "REQUIRED_USE=\"|| ( gui cli ) gui? ( || ( X wayland ) )\"",
+            "RESTRICT=\"!test? ( test )\"",
+            "",
+            "src_test() {",
+            "\tcargo_src_test --workspace --exclude photocraft-web --exclude xtask",
+            "}",
+            "",
+            "src_install() {",
+            "\tdomenu packaging/linux/ai.storyteller.photocraft.desktop",
+            "}"
+          ]
+      simulated = T.replace oldGen newGen donor
+      rewritten0 = setKeywords ["-*", "~amd64"] (ensureCargoAssetsSrcUri "photocraft" (ensureEmptyCrates simulated))
+  rewritten <- assertRight "rust min" (ensureRustMinVer "1.91" rewritten0)
+  assertTrue "IUSE survives" ("IUSE=\"+gui +cli +portal +X +wayland test\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "REQUIRED_USE survives"
+    ("REQUIRED_USE=\"|| ( gui cli ) gui? ( || ( X wayland ) )\"" `T.isInfixOf` rewritten)
+  assertTrue "workspace excludes survive" ("--exclude photocraft-web --exclude xtask" `T.isInfixOf` rewritten)
+  assertTrue
+    "desktop install survives"
+    ("domenu packaging/linux/ai.storyteller.photocraft.desktop" `T.isInfixOf` rewritten)
+  assertTrue
+    "extra license line survives"
+    ("LICENSE+=\"OFL-1.1 ISC CC0-1.0 SCOWL\"" `T.isInfixOf` rewritten)
+  let (generated, after) = T.breakOn "LICENSE+=\"OFL-1.1" rewritten
+  assertTrue "generated block changed" ("Unicode-3.0" `T.isInfixOf` generated)
+  assertTrue "old generated license dropped" (not ("ZLIB" `T.isInfixOf` generated))
+  assertTrue "SCOWL stays outside the generated block" (not ("SCOWL" `T.isInfixOf` generated))
+  assertTrue "SCOWL remains after the generated block" ("SCOWL" `T.isInfixOf` after)
+  assertTrue "CRATES emptied" ("CRATES=\"\"" `T.isInfixOf` rewritten)
+  assertTrue "old crate list dropped" (not ("oldcrate@1.0.0" `T.isInfixOf` rewritten))
+  assertTrue "RUST_MIN_VER updated" ("RUST_MIN_VER=\"1.91.0\"" `T.isInfixOf` rewritten)
+  assertTrue "old floor dropped" (not ("RUST_MIN_VER=\"1.90.0\"" `T.isInfixOf` rewritten))
+  assertTrue "KEYWORDS updated" ("KEYWORDS=\"-* ~amd64\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "assets SRC_URI parameterized"
+    ( "photocraft-${PV}/photocraft-${PV}-crates.tar.xz" `T.isInfixOf` rewritten
+        && not ("photocraft-0.1.1" `T.isInfixOf` rewritten)
+    )

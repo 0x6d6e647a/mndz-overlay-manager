@@ -48,11 +48,14 @@ The hardcoded policy map SHALL include an entry for every package known to ship 
 - `dev-util/openspec` SHALL use `DepsAndAssets Npm` with its npm source
 - `dev-util/ralph-tui` and `dev-util/opencode` SHALL use `DepsAndAssets Bun` with GitHub sources (`subsy/ralph-tui`, `anomalyco/opencode`, tag prefix `v`)
 - `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets Cargo` with GitHub sources (`jdx` / respective repos / tag prefix `v`); `usage` SHALL use package subdirectory `cli` when required for package metadata
+- `media-gfx/photocraft` SHALL use `DepsAndAssets` with ecosystem `Cargo`, provenance `CargoGitTag`, repository-root lock, package subdirectory `apps/photocraft`, GitHub source `storytold/photocraft`, tag prefix `v`, and runtime-lane architectures restricted to `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`
 - `dev-util/autolith` SHALL use `DepsAndAssets Sbcl` with GitHub source `luciusmagn/autolith` and tag prefix `v`
 
 The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone. `dev-lisp/qlot` SHALL NOT be an overlay wait-edge provider for Autolith or other packages. `dev-build/node-gyp` SHALL NOT be an overlay wait-edge provider for opencode, ralph-tui, or other packages. `dev-util/grok-bot-bin` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image. `net-analyzer/witen-warden-bin` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image. `dev-util/gastown` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
 
 `net-analyzer/caddy-analyzer` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
+
+`media-gfx/photocraft` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
 
 #### Scenario: Simple binary package is GitMvAndManifest
 
@@ -145,6 +148,24 @@ The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for c
 - **WHEN** `outdated` or `update` selects `net-analyzer/caddy-analyzer`, or the unambiguous bare name `caddy-analyzer`
 - **THEN** both tokens resolve to the same inventory key using existing target rules
 - **AND** target PVs are selected from comparable upstream tags and the permitted Go runtime lanes
+- **AND** the commands do not interpret a supplied version as a CLI version pin
+
+#### Scenario: Photocraft follows the Cargo update path
+
+- **WHEN** policy is resolved for `media-gfx/photocraft`
+- **THEN** the technique is `DepsAndAssets` Cargo with provenance `CargoGitTag`, no lock subdirectory, and package subdirectory `apps/photocraft`
+- **AND** the source is GitHub `storytold/photocraft` with tag prefix `v`
+- **AND** runtime lanes consider only `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`
+- **AND** when each of those arches has a lane target, planned KEYWORDS are `-* ~amd64 ~x86 ~arm ~arm64 ~ppc64 ~loong ~riscv ~sparc ~s390`
+- **AND** an allowlisted arch with no lane target is omitted from planned KEYWORDS
+- **AND** `ppc` and `mips` are absent from planned KEYWORDS
+- **AND** the package does not become a materialize-image dependency or an overlay wait-edge provider
+
+#### Scenario: Photocraft target does not select a version
+
+- **WHEN** `outdated` or `update` selects `media-gfx/photocraft`, or the unambiguous bare name `photocraft`
+- **THEN** both tokens resolve to the same inventory key using existing target rules
+- **AND** target PVs are selected from comparable upstream tags and the permitted Cargo runtime lanes
 - **AND** the commands do not interpret a supplied version as a CLI version pin
 
 ### Requirement: Preserve Autolith template body on Sbcl apply

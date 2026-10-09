@@ -312,6 +312,7 @@ tests =
       testCase "Hardcoded Grok Bot" testHardcodedGrokBot,
       testCase "Hardcoded Warden" testHardcodedWarden,
       testCase "Policy Classification" testPolicyClassification,
+      testCase "Photocraft target resolution" testPhotocraftTargets,
       testCase "Resolve Map Only" testResolveMapOnly,
       testCase "Group Newest" testGroupNewest,
       testCase "Check Package Product Statuses" testCheckPackageProductStatuses,
@@ -338,6 +339,36 @@ tests =
 ------------------------------------------------------------------------
 -- Hardcoded policy
 ------------------------------------------------------------------------
+
+testPhotocraftTargets :: IO ()
+testPhotocraftTargets = do
+  let photo =
+        PackageEntry
+          { peKey = mkPackageKey "media-gfx" "photocraft",
+            pePN = "photocraft",
+            peLocal = parseEbuildVersion "0.1.1",
+            pePath = "/overlay/media-gfx/photocraft/photocraft-0.1.1.ebuild"
+          }
+      key = peKey photo
+      inventory = [photo]
+  assertEq
+    "qualified"
+    (Right [key])
+    (resolveTargets inventory ["media-gfx/photocraft"])
+  assertEq
+    "bare"
+    (Right [key])
+    (resolveTargets inventory ["photocraft"])
+  case resolveTargets inventory ["0.2.0"] of
+    Left [UnknownPackage "0.2.0"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "version token: " <> show other
+      exitFailure
+  case resolveTargets inventory ["photocraft-0.2.0"] of
+    Left [UnknownPackage "photocraft-0.2.0"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "pv token: " <> show other
+      exitFailure
 
 testHardcodedGrok :: IO ()
 testHardcodedGrok = do
@@ -517,6 +548,31 @@ testPolicyClassification = do
     "caddy-analyzer arches"
     ["amd64", "arm", "arm64"]
     (lookupLaneArches (PackageKey "net-analyzer/caddy-analyzer"))
+  let photocraftArches =
+        ["amd64", "x86", "arm", "arm64", "ppc64", "loong", "riscv", "sparc", "s390"]
+  case lookupPolicy (PackageKey "media-gfx/photocraft") of
+    Just
+      ( PackagePolicy
+          (GitHub "storytold" "photocraft" "v")
+          (DepsAndAssets (Cargo Nothing (Just "apps/photocraft") CargoGitTag))
+          arches
+        )
+        | arches == photocraftArches ->
+            pure ()
+    other -> do
+      hPutStrLn stderr $ "photocraft technique: " <> show other
+      exitFailure
+  assertEq
+    "photocraft source"
+    (Just (GitHub "storytold" "photocraft" "v"))
+    (resolveSource (PackageKey "media-gfx/photocraft"))
+  assertEq
+    "photocraft arches"
+    photocraftArches
+    (lookupLaneArches (PackageKey "media-gfx/photocraft"))
+  assertTrue "photocraft allowlist is not empty" (not (null photocraftArches))
+  assertTrue "ppc absent" ("ppc" `notElem` photocraftArches)
+  assertTrue "mips absent" ("mips" `notElem` photocraftArches)
   case lookupPolicy (PackageKey "dev-util/openspec") of
     Just (PackagePolicy (Npm "@fission-ai/openspec") (DepsAndAssets NpmEco) []) -> pure ()
     other -> do
