@@ -559,7 +559,7 @@ ensureCargoAssetsSrcUriHost host pn content
   | hasCratesAssetsSrcUriFor host content
       && hasCleanGithubSourceLineFor host content
       && not (hasListEraCargoDeps content) =
-      parameterizeAssetsSrcUriFor host pn content
+      ensureGitCrateSrcUri (parameterizeAssetsSrcUriFor host pn content)
   | otherwise =
       let (pre, oldBlock, post) = splitSrcUriAssignment (T.lines content)
           mSource = extractGithubSourceArchiveUriFor host content
@@ -569,7 +569,36 @@ ensureCargoAssetsSrcUriHost host pn content
           cratesLine = cargoCratesSrcUriLineFor host pn
           extras = extraCargoSrcUriLines host pn (hasListEraCargoDeps content) oldBlock
           rebuilt = T.unlines (pre <> [sourceLine, cratesLine] <> extras <> post)
-       in parameterizeAssetsSrcUriFor host pn rebuilt
+       in ensureGitCrateSrcUri (parameterizeAssetsSrcUriFor host pn rebuilt)
+
+-- | Empty @CRATES@ plus a @GIT_CRATES@ block needs @${CARGO_CRATE_URIS}@ so
+-- cargo.eclass fetches the git archive tarballs. A donor that already has the
+-- clean source and crates-tarball lines does not otherwise grow that line.
+ensureGitCrateSrcUri :: Text -> Text
+ensureGitCrateSrcUri content
+  | hasListEraCargoDeps content = content
+  | not (hasGitCratesDecl content) = content
+  | "CARGO_CRATE_URIS" `T.isInfixOf` content = content
+  | otherwise =
+      let lns = T.lines content
+          (pre, post) = break isCratesTarballLine lns
+       in case post of
+            (hit : rest) ->
+              T.unlines (pre <> [hit, "SRC_URI+=\" ${CARGO_CRATE_URIS}\""] <> rest)
+            [] -> content
+  where
+    isCratesTarballLine ln =
+      "SRC_URI" `T.isInfixOf` ln && "-crates.tar.xz" `T.isInfixOf` ln
+
+hasGitCratesDecl :: Text -> Bool
+hasGitCratesDecl content =
+  any
+    ( \ln ->
+        let s = T.stripStart ln
+         in "GIT_CRATES=" `T.isPrefixOf` s
+              || "declare -A GIT_CRATES=" `T.isPrefixOf` s
+    )
+    (T.lines content)
 
 -- | Companion @SRC_URI+=@ lines that are neither the GitHub/crates.io primary
 -- source nor the assets crates tarball. List-era drops @CARGO_CRATE_URIS@;

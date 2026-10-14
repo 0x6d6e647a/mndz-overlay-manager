@@ -86,8 +86,11 @@ import Test.Tasty.HUnit (testCase)
 import Update.Apply
   ( ApplyEnv (..),
     EbuildRunner,
+    PackagePlanResult (..),
+    PlanEnv (..),
     applyPackagePhase1Tracked,
     foldExitHardFail,
+    planPackage,
   )
 import Update.Apply.Errors
   ( ApplyUnitError (..),
@@ -256,6 +259,7 @@ import Update.Npm.Cache
     productionNpmCacheOps,
     resolveNpmNodeRequirement,
   )
+import Update.OverlayTree (withNewTreeLock)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
@@ -313,6 +317,8 @@ tests =
       testCase "Hardcoded Warden" testHardcodedWarden,
       testCase "Policy Classification" testPolicyClassification,
       testCase "Photocraft target resolution" testPhotocraftTargets,
+      testCase "Craft-fonts target resolution" testCraftFontsTargets,
+      testCase "Craft app target resolution" testCraftAppTargets,
       testCase "Resolve Map Only" testResolveMapOnly,
       testCase "Group Newest" testGroupNewest,
       testCase "Check Package Product Statuses" testCheckPackageProductStatuses,
@@ -366,6 +372,109 @@ testPhotocraftTargets = do
       exitFailure
   case resolveTargets inventory ["photocraft-0.2.0"] of
     Left [UnknownPackage "photocraft-0.2.0"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "pv token: " <> show other
+      exitFailure
+
+testCraftAppTargets :: IO ()
+testCraftAppTargets = do
+  let arches =
+        ["amd64", "x86", "arm", "arm64", "ppc64", "loong", "riscv", "sparc", "s390"]
+      apps :: [(T.Text, T.Text, T.Text)]
+      apps =
+        [ ("app-office", "gridcraft", "0.4.0"),
+          ("app-office", "wordcraft", "0.4.0"),
+          ("app-office", "designcraft", "0.5.0"),
+          ("app-office", "deckcraft", "0.4.0"),
+          ("media-gfx", "cadcraft", "0.4.0"),
+          ("media-gfx", "vectorcraft", "0.8.0"),
+          ("media-gfx", "lightcraft", "0.5.0"),
+          ("media-sound", "soundcraft", "0.4.0"),
+          ("media-video", "filmcraft", "0.5.0"),
+          ("app-text", "pdfcraft", "0.5.0"),
+          ("media-video", "effectcraft", "0.7.0")
+        ]
+  mapM_ (assertCraftApp arches) apps
+  where
+    assertCraftApp :: [T.Text] -> (T.Text, T.Text, T.Text) -> IO ()
+    assertCraftApp arches (cat, pn, pv) = do
+      let key = PackageKey (cat <> "/" <> pn)
+          tech = DepsAndAssets (Cargo Nothing (Just ("apps/" <> T.unpack pn)) CargoGitTag)
+      case lookupPolicy key of
+        Just (PackagePolicy (GitHub "storytold" name "v") gotTech gotArches)
+          | name == pn && gotTech == tech && gotArches == arches ->
+              pure ()
+        other -> do
+          hPutStrLn stderr $ "craft app technique " <> T.unpack pn <> ": " <> show other
+          exitFailure
+      assertEq
+        (T.unpack pn <> " source")
+        (Just (GitHub "storytold" pn "v"))
+        (resolveSource key)
+      assertEq
+        (T.unpack pn <> " arches")
+        arches
+        (lookupLaneArches key)
+      assertTrue (T.unpack pn <> " ppc absent") ("ppc" `notElem` arches)
+      assertTrue (T.unpack pn <> " mips absent") ("mips" `notElem` arches)
+      assertTrue
+        (T.unpack pn <> " publishes assets")
+        (techniqueNeedsAssets tech)
+      let entry =
+            PackageEntry
+              { peKey = key,
+                pePN = pn,
+                peLocal = parseEbuildVersion pv,
+                pePath =
+                  T.unpack
+                    ("/overlay/" <> cat <> "/" <> pn <> "/" <> pn <> "-" <> pv <> ".ebuild")
+              }
+          inventory = [entry]
+      assertEq
+        (T.unpack pn <> " qualified")
+        (Right [key])
+        (resolveTargets inventory [cat <> "/" <> pn])
+      assertEq
+        (T.unpack pn <> " bare")
+        (Right [key])
+        (resolveTargets inventory [pn])
+      case resolveTargets inventory ["9.9.9"] of
+        Left [UnknownPackage "9.9.9"] -> pure ()
+        other -> do
+          hPutStrLn stderr $ "craft version token " <> T.unpack pn <> ": " <> show other
+          exitFailure
+      case resolveTargets inventory [pn <> "-" <> pv] of
+        Left [UnknownPackage token] | token == pn <> "-" <> pv -> pure ()
+        other -> do
+          hPutStrLn stderr $ "craft pv token " <> T.unpack pn <> ": " <> show other
+          exitFailure
+
+testCraftFontsTargets :: IO ()
+testCraftFontsTargets = do
+  let fonts =
+        PackageEntry
+          { peKey = mkPackageKey "media-fonts" "craft-fonts",
+            pePN = "craft-fonts",
+            peLocal = parseEbuildVersion "0.0.0",
+            pePath = "/overlay/media-fonts/craft-fonts/craft-fonts-0.0.0.ebuild"
+          }
+      key = peKey fonts
+      inventory = [fonts]
+  assertEq
+    "qualified"
+    (Right [key])
+    (resolveTargets inventory ["media-fonts/craft-fonts"])
+  assertEq
+    "bare"
+    (Right [key])
+    (resolveTargets inventory ["craft-fonts"])
+  case resolveTargets inventory ["0.0.0"] of
+    Left [UnknownPackage "0.0.0"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "version token: " <> show other
+      exitFailure
+  case resolveTargets inventory ["craft-fonts-0.0.0"] of
+    Left [UnknownPackage "craft-fonts-0.0.0"] -> pure ()
     other -> do
       hPutStrLn stderr $ "pv token: " <> show other
       exitFailure
@@ -573,6 +682,56 @@ testPolicyClassification = do
   assertTrue "photocraft allowlist is not empty" (not (null photocraftArches))
   assertTrue "ppc absent" ("ppc" `notElem` photocraftArches)
   assertTrue "mips absent" ("mips" `notElem` photocraftArches)
+  let fontsKey = PackageKey "media-fonts/craft-fonts"
+      fontsReason = "storytold/craft-fonts publishes no comparable numeric tag"
+  case lookupPolicy fontsKey of
+    Just
+      ( PackagePolicy
+          (GitHub "storytold" "craft-fonts" "v")
+          (Unsupported reason)
+          []
+        )
+        | reason == fontsReason ->
+            pure ()
+    other -> do
+      hPutStrLn stderr $ "craft-fonts technique: " <> show other
+      exitFailure
+  assertEq
+    "craft-fonts source"
+    (Just (GitHub "storytold" "craft-fonts" "v"))
+    (resolveSource fontsKey)
+  assertEq "craft-fonts arches" [] (lookupLaneArches fontsKey)
+  assertTrue
+    "craft-fonts needs no assets publish"
+    (not (techniqueNeedsAssets (Unsupported fontsReason)))
+  cache <- fst <$> openCheckCache CacheDisabled False "/tmp"
+  depsOps <- productionDepsPlanOps Nothing 1 Nothing
+  let fontsEntry =
+        PackageEntry
+          { peKey = fontsKey,
+            pePN = "craft-fonts",
+            peLocal = parseEbuildVersion "0.0.0",
+            pePath = "/overlay/media-fonts/craft-fonts/craft-fonts-0.0.0.ebuild"
+          }
+      planEnv =
+        PlanEnv
+          { peFetcher = \_ -> pure (Left "craft-fonts fetch unused"),
+            peDepsPlanOps = depsOps,
+            peCheckCache = cache,
+            peJobs = 1,
+            peMulti = noopMultiHandle,
+            peSelectedKeys = [fontsKey],
+            peObserveTree = withNewTreeLock
+          }
+  planned <- planPackage planEnv Map.empty fontsEntry
+  case planned of
+    PlanSoftSkip k msg -> do
+      assertEq "craft-fonts plan key" fontsKey k
+      assertTrue "names the unsupported technique" ("unsupported" `T.isInfixOf` msg)
+      assertTrue "skip keeps the tag reason" (fontsReason `T.isInfixOf` msg)
+    other -> do
+      hPutStrLn stderr $ "craft-fonts plan: " <> show other
+      exitFailure
   case lookupPolicy (PackageKey "dev-util/openspec") of
     Just (PackagePolicy (Npm "@fission-ai/openspec") (DepsAndAssets NpmEco) []) -> pure ()
     other -> do

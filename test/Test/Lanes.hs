@@ -1216,6 +1216,66 @@ testCargoTargetCfg = do
     TagFloorComplete (Just v) _ ->
       assertEq "unknown target_env ignored" "1.91.0" v
     other -> assertFailure ("sgx: " <> show other)
+  win7 <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(all(windows, not(target_vendor = \"win7\")))'.dependencies]",
+              "win7crate = { path = \"win7crate\" }"
+            ]
+        ),
+        (Just "win7crate", pkgToml "win7crate" "1.99")
+      ]
+  case win7 of
+    TagFloorComplete (Just v) _ ->
+      assertEq "win7 vendor table ignored" "1.91.0" v
+    other -> assertFailure ("win7: " <> show other)
+  win7open <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(not(target_vendor = \"win7\"))'.dependencies]",
+              "opencrate = { path = \"opencrate\" }"
+            ]
+        ),
+        (Just "opencrate", pkgToml "opencrate" "1.94")
+      ]
+  case win7open of
+    TagFloorComplete (Just v) _ ->
+      assertEq "non-win7 table is active" "1.94.0" v
+    other -> assertFailure ("win7 open: " <> show other)
+  vendorUnknown <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.91\"",
+              "[target.'cfg(target_vendor = \"unknown\")'.dependencies]",
+              "unk = { path = \"unk\" }"
+            ]
+        ),
+        (Just "unk", pkgToml "unk" "1.99")
+      ]
+  case vendorUnknown of
+    TagFloorComplete mFloor _ ->
+      assertFailure
+        ("target_vendor unknown selected as " <> show mFloor)
+    TagFloorIncomplete reasons _ ->
+      assertTrue "unknown vendor unparsed" (any ("target_vendor" `T.isInfixOf`) reasons)
+    other -> assertFailure ("target_vendor unknown: " <> show other)
   codex <-
     runFloor
       Nothing

@@ -320,7 +320,8 @@ tests =
       testCase "Go Keywords Assembly" testGoKeywordsAssembly,
       testCase "Set Keywords" testSetKeywords,
       testCase "Origin-derived assets SRC_URI" testOriginAssetsSrcUri,
-      testCase "Photocraft donor preservation" testPhotocraftDonorPreservation
+      testCase "Photocraft donor preservation" testPhotocraftDonorPreservation,
+      testCase "Craft app donor preservation" testCraftAppDonorPreservation
     ]
 
 testEbuildEdit :: IO ()
@@ -957,6 +958,33 @@ testCargoEmptyCratesSrcUri = do
             (Just "1.95.0")
         )
     )
+  -- A clean donor that newly gained GIT_CRATES still needs the fetch line.
+  let gained =
+        T.unlines
+          [ "CRATES=\"\"",
+            "declare -A GIT_CRATES=(",
+            "\t[craft-ui]='https://github.com/storytold/craft-libs;abc;craft-libs-%commit%/crates/ui'",
+            ")",
+            "SRC_URI=\"https://github.com/storytold/cadcraft/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/cadcraft-${PV}/cadcraft-${PV}-crates.tar.xz\""
+          ]
+      gainedFixed = ensureCargoAssetsSrcUri "cadcraft" gained
+  assertTrue
+    "new GIT_CRATES gains CARGO_CRATE_URIS"
+    ("SRC_URI+=\" ${CARGO_CRATE_URIS}\"" `T.isInfixOf` gainedFixed)
+  assertTrue
+    "new GIT_CRATES keeps crates tarball"
+    ("cadcraft-${PV}-crates.tar.xz" `T.isInfixOf` gainedFixed)
+  let noGit =
+        T.unlines
+          [ "CRATES=\"\"",
+            "SRC_URI=\"https://github.com/storytold/wordcraft/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/wordcraft-${PV}/wordcraft-${PV}-crates.tar.xz\""
+          ]
+      noGitFixed = ensureCargoAssetsSrcUri "wordcraft" noGit
+  assertTrue
+    "no GIT_CRATES does not add CARGO_CRATE_URIS"
+    (not ("CARGO_CRATE_URIS" `T.isInfixOf` noGitFixed))
 
 testPackageOwnedAssetsUri :: IO ()
 testPackageOwnedAssetsUri = do
@@ -1436,4 +1464,105 @@ testPhotocraftDonorPreservation = do
     "assets SRC_URI parameterized"
     ( "photocraft-${PV}/photocraft-${PV}-crates.tar.xz" `T.isInfixOf` rewritten
         && not ("photocraft-0.1.1" `T.isInfixOf` rewritten)
+    )
+
+-- | A craft-app donor that carries every per-app flag the Cargo rewrite must
+-- keep, rewritten the same way apply does.
+testCraftAppDonorPreservation :: IO ()
+testCraftAppDonorPreservation = do
+  let oldGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tMIT",
+            "\tZLIB",
+            "\""
+          ]
+      newGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tApache-2.0",
+            "\tUnicode-3.0",
+            "\""
+          ]
+      donor =
+        T.unlines
+          [ "EAPI=8",
+            "",
+            "RUST_MIN_VER=\"1.90.0\"",
+            "",
+            "CRATES=\"",
+            "\toldcrate@1.0.0",
+            "\"",
+            "",
+            "inherit cargo",
+            "",
+            "DESCRIPTION=\"Craft app\"",
+            "HOMEPAGE=\"https://github.com/storytold/gridcraft\"",
+            "SRC_URI=\"https://github.com/storytold/gridcraft/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/gridcraft-0.1.0/gridcraft-0.1.0-crates.tar.xz\"",
+            "",
+            "LICENSE=\"|| ( MIT Apache-2.0 )\"",
+            oldGen,
+            "LICENSE+=\"OFL-1.1 CC0-1.0\"",
+            "SLOT=\"0\"",
+            "KEYWORDS=\"-* ~amd64 ~x86 ~arm ~arm64 ~ppc64 ~loong ~riscv ~sparc ~s390\"",
+            "IUSE=\"+gui +cli +portal +X +wayland test +heif rawnind-model cups whisper\"",
+            "REQUIRED_USE=\"|| ( gui cli ) gui? ( || ( X wayland ) )\"",
+            "RESTRICT=\"!test? ( test )\"",
+            "",
+            "src_compile() {",
+            "\texport CRAFT_FONTS_DIR=/usr/share/craft-fonts",
+            "}",
+            "",
+            "src_test() {",
+            "\tcargo_src_test --workspace --exclude gridcraft-web --exclude xtask",
+            "}",
+            "",
+            "src_install() {",
+            "\tdomenu packaging/linux/ai.storyteller.gridcraft.desktop",
+            "}"
+          ]
+      simulated = T.replace oldGen newGen donor
+      rewritten0 = setKeywords ["-*", "~amd64"] (ensureCargoAssetsSrcUri "gridcraft" (ensureEmptyCrates simulated))
+  rewritten <- assertRight "rust min" (ensureRustMinVer "1.95" rewritten0)
+  assertTrue
+    "IUSE survives"
+    ( "IUSE=\"+gui +cli +portal +X +wayland test +heif rawnind-model cups whisper\""
+        `T.isInfixOf` rewritten
+    )
+  assertTrue "heif default survives" ("+heif" `T.isInfixOf` rewritten)
+  assertTrue "rawnind-model survives" ("rawnind-model" `T.isInfixOf` rewritten)
+  assertTrue "cups survives" ("cups" `T.isInfixOf` rewritten)
+  assertTrue "whisper survives" ("whisper" `T.isInfixOf` rewritten)
+  assertTrue
+    "REQUIRED_USE survives"
+    ("REQUIRED_USE=\"|| ( gui cli ) gui? ( || ( X wayland ) )\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "workspace excludes survive"
+    ("--exclude gridcraft-web --exclude xtask" `T.isInfixOf` rewritten)
+  assertTrue
+    "desktop install survives"
+    ("domenu packaging/linux/ai.storyteller.gridcraft.desktop" `T.isInfixOf` rewritten)
+  assertTrue
+    "font dir export survives"
+    ("export CRAFT_FONTS_DIR=/usr/share/craft-fonts" `T.isInfixOf` rewritten)
+  assertTrue
+    "extra license line survives"
+    ("LICENSE+=\"OFL-1.1 CC0-1.0\"" `T.isInfixOf` rewritten)
+  let (generated, after) = T.breakOn "LICENSE+=\"OFL-1.1 CC0-1.0\"" rewritten
+  assertTrue "generated block changed" ("Unicode-3.0" `T.isInfixOf` generated)
+  assertTrue "old generated license dropped" (not ("ZLIB" `T.isInfixOf` generated))
+  assertTrue "donor license stays outside the generated block" (not ("CC0-1.0" `T.isInfixOf` generated))
+  assertTrue "donor license remains after the generated block" ("CC0-1.0" `T.isInfixOf` after)
+  assertTrue "CRATES emptied" ("CRATES=\"\"" `T.isInfixOf` rewritten)
+  assertTrue "old crate list dropped" (not ("oldcrate@1.0.0" `T.isInfixOf` rewritten))
+  assertTrue "RUST_MIN_VER updated" ("RUST_MIN_VER=\"1.95.0\"" `T.isInfixOf` rewritten)
+  assertTrue "old floor dropped" (not ("RUST_MIN_VER=\"1.90.0\"" `T.isInfixOf` rewritten))
+  assertTrue "KEYWORDS updated" ("KEYWORDS=\"-* ~amd64\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "assets SRC_URI parameterized"
+    ( "gridcraft-${PV}/gridcraft-${PV}-crates.tar.xz" `T.isInfixOf` rewritten
+        && not ("gridcraft-0.1.0" `T.isInfixOf` rewritten)
     )

@@ -28,7 +28,7 @@ The library SHALL model an update source as one of: GitHub (owner, repository, t
 
 ### Requirement: Hardcoded source overrides
 
-The library SHALL provide a hardcoded map from package key `category/package` to update source as part of each package’s policy entry. Resolution of an update source SHALL use only this hardcoded map. At minimum, `dev-util/grok-build-bin` SHALL map to an Http source for the grok-build stable channel (primary `https://x.ai/cli/stable` with the known GCS fallback). `dev-util/grok-bot-bin` SHALL map to the Cursor stable download feeds `https://api2.cursor.sh/updates/api/download/stable/linux-x64/sand` and `https://api2.cursor.sh/updates/api/download/stable/linux-arm64/sand`, each an HttpJson source whose version field is `version`. `net-analyzer/witen-warden-bin` SHALL map to an Http source whose primary URL is `https://www.witenlabs.com/api/releases/warden/version` and which has no fallback URL. `net-analyzer/caddy-analyzer` SHALL map to GitHub owner `lenny-ts`, repository `caddy-analyzer`, with tag prefix `v`. `media-gfx/photocraft` SHALL map to GitHub owner `storytold`, repository `photocraft`, with tag prefix `v`. The map SHALL also include explicit sources for all other packages known in the mndz overlay policy set (GitHub, npm, Http, or HttpJson as appropriate).
+The library SHALL provide a hardcoded map from package key `category/package` to update source as part of each package’s policy entry. Resolution of an update source SHALL use only this hardcoded map. At minimum, `dev-util/grok-build-bin` SHALL map to an Http source for the grok-build stable channel (primary `https://x.ai/cli/stable` with the known GCS fallback). `dev-util/grok-bot-bin` SHALL map to the Cursor stable download feeds `https://api2.cursor.sh/updates/api/download/stable/linux-x64/sand` and `https://api2.cursor.sh/updates/api/download/stable/linux-arm64/sand`, each an HttpJson source whose version field is `version`. `net-analyzer/witen-warden-bin` SHALL map to an Http source whose primary URL is `https://www.witenlabs.com/api/releases/warden/version` and which has no fallback URL. `net-analyzer/caddy-analyzer` SHALL map to GitHub owner `lenny-ts`, repository `caddy-analyzer`, with tag prefix `v`. `media-gfx/photocraft` SHALL map to GitHub owner `storytold`, repository `photocraft`, with tag prefix `v`. `app-office/deckcraft`, `app-office/designcraft`, `app-office/gridcraft`, `app-office/wordcraft`, `app-text/pdfcraft`, `media-gfx/cadcraft`, `media-gfx/lightcraft`, `media-gfx/vectorcraft`, `media-sound/soundcraft`, `media-video/effectcraft`, and `media-video/filmcraft` SHALL each map to GitHub owner `storytold`, repository equal to the package name, with tag prefix `v`. `media-fonts/craft-fonts` SHALL map to GitHub owner `storytold`, repository `craft-fonts`, with tag prefix `v`. The map SHALL also include explicit sources for all other packages known in the mndz overlay policy set (GitHub, npm, Http, or HttpJson as appropriate).
 
 #### Scenario: Grok-build uses hardcoded Http
 
@@ -69,6 +69,20 @@ The library SHALL provide a hardcoded map from package key `category/package` to
 - **WHEN** resolving an update source for `media-gfx/photocraft`
 - **THEN** the source is GitHub `storytold/photocraft` with tag prefix `v`
 - **AND** release tag `v0.1.1` parses as PV `0.1.1` using the existing GitHub fetch rules
+- **AND** a tag that does not parse as a numeric PV is not a comparable version
+- **AND** no update source is inferred from the ebuild
+
+#### Scenario: Storytold craft apps use storytold GitHub repositories
+
+- **WHEN** resolving an update source for `app-office/deckcraft`, `app-office/designcraft`, `app-office/gridcraft`, `app-office/wordcraft`, `app-text/pdfcraft`, `media-gfx/cadcraft`, `media-gfx/lightcraft`, `media-gfx/vectorcraft`, `media-sound/soundcraft`, `media-video/effectcraft`, or `media-video/filmcraft`
+- **THEN** each source is GitHub owner `storytold` and repository equal to the package name, with tag prefix `v`
+- **AND** a tag that does not parse as a numeric PV is not a comparable version
+- **AND** no update source is inferred from the ebuild
+
+#### Scenario: craft-fonts uses the storytold GitHub repository
+
+- **WHEN** resolving an update source for `media-fonts/craft-fonts`
+- **THEN** the source is GitHub `storytold/craft-fonts` with tag prefix `v`
 - **AND** a tag that does not parse as a numeric PV is not a comparable version
 - **AND** no update source is inferred from the ebuild
 

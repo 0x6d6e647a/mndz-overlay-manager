@@ -149,9 +149,70 @@ hardcodedPolicies =
         "media-gfx/photocraft"
         (GitHub "storytold" "photocraft" "v")
         (DepsAndAssets (Cargo Nothing (Just "apps/photocraft") CargoGitTag))
-        ["amd64", "x86", "arm", "arm64", "ppc64", "loong", "riscv", "sparc", "s390"]
+        ["amd64", "x86", "arm", "arm64", "ppc64", "loong", "riscv", "sparc", "s390"],
+      policy
+        "media-fonts/craft-fonts"
+        (GitHub "storytold" "craft-fonts" "v")
+        (Unsupported "storytold/craft-fonts publishes no comparable numeric tag"),
+      policyArches
+        "app-office/gridcraft"
+        (GitHub "storytold" "gridcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/gridcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "app-office/wordcraft"
+        (GitHub "storytold" "wordcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/wordcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "app-office/designcraft"
+        (GitHub "storytold" "designcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/designcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "app-office/deckcraft"
+        (GitHub "storytold" "deckcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/deckcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "media-gfx/cadcraft"
+        (GitHub "storytold" "cadcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/cadcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "media-gfx/vectorcraft"
+        (GitHub "storytold" "vectorcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/vectorcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "media-gfx/lightcraft"
+        (GitHub "storytold" "lightcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/lightcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "media-sound/soundcraft"
+        (GitHub "storytold" "soundcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/soundcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "media-video/filmcraft"
+        (GitHub "storytold" "filmcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/filmcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "app-text/pdfcraft"
+        (GitHub "storytold" "pdfcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/pdfcraft") CargoGitTag))
+        craftArches,
+      policyArches
+        "media-video/effectcraft"
+        (GitHub "storytold" "effectcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/effectcraft") CargoGitTag))
+        craftArches
     ]
   where
+    craftArches =
+      ["amd64", "x86", "arm", "arm64", "ppc64", "loong", "riscv", "sparc", "s390"]
     policy key src tech = policyArches key src tech []
     policyArches key src tech arches =
       ( PackageKey key,

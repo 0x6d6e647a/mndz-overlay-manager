@@ -49,6 +49,8 @@ The hardcoded policy map SHALL include an entry for every package known to ship 
 - `dev-util/ralph-tui` and `dev-util/opencode` SHALL use `DepsAndAssets Bun` with GitHub sources (`subsy/ralph-tui`, `anomalyco/opencode`, tag prefix `v`)
 - `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets Cargo` with GitHub sources (`jdx` / respective repos / tag prefix `v`); `usage` SHALL use package subdirectory `cli` when required for package metadata
 - `media-gfx/photocraft` SHALL use `DepsAndAssets` with ecosystem `Cargo`, provenance `CargoGitTag`, repository-root lock, package subdirectory `apps/photocraft`, GitHub source `storytold/photocraft`, tag prefix `v`, and runtime-lane architectures restricted to `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`
+- `app-office/deckcraft`, `app-office/designcraft`, `app-office/gridcraft`, `app-office/wordcraft`, `app-text/pdfcraft`, `media-gfx/cadcraft`, `media-gfx/lightcraft`, `media-gfx/vectorcraft`, `media-sound/soundcraft`, `media-video/effectcraft`, and `media-video/filmcraft` SHALL each use `DepsAndAssets` with ecosystem `Cargo`, provenance `CargoGitTag`, repository-root lock, package subdirectory `apps/<package-name>`, GitHub source `storytold/<package-name>`, tag prefix `v`, and runtime-lane architectures restricted to `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`
+- `media-fonts/craft-fonts` SHALL use `Unsupported` with a reason that `storytold/craft-fonts` publishes no comparable numeric tag, and GitHub source `storytold/craft-fonts` with tag prefix `v`
 - `dev-util/autolith` SHALL use `DepsAndAssets Sbcl` with GitHub source `luciusmagn/autolith` and tag prefix `v`
 
 The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for cargo CRATES list regeneration SHALL remain `Unsupported` for that reason alone. `dev-lisp/qlot` SHALL NOT be an overlay wait-edge provider for Autolith or other packages. `dev-build/node-gyp` SHALL NOT be an overlay wait-edge provider for opencode, ralph-tui, or other packages. `dev-util/grok-bot-bin` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image. `net-analyzer/witen-warden-bin` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image. `dev-util/gastown` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
@@ -56,6 +58,7 @@ The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for c
 `net-analyzer/caddy-analyzer` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
 
 `media-gfx/photocraft` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
+Each Storytold craft app and `media-fonts/craft-fonts` SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
 
 #### Scenario: Simple binary package is GitMvAndManifest
 
@@ -167,6 +170,37 @@ The map SHALL NOT include `dev-util/opencode-bin`. No package known solely for c
 - **THEN** both tokens resolve to the same inventory key using existing target rules
 - **AND** target PVs are selected from comparable upstream tags and the permitted Cargo runtime lanes
 - **AND** the commands do not interpret a supplied version as a CLI version pin
+
+#### Scenario: Storytold craft apps follow the Cargo update path
+
+- **WHEN** policy is resolved for `app-office/deckcraft`, `app-office/designcraft`, `app-office/gridcraft`, `app-office/wordcraft`, `app-text/pdfcraft`, `media-gfx/cadcraft`, `media-gfx/lightcraft`, `media-gfx/vectorcraft`, `media-sound/soundcraft`, `media-video/effectcraft`, or `media-video/filmcraft`
+- **THEN** the technique is `DepsAndAssets` Cargo with provenance `CargoGitTag`, no lock subdirectory, and package subdirectory `apps/<package-name>`
+- **AND** the source is GitHub `storytold/<package-name>` with tag prefix `v`
+- **AND** runtime lanes consider only `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`
+- **AND** when each of those arches has a lane target, planned KEYWORDS are `-* ~amd64 ~x86 ~arm ~arm64 ~ppc64 ~loong ~riscv ~sparc ~s390`
+- **AND** an allowlisted arch with no lane target is omitted from planned KEYWORDS
+- **AND** `ppc` and `mips` are absent from planned KEYWORDS
+- **AND** the package does not become a materialize-image dependency or an overlay wait-edge provider
+
+#### Scenario: A craft app target does not select a version
+
+- **WHEN** `outdated` or `update` selects `app-office/deckcraft`, or the unambiguous bare name `deckcraft`
+- **THEN** both tokens resolve to the same inventory key using existing target rules
+- **AND** target PVs are selected from comparable upstream tags and the permitted Cargo runtime lanes
+- **AND** the commands do not interpret a supplied version as a CLI version pin
+
+#### Scenario: craft-fonts is Unsupported
+
+- **WHEN** policy is resolved for `media-fonts/craft-fonts`
+- **THEN** the technique is `Unsupported` and the reason says `storytold/craft-fonts` publishes no comparable numeric tag
+- **AND** the source is GitHub `storytold/craft-fonts` with tag prefix `v`
+- **AND** the package does not become a materialize-image dependency or an overlay wait-edge provider
+
+#### Scenario: craft-fonts update soft-skips
+
+- **WHEN** `update` selects `media-fonts/craft-fonts` or the unambiguous bare name `craft-fonts`
+- **THEN** the package is soft-skipped with a reason that names the unsupported technique
+- **AND** no ebuild rewrite or assets publish runs for it
 
 ### Requirement: Preserve Autolith template body on Sbcl apply
 
