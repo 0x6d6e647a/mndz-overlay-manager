@@ -49,7 +49,7 @@ The hardcoded policy map SHALL include an entry for every package known to ship 
 - `dev-util/ralph-tui` and `dev-util/opencode` SHALL use `DepsAndAssets Bun` with GitHub sources (`subsy/ralph-tui`, `anomalyco/opencode`, tag prefix `v`)
 - `dev-util/hk`, `dev-util/mise`, and `dev-util/usage` SHALL use `DepsAndAssets Cargo` with GitHub sources (`jdx` / respective repos / tag prefix `v`); `usage` SHALL use package subdirectory `cli` when required for package metadata
 - `media-gfx/photocraft` SHALL use `DepsAndAssets` with ecosystem `Cargo`, provenance `CargoGitTag`, repository-root lock, package subdirectory `apps/photocraft`, GitHub source `storytold/photocraft`, tag prefix `v`, and runtime-lane architectures restricted to `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`
-- `app-office/deckcraft`, `app-office/designcraft`, `app-office/gridcraft`, `app-office/wordcraft`, `app-text/pdfcraft`, `media-gfx/cadcraft`, `media-gfx/lightcraft`, `media-gfx/vectorcraft`, `media-sound/soundcraft`, `media-video/effectcraft`, and `media-video/filmcraft` SHALL each use `DepsAndAssets` with ecosystem `Cargo`, provenance `CargoGitTag`, repository-root lock, package subdirectory `apps/<package-name>`, GitHub source `storytold/<package-name>`, tag prefix `v`, and runtime-lane architectures restricted to `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`
+- `app-office/deckcraft`, `app-office/designcraft`, `app-office/gridcraft`, `app-office/wordcraft`, `app-text/pdfcraft`, `media-gfx/cadcraft`, `media-gfx/figcraft`, `media-gfx/lightcraft`, `media-gfx/vectorcraft`, `media-sound/soundcraft`, `media-video/effectcraft`, and `media-video/filmcraft` SHALL each use `DepsAndAssets` with ecosystem `Cargo`, provenance `CargoGitTag`, repository-root lock, package subdirectory `apps/<package-name>`, GitHub source `storytold/<package-name>`, tag prefix `v`, and runtime-lane architectures restricted to `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`
 - `media-fonts/craft-fonts` SHALL use `Unsupported` with a reason that `storytold/craft-fonts` publishes no comparable numeric tag, and GitHub source `storytold/craft-fonts` with tag prefix `v`
 - `dev-util/autolith` SHALL use `DepsAndAssets Sbcl` with GitHub source `luciusmagn/autolith` and tag prefix `v`
 
@@ -173,7 +173,7 @@ Each Storytold craft app and `media-fonts/craft-fonts` SHALL NOT be an overlay w
 
 #### Scenario: Storytold craft apps follow the Cargo update path
 
-- **WHEN** policy is resolved for `app-office/deckcraft`, `app-office/designcraft`, `app-office/gridcraft`, `app-office/wordcraft`, `app-text/pdfcraft`, `media-gfx/cadcraft`, `media-gfx/lightcraft`, `media-gfx/vectorcraft`, `media-sound/soundcraft`, `media-video/effectcraft`, or `media-video/filmcraft`
+- **WHEN** policy is resolved for `app-office/deckcraft`, `app-office/designcraft`, `app-office/gridcraft`, `app-office/wordcraft`, `app-text/pdfcraft`, `media-gfx/cadcraft`, `media-gfx/figcraft`, `media-gfx/lightcraft`, `media-gfx/vectorcraft`, `media-sound/soundcraft`, `media-video/effectcraft`, or `media-video/filmcraft`
 - **THEN** the technique is `DepsAndAssets` Cargo with provenance `CargoGitTag`, no lock subdirectory, and package subdirectory `apps/<package-name>`
 - **AND** the source is GitHub `storytold/<package-name>` with tag prefix `v`
 - **AND** runtime lanes consider only `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`

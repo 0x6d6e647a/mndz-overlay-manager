@@ -387,6 +387,7 @@ testCraftAppTargets = do
           ("app-office", "designcraft", "0.5.0"),
           ("app-office", "deckcraft", "0.4.0"),
           ("media-gfx", "cadcraft", "0.4.0"),
+          ("media-gfx", "figcraft", "0.5.1"),
           ("media-gfx", "vectorcraft", "0.8.0"),
           ("media-gfx", "lightcraft", "0.5.0"),
           ("media-sound", "soundcraft", "0.4.0"),

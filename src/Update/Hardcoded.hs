@@ -180,6 +180,11 @@ hardcodedPolicies =
         (DepsAndAssets (Cargo Nothing (Just "apps/cadcraft") CargoGitTag))
         craftArches,
       policyArches
+        "media-gfx/figcraft"
+        (GitHub "storytold" "figcraft" "v")
+        (DepsAndAssets (Cargo Nothing (Just "apps/figcraft") CargoGitTag))
+        craftArches,
+      policyArches
         "media-gfx/vectorcraft"
         (GitHub "storytold" "vectorcraft" "v")
         (DepsAndAssets (Cargo Nothing (Just "apps/vectorcraft") CargoGitTag))
