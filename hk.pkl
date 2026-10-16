@@ -12,7 +12,7 @@ local hsGlob = List("**/*.hs")
 local linters = new Mapping<String, Step> {
   ["tools-preflight"] {
     exclusive = true
-    check = #"
+    check = #"""
       missing=0
       for t in ormolu hlint stan weeder; do
         if [ ! -x ".tools/bin/$t" ]; then
@@ -25,7 +25,7 @@ local linters = new Mapping<String, Step> {
         echo "error: hooks use .tools/bin only (strict; no global PATH fallback)" >&2
         exit 1
       fi
-    "#
+    """#
   }
   ["ormolu"] {
     glob = hsGlob
