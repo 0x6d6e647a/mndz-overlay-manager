@@ -42,10 +42,12 @@ import Control.Monad (forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
+import Data.Char (isSpace)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (nub, sort, sortBy)
+import Data.List (elemIndex, nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -149,6 +151,7 @@ import Update.EbuildEdit
     ensureNodejsBdepend,
     ensureRustMinVer,
     ensureSbclAtom,
+    ensureStorytoldPatchPinHook,
     goBdependAtom,
     goBdependMatches,
     hasCleanCratesIoSourceLine,
@@ -167,6 +170,7 @@ import Update.EbuildEdit
     sbclBdependMatches,
     setKeywords,
     setSlotField,
+    storytoldPatchPinPackageNames,
     stripWindowsOnlyGitCrates,
     writeVersionForPlannedPV,
   )
@@ -321,7 +325,14 @@ tests =
       testCase "Set Keywords" testSetKeywords,
       testCase "Origin-derived assets SRC_URI" testOriginAssetsSrcUri,
       testCase "Photocraft donor preservation" testPhotocraftDonorPreservation,
-      testCase "Craft app donor preservation" testCraftAppDonorPreservation
+      testCase "Craft app donor preservation" testCraftAppDonorPreservation,
+      testCase "storytoldPatchPinHook missing phase" testStorytoldPatchPinHookMissingPhase,
+      testCase "storytoldPatchPinHook existing phase" testStorytoldPatchPinHookExistingPhase,
+      testCase "storytoldPatchPinHook already correct" testStorytoldPatchPinHookAlreadyCorrect,
+      testCase "storytoldPatchPinHook no GIT_CRATES" testStorytoldPatchPinHookNoGitCrates,
+      testCase "storytoldPatchPinHook codex unchanged" testStorytoldPatchPinHookCodex,
+      testCase "storytoldPatchPinHook missing default" testStorytoldPatchPinHookMissingDefault,
+      testCase "storytoldPatchPinHook package set" testStorytoldPatchPinHookPackageSet
     ]
 
 testEbuildEdit :: IO ()
@@ -1566,3 +1577,147 @@ testCraftAppDonorPreservation = do
     ( "gridcraft-${PV}/gridcraft-${PV}-crates.tar.xz" `T.isInfixOf` rewritten
         && not ("gridcraft-0.1.0" `T.isInfixOf` rewritten)
     )
+
+gitCratesDecl :: T.Text
+gitCratesDecl =
+  T.unlines
+    [ "declare -A GIT_CRATES=(",
+      "\t[krilla]='https://github.com/storytold/craft-libs;abc;craft-libs-%commit%/vendor/krilla'",
+      ")"
+    ]
+
+testStorytoldPatchPinHookMissingPhase :: IO ()
+testStorytoldPatchPinHookMissingPhase = do
+  let body =
+        T.unlines
+          [ "EAPI=8",
+            "CRATES=\"\"",
+            gitCratesDecl,
+            "inherit cargo desktop xdg",
+            "src_compile() {",
+            "\tcargo_src_compile",
+            "}"
+          ]
+  rewritten <- assertRight "missing phase" (ensureStorytoldPatchPinHook "deckcraft" body)
+  assertTrue
+    "inherit gains mndz-cargo after cargo"
+    ("inherit cargo mndz-cargo desktop xdg" `T.isInfixOf` rewritten)
+  let lns = T.lines rewritten
+      prepare = dropWhile (not . isPrepare) lns
+  case prepare of
+    def : defaultLine : hook : _ -> do
+      assertEq "phase header" "src_prepare() {" def
+      assertEq "default first" "\tdefault" defaultLine
+      assertEq "hook after default" "\tmndz-cargo_rewrite_patch_git_pins" hook
+    other -> do
+      hPutStrLn stderr ("src_prepare shape: " <> show other)
+      exitFailure
+  again <- assertRight "idempotent" (ensureStorytoldPatchPinHook "deckcraft" rewritten)
+  assertEq "second pass unchanged" rewritten again
+  where
+    isPrepare ln = "src_prepare()" `T.isPrefixOf` T.filter (not . isSpace) ln
+
+testStorytoldPatchPinHookExistingPhase :: IO ()
+testStorytoldPatchPinHookExistingPhase = do
+  let body =
+        T.unlines
+          [ "inherit cargo desktop xdg",
+            gitCratesDecl,
+            "src_prepare() {",
+            "\tdefault",
+            "",
+            "\t# keep the libz edit",
+            "\tsed -i 's/libz/libz64/' \"${S}/crates/vst3-host/src/lib.rs\" || die",
+            "}"
+          ]
+  rewritten <- assertRight "existing phase" (ensureStorytoldPatchPinHook "soundcraft" body)
+  let lns = T.lines rewritten
+  assertTrue
+    "inherit gains mndz-cargo after cargo"
+    ("inherit cargo mndz-cargo desktop xdg" `T.isInfixOf` rewritten)
+  let edit = "\tsed -i 's/libz/libz64/' \"${S}/crates/vst3-host/src/lib.rs\" || die"
+  assertTrue "libz edit survives" (edit `elem` lns)
+  let defaultAt = idx "\tdefault" lns
+      hookAt = idx "\tmndz-cargo_rewrite_patch_git_pins" lns
+      editAt = idx edit lns
+  assertEq "hook is the line after default" (defaultAt + 1) hookAt
+  assertTrue "hook precedes the edit" (hookAt < editAt)
+  where
+    idx :: T.Text -> [T.Text] -> Int
+    idx needle lns = fromMaybe (-1) (elemIndex needle lns)
+
+testStorytoldPatchPinHookAlreadyCorrect :: IO ()
+testStorytoldPatchPinHookAlreadyCorrect = do
+  let body =
+        T.unlines
+          [ "inherit cargo mndz-cargo desktop xdg",
+            gitCratesDecl,
+            "src_prepare() {",
+            "\tdefault",
+            "\tmndz-cargo_rewrite_patch_git_pins",
+            "\tsed -i 's/libz/libz64/' \"${S}/src/lib.rs\" || die",
+            "}"
+          ]
+  rewritten <- assertRight "already correct" (ensureStorytoldPatchPinHook "soundcraft" body)
+  assertEq "unchanged" body rewritten
+
+testStorytoldPatchPinHookNoGitCrates :: IO ()
+testStorytoldPatchPinHookNoGitCrates = do
+  let body =
+        T.unlines
+          [ "CRATES=\"\"",
+            "inherit cargo desktop xdg",
+            "src_compile() {",
+            "\tcargo_src_compile",
+            "}"
+          ]
+  rewritten <- assertRight "no git crates" (ensureStorytoldPatchPinHook "wordcraft" body)
+  assertEq "unchanged" body rewritten
+  assertTrue "no mndz-cargo inherit" (not ("mndz-cargo" `T.isInfixOf` rewritten))
+  assertTrue "no hook call" (not ("mndz-cargo_rewrite_patch_git_pins" `T.isInfixOf` rewritten))
+
+testStorytoldPatchPinHookCodex :: IO ()
+testStorytoldPatchPinHookCodex = do
+  let body =
+        T.unlines
+          [ "CRATES=\"\"",
+            gitCratesDecl,
+            "inherit cargo",
+            "src_compile() {",
+            "\tcargo_src_compile",
+            "}"
+          ]
+  rewritten <- assertRight "codex" (ensureStorytoldPatchPinHook "codex" body)
+  assertEq "codex unchanged" body rewritten
+
+testStorytoldPatchPinHookMissingDefault :: IO ()
+testStorytoldPatchPinHookMissingDefault = do
+  let body =
+        T.unlines
+          [ "inherit cargo desktop xdg",
+            gitCratesDecl,
+            "src_prepare() {",
+            "\tsed -i 's/a/b/' \"${S}/src/lib.rs\" || die",
+            "}"
+          ]
+  msg <- assertLeft "missing default" (ensureStorytoldPatchPinHook "deckcraft" body)
+  assertEq
+    "names the missing default"
+    "cannot insert the patch-pin hook: src_prepare has no default call"
+    msg
+  assertTrue "error is not a rewritten ebuild" (not ("mndz-cargo" `T.isInfixOf` msg))
+  assertTrue "sed line is not the error body" (not ("sed -i" `T.isInfixOf` msg))
+
+testStorytoldPatchPinHookPackageSet :: IO ()
+testStorytoldPatchPinHookPackageSet = do
+  let fromPolicies =
+        Set.fromList
+          [ pn
+          | (key, policy) <- Map.toList hardcodedPolicies,
+            GitHub {ghOwner = "storytold"} <- [policySource policy],
+            DepsAndAssets Cargo {cargoSource = CargoGitTag} <- [policyTechnique policy],
+            Just (_, pn) <- [splitPackageKey key]
+          ]
+  assertEq "set matches storytold Cargo GitTag policies" fromPolicies storytoldPatchPinPackageNames
+  assertEq "craft-fonts absent" False (Set.member "craft-fonts" storytoldPatchPinPackageNames)
+  assertEq "codex absent" False (Set.member "codex" storytoldPatchPinPackageNames)

@@ -53,6 +53,8 @@ module Update.EbuildEdit
     ensureCargoAssetsSrcUri,
     ensureCargoAssetsSrcUriFor,
     ensureCargoAssetsSrcUriForHost,
+    ensureStorytoldPatchPinHook,
+    storytoldPatchPinPackageNames,
     stripWindowsOnlyGitCrates,
     hasCleanCratesIoSourceLine,
     cargoCratesIoSrcUriLine,
@@ -68,9 +70,13 @@ module Update.EbuildEdit
 where
 
 import Control.Applicative ((<|>))
-import Data.Char (isAlpha, isAlphaNum, isDigit)
+import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
 import Data.Containers.ListUtils (nubOrd)
+import Data.List (dropWhileEnd)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), renderPV, samePV)
@@ -82,9 +88,18 @@ import Update.Cargo.Msrv
     rustMinVerTooLow,
     windowsOnlyDepNames,
   )
+import Update.Hardcoded (hardcodedPolicies)
 import Update.Manifest.Dist (exactDistSHA512, manifestHasExactDist)
 import Update.TextUtil (stripSurroundingQuotes)
-import Update.Types (CargoSource (..), PackageKey)
+import Update.Types
+  ( CargoSource (..),
+    EcosystemSpec (..),
+    PackageKey,
+    PackagePolicy (..),
+    UpdateSource (..),
+    UpdateTechnique (..),
+    splitPackageKey,
+  )
 
 -- | GitHub owner/repo for assets-repository SRC_URI (from @assets-path@ origin).
 data AssetsHost = AssetsHost
@@ -599,6 +614,163 @@ hasGitCratesDecl content =
               || "declare -A GIT_CRATES=" `T.isPrefixOf` s
     )
     (T.lines content)
+
+-- | Package names of Cargo GitTag policies whose GitHub owner is @storytold@.
+storytoldPatchPinPackageNames :: Set Text
+storytoldPatchPinPackageNames =
+  Set.fromList
+    [ pn
+    | (key, policy) <- Map.toList hardcodedPolicies,
+      GitHub {ghOwner = "storytold"} <- [policySource policy],
+      DepsAndAssets Cargo {cargoSource = CargoGitTag} <- [policyTechnique policy],
+      Just (_, pn) <- [splitPackageKey key]
+    ]
+
+-- | Eclass helper a Storytold @src_prepare@ calls after @default@.
+patchPinHookCall :: Text
+patchPinHookCall = "mndz-cargo_rewrite_patch_git_pins"
+
+mndzCargoEclass :: Text
+mndzCargoEclass = "mndz-cargo"
+
+-- | Keep a Storytold GitTag ebuild that declares @GIT_CRATES@ calling the
+-- patch-pin helper. Other packages, and Storytold ebuilds with no
+-- @GIT_CRATES@ declaration, are returned unchanged. A declared @GIT_CRATES@
+-- whose @inherit@ line has no @cargo@ token, or whose @src_prepare@ has no
+-- @default@ call, is an error and does not rewrite the body.
+ensureStorytoldPatchPinHook :: Text -> Text -> Either Text Text
+ensureStorytoldPatchPinHook pn content
+  | pn `Set.notMember` storytoldPatchPinPackageNames = Right content
+  | not (hasGitCratesDecl content) = Right content
+  | otherwise =
+      case ensureMndzCargoInherit (T.lines content) of
+        Left err -> Left err
+        Right inherited ->
+          case ensurePatchPinPrepare inherited of
+            Left err -> Left err
+            Right prepared ->
+              Right
+                ( if prepared == T.lines content
+                    then content
+                    else T.unlines prepared
+                )
+
+ensureMndzCargoInherit :: [Text] -> Either Text [Text]
+ensureMndzCargoInherit lns =
+  case break isCargoInheritLine lns of
+    (_, []) -> Left "cannot insert the patch-pin hook: the inherit line has no cargo token"
+    (pre, line : post) ->
+      Right (pre <> [rewriteInheritLine line] <> post)
+
+isCargoInheritLine :: Text -> Bool
+isCargoInheritLine ln =
+  case T.words ln of
+    "inherit" : toks -> "cargo" `elem` toks
+    _ -> False
+
+rewriteInheritLine :: Text -> Text
+rewriteInheritLine line =
+  let (indent, rest) = T.span isSpace line
+      toks = insertMndzCargo (T.words rest)
+      rewritten = T.unwords toks
+   in if rewritten == T.strip rest then line else indent <> rewritten
+
+insertMndzCargo :: [Text] -> [Text]
+insertMndzCargo toks = go (filter (/= mndzCargoEclass) toks)
+  where
+    go [] = []
+    go (t : ts)
+      | t == "cargo" = t : mndzCargoEclass : ts
+      | otherwise = t : go ts
+
+ensurePatchPinPrepare :: [Text] -> Either Text [Text]
+ensurePatchPinPrepare lns =
+  case findSrcPrepare lns of
+    Nothing -> Right (insertPreparePhase lns)
+    Just start ->
+      case functionEnd lns start of
+        Nothing ->
+          Left "cannot insert the patch-pin hook: src_prepare is not closed"
+        Just end ->
+          case firstDefault (drop (start + 1) (take end lns)) of
+            Nothing ->
+              Left "cannot insert the patch-pin hook: src_prepare has no default call"
+            Just rel ->
+              let defaultIdx = start + 1 + rel
+               in Right (insertHookAfter defaultIdx lns)
+
+findSrcPrepare :: [Text] -> Maybe Int
+findSrcPrepare = go 0
+  where
+    go _ [] = Nothing
+    go i (ln : rest)
+      | isSrcPrepareDef ln = Just i
+      | otherwise = go (i + 1) rest
+
+isSrcPrepareDef :: Text -> Bool
+isSrcPrepareDef ln =
+  "src_prepare()" `T.isPrefixOf` T.filter (not . isSpace) ln
+
+functionEnd :: [Text] -> Int -> Maybe Int
+functionEnd lns start = go 0 False (drop start (zip [start ..] lns))
+  where
+    go _ _ [] = Nothing
+    go depth seen ((i, ln) : rest) =
+      let depth' = depth + T.count "{" ln - T.count "}" ln
+          seen' = seen || "{" `T.isInfixOf` ln
+       in if seen' && depth' <= 0
+            then Just i
+            else go depth' seen' rest
+
+firstDefault :: [Text] -> Maybe Int
+firstDefault = go 0
+  where
+    go _ [] = Nothing
+    go i (ln : rest)
+      | isDefaultCall ln = Just i
+      | otherwise = go (i + 1) rest
+
+isDefaultCall :: Text -> Bool
+isDefaultCall ln =
+  case T.words (T.stripEnd (fst (T.breakOn "#" (T.strip ln)))) of
+    "default" : _ -> True
+    _ -> False
+
+insertHookAfter :: Int -> [Text] -> [Text]
+insertHookAfter defaultIdx lns =
+  case drop (defaultIdx + 1) lns of
+    next : _
+      | isHookCall next -> lns
+    _ ->
+      let (pre, post) = splitAt (defaultIdx + 1) lns
+       in pre <> ["\t" <> patchPinHookCall] <> post
+
+isHookCall :: Text -> Bool
+isHookCall ln =
+  case T.words ln of
+    call : _ -> call == patchPinHookCall
+    _ -> False
+
+insertPreparePhase :: [Text] -> [Text]
+insertPreparePhase lns =
+  let (pre, post) = break isPhaseDef lns
+      block =
+        [ "src_prepare() {",
+          "\tdefault",
+          "\t" <> patchPinHookCall,
+          "}"
+        ]
+      trimmed = dropWhileEnd T.null pre
+   in trimmed
+        <> [""]
+        <> block
+        <> ["" | not (null post)]
+        <> post
+
+isPhaseDef :: Text -> Bool
+isPhaseDef ln =
+  let compact = T.filter (not . isSpace) ln
+   in "src_" `T.isPrefixOf` compact && "()" `T.isInfixOf` compact
 
 -- | Companion @SRC_URI+=@ lines that are neither the GitHub/crates.io primary
 -- source nor the assets crates tarball. List-era drops @CARGO_CRATE_URIS@;

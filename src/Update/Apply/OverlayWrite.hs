@@ -47,6 +47,7 @@ import Update.EbuildEdit
     ensureNodejsBdepend,
     ensureRustMinVer,
     ensureSbclAtom,
+    ensureStorytoldPatchPinHook,
     parameterizeAssetsSrcUriFor,
     rewriteBunExactInvocations,
     setKeywords,
@@ -68,6 +69,7 @@ import Update.OverlayTree
   )
 import Update.Types
   ( ApplyOutcome (..),
+    CargoSource (..),
     EcosystemSpec (..),
     PackageKey (..),
     SuccessLine,
@@ -236,62 +238,71 @@ publishPrepared
                   pn
                   prepared
               _ -> parameterizeAssetsSrcUriFor assetsHost pn prepared
-            withKw = setKeywords keywords withAssets
-        contentFixed <- case (eco, mReqVer) of
-          (Go _, Just goVer) -> pure (ensureGoBdepend goVer withKw)
-          (Go _, Nothing)
-            | ebuildHasDevLangGoBdepend withKw -> pure (Right withKw)
-            | otherwise ->
+            -- After the git-crate fetch line. A hook error must not write
+            -- the ebuild, Manifest, or commit.
+            pinnedOrErr = case eco of
+              Cargo {cargoSource = CargoGitTag} ->
+                ensureStorytoldPatchPinHook pn withAssets
+              _ -> Right withAssets
+        case pinnedOrErr of
+          Left err -> pure (ApplyHardFail key err False orphan)
+          Right pinned -> do
+            let withKw = setKeywords keywords pinned
+            contentFixed <- case (eco, mReqVer) of
+              (Go _, Just goVer) -> pure (ensureGoBdepend goVer withKw)
+              (Go _, Nothing)
+                | ebuildHasDevLangGoBdepend withKw -> pure (Right withKw)
+                | otherwise ->
+                    pure $
+                      Left
+                        "could not obtain go.mod version required for BDEPEND alignment"
+              (NpmEco, Just ver) -> pure (ensureNodejsBdepend ver withKw)
+              (NpmEco, Nothing) ->
+                pure (Left "could not obtain engines.node for BDEPEND alignment")
+              (Bun, Just ver) ->
                 pure $
-                  Left
-                    "could not obtain go.mod version required for BDEPEND alignment"
-          (NpmEco, Just ver) -> pure (ensureNodejsBdepend ver withKw)
-          (NpmEco, Nothing) ->
-            pure (Left "could not obtain engines.node for BDEPEND alignment")
-          (Bun, Just ver) ->
-            pure $
-              case ensureBunBdependFor key ver withKw of
-                Left err -> Left err
-                Right withBun
-                  | isBunCompilePinPackage key ->
-                      Right (rewriteBunExactInvocations ver withBun)
-                  | otherwise -> Right withBun
-          (Bun, Nothing) ->
-            pure (Left "could not obtain engines.bun for BDEPEND alignment")
-          (Cargo {}, Just msrv) ->
-            pure (fmap (applyCodexV8 assetsHost key mCodexV8) (ensureRustMinVer msrv withKw))
-          (Cargo {}, Nothing) ->
-            pure
-              ( Left
-                  "could not determine RUST_MIN_VER (no package.rust-version, \
-                  \dependency rust-version, or donor RUST_MIN_VER)"
-              )
-          (Sbcl, Just ver) -> pure (ensureSbclAtom ver withKw)
-          (Sbcl, Nothing) ->
-            pure (Left "could not obtain sbcl.version floor for SBCL atom alignment")
-        case contentFixed of
-          Left err -> pure $ ApplyHardFail key err False orphan
-          Right fixed -> do
-            gated <- applyGastownIfNeeded key mGastownSrc fixed
-            case gated of
+                  case ensureBunBdependFor key ver withKw of
+                    Left err -> Left err
+                    Right withBun
+                      | isBunCompilePinPackage key ->
+                          Right (rewriteBunExactInvocations ver withBun)
+                      | otherwise -> Right withBun
+              (Bun, Nothing) ->
+                pure (Left "could not obtain engines.bun for BDEPEND alignment")
+              (Cargo {}, Just msrv) ->
+                pure (fmap (applyCodexV8 assetsHost key mCodexV8) (ensureRustMinVer msrv withKw))
+              (Cargo {}, Nothing) ->
+                pure
+                  ( Left
+                      "could not determine RUST_MIN_VER (no package.rust-version, \
+                      \dependency rust-version, or donor RUST_MIN_VER)"
+                  )
+              (Sbcl, Just ver) -> pure (ensureSbclAtom ver withKw)
+              (Sbcl, Nothing) ->
+                pure (Left "could not obtain sbcl.version floor for SBCL atom alignment")
+            case contentFixed of
               Left err -> pure $ ApplyHardFail key err False orphan
-              Right (body, mNotice) ->
-                publishOverlayBody
-                  env
-                  overlayRoot
-                  key
-                  pn
-                  pkgDir
-                  templatePath
-                  ebuildRel
-                  orphan
-                  lines_
-                  targetVer
-                  distDigests
-                  body
-                  mNotice
-                  ebuildRun
-                  Set.empty
+              Right fixed -> do
+                gated <- applyGastownIfNeeded key mGastownSrc fixed
+                case gated of
+                  Left err -> pure $ ApplyHardFail key err False orphan
+                  Right (body, mNotice) ->
+                    publishOverlayBody
+                      env
+                      overlayRoot
+                      key
+                      pn
+                      pkgDir
+                      templatePath
+                      ebuildRel
+                      orphan
+                      lines_
+                      targetVer
+                      distDigests
+                      body
+                      mNotice
+                      ebuildRun
+                      Set.empty
 
 -- | Rewrite Gas Town's Dolt atom and Beads window before any overlay write.
 applyGastownIfNeeded ::
