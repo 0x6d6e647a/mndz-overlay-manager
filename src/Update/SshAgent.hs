@@ -1,44 +1,62 @@
+{-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Update.SshAgent
   ( SshSession (..),
-    AgentIdentities (..),
     ensureSshAgent,
     teardownSshSession,
     SshAgentOps (..),
     productionSshAgentOps,
     mkSshAgentOps,
-    discoverIdentityFiles,
-    defaultIdentityCandidates,
-    parseIdentityFiles,
+    resolveSshIdentity,
+    prepareSshIdentity,
+    takeSshSessionSupervisor,
+    spawnSshSessionSupervisorIn,
   )
 where
 
-import Control.Monad (filterM, unless)
-import Data.Char (isAsciiUpper, isSpace)
-import Data.Containers.ListUtils (nubOrd)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (race)
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
+import Control.Exception (IOException, try)
+import Control.Monad (filterM, unless, void, when)
+import Data.List (isPrefixOf, isSuffixOf)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.Directory
-  ( doesFileExist,
-    getHomeDirectory,
+import Foreign.C.Types (CInt (..), CLong (..))
+import System.Directory (doesFileExist, getHomeDirectory)
+import System.Environment
+  ( getEnvironment,
+    getExecutablePath,
+    lookupEnv,
+    setEnv,
+    unsetEnv,
   )
-import System.Environment (getEnvironment, lookupEnv, setEnv, unsetEnv)
-import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.Exit (ExitCode (..), exitFailure)
+import System.FilePath (isAbsolute, takeFileName, (</>))
 import System.IO
-  ( IOMode (ReadWriteMode),
+  ( BufferMode (LineBuffering),
+    IOMode (ReadWriteMode),
+    hClose,
     hFlush,
+    hGetLine,
     hPutStrLn,
+    hSetBuffering,
     stderr,
     stdout,
     withFile,
   )
+import System.Posix.Process (getParentProcessID)
+import System.Posix.Signals (installHandler, sigTERM)
+import System.Posix.Signals qualified as Signals
 import System.Process
   ( CreateProcess (..),
-    StdStream (Inherit, UseHandle),
+    StdStream (CreatePipe, Inherit, NoStream, UseHandle),
+    createProcess,
     proc,
+    readProcessWithExitCode,
+    terminateProcess,
     waitForProcess,
     withCreateProcess,
   )
@@ -50,44 +68,59 @@ import Update.Process
     productionCommandRunner,
   )
 
--- | SSH agent session for the process lifetime.
-data SshSession
-  = -- | Reused existing agent; do not kill on exit.
-    SshSessionReused
-  | -- | Agent we started; kill on exit.
-    SshSessionOwned
-      { ssAgentPid :: String
-      }
-  deriving (Eq, Show)
+-- | Env var set only on the supervisor child. The value is the agent pid.
+sshSupervisorEnv :: String
+sshSupervisorEnv = "MNDZ_OVERLAY_MANAGER_SSH_SUPERVISOR"
 
--- | Result of querying identities in the agent.
-data AgentIdentities
-  = -- | @ssh-add -l@ exit 0
-    HasIdentities
-  | -- | @ssh-add -l@ exit 1 (reachable, empty)
-    NoIdentities
-  | -- | @ssh-add -l@ exit 2 or other (unreachable)
-    AgentUnreachable Text
-  deriving (Eq, Show)
+-- | Linux @PR_SET_PDEATHSIG@. Copied beside the GPG supervisor on purpose.
+prSetPdeathsig :: CInt
+prSetPdeathsig = 1
+
+foreign import ccall unsafe "prctl"
+  c_prctl :: CInt -> CLong -> CLong -> CLong -> CLong -> IO CInt
+
+-- | SSH agent session for the process lifetime.
+--
+-- An owned session carries the reap action for its parent-death supervisor.
+-- That action keeps the type from being 'Eq'.
+data SshSession
+  = -- | Reused existing agent. No supervisor, and no kill on exit.
+    SshSessionReused
+  | -- | Agent this process started. Kill the pid, then reap the supervisor.
+    SshSessionOwned
+      { ssAgentPid :: String,
+        ssReap :: IO ()
+      }
+
+instance Show SshSession where
+  show SshSessionReused = "SshSessionReused"
+  show (SshSessionOwned pid _) = "SshSessionOwned " <> show pid
 
 -- | Injectable SSH agent operations.
 data SshAgentOps = SshAgentOps
   { saoLookupEnv :: String -> IO (Maybe String),
     saoSetEnv :: String -> String -> IO (),
     saoUnsetEnv :: String -> IO (),
-    saoRunAgent :: IO (Either Text (String, String)), -- sock, pid
-
-    -- | Interactive @ssh-add@ of discovered keys (TTY / askpass).
-    saoSshAdd :: IO (Either Text ()),
-    saoListIdentities :: IO AgentIdentities,
-    saoKillAgent :: String -> IO ()
+    saoRunAgent :: IO (Either Text (String, String)),
+    -- | Interactive @ssh-add@ of the one resolved private key.
+    saoSshAdd :: FilePath -> IO (Either Text ()),
+    -- | @ssh-keygen -lf <path> -E sha256@, as the @SHA256:@ token only.
+    saoFingerprint :: FilePath -> IO (Either Text Text),
+    -- | @ssh-add -E sha256 -l@. 'Left' is unreachable. 'Right' is the tokens,
+    -- empty when the agent is reachable and has no identities.
+    saoListTokens :: IO (Either Text [Text]),
+    saoKillAgent :: String -> IO (),
+    -- | Start the parent-death supervisor for an agent this process owns.
+    -- 'Left' means it did not become ready. 'Right' is the reap action.
+    saoStartSupervisor :: String -> IO (Either Text (IO ())),
+    saoOperatorHome :: IO FilePath,
+    saoFileExists :: FilePath -> IO Bool
   }
 
--- | Build SSH agent ops over an injectable command runner (Unit heat surface).
+-- | Build SSH agent ops over an injectable command runner.
 --
--- Captured-I/O helpers (@ssh-agent@, @ssh-add -l@, @kill@) go through the
--- runner. Interactive @ssh-add@ (TTY / askpass) stays on the inherited-stdio
--- path and is out of scope for CommandRunner heating.
+-- Captured helpers (@ssh-keygen@, @ssh-agent@, @ssh-add -l@, @kill@) go
+-- through the runner. Interactive @ssh-add@ stays on the inherited-stdio path.
 mkSshAgentOps :: CommandRunner -> SshAgentOps
 mkSshAgentOps run =
   SshAgentOps
@@ -96,90 +129,196 @@ mkSshAgentOps run =
       saoUnsetEnv = unsetEnv,
       saoRunAgent = runSshAgent run,
       saoSshAdd = runSshAddInteractive,
-      saoListIdentities = listIdentities run,
-      saoKillAgent = killSshAgent run
+      saoFingerprint = fingerprintOf run,
+      saoListTokens = listTokens run,
+      saoKillAgent = killSshAgent run,
+      saoStartSupervisor = spawnSshSessionSupervisor,
+      saoOperatorHome = getHomeDirectory,
+      saoFileExists = doesFileExist
     }
 
 productionSshAgentOps :: SshAgentOps
 productionSshAgentOps = mkSshAgentOps productionCommandRunner
 
--- | Ensure an SSH agent is available for git push.
---
--- The program starts @ssh-agent@ when needed and tears it down if we own it.
--- Keys are discovered from @~\/.ssh\/config@ @IdentityFile@ lines and default
--- paths (not only bare @ssh-add@ defaults).
-ensureSshAgent :: SshAgentOps -> IO (Either Text SshSession)
-ensureSshAgent ops = do
-  mSock <- saoLookupEnv ops "SSH_AUTH_SOCK"
-  case mSock of
-    Just sock | not (null sock) -> ensureWithExistingSocket ops
-    _ -> startFreshAgent ops
+-- | Error for an omitted or empty @ssh-identity@. Names the key and no path.
+sshIdentityRequired :: Text
+sshIdentityRequired =
+  "ssh-identity is required when an assets push will run"
 
-ensureWithExistingSocket :: SshAgentOps -> IO (Either Text SshSession)
-ensureWithExistingSocket ops = do
-  ids <- saoListIdentities ops
-  case ids of
-    HasIdentities -> pure (Right SshSessionReused)
-    NoIdentities -> do
-      hPutStrLn stderr "SSH agent has no identities; adding keys (passphrase prompt if needed)…"
-      hFlush stderr
-      added <- saoSshAdd ops
-      case added of
-        Left err -> pure (Left err)
-        Right () -> confirmIdentities ops SshSessionReused
-    AgentUnreachable err -> do
-      hPutStrLn
-        stderr
+-- | Expand a leading @~@ or @~/@ and require an absolute private-key path.
+--
+-- Does not touch the disk. @~user@ is rejected. An empty or omitted value
+-- uses 'sshIdentityRequired' and does not quote a path.
+resolveSshIdentity :: FilePath -> Maybe FilePath -> Either Text FilePath
+resolveSshIdentity _ Nothing = Left sshIdentityRequired
+resolveSshIdentity home (Just raw)
+  | null raw = Left sshIdentityRequired
+  | otherwise = do
+      expanded <- expandLeadingHome home raw
+      if not (isAbsolute expanded)
+        then
+          Left
+            ( "ssh-identity must be an absolute path after expanding a leading ~: "
+                <> T.pack raw
+            )
+        else
+          if ".pub" `isSuffixOf` takeFileName expanded
+            then
+              Left
+                ( "ssh-identity must name a private key, not a .pub file: "
+                    <> T.pack raw
+                )
+            else Right expanded
+
+expandLeadingHome :: FilePath -> FilePath -> Either Text FilePath
+expandLeadingHome home raw =
+  case raw of
+    "~" -> Right home
+    '~' : '/' : rest -> Right (home </> rest)
+    '~' : _ ->
+      Left ("ssh-identity does not expand ~user: " <> T.pack raw)
+    _ -> Right raw
+
+-- | Resolve @ssh-identity@ and require the file to exist.
+--
+-- A missing file fails here, before a passphrase prompt. The error includes
+-- the resolved path.
+prepareSshIdentity :: SshAgentOps -> Maybe FilePath -> IO (Either Text FilePath)
+prepareSshIdentity ops raw = do
+  home <- saoOperatorHome ops
+  case resolveSshIdentity home raw of
+    Left err -> pure (Left err)
+    Right path -> do
+      exists <- saoFileExists ops path
+      pure $
+        if exists
+          then Right path
+          else Left ("ssh-identity file not found: " <> T.pack path)
+
+-- | Ensure the configured private key is available for git push.
+--
+-- Fingerprint the key before choosing a socket. Reuse a reachable agent only
+-- when that @SHA256:@ token is already loaded. Otherwise start an agent this
+-- process owns, supervise it, and @ssh-add@ only @keyPath@.
+ensureSshAgent :: SshAgentOps -> FilePath -> IO (Either Text SshSession)
+ensureSshAgent ops keyPath = do
+  fingerprinted <- saoFingerprint ops keyPath
+  case fingerprinted of
+    Left err -> pure (Left err)
+    Right token -> do
+      mSock <- saoLookupEnv ops "SSH_AUTH_SOCK"
+      case mSock of
+        Just sock | not (null sock) -> ensureWithExistingSocket ops keyPath token
+        _ -> startOwnedAgent ops keyPath token
+
+ensureWithExistingSocket ::
+  SshAgentOps ->
+  FilePath ->
+  Text ->
+  IO (Either Text SshSession)
+ensureWithExistingSocket ops keyPath token = do
+  listed <- saoListTokens ops
+  case listed of
+    Right tokens
+      | token `elem` tokens ->
+          pure (Right SshSessionReused)
+    Right _ -> do
+      note
+        "configured SSH key is not loaded in the current agent; starting a new one…"
+      startOwnedAgent ops keyPath token
+    Left err -> do
+      note
         ( "existing SSH agent unreachable ("
             <> T.unpack err
             <> "); starting a new one…"
         )
-      hFlush stderr
-      startFreshAgent ops
+      startOwnedAgent ops keyPath token
 
-startFreshAgent :: SshAgentOps -> IO (Either Text SshSession)
-startFreshAgent ops = do
-  hPutStrLn stderr "Starting ssh-agent…"
-  hFlush stderr
+startOwnedAgent ::
+  SshAgentOps ->
+  FilePath ->
+  Text ->
+  IO (Either Text SshSession)
+startOwnedAgent ops keyPath token = do
+  note "Starting ssh-agent…"
   started <- saoRunAgent ops
   case started of
     Left err -> pure (Left err)
     Right (sock, pid) -> do
       saoSetEnv ops "SSH_AUTH_SOCK" sock
       saoSetEnv ops "SSH_AGENT_PID" pid
-      hPutStrLn
-        stderr
-        ( "ssh-agent ready (SSH_AUTH_SOCK="
-            <> sock
-            <> "); adding SSH keys…"
-        )
-      hFlush stderr
-      added <- saoSshAdd ops
-      case added of
+      supervised <- saoStartSupervisor ops pid
+      case supervised of
         Left err -> do
-          saoKillAgent ops pid
-          saoUnsetEnv ops "SSH_AUTH_SOCK"
-          saoUnsetEnv ops "SSH_AGENT_PID"
+          abandonOwned ops pid
           pure (Left err)
-        Right () -> confirmIdentities ops (SshSessionOwned pid)
+        Right reap -> do
+          note
+            ( "ssh-agent ready (SSH_AUTH_SOCK="
+                <> sock
+                <> "); adding "
+                <> keyPath
+                <> "…"
+            )
+          added <- saoSshAdd ops keyPath
+          case added of
+            Left err -> do
+              releaseOwned ops pid reap
+              pure (Left err)
+            Right () -> confirmToken ops token (SshSessionOwned pid reap)
 
-confirmIdentities :: SshAgentOps -> SshSession -> IO (Either Text SshSession)
-confirmIdentities ops session = do
-  ids <- saoListIdentities ops
-  pure $ case ids of
-    HasIdentities -> Right session
-    NoIdentities ->
-      Left
-        "ssh-add finished but the agent still has no identities"
-    AgentUnreachable err ->
-      Left ("SSH agent not usable after ssh-add: " <> err)
+confirmToken ::
+  SshAgentOps ->
+  Text ->
+  SshSession ->
+  IO (Either Text SshSession)
+confirmToken ops token session = do
+  listed <- saoListTokens ops
+  case listed of
+    Right tokens
+      | token `elem` tokens ->
+          pure (Right session)
+    Right _ -> do
+      releaseSession ops session
+      pure (Left "ssh-add finished but the configured key is not loaded")
+    Left err -> do
+      releaseSession ops session
+      pure (Left ("SSH agent not usable after ssh-add: " <> err))
+
+releaseSession :: SshAgentOps -> SshSession -> IO ()
+releaseSession _ SshSessionReused = pure ()
+releaseSession ops (SshSessionOwned pid reap) = releaseOwned ops pid reap
+
+-- | Kill an owned agent, then reap its supervisor, then drop the socket vars.
+releaseOwned :: SshAgentOps -> String -> IO () -> IO ()
+releaseOwned ops pid reap = do
+  saoKillAgent ops pid
+  reap
+  clearOwnedEnv ops
+
+-- | Supervisor never became ready. Kill the agent and drop the socket vars.
+abandonOwned :: SshAgentOps -> String -> IO ()
+abandonOwned ops pid = do
+  saoKillAgent ops pid
+  clearOwnedEnv ops
+
+clearOwnedEnv :: SshAgentOps -> IO ()
+clearOwnedEnv ops = do
+  saoUnsetEnv ops "SSH_AUTH_SOCK"
+  saoUnsetEnv ops "SSH_AGENT_PID"
 
 teardownSshSession :: SshAgentOps -> SshSession -> IO ()
 teardownSshSession _ SshSessionReused = pure ()
-teardownSshSession ops (SshSessionOwned pid) = do
-  saoKillAgent ops pid
-  saoUnsetEnv ops "SSH_AUTH_SOCK"
-  saoUnsetEnv ops "SSH_AGENT_PID"
+teardownSshSession ops (SshSessionOwned pid reap) = releaseOwned ops pid reap
+
+note :: String -> IO ()
+note msg = do
+  hPutStrLn stderr msg
+  hFlush stderr
+
+------------------------------------------------------------------------
+-- Agent process
+------------------------------------------------------------------------
 
 runSshAgent :: CommandRunner -> IO (Either Text (String, String))
 runSshAgent run = do
@@ -192,7 +331,9 @@ runSshAgent run = do
           prStdin = ""
         }
   if prExitCode res /= ExitSuccess
-    then pure $ Left ("ssh-agent failed: " <> T.pack (nullToDash (prStderr res) (prStdout res)))
+    then
+      pure $
+        Left ("ssh-agent failed: " <> T.pack (nullToDash (prStderr res) (prStdout res)))
     else pure $ parseAgentEnv (prStdout res)
 
 parseAgentEnv :: String -> Either Text (String, String)
@@ -211,120 +352,209 @@ parseAgentEnv out =
            in if null k || null val then Nothing else Just (k, val)
         _ -> Nothing
 
+fingerprintOf :: CommandRunner -> FilePath -> IO (Either Text Text)
+fingerprintOf run path = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "ssh-keygen" ["-lf", path, "-E", "sha256"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  pure $
+    if prExitCode res /= ExitSuccess
+      then
+        Left (T.pack (nullToDash (prStderr res) (prStdout res)))
+      else case sha256Tokens (prStdout res) of
+        (token : _) -> Right token
+        [] ->
+          Left
+            ( "ssh-keygen did not report a SHA256 fingerprint: "
+                <> T.pack (nullToDash (prStdout res) (prStderr res))
+            )
+
+listTokens :: CommandRunner -> IO (Either Text [Text])
+listTokens run = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "ssh-add" ["-E", "sha256", "-l"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  pure $ case prExitCode res of
+    ExitSuccess -> Right (sha256Tokens (prStdout res))
+    ExitFailure 1 -> Right []
+    ExitFailure n ->
+      Left
+        ( "ssh-add -l exit "
+            <> T.pack (show n)
+            <> ": "
+            <> T.pack (nullToDash (prStderr res) (prStdout res))
+        )
+
+-- | @SHA256:@ words only. Comments around them are not part of the match.
+sha256Tokens :: String -> [Text]
+sha256Tokens = map T.pack . filter ("SHA256:" `isPrefixOf`) . words
+
+killSshAgent :: CommandRunner -> String -> IO ()
+killSshAgent run pid = do
+  _ <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "kill" [pid],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  pure ()
+
 ------------------------------------------------------------------------
--- Key discovery
+-- Parent-death supervisor
+--
+-- Same sequence as the GPG session supervisor (re-exec, PR_SET_PDEATHSIG,
+-- recheck the parent, signal ready, then kill). A second copy lives here so
+-- this change does not refactor the signing supervisor.
 ------------------------------------------------------------------------
 
--- | OpenSSH default private key paths (relative to home @.ssh@).
-defaultIdentityCandidates :: FilePath -> [FilePath]
-defaultIdentityCandidates sshDir =
-  map
-    (sshDir </>)
-    [ "id_rsa",
-      "id_ecdsa",
-      "id_ecdsa_sk",
-      "id_ed25519",
-      "id_ed25519_sk",
-      "id_xmss",
-      "id_dsa"
-    ]
+-- | If this process was spawned as the SSH supervisor, run it and return
+-- @True@. The normal program returns @False@ without starting a supervisor.
+takeSshSessionSupervisor :: IO Bool
+takeSshSessionSupervisor = do
+  mPid <- lookupEnv sshSupervisorEnv
+  case mPid of
+    Nothing -> pure False
+    Just pid -> do
+      unsetEnv sshSupervisorEnv
+      runSshSessionSupervisor pid
+      pure True
 
--- | Discover private key paths: @IdentityFile@ from @~\/.ssh\/config@ plus
--- default identity names that exist on disk.
-discoverIdentityFiles :: IO [FilePath]
-discoverIdentityFiles = do
-  home <- getHomeDirectory
-  let sshDir = home </> ".ssh"
-      configPath = sshDir </> "config"
-  configExists <- doesFileExist configPath
-  fromConfig <-
-    if configExists
-      then parseIdentityFiles home <$> readFile configPath
-      else pure []
-  let defaults = defaultIdentityCandidates sshDir
-  filterM doesFileExist (nubOrd (fromConfig <> defaults))
+spawnSshSessionSupervisor :: String -> IO (Either Text (IO ()))
+spawnSshSessionSupervisor pid = do
+  env0 <- getEnvironment
+  spawnSshSessionSupervisorIn env0 pid
 
--- | Collect @IdentityFile@ values from an OpenSSH config body.
-parseIdentityFiles :: FilePath -> String -> [FilePath]
-parseIdentityFiles home =
-  mapMaybe (parseIdentityLine home) . lines
-
-parseIdentityLine :: FilePath -> String -> Maybe FilePath
-parseIdentityLine home raw =
-  let line = trim (takeWhile (/= '#') raw)
-      ws = words line
-   in case ws of
-        (kw : path : _)
-          | map toLower kw == "identityfile" ->
-              Just (expandTilde home path)
-        _ -> Nothing
+-- | Like 'spawnSshSessionSupervisor' with an explicit environment.
+-- The supervisor variable is set to the agent pid.
+spawnSshSessionSupervisorIn ::
+  [(String, String)] ->
+  String ->
+  IO (Either Text (IO ()))
+spawnSshSessionSupervisorIn env0 pid = do
+  exe <- getExecutablePath
+  let env1 =
+        (sshSupervisorEnv, pid)
+          : filter (\(k, _) -> k /= sshSupervisorEnv) env0
+  started <-
+    try @IOException $
+      createProcess
+        (proc exe [])
+          { env = Just env1,
+            std_in = NoStream,
+            std_out = CreatePipe,
+            std_err = NoStream
+          }
+  case started of
+    Left e ->
+      pure (Left ("SSH supervisor failed to start: " <> T.pack (show e)))
+    Right (Nothing, Just outH, Nothing, ph) ->
+      waitReady outH ph
+    Right _ ->
+      pure (Left "SSH supervisor did not return a stdout pipe")
   where
-    toLower c
-      | isAsciiUpper c = toEnum (fromEnum c + 32)
-      | otherwise = c
-    trim = dropWhile isSpace . reverse . dropWhile isSpace . reverse
+    waitReady outH ph = do
+      ready <- race (threadDelay 60_000_000) (try @IOException (hGetLine outH))
+      case ready of
+        Left () -> do
+          terminateProcess ph
+          void (waitForProcess ph)
+          hClose outH
+          pure (Left "SSH supervisor did not become ready")
+        Right (Left _) -> do
+          ec <- waitForProcess ph
+          hClose outH
+          pure
+            ( Left
+                ( "SSH supervisor exited before ready: "
+                    <> T.pack (show ec)
+                )
+            )
+        Right (Right "ready") -> do
+          hClose outH
+          pure (Right (reap ph))
+        Right (Right other) -> do
+          terminateProcess ph
+          void (waitForProcess ph)
+          hClose outH
+          pure (Left ("SSH supervisor sent " <> T.pack (show other)))
+    reap ph = do
+      terminateProcess ph
+      void (waitForProcess ph)
 
-expandTilde :: FilePath -> FilePath -> FilePath
-expandTilde home path =
-  case path of
-    '~' : '/' : rest -> home </> rest
-    "~" -> home
-    _ -> path
+-- | Set the parent-death signal, recheck the parent, then wait for @SIGTERM@.
+runSshSessionSupervisor :: String -> IO ()
+runSshSessionSupervisor pid = do
+  parent <- getParentProcessID
+  done <- newEmptyMVar
+  _ <-
+    installHandler
+      sigTERM
+      (Signals.Catch (void (tryPutMVar done ())))
+      Nothing
+  rc <- c_prctl prSetPdeathsig (fromIntegral sigTERM) 0 0 0
+  when (rc < 0) exitFailure
+  parent2 <- getParentProcessID
+  -- prctl then recheck: a parent that died in between is not signaled.
+  if parent2 /= parent || parent2 == 1
+    then killAgentPid pid
+    else do
+      hSetBuffering stdout LineBuffering
+      putStrLn "ready"
+      hFlush stdout
+      void (takeMVar done)
+      killAgentPid pid
+
+killAgentPid :: String -> IO ()
+killAgentPid pid =
+  void $
+    try @IOException $
+      readProcessWithExitCode "kill" [pid] ""
 
 ------------------------------------------------------------------------
 -- Interactive ssh-add
 ------------------------------------------------------------------------
 
--- | Add discovered keys. Prefer @\/dev\/tty@ for passphrase prompts; fall back
--- to @SSH_ASKPASS@ (e.g. ksshaskpass) when no controlling TTY is available.
-runSshAddInteractive :: IO (Either Text ())
-runSshAddInteractive = do
-  keys <- discoverIdentityFiles
-  case keys of
-    [] ->
-      pure $
-        Left
-          ( "no SSH private keys found. Expected IdentityFile entries in "
-              <> "~/.ssh/config and/or default keys under ~/.ssh/id_*. "
-              <> "Your GitHub key may live under ~/.ssh/keys/ — ensure it is "
-              <> "listed as IdentityFile for github.com."
-          )
-    _ -> do
-      hPutStrLn stderr ("Adding keys: " <> unwords keys)
-      hFlush stderr
-      addKeysWithPrompt keys
-
-addKeysWithPrompt :: [FilePath] -> IO (Either Text ())
-addKeysWithPrompt keys = do
+-- | Add one private key. Prefer @\/dev\/tty@; fall back to @SSH_ASKPASS@.
+runSshAddInteractive :: FilePath -> IO (Either Text ())
+runSshAddInteractive keyPath = do
   ttyOk <- canUseDevTty
   if ttyOk
-    then sshAddWithDevTty keys
-    else sshAddWithAskPass keys
+    then sshAddWithDevTty keyPath
+    else sshAddWithAskPass keyPath
 
 canUseDevTty :: IO Bool
 canUseDevTty = doesFileExist "/dev/tty"
 
 -- | Open @\/dev\/tty@ so ssh-add can prompt even when stdio is not a TTY.
-sshAddWithDevTty :: [FilePath] -> IO (Either Text ())
-sshAddWithDevTty keys =
+sshAddWithDevTty :: FilePath -> IO (Either Text ())
+sshAddWithDevTty keyPath =
   withFile "/dev/tty" ReadWriteMode $ \tty -> do
-    hPutStrLn
-      stderr
-      "Using /dev/tty for ssh-add passphrase prompt…"
-    hFlush stderr
+    note "Using /dev/tty for ssh-add passphrase prompt…"
     env0 <- getEnvironment
     let cp =
-          (proc "ssh-add" keys)
+          (proc "ssh-add" [keyPath])
             { std_in = UseHandle tty,
               std_out = Inherit,
               std_err = Inherit,
               env = Just env0
             }
-    runSshAddProcess cp keys "tty"
+    runSshAddProcess cp keyPath "tty"
 
 -- | Force GUI/CLI askpass when there is no usable controlling terminal.
-sshAddWithAskPass :: [FilePath] -> IO (Either Text ())
-sshAddWithAskPass keys = do
+sshAddWithAskPass :: FilePath -> IO (Either Text ())
+sshAddWithAskPass keyPath = do
   askPass <- findAskPass
   case askPass of
     Nothing ->
@@ -332,20 +562,15 @@ sshAddWithAskPass keys = do
         Left
           ( "cannot prompt for SSH key passphrase: no controlling TTY and no "
               <> "ssh-askpass helper (install ksshaskpass or ssh-askpass, or run "
-              <> "from a real terminal). Keys: "
-              <> T.pack (unwords keys)
+              <> "from a real terminal). Key: "
+              <> T.pack keyPath
           )
     Just askPath -> do
       display <- lookupEnv "DISPLAY"
       wayland <- lookupEnv "WAYLAND_DISPLAY"
       unless (maybe False (not . null) display || maybe False (not . null) wayland) $
-        hPutStrLn
-          stderr
-          "warning: DISPLAY/WAYLAND_DISPLAY unset; askpass may fail"
-      hPutStrLn
-        stderr
-        ("Using SSH_ASKPASS=" <> askPath <> " for passphrase prompt…")
-      hFlush stderr
+        note "warning: DISPLAY/WAYLAND_DISPLAY unset; askpass may fail"
+      note ("Using SSH_ASKPASS=" <> askPath <> " for passphrase prompt…")
       env0 <- getEnvironment
       let env1 =
             ("SSH_ASKPASS", askPath)
@@ -356,13 +581,13 @@ sshAddWithAskPass keys = do
                 )
                 env0
           cp =
-            (proc "ssh-add" keys)
+            (proc "ssh-add" [keyPath])
               { std_in = Inherit,
                 std_out = Inherit,
                 std_err = Inherit,
                 env = Just env1
               }
-      runSshAddProcess cp keys "askpass"
+      runSshAddProcess cp keyPath "askpass"
 
 findAskPass :: IO (Maybe FilePath)
 findAskPass = do
@@ -384,8 +609,8 @@ findAskPass = do
         (p : _) -> Just p
         [] -> Nothing
 
-runSshAddProcess :: CreateProcess -> [FilePath] -> String -> IO (Either Text ())
-runSshAddProcess cp keys mode = do
+runSshAddProcess :: CreateProcess -> FilePath -> String -> IO (Either Text ())
+runSshAddProcess cp keyPath mode = do
   hFlush stdout
   hFlush stderr
   withCreateProcess cp $ \_ _ _ ph -> do
@@ -399,43 +624,11 @@ runSshAddProcess cp keys mode = do
                 <> T.pack mode
                 <> " (exit "
                 <> T.pack (show code)
-                <> ") for keys: "
-                <> T.pack (unwords keys)
+                <> ") for key: "
+                <> T.pack keyPath
                 <> ". Unlock manually with: ssh-add "
-                <> T.pack (unwords keys)
+                <> T.pack keyPath
             )
-
-listIdentities :: CommandRunner -> IO AgentIdentities
-listIdentities run = do
-  res <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "ssh-add" ["-l"],
-          prCwd = Nothing,
-          prEnv = Nothing,
-          prStdin = ""
-        }
-  pure $ case prExitCode res of
-    ExitSuccess -> HasIdentities
-    ExitFailure 1 -> NoIdentities
-    ExitFailure n ->
-      AgentUnreachable $
-        "ssh-add -l exit "
-          <> T.pack (show n)
-          <> ": "
-          <> T.pack (nullToDash (prStderr res) (prStdout res))
-
-killSshAgent :: CommandRunner -> String -> IO ()
-killSshAgent run pid = do
-  _ <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "kill" [pid],
-          prCwd = Nothing,
-          prEnv = Nothing,
-          prStdin = ""
-        }
-  pure ()
 
 nullToDash :: String -> String -> String
 nullToDash primary fallback =

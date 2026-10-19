@@ -255,11 +255,9 @@ import Update.Runtime.Ceilings
   )
 import Update.Sbcl.Deps (productionSbclDepsOps)
 import Update.SshAgent
-  ( AgentIdentities (..),
-    SshAgentOps (..),
+  ( SshAgentOps (..),
     SshSession (..),
     ensureSshAgent,
-    parseIdentityFiles,
   )
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.TempWorkspace (openRunRoot)

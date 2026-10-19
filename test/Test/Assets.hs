@@ -304,11 +304,9 @@ import Update.Runtime.Ceilings
     parseRuntimeEbuildMeta,
   )
 import Update.SshAgent
-  ( AgentIdentities (..),
-    SshAgentOps (..),
+  ( SshAgentOps (..),
     SshSession (..),
     ensureSshAgent,
-    parseIdentityFiles,
   )
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types
@@ -414,7 +412,8 @@ testTokenResolverIO = do
             assetsPath = Nothing,
             githubToken = Just "mndz1.from-config",
             distfilesPath = Nothing,
-            checkCacheTtl = defaultCheckCacheTtl
+            checkCacheTtl = defaultCheckCacheTtl,
+            sshIdentity = Nothing
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "config envelope not decrypted" Nothing =<< resolveGitHubToken cfg
@@ -430,7 +429,8 @@ testTokenResolverIO = do
             assetsPath = Nothing,
             githubToken = Nothing,
             distfilesPath = Nothing,
-            checkCacheTtl = defaultCheckCacheTtl
+            checkCacheTtl = defaultCheckCacheTtl,
+            sshIdentity = Nothing
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "none" Nothing =<< resolveGitHubToken cfgNoTok
@@ -1008,7 +1008,8 @@ testGitHubTokenExistingKey = do
             assetsPath = Just "/tmp/assets",
             githubToken = Just "mndz1.existing",
             distfilesPath = Nothing,
-            checkCacheTtl = defaultCheckCacheTtl
+            checkCacheTtl = defaultCheckCacheTtl,
+            sshIdentity = Nothing
           }
       boom = error "github-token should not prompt or probe without --force"
       ops =

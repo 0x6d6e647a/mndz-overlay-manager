@@ -82,10 +82,7 @@ import Update.Spine
     UpdateSpineResult (..),
     runUpdatePhases,
   )
-import Update.SshAgent
-  ( AgentIdentities (..),
-    SshAgentOps (..),
-  )
+import Update.SshAgent (SshAgentOps (..))
 import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
@@ -122,6 +119,12 @@ integrationTests =
       testCase
         "reuse-only never calls image ensure"
         testReuseOnlyNeverEnsure,
+      testCase
+        "omitted ssh-identity fails an assets push before ssh-add"
+        testOmittedSshIdentitySkipsAdd,
+      testCase
+        "missing ssh-identity file fails before ssh-add"
+        testMissingSshIdentitySkipsAdd,
       testCase
         "re-entry ensure after bun-bin; failed ensure keeps commit"
         testFailedReEnsureKeepsCommit,
@@ -183,6 +186,8 @@ plentyDisk =
       dspDeviceId = \_ -> pure (Right 1)
     }
 
+-- | Reachable agent whose loaded token matches whatever path it is given.
+-- Assets tests reuse this session and do not @ssh-add@.
 sshOk :: SshAgentOps
 sshOk =
   SshAgentOps
@@ -194,9 +199,13 @@ sshOk =
       saoSetEnv = \_ _ -> pure (),
       saoUnsetEnv = \_ -> pure (),
       saoRunAgent = pure (Left "should not start"),
-      saoSshAdd = pure (Left "should not add"),
-      saoListIdentities = pure HasIdentities,
-      saoKillAgent = \_ -> pure ()
+      saoSshAdd = \_ -> pure (Left "should not add"),
+      saoFingerprint = \_ -> pure (Right "SHA256:configured"),
+      saoListTokens = pure (Right ["SHA256:configured"]),
+      saoKillAgent = \_ -> pure (),
+      saoStartSupervisor = \_ -> pure (Left "should not supervise"),
+      saoOperatorHome = pure "/home/test",
+      saoFileExists = \_ -> pure True
     }
 
 cleanGit :: GitOps
@@ -414,6 +423,7 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
         usdDistDir = dist,
         usdOverlayRoot = overlay,
         usdSshOps = sshOk,
+        usdSshIdentity = Just "/tmp/configured-ssh-key",
         usdEbuildRunner = fakeEbuildRun,
         usdEgencacheRunner = mockEgencacheWriteMatching,
         usdPreflightTools = preflight,
@@ -660,15 +670,109 @@ testReuseOnlyNeverEnsure =
           ]
         entries = groupNewest ebuilds
     nEnsure <- newIORef (0 :: Int)
+    nAdd <- newIORef (0 :: Int)
     deps0 <-
       baseSpine overlay assets dist cleanGit releaseRalphReuse 2 preflightOk
-    let deps = deps0 {usdEnsureImage = countingEnsure nEnsure}
+    let deps =
+          deps0
+            { usdEnsureImage = countingEnsure nEnsure,
+              usdSshOps =
+                sshOk
+                  { saoSshAdd = \_ -> do
+                      atomicModifyIORef' nAdd (\n -> (n + 1, ()))
+                      pure (Left "should not add")
+                  }
+            }
     result <- runUpdatePhases deps entries ebuilds entries
     case result of
       Left err -> assertFailure $ "spine failed: " <> T.unpack err
       Right _ -> do
         n <- readIORef nEnsure
         assertEq "reuse-only never ensures" 0 n
+        adds <- readIORef nAdd
+        assertEq "assets stub reuses without ssh-add" 0 adds
+
+-- | Assets work with no configured key hard-fails and does not @ssh-add@.
+testOmittedSshIdentitySkipsAdd :: IO ()
+testOmittedSshIdentitySkipsAdd =
+  withSystemTempDirectory "om-wave-ssh-omit" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.2.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds =
+          [ Ebuild "dev-lang" "bun-bin" "1.2.0" bunPath,
+            Ebuild "dev-util" "ralph-tui" "1.0.0" ralphPath
+          ]
+        entries = groupNewest ebuilds
+    nAdd <- newIORef (0 :: Int)
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseRalphReuse 2 preflightOk
+    let deps =
+          deps0
+            { usdSshIdentity = Nothing,
+              usdSshOps =
+                sshOk
+                  { saoSshAdd = \_ -> do
+                      atomicModifyIORef' nAdd (\n -> (n + 1, ()))
+                      pure (Right ())
+                  }
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed closed as Left: " <> T.unpack err
+      Right res -> do
+        let msgs = [m | ApplyHardFail _ m _ _ <- usrOutcomes res]
+        assertTrue
+          "omitted key names ssh-identity"
+          (any ("ssh-identity" `T.isInfixOf`) msgs)
+        adds <- readIORef nAdd
+        assertEq "omitted key does not ssh-add" 0 adds
+
+-- | A configured path that is not a file fails before a prompt.
+testMissingSshIdentitySkipsAdd :: IO ()
+testMissingSshIdentitySkipsAdd =
+  withSystemTempDirectory "om-wave-ssh-missing" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+        missing = "/no/such/ssh-identity"
+    bunPath <- seedBunBin overlay "1.2.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds =
+          [ Ebuild "dev-lang" "bun-bin" "1.2.0" bunPath,
+            Ebuild "dev-util" "ralph-tui" "1.0.0" ralphPath
+          ]
+        entries = groupNewest ebuilds
+    nAdd <- newIORef (0 :: Int)
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseRalphReuse 2 preflightOk
+    let deps =
+          deps0
+            { usdSshIdentity = Just missing,
+              usdSshOps =
+                sshOk
+                  { saoFileExists = \_ -> pure False,
+                    saoSshAdd = \_ -> do
+                      atomicModifyIORef' nAdd (\n -> (n + 1, ()))
+                      pure (Right ())
+                  }
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed closed as Left: " <> T.unpack err
+      Right res -> do
+        let msgs = [m | ApplyHardFail _ m _ _ <- usrOutcomes res]
+        assertTrue
+          "missing file names the path"
+          (any (T.pack missing `T.isInfixOf`) msgs)
+        adds <- readIORef nAdd
+        assertEq "missing file does not ssh-add" 0 adds
 
 testFailedReEnsureKeepsCommit :: IO ()
 testFailedReEnsureKeepsCommit =

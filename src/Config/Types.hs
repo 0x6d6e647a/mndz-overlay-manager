@@ -95,7 +95,10 @@ data OverlayConfig = OverlayConfig
     -- | Optional private Portage DISTDIR for @ebuild … manifest@ (see @--distfiles-path@).
     distfilesPath :: Maybe FilePath,
     -- | Check-cache TTL (default 5m when omitted; zero disables).
-    checkCacheTtl :: CheckCacheTtl
+    checkCacheTtl :: CheckCacheTtl,
+    -- | Private key for an assets git push. Stored as written: no @~@ expansion
+    -- and no disk access at parse. Omitted stays 'Nothing'.
+    sshIdentity :: Maybe FilePath
   }
   deriving (Eq, Show, Generic)
 
@@ -108,3 +111,4 @@ instance FromValue OverlayConfig where
         <*> optKey "github-token"
         <*> optKey "distfiles-path"
         <*> (fromMaybe defaultCheckCacheTtl <$> optKey "check-cache-ttl")
+        <*> optKey "ssh-identity"

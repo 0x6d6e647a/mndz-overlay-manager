@@ -464,7 +464,8 @@ testCfg tok =
       assetsPath = Nothing,
       githubToken = tok,
       distfilesPath = Nothing,
-      checkCacheTtl = defaultCheckCacheTtl
+      checkCacheTtl = defaultCheckCacheTtl,
+      sshIdentity = Nothing
     }
 
 countingPrompt :: IORef Int -> SecretPrompt

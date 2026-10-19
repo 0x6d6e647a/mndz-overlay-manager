@@ -114,6 +114,7 @@ import Update.Sbcl.Deps (mkSbclDepsOps)
 import Update.SshAgent
   ( SshAgentOps,
     ensureSshAgent,
+    prepareSshIdentity,
     teardownSshSession,
   )
 import Update.TempWorkspace (RunRoot (..), openRunRoot)
@@ -148,6 +149,8 @@ data UpdateSpineDeps = UpdateSpineDeps
     usdDistDir :: FilePath,
     usdOverlayRoot :: FilePath,
     usdSshOps :: SshAgentOps,
+    -- | Raw @ssh-identity@ from config. Resolved only when this run will push.
+    usdSshIdentity :: Maybe FilePath,
     usdEbuildRunner :: EbuildRunner,
     usdEgencacheRunner :: EgencacheRunner,
     usdPreflightTools :: AssetsPreflight -> IO (Either Text ()),
@@ -705,7 +708,16 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                             if needDeps
                               then
                                 bracket
-                                  (ensureSshAgent (usdSshOps deps))
+                                  ( do
+                                      prepared <-
+                                        prepareSshIdentity
+                                          (usdSshOps deps)
+                                          (usdSshIdentity deps)
+                                      case prepared of
+                                        Left err -> pure (Left err)
+                                        Right path ->
+                                          ensureSshAgent (usdSshOps deps) path
+                                  )
                                   ( \case
                                       Left _ -> pure ()
                                       Right sess -> teardownSshSession (usdSshOps deps) sess

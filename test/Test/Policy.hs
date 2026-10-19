@@ -278,11 +278,9 @@ import Update.Runtime.Ceilings
     parseRuntimeEbuildMeta,
   )
 import Update.SshAgent
-  ( AgentIdentities (..),
-    SshAgentOps (..),
+  ( SshAgentOps (..),
     SshSession (..),
     ensureSshAgent,
-    parseIdentityFiles,
   )
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types

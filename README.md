@@ -69,6 +69,7 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 | `github-token` | no | Encrypted (`mndz1.`) GitHub token envelope for authenticated fetch / release publish. A plaintext value hard-fails every command that loads config until you run `github-token --force`. |
 | `distfiles-path` | no | Private Portage `DISTDIR` for `ebuild … manifest` during `update` (default: XDG cache path below) |
 | `check-cache-ttl` | no | How long successful outdated-check / plan results are reused (human duration, default **5m**). Single unit: `s` / `m` / `h` / `d` (for example `30s`, `5m`, `1h`). **`0` or `0s` disables** the check cache (never read, never write) |
+| `ssh-identity` | no | One private-key path for an assets `git push`. A leading `~` is allowed. Required only when that push will run |
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then the decrypted `github-token` envelope in the config. Using an environment token logs a warning (and an extra warning when that value is not a fine-grained PAT `github_pat_`). `outdated` and `update` use that token for live `api.github.com` version fetch when a token is available. If the winning source is the encrypted config envelope, they prompt for the wrap password on a controlling TTY when this run will call `api.github.com` (cache miss, `--refresh`, or assets GitHub work). Unattended `outdated` / `update` **must** set `GITHUB_TOKEN` or `GH_TOKEN` rather than relying on TTY decrypt; without a controlling TTY the command exits `1` and does not fall back to unauthenticated fetch. Live unauthenticated fetch is still allowed when no token is configured, is limited to **60 requests per hour** per IP, and logs a warning. The program never logs the raw token, wrap password, or ciphertext.
 
@@ -97,7 +98,12 @@ assets-path = "/path/to/mndz-overlay-assets"
 # github-token = "mndz1...."  # set with: mndz-overlay-manager github-token
 # distfiles-path = "/path/to/private-distfiles"  # optional; default is XDG cache
 # check-cache-ttl = "5m"  # optional; default 5m; use "0s" to disable
+ssh-identity = "~/.ssh/keys/shanty_github_id"
 ```
+
+`ssh-identity` names the one private key used when `update` will `git push` the assets worktree. A leading `~` is expanded to your home directory. Any other relative path is rejected. `list`, `outdated`, `gencache`, and an `update` that will not push that worktree accept a config that omits the key.
+
+A reachable agent that already has the key is reused and does not prompt. Otherwise the run prompts once for that key and does not leave it in the desktop agent.
 
 ### Check cache (outdated / update)
 

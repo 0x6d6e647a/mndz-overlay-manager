@@ -122,7 +122,7 @@ import Update.Spine
     UpdateSpineResult (..),
     runUpdatePhases,
   )
-import Update.SshAgent (productionSshAgentOps)
+import Update.SshAgent (productionSshAgentOps, takeSshSessionSupervisor)
 import Update.Targets (resolveTargets, targetErrorMessage)
 import Update.TempWorkspace (openRunRoot, rrPath)
 import Update.Types
@@ -147,8 +147,9 @@ data Runtime = Runtime
 
 main :: IO ()
 main = do
-  took <- takeGpgSessionSupervisor
-  unless took runProgram
+  tookGpg <- takeGpgSessionSupervisor
+  tookSsh <- takeSshSessionSupervisor
+  unless (tookGpg || tookSsh) runProgram
 
 runProgram :: IO ()
 runProgram = do
@@ -392,6 +393,7 @@ runUpdate rt refresh pkgArgs = do
                           usdDistDir = distDir,
                           usdOverlayRoot = overlayPath,
                           usdSshOps = productionSshAgentOps,
+                          usdSshIdentity = sshIdentity cfg,
                           usdEbuildRunner = productionEbuildRunner distDir,
                           usdEgencacheRunner = productionEgencacheRunner,
                           usdPreflightTools = preflightUpdateTools,

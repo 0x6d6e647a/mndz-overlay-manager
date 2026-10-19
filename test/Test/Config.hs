@@ -253,11 +253,9 @@ import Update.Runtime.Ceilings
     parseRuntimeEbuildMeta,
   )
 import Update.SshAgent
-  ( AgentIdentities (..),
-    SshAgentOps (..),
+  ( SshAgentOps (..),
     SshSession (..),
     ensureSshAgent,
-    parseIdentityFiles,
   )
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
 import Update.Types
@@ -293,7 +291,8 @@ tests =
       testCase "Config mode 0644 hard-fails" testConfigModeWrong,
       testCase "Config mode 0600 loads" testConfigModeOk,
       testCase "Config unreadable mode hard-fails" testConfigModeUnreadable,
-      testCase "Plaintext github-token hard-fails load" testPlaintextGitHubTokenLoad
+      testCase "Plaintext github-token hard-fails load" testPlaintextGitHubTokenLoad,
+      testCase "Config ssh-identity raw path" testSshIdentityRawPath
     ]
 
 -- | Git does not persist @0600@ on tracked fixtures; temp files follow umask.
@@ -309,6 +308,26 @@ testConfigLoadSuccess = do
   assertEq "token optional absent" Nothing (githubToken cfg)
   assertEq "distfiles optional absent" Nothing (distfilesPath cfg)
   assertEq "check-cache-ttl default" defaultCheckCacheTtl (checkCacheTtl cfg)
+  assertEq "ssh-identity omitted" Nothing (sshIdentity cfg)
+
+-- | Parse stores the path text. No @~@ expansion and no disk access.
+testSshIdentityRawPath :: IO ()
+testSshIdentityRawPath =
+  withSystemTempDirectory "ssh-id-cfg" $ \tmp -> do
+    let absFile = tmp </> "absolute.toml"
+        tildeFile = tmp </> "tilde.toml"
+        absKey = "/home/u/.ssh/keys/shanty_github_id"
+        tildeKey = "~/.ssh/keys/shanty_github_id"
+    TIO.writeFile absFile $
+      "overlay-path = \"/tmp/ov\"\nssh-identity = \"" <> T.pack absKey <> "\"\n"
+    TIO.writeFile tildeFile $
+      "overlay-path = \"/tmp/ov\"\nssh-identity = \"" <> T.pack tildeKey <> "\"\n"
+    chmodConfig600 absFile
+    chmodConfig600 tildeFile
+    absCfg <- assertRight "absolute ssh-identity" =<< loadConfig (Just absFile)
+    assertEq "absolute path stays raw" (Just absKey) (sshIdentity absCfg)
+    tildeCfg <- assertRight "tilde ssh-identity" =<< loadConfig (Just tildeFile)
+    assertEq "tilde path stays raw" (Just tildeKey) (sshIdentity tildeCfg)
 
 testConfigOptionalKeys :: IO ()
 testConfigOptionalKeys = do

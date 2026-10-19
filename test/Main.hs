@@ -34,6 +34,7 @@ import Test.Tasty (defaultMain, testGroup)
 import Test.TempWorkspace qualified as TempWorkspace
 import Test.Waves qualified as Waves
 import Update.GpgAgent (takeGpgSessionSupervisor)
+import Update.SshAgent (takeSshSessionSupervisor)
 
 -- Test taxonomy (Unit vs Integration) — design D3 / CONTRIBUTING.
 --
@@ -51,9 +52,11 @@ import Update.GpgAgent (takeGpgSessionSupervisor)
 
 main :: IO ()
 main = do
-  took <- takeGpgSessionSupervisor
+  tookGpg <- takeGpgSessionSupervisor
+  tookSsh <- takeSshSessionSupervisor
   probed <- Gpg.takeGpgTtyProbe
-  unless (took || probed) $
+  unless (tookGpg || tookSsh || probed) $ do
+    Git.clearGitLocalEnv
     defaultMain $
       testGroup
         "mndz-overlay-manager"

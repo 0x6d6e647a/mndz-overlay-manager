@@ -2,72 +2,120 @@
 
 ## Purpose
 
-SSH agent lifecycle for assets git push: key discovery, passphrase prompt, reuse and teardown.
+SSH agent lifecycle for assets git push: configured identity, passphrase prompt, reuse, and owned-agent teardown.
 
 ## Requirements
 
-### Requirement: Early SSH readiness for assets push
+### Requirement: Assets push unlocks only ssh-identity
 
-When `update` will attempt at least one assets-repository `git push`, the program SHALL ensure SSH authentication is available before parallel package work begins. The program SHALL:
+When `update` will attempt an assets-repository `git push`, the program SHALL unlock only the private key named by config key `ssh-identity`. That value SHALL be one path. After a leading `~` expands to the operator's home, the path SHALL be absolute, SHALL name an existing file, and SHALL NOT end in `.pub`. Any other value SHALL hard-fail before a passphrase prompt. An omitted or empty value SHALL name `ssh-identity` in the error. A non-empty path SHALL appear in the error.
 
-1. Reuse an existing reachable `SSH_AUTH_SOCK` agent when it already has loaded identities.
-2. If the existing agent is reachable but has no identities, load keys into that agent (see key discovery and passphrase prompting).
-3. If no usable agent is available (missing or unreachable `SSH_AUTH_SOCK`), start a new `ssh-agent`, export `SSH_AUTH_SOCK` and `SSH_AGENT_PID` for child processes (including assets `git push`), load keys, and own teardown of that agent.
+#### Scenario: Tilde path is the only key added
 
-The program SHALL NOT require the operator to manually start `ssh-agent` for the normal assets-push path.
+- **WHEN** an assets push will run and `ssh-identity` is `~/.ssh/keys/shanty_github_id` and that file exists under the operator's home
+- **THEN** the program expands the leading `~` and passes only that absolute path to `ssh-add` when it must unlock a key
+
+#### Scenario: Relative path fails before a prompt
+
+- **WHEN** an assets push will run and `ssh-identity` is `keys/github`
+- **THEN** the program hard-fails before a passphrase prompt
+- **AND** the error includes `keys/github`
+
+#### Scenario: Public-key path fails before a prompt
+
+- **WHEN** an assets push will run and `ssh-identity` names an existing file that ends in `.pub`
+- **THEN** the program hard-fails before a passphrase prompt
+- **AND** the error includes that path
+
+#### Scenario: Omitted key fails only when a push will run
+
+- **WHEN** an assets push will run and the config omits `ssh-identity`
+- **THEN** the program hard-fails before a passphrase prompt
+- **AND** the error names `ssh-identity`
+
+### Requirement: Omitted ssh-identity is valid without an assets push
+
+A command that will not `git push` the assets repository SHALL load a config that omits `ssh-identity`. It SHALL NOT prompt for an SSH passphrase because that key is omitted.
+
+#### Scenario: List loads without ssh-identity
+
+- **WHEN** the operator runs `list` and the config omits `ssh-identity`
+- **THEN** the command loads the config and does not prompt for an SSH passphrase
+
+#### Scenario: Update without an assets push does not prompt
+
+- **WHEN** the operator runs `update` for packages that will not `git push` the assets repository and the config omits `ssh-identity`
+- **THEN** the program does not prompt for an SSH passphrase and does not start an `ssh-agent`
+
+### Requirement: Early SSH readiness for the configured key
+
+When `update` will attempt at least one assets-repository `git push`, the program SHALL make the configured private key available before parallel package work. When a reachable agent already has that key loaded, the program SHALL reuse it with no prompt and no `ssh-add`, and SHALL leave the inherited agent socket unchanged. Otherwise the program SHALL start an `ssh-agent`, add only that key, and this process's children SHALL inherit that socket, including assets `git push`.
 
 #### Scenario: Spawn agent when none usable
 
-- **WHEN** assets push is required and no usable SSH agent is available
-- **THEN** the program starts `ssh-agent`, exports its environment, and loads discovered private keys before package parallel work
+- **WHEN** an assets push will run and no reachable agent has the configured key loaded
+- **THEN** the program starts an `ssh-agent`, adds only that key, and children of this process inherit that socket before package parallel work
 
-#### Scenario: Reuse existing agent with identities
+#### Scenario: Reuse when the configured key is loaded
 
-- **WHEN** assets push is required and an existing usable `SSH_AUTH_SOCK` already has identities
-- **THEN** the program does not replace that agent and does not kill it on exit
+- **WHEN** an assets push will run and a reachable agent already has the configured key loaded
+- **THEN** the program does not prompt, does not run `ssh-add`, does not replace that agent, and does not kill it on exit
 
-#### Scenario: Empty existing agent loads keys
+#### Scenario: Other loaded identities do not count
 
-- **WHEN** assets push is required and an existing agent is reachable but has no identities
-- **THEN** the program runs key loading against that agent without starting a second agent unless the existing agent is unreachable
+- **WHEN** an assets push will run and a reachable agent has identities loaded, none of which is the configured key
+- **THEN** the program does not add a key to that agent
+- **AND** it starts an agent, adds only the configured key, and leaves the original agent running
+
+#### Scenario: Empty existing agent is not the add target
+
+- **WHEN** an assets push will run and a reachable agent has no identities
+- **THEN** the program does not run `ssh-add` against that agent
+- **AND** it starts an agent and adds only the configured key
 
 #### Scenario: Stale SSH_AUTH_SOCK falls back to new agent
 
-- **WHEN** `SSH_AUTH_SOCK` is set but the agent is unreachable
-- **THEN** the program starts a new `ssh-agent` and loads keys into it
+- **WHEN** `SSH_AUTH_SOCK` is set but the agent is unreachable and an assets push will run
+- **THEN** the program starts a new `ssh-agent` and adds only the configured key
 
-### Requirement: Discover private keys from SSH config and defaults
+#### Scenario: Add that does not load the key fails closed
 
-When loading keys into an agent, the program SHALL discover private key paths by:
-
-1. Parsing `IdentityFile` entries from `~/.ssh/config` (expanding `~`), and
-2. Including OpenSSH default identity basenames under `~/.ssh/` when those files exist (`id_rsa`, `id_ed25519`, and other standard defaults).
-
-The program SHALL pass the discovered existing key paths explicitly to `ssh-add`. It SHALL NOT rely solely on bare `ssh-add` with no arguments (which only tries default basenames and fails silently when keys live only under custom paths such as `~/.ssh/keys/…`).
-
-#### Scenario: IdentityFile under keys subdirectory
-
-- **WHEN** `~/.ssh/config` contains `IdentityFile ~/.ssh/keys/shanty_github_id` and that file exists
-- **THEN** key loading includes that path in the `ssh-add` argument list
-
-#### Scenario: No discoverable keys
-
-- **WHEN** no `IdentityFile` paths exist on disk and no default identity files exist
-- **THEN** SSH setup fails with an error explaining that keys must be listed as `IdentityFile` and/or placed under default `~/.ssh/id_*` names
+- **WHEN** the program starts an agent and `ssh-add` of the configured key finishes without that key loaded
+- **THEN** the program hard-fails and terminates the agent it started
 
 ### Requirement: Passphrase prompting via TTY or askpass
 
-When `ssh-add` must unlock passphrase-protected keys, the program SHALL prefer prompting on the controlling terminal by attaching `ssh-add` to `/dev/tty` when available. When `/dev/tty` cannot be used, the program SHALL attempt `SSH_ASKPASS` (respecting an existing `SSH_ASKPASS` environment variable when set, otherwise a well-known helper such as `ksshaskpass` / `ssh-askpass` when present) and SHALL set `SSH_ASKPASS_REQUIRE=force` so a graphical or helper prompt can appear even without a TTY. Failure to prompt and load keys SHALL produce an error that names the key paths and the prompt mode used (`tty` or `askpass`).
+When `ssh-add` must unlock the configured private key, the program SHALL prefer prompting on the controlling terminal by attaching `ssh-add` to `/dev/tty` when available. When `/dev/tty` cannot be used, the program SHALL attempt `SSH_ASKPASS` (respecting an existing `SSH_ASKPASS` environment variable when set, otherwise a well-known helper such as `ksshaskpass` / `ssh-askpass` when present) and SHALL set `SSH_ASKPASS_REQUIRE=force` so a graphical or helper prompt can appear even without a TTY. Failure to prompt and load the key SHALL produce an error that names the key path and the prompt mode used (`tty` or `askpass`).
 
 #### Scenario: Prompt on controlling terminal
 
-- **WHEN** `/dev/tty` is available for passphrase entry
-- **THEN** the program runs `ssh-add` with stdin attached to `/dev/tty` for the discovered keys
+- **WHEN** `/dev/tty` is available and the configured key must be unlocked
+- **THEN** the program runs `ssh-add` with stdin attached to `/dev/tty` for that key only
 
 #### Scenario: Askpass fallback without TTY
 
-- **WHEN** `/dev/tty` is not usable and a suitable askpass helper is available
-- **THEN** the program runs `ssh-add` with `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE=force` for the discovered keys
+- **WHEN** `/dev/tty` is not usable, a suitable askpass helper is available, and the configured key must be unlocked
+- **THEN** the program runs `ssh-add` with `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE=force` for that key only
+
+### Requirement: Owned SSH agent dies if the process is killed
+
+When the program starts an `ssh-agent` for an assets push, a parent-death supervisor SHALL be running before the passphrase prompt. If the supervisor cannot start, the program SHALL hard-fail before the prompt and SHALL terminate that agent. If this process is killed after the agent has started, that agent SHALL still be terminated. The supervisor SHALL NOT terminate an agent the program reused.
+
+#### Scenario: Supervisor failure blocks the prompt
+
+- **WHEN** an assets push will run, the configured key is not already loaded, and the parent-death supervisor cannot start
+- **THEN** the program hard-fails before a passphrase prompt
+- **AND** the agent it started is not left running
+
+#### Scenario: Killed process does not leave the owned agent
+
+- **WHEN** the program has started an `ssh-agent` and loaded the configured key, and the process is then killed
+- **THEN** that agent is terminated
+
+#### Scenario: Reused agent survives the supervisor
+
+- **WHEN** the program reused an agent that already had the configured key loaded, and the process then exits
+- **THEN** that agent is still running
 
 ### Requirement: Kill only agent started by the program
 

@@ -38,14 +38,14 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forever, unless, void)
+import Control.Monad (forever, join, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (nub, sort, sortBy)
+import Data.List (isInfixOf, nub, sort, sortBy)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isNothing)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
@@ -70,10 +70,12 @@ import Overlay.Version
     prettyVersion,
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Posix.Files (setFileMode)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
@@ -251,13 +253,13 @@ import Update.Runtime.Ceilings
     parseRuntimeEbuildMeta,
   )
 import Update.SshAgent
-  ( AgentIdentities (..),
-    SshAgentOps (..),
+  ( SshAgentOps (..),
     SshSession (..),
-    defaultIdentityCandidates,
     ensureSshAgent,
     mkSshAgentOps,
-    parseIdentityFiles,
+    prepareSshIdentity,
+    resolveSshIdentity,
+    spawnSshSessionSupervisorIn,
     teardownSshSession,
   )
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
@@ -280,21 +282,28 @@ tests :: TestTree
 tests =
   testGroup
     "Ssh"
-    [ testCase "Ssh Agent Reuse" testSshAgentReuse,
-      testCase "Ssh Ensure Empty Then Add" testSshEnsureEmptyThenAdd,
-      testCase "Ssh Ensure Empty Add Fails" testSshEnsureEmptyAddFails,
-      testCase "Ssh Ensure Unreachable Starts Fresh" testSshEnsureUnreachableStartsFresh,
-      testCase "Ssh Ensure Fresh Success" testSshEnsureFreshSuccess,
-      testCase "Ssh Ensure Fresh RunAgent Fails" testSshEnsureFreshRunAgentFails,
-      testCase "Ssh Ensure Fresh Add Fails Kills" testSshEnsureFreshAddFailsKills,
-      testCase "Ssh Ensure Fresh Still Empty" testSshEnsureFreshStillEmpty,
-      testCase "Ssh Ensure Fresh Unreachable After Add" testSshEnsureFreshUnreachableAfterAdd,
-      testCase "Ssh Teardown Reused And Owned" testSshTeardownReusedAndOwned,
-      testCase "Default Identity Candidates" testDefaultIdentityCandidates,
-      testCase "Parse Identity Files Edges" testParseIdentityFilesEdges,
+    [ testCase "Resolve ssh-identity" testResolveSshIdentity,
+      testCase "Prepare missing ssh-identity file" testPrepareMissingFile,
+      testCase "Ssh reuse when the token is present" testSshReuseToken,
+      testCase "Ssh other tokens start an owned agent" testSshOtherTokensOwned,
+      testCase "Ssh empty agent is not the add target" testSshEmptyAgentOwned,
+      testCase "Ssh unreachable socket starts an owned agent" testSshUnreachableOwned,
+      testCase "Ssh keygen failure does not ssh-add" testSshKeygenFailure,
+      testCase "Ssh add without the token kills the owned agent" testSshAddMissesToken,
+      testCase "Ssh add failure kills the owned agent" testSshAddFailsKills,
+      testCase "Ssh supervisor failure before ssh-add" testSshSupervisorFailure,
+      testCase "Ssh supervisor kill records the agent pid" testSshSupervisorKill,
+      testCase "Ssh teardown reused and owned" testSshTeardownReusedAndOwned,
+      testCase "Go missing among assets tools" testGoMissingAmongAssetsTools,
       testCase "Ssh mk CommandRunner success lifecycle" testSshMkCommandRunnerSuccess,
       testCase "Ssh mk CommandRunner failure edges" testSshMkCommandRunnerFailures
     ]
+
+configuredKey :: FilePath
+configuredKey = "/home/u/.ssh/keys/shanty_github_id"
+
+token :: T.Text
+token = "SHA256:abc"
 
 baseSshOps :: SshAgentOps
 baseSshOps =
@@ -303,54 +312,262 @@ baseSshOps =
       saoSetEnv = \_ _ -> pure (),
       saoUnsetEnv = \_ -> pure (),
       saoRunAgent = pure (Left "should not start"),
-      saoSshAdd = pure (Left "should not add"),
-      saoListIdentities = pure HasIdentities,
-      saoKillAgent = \_ -> pure ()
+      saoSshAdd = \_ -> pure (Left "should not add"),
+      saoFingerprint = \_ -> pure (Right token),
+      saoListTokens = pure (Right [token]),
+      saoKillAgent = \_ -> pure (),
+      saoStartSupervisor = \_ -> pure (Right (pure ())),
+      saoOperatorHome = pure "/home/u",
+      saoFileExists = \_ -> pure True
     }
 
-testSshAgentReuse :: IO ()
-testSshAgentReuse = do
-  let opsWithKeys =
-        baseSshOps
-          { saoLookupEnv = \k -> pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/agent" else Nothing,
-            saoListIdentities = pure HasIdentities
-          }
-  result <- ensureSshAgent opsWithKeys
-  case result of
-    Right SshSessionReused -> pure ()
-    other -> do
-      hPutStrLn stderr $ "expected reused session, got " <> show other
-      exitFailure
-  let opsEmpty =
-        opsWithKeys
-          { saoListIdentities = pure NoIdentities,
-            saoSshAdd = pure (Right ())
-          }
-  resultEmpty <- ensureSshAgent opsEmpty
-  case resultEmpty of
-    Left msg ->
-      assertTrue
-        "mentions no identities"
-        ("no identities" `T.isInfixOf` msg)
-    Right _ -> do
-      hPutStrLn stderr "expected failure when agent stays empty"
-      exitFailure
-  -- empty sock string treated as missing → start fresh path
-  let opsEmptySock =
-        baseSshOps
-          { saoLookupEnv = \k -> pure $ if k == "SSH_AUTH_SOCK" then Just "" else Nothing,
-            saoRunAgent = pure (Left "agent boom")
-          }
-  errSock <- assertLeft "empty sock starts fresh" =<< ensureSshAgent opsEmptySock
-  assertTrue "agent fail" ("agent boom" `T.isInfixOf` errSock)
-  let parsed =
-        parseIdentityFiles
-          "/home/u"
-          "Host github.com\n  IdentityFile ~/.ssh/keys/github\n# IdentityFile ~/.ssh/skip\nIdentityFile /abs/key\n"
+noQuotedPath :: T.Text -> IO ()
+noQuotedPath err = do
+  assertTrue "names ssh-identity" ("ssh-identity" `T.isInfixOf` err)
+  assertTrue "does not quote a path" (not ("\"" `T.isInfixOf` err))
+  assertTrue "does not include a path" (not ("/" `T.isInfixOf` err))
+
+testResolveSshIdentity :: IO ()
+testResolveSshIdentity = do
+  let home = "/home/mndz"
   assertEq
-    "parsed identity files"
-    ["/home/u/.ssh/keys/github", "/abs/key"]
-    parsed
+    "tilde key"
+    (Right "/home/mndz/.ssh/keys/shanty_github_id")
+    (resolveSshIdentity home (Just "~/.ssh/keys/shanty_github_id"))
+  rel <- assertLeft "relative" (resolveSshIdentity home (Just "keys/github"))
+  assertTrue "relative includes the configured text" ("keys/github" `T.isInfixOf` rel)
+  pub <-
+    assertLeft "pub" (resolveSshIdentity home (Just "/home/u/.ssh/id_ed25519.pub"))
+  assertTrue
+    "pub includes the configured text"
+    ("/home/u/.ssh/id_ed25519.pub" `T.isInfixOf` pub)
+  user <- assertLeft "tilde user" (resolveSshIdentity home (Just "~other/key"))
+  assertTrue "tilde user includes the configured text" ("~other/key" `T.isInfixOf` user)
+  empty <- assertLeft "empty" (resolveSshIdentity home (Just ""))
+  omitted <- assertLeft "omitted" (resolveSshIdentity home Nothing)
+  noQuotedPath empty
+  noQuotedPath omitted
+
+testPrepareMissingFile :: IO ()
+testPrepareMissingFile = do
+  let ops = baseSshOps {saoFileExists = \_ -> pure False}
+  err <-
+    assertLeft "missing file" =<< prepareSshIdentity ops (Just "/no/such/key")
+  assertTrue "includes the path" ("/no/such/key" `T.isInfixOf` err)
+
+testSshReuseToken :: IO ()
+testSshReuseToken = do
+  kills <- newIORef ([] :: [String])
+  sets <- newIORef ([] :: [(String, String)])
+  adds <- newIORef ([] :: [FilePath])
+  sups <- newIORef ([] :: [String])
+  let ops =
+        baseSshOps
+          { saoLookupEnv = \k ->
+              pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/agent" else Nothing,
+            saoSetEnv = \k v -> atomicModifyIORef' sets (\xs -> (xs <> [(k, v)], ())),
+            saoSshAdd = \path -> do
+              atomicModifyIORef' adds (\xs -> (xs <> [path], ()))
+              pure (Right ()),
+            saoKillAgent = \pid -> atomicModifyIORef' kills (\xs -> (xs <> [pid], ())),
+            saoStartSupervisor = \pid -> do
+              atomicModifyIORef' sups (\xs -> (xs <> [pid], ()))
+              pure (Right (pure ()))
+          }
+  session <- assertRight "reuse" =<< ensureSshAgent ops configuredKey
+  case session of
+    SshSessionReused -> pure ()
+    SshSessionOwned pid _ -> do
+      hPutStrLn stderr $ "expected reuse, owned " <> pid
+      exitFailure
+  assertEq "add not called" [] =<< readIORef adds
+  assertEq "no setEnv" [] =<< readIORef sets
+  assertEq "no kill" [] =<< readIORef kills
+  assertEq "no supervisor" [] =<< readIORef sups
+
+-- | Existing socket has some other identity. Add only the configured key,
+-- and only after the owned socket is current.
+testSshOtherTokensOwned :: IO ()
+testSshOtherTokensOwned = assertOwnedAdd (Right ["SHA256:other"])
+
+testSshEmptyAgentOwned :: IO ()
+testSshEmptyAgentOwned = assertOwnedAdd (Right [])
+
+testSshUnreachableOwned :: IO ()
+testSshUnreachableOwned = assertOwnedAdd (Left "exit 2")
+
+assertOwnedAdd :: Either T.Text [T.Text] -> IO ()
+assertOwnedAdd firstList = do
+  envRef <- newIORef (Map.fromList [("SSH_AUTH_SOCK", "/tmp/existing")])
+  listRef <- newIORef (0 :: Int)
+  adds <- newIORef ([] :: [(FilePath, Maybe String)])
+  kills <- newIORef ([] :: [String])
+  order <- newIORef ([] :: [String])
+  let ops =
+        baseSshOps
+          { saoLookupEnv = \k -> Map.lookup k <$> readIORef envRef,
+            saoSetEnv = \k v -> modifyIORef' envRef (Map.insert k v),
+            saoListTokens = do
+              n <- atomicModifyIORef' listRef (\i -> (i + 1, i))
+              pure $ if n == 0 then firstList else Right [token],
+            saoRunAgent = pure (Right ("/tmp/owned.sock", "5150")),
+            saoSshAdd = \path -> do
+              sock <- Map.lookup "SSH_AUTH_SOCK" <$> readIORef envRef
+              atomicModifyIORef' adds (\xs -> (xs <> [(path, sock)], ()))
+              atomicModifyIORef' order (\xs -> (xs <> ["add"], ()))
+              pure (Right ()),
+            saoKillAgent = \pid -> atomicModifyIORef' kills (\xs -> (xs <> [pid], ())),
+            saoStartSupervisor = \pid -> do
+              atomicModifyIORef' order (\xs -> (xs <> ["supervisor:" <> pid], ()))
+              pure (Right (pure ()))
+          }
+  session <- assertRight "owned" =<< ensureSshAgent ops configuredKey
+  case session of
+    SshSessionOwned pid _ -> assertEq "owned pid" "5150" pid
+    SshSessionReused -> do
+      hPutStrLn stderr "expected an owned agent"
+      exitFailure
+  assertEq
+    "add only the configured key on the owned socket"
+    [(configuredKey, Just "/tmp/owned.sock")]
+    =<< readIORef adds
+  assertEq "existing agent stays up" [] =<< readIORef kills
+  events <- readIORef order
+  assertEq
+    "supervisor before ssh-add"
+    ["supervisor:5150", "add"]
+    events
+
+testSshKeygenFailure :: IO ()
+testSshKeygenFailure = do
+  lookups <- newIORef (0 :: Int)
+  adds <- newIORef (0 :: Int)
+  starts <- newIORef (0 :: Int)
+  let ops =
+        baseSshOps
+          { saoLookupEnv = \_ -> do
+              atomicModifyIORef' lookups (\n -> (n + 1, ()))
+              pure (Just "/tmp/agent"),
+            saoFingerprint = \_ -> pure (Left "ssh-keygen: invalid format"),
+            saoSshAdd = \_ -> do
+              atomicModifyIORef' adds (\n -> (n + 1, ()))
+              pure (Right ()),
+            saoRunAgent = do
+              atomicModifyIORef' starts (\n -> (n + 1, ()))
+              pure (Right ("/tmp/owned.sock", "1"))
+          }
+  err <- assertLeft "keygen" =<< ensureSshAgent ops configuredKey
+  assertTrue "stderr" ("invalid format" `T.isInfixOf` err)
+  assertEq "no socket choice" 0 =<< readIORef lookups
+  assertEq "no ssh-add" 0 =<< readIORef adds
+  assertEq "no agent" 0 =<< readIORef starts
+
+testSshAddMissesToken :: IO ()
+testSshAddMissesToken = do
+  kills <- newIORef ([] :: [String])
+  unsets <- newIORef ([] :: [String])
+  reaped <- newIORef False
+  let ops =
+        baseSshOps
+          { saoLookupEnv = \_ -> pure Nothing,
+            saoRunAgent = pure (Right ("/tmp/s", "77")),
+            saoSshAdd = \_ -> pure (Right ()),
+            saoListTokens = pure (Right ["SHA256:other"]),
+            saoKillAgent = \pid -> atomicModifyIORef' kills (\xs -> (xs <> [pid], ())),
+            saoUnsetEnv = \k -> atomicModifyIORef' unsets (\xs -> (xs <> [k], ())),
+            saoStartSupervisor = \_ -> pure (Right (writeIORef reaped True))
+          }
+  err <- assertLeft "token missing" =<< ensureSshAgent ops configuredKey
+  assertTrue "not loaded" ("not loaded" `T.isInfixOf` err)
+  assertEq "killed owned pid only" ["77"] =<< readIORef kills
+  assertTrue "unset sock" . ("SSH_AUTH_SOCK" `elem`) =<< readIORef unsets
+  assertTrue "reaped" =<< readIORef reaped
+
+testSshAddFailsKills :: IO ()
+testSshAddFailsKills = do
+  kills <- newIORef ([] :: [String])
+  unsets <- newIORef ([] :: [String])
+  let ops =
+        baseSshOps
+          { saoLookupEnv = \_ -> pure Nothing,
+            saoRunAgent = pure (Right ("/tmp/s", "77")),
+            saoSshAdd = \_ -> pure (Left "no keys"),
+            saoKillAgent = \pid -> atomicModifyIORef' kills (\xs -> (xs <> [pid], ())),
+            saoUnsetEnv = \k -> atomicModifyIORef' unsets (\xs -> (xs <> [k], ()))
+          }
+  err <- assertLeft "add fail kills" =<< ensureSshAgent ops configuredKey
+  assertEq "add error" "no keys" err
+  assertEq "killed owned pid only" ["77"] =<< readIORef kills
+  unsets' <- readIORef unsets
+  assertTrue "unset sock" ("SSH_AUTH_SOCK" `elem` unsets')
+  assertTrue "unset pid" ("SSH_AGENT_PID" `elem` unsets')
+
+testSshSupervisorFailure :: IO ()
+testSshSupervisorFailure = do
+  adds <- newIORef (0 :: Int)
+  kills <- newIORef ([] :: [String])
+  unsets <- newIORef ([] :: [String])
+  let ops =
+        baseSshOps
+          { saoLookupEnv = \_ -> pure Nothing,
+            saoRunAgent = pure (Right ("/tmp/s", "88")),
+            saoSshAdd = \_ -> do
+              atomicModifyIORef' adds (\n -> (n + 1, ()))
+              pure (Right ()),
+            saoKillAgent = \pid -> atomicModifyIORef' kills (\xs -> (xs <> [pid], ())),
+            saoUnsetEnv = \k -> atomicModifyIORef' unsets (\xs -> (xs <> [k], ())),
+            saoStartSupervisor = \_ -> pure (Left "SSH supervisor did not become ready")
+          }
+  err <- assertLeft "supervisor" =<< ensureSshAgent ops configuredKey
+  assertTrue "names supervisor" ("supervisor" `T.isInfixOf` err)
+  assertEq "no ssh-add" 0 =<< readIORef adds
+  assertEq "killed the agent it started" ["88"] =<< readIORef kills
+  assertTrue "sock unset" . ("SSH_AUTH_SOCK" `elem`) =<< readIORef unsets
+
+testSshSupervisorKill :: IO ()
+testSshSupervisorKill =
+  withSystemTempDirectory "mndz-ssh-sup-" $ \tmp -> do
+    let bin = tmp </> "bin"
+        record = tmp </> "kill-args"
+        pid = "424242"
+    createDirectoryIfMissing True bin
+    writeFile (bin </> "kill") $
+      unlines
+        [ "#!/bin/sh",
+          "printf '%s\\n' \"$*\" > " <> show record
+        ]
+    setFileMode (bin </> "kill") 0o755
+    env0 <- getEnvironment
+    let env1 =
+          ("PATH", bin <> ":" <> fromMaybe "" (lookup "PATH" env0))
+            : filter (\(k, _) -> k /= "PATH") env0
+    started <- spawnSshSessionSupervisorIn env1 pid
+    join (assertRight "supervisor started" started)
+    body <- readFile record
+    assertTrue "kill saw the agent pid" (pid `isInfixOf` body)
+
+testSshTeardownReusedAndOwned :: IO ()
+testSshTeardownReusedAndOwned = do
+  kills <- newIORef ([] :: [String])
+  unsets <- newIORef ([] :: [String])
+  reaped <- newIORef False
+  let ops =
+        baseSshOps
+          { saoKillAgent = \pid -> atomicModifyIORef' kills (\xs -> (xs <> [pid], ())),
+            saoUnsetEnv = \k -> atomicModifyIORef' unsets (\xs -> (xs <> [k], ()))
+          }
+  teardownSshSession ops SshSessionReused
+  assertEq "no kill reused" [] =<< readIORef kills
+  assertEq "no unset reused" [] =<< readIORef unsets
+  teardownSshSession ops (SshSessionOwned "1234" (writeIORef reaped True))
+  assertEq "kill owned" ["1234"] =<< readIORef kills
+  assertTrue "reaped after kill" =<< readIORef reaped
+  unsets' <- readIORef unsets
+  assertTrue "unset sock owned" ("SSH_AUTH_SOCK" `elem` unsets')
+  assertTrue "unset pid owned" ("SSH_AGENT_PID" `elem` unsets')
+
+testGoMissingAmongAssetsTools :: IO ()
+testGoMissingAmongAssetsTools = do
   missing <-
     checkToolsOnPath
       ( \name ->
@@ -361,195 +578,6 @@ testSshAgentReuse = do
       )
       goAssetsRequiredTools
   assertEq "go missing among assets tools" ["go"] missing
-
-testSshEnsureEmptyThenAdd :: IO ()
-testSshEnsureEmptyThenAdd = do
-  listRef <- newIORef (0 :: Int)
-  addRef <- newIORef (0 :: Int)
-  let ops =
-        baseSshOps
-          { saoLookupEnv = \k -> pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/agent" else Nothing,
-            saoSshAdd = do
-              atomicModifyIORef' addRef (\n -> (n + 1, ()))
-              pure (Right ()),
-            saoListIdentities = do
-              n <- atomicModifyIORef' listRef (\i -> (i + 1, i))
-              pure $ if n == 0 then NoIdentities else HasIdentities
-          }
-  session <- assertRight "reuse after add" =<< ensureSshAgent ops
-  assertEq "reused session" SshSessionReused session
-  adds <- readIORef addRef
-  assertEq "ssh-add once" 1 adds
-
-testSshEnsureEmptyAddFails :: IO ()
-testSshEnsureEmptyAddFails = do
-  let ops =
-        baseSshOps
-          { saoLookupEnv = \k -> pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/agent" else Nothing,
-            saoListIdentities = pure NoIdentities,
-            saoSshAdd = pure (Left "add failed")
-          }
-  err <- assertLeft "add fail" =<< ensureSshAgent ops
-  assertEq "propagates add error" "add failed" err
-
-testSshEnsureUnreachableStartsFresh :: IO ()
-testSshEnsureUnreachableStartsFresh = do
-  killRef <- newIORef ([] :: [String])
-  setRef <- newIORef ([] :: [(String, String)])
-  listRef <- newIORef (0 :: Int)
-  let ops =
-        baseSshOps
-          { saoLookupEnv = \k -> pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/stale" else Nothing,
-            -- first list: stale agent; after restart+add: identities present
-            saoListIdentities = do
-              n <- atomicModifyIORef' listRef (\i -> (i + 1, i))
-              pure $
-                if n == 0
-                  then AgentUnreachable "exit 2"
-                  else HasIdentities,
-            saoRunAgent = pure (Right ("/tmp/new.sock", "4242")),
-            saoSetEnv = \k v -> atomicModifyIORef' setRef (\xs -> (xs <> [(k, v)], ())),
-            saoSshAdd = pure (Right ()),
-            saoKillAgent = \pid -> atomicModifyIORef' killRef (\xs -> (xs <> [pid], ()))
-          }
-  session <- assertRight "fresh after unreachable" =<< ensureSshAgent ops
-  assertEq "owned session" (SshSessionOwned "4242") session
-  sets <- readIORef setRef
-  assertTrue "set sock" (("SSH_AUTH_SOCK", "/tmp/new.sock") `elem` sets)
-  assertTrue "set pid" (("SSH_AGENT_PID", "4242") `elem` sets)
-  kills <- readIORef killRef
-  assertEq "no kill on success" [] kills
-
-testSshEnsureFreshSuccess :: IO ()
-testSshEnsureFreshSuccess = do
-  let ops =
-        baseSshOps
-          { saoLookupEnv = \_ -> pure Nothing,
-            saoRunAgent = pure (Right ("/tmp/s", "99")),
-            saoSshAdd = pure (Right ()),
-            saoListIdentities = pure HasIdentities
-          }
-  session <- assertRight "fresh owned" =<< ensureSshAgent ops
-  assertEq "owned" (SshSessionOwned "99") session
-
-testSshEnsureFreshRunAgentFails :: IO ()
-testSshEnsureFreshRunAgentFails = do
-  let ops =
-        baseSshOps
-          { saoLookupEnv = \_ -> pure Nothing,
-            saoRunAgent = pure (Left "ssh-agent failed: no binary")
-          }
-  err <- assertLeft "run agent" =<< ensureSshAgent ops
-  assertTrue "mentions agent" ("ssh-agent" `T.isInfixOf` err)
-
-testSshEnsureFreshAddFailsKills :: IO ()
-testSshEnsureFreshAddFailsKills = do
-  killRef <- newIORef ([] :: [String])
-  unsetRef <- newIORef ([] :: [String])
-  let ops =
-        baseSshOps
-          { saoLookupEnv = \_ -> pure Nothing,
-            saoRunAgent = pure (Right ("/tmp/s", "77")),
-            saoSshAdd = pure (Left "no keys"),
-            saoKillAgent = \pid -> atomicModifyIORef' killRef (\xs -> (xs <> [pid], ())),
-            saoUnsetEnv = \k -> atomicModifyIORef' unsetRef (\xs -> (xs <> [k], ()))
-          }
-  err <- assertLeft "add fail kills" =<< ensureSshAgent ops
-  assertEq "add error" "no keys" err
-  kills <- readIORef killRef
-  assertEq "killed owned agent" ["77"] kills
-  unsets <- readIORef unsetRef
-  assertTrue "unset sock" ("SSH_AUTH_SOCK" `elem` unsets)
-  assertTrue "unset pid" ("SSH_AGENT_PID" `elem` unsets)
-
-testSshEnsureFreshStillEmpty :: IO ()
-testSshEnsureFreshStillEmpty = do
-  let ops =
-        baseSshOps
-          { saoLookupEnv = \_ -> pure Nothing,
-            saoRunAgent = pure (Right ("/tmp/s", "1")),
-            saoSshAdd = pure (Right ()),
-            saoListIdentities = pure NoIdentities
-          }
-  err <- assertLeft "still empty" =<< ensureSshAgent ops
-  assertTrue "no identities msg" ("no identities" `T.isInfixOf` err)
-
-testSshEnsureFreshUnreachableAfterAdd :: IO ()
-testSshEnsureFreshUnreachableAfterAdd = do
-  let ops =
-        baseSshOps
-          { saoLookupEnv = \_ -> pure Nothing,
-            saoRunAgent = pure (Right ("/tmp/s", "1")),
-            saoSshAdd = pure (Right ()),
-            saoListIdentities = pure (AgentUnreachable "gone")
-          }
-  err <- assertLeft "unreachable after add" =<< ensureSshAgent ops
-  assertTrue "usable msg" ("not usable" `T.isInfixOf` err)
-  assertTrue "carries cause" ("gone" `T.isInfixOf` err)
-
-testSshTeardownReusedAndOwned :: IO ()
-testSshTeardownReusedAndOwned = do
-  killRef <- newIORef ([] :: [String])
-  unsetRef <- newIORef ([] :: [String])
-  let ops =
-        baseSshOps
-          { saoKillAgent = \pid -> atomicModifyIORef' killRef (\xs -> (xs <> [pid], ())),
-            saoUnsetEnv = \k -> atomicModifyIORef' unsetRef (\xs -> (xs <> [k], ()))
-          }
-  teardownSshSession ops SshSessionReused
-  kills0 <- readIORef killRef
-  unsets0 <- readIORef unsetRef
-  assertEq "no kill reused" [] kills0
-  assertEq "no unset reused" [] unsets0
-  teardownSshSession ops (SshSessionOwned "1234")
-  kills1 <- readIORef killRef
-  unsets1 <- readIORef unsetRef
-  assertEq "kill owned" ["1234"] kills1
-  assertTrue "unset sock owned" ("SSH_AUTH_SOCK" `elem` unsets1)
-  assertTrue "unset pid owned" ("SSH_AGENT_PID" `elem` unsets1)
-
-testDefaultIdentityCandidates :: IO ()
-testDefaultIdentityCandidates = do
-  let cands = defaultIdentityCandidates "/home/u/.ssh"
-  assertEq
-    "default identity paths"
-    [ "/home/u/.ssh/id_rsa",
-      "/home/u/.ssh/id_ecdsa",
-      "/home/u/.ssh/id_ecdsa_sk",
-      "/home/u/.ssh/id_ed25519",
-      "/home/u/.ssh/id_ed25519_sk",
-      "/home/u/.ssh/id_xmss",
-      "/home/u/.ssh/id_dsa"
-    ]
-    cands
-
-testParseIdentityFilesEdges :: IO ()
-testParseIdentityFilesEdges = do
-  assertEq "empty config" [] (parseIdentityFiles "/home/u" "")
-  assertEq
-    "tilde only home"
-    ["/home/u"]
-    (parseIdentityFiles "/home/u" "IdentityFile ~\n")
-  assertEq
-    "case insensitive keyword"
-    ["/abs/key"]
-    (parseIdentityFiles "/home/u" "identityfile /abs/key\n")
-  assertEq
-    "inline comment stripped"
-    ["/home/u/.ssh/id_ed25519"]
-    (parseIdentityFiles "/home/u" "IdentityFile ~/.ssh/id_ed25519 # comment\n")
-  assertEq
-    "comment only line ignored"
-    []
-    (parseIdentityFiles "/home/u" "# IdentityFile ~/.ssh/skip\nHost *\n")
-  assertEq
-    "non identity keywords ignored"
-    []
-    (parseIdentityFiles "/home/u" "Host github.com\n  User git\n")
-  assertEq
-    "multiple files order preserved"
-    ["/a", "/b"]
-    (parseIdentityFiles "/home/u" "IdentityFile /a\nIdentityFile /b\n")
 
 ------------------------------------------------------------------------
 -- Production mkSshAgentOps via scripted CommandRunner (captured I/O)
@@ -581,17 +609,32 @@ agentEnvOut =
   "SSH_AUTH_SOCK=/tmp/mk-agent.sock; export SSH_AUTH_SOCK;\n"
     <> "SSH_AGENT_PID=4242; export SSH_AGENT_PID;\n"
 
+keygenOut :: String
+keygenOut = "256 SHA256:abc filecomment (ED25519)\n"
+
+listOut :: String
+listOut = "256 SHA256:abc agentcomment (ED25519)\n"
+
+matchesKeygen :: [String] -> Bool
+matchesKeygen args = args == ["-lf", configuredKey, "-E", "sha256"]
+
+matchesList :: [String] -> Bool
+matchesList args = args == ["-E", "sha256", "-l"]
+
 testSshMkCommandRunnerSuccess :: IO ()
 testSshMkCommandRunnerSuccess = do
-  listRef <- newIORef (0 :: Int)
   killRef <- newIORef ([] :: [String])
   setRef <- newIORef ([] :: [(String, String)])
   unsetRef <- newIORef ([] :: [String])
+  addRef <- newIORef ([] :: [FilePath])
   let lifecycleRun req = case execCmd req of
+        Just ("ssh-keygen", args)
+          | matchesKeygen args ->
+              pure (okResult keygenOut)
         Just ("ssh-agent", ["-s"]) -> pure (okResult agentEnvOut)
-        Just ("ssh-add", ["-l"]) -> do
-          _ <- atomicModifyIORef' listRef (\i -> (i + 1, i))
-          pure (okResult "identity\n")
+        Just ("ssh-add", args)
+          | matchesList args ->
+              pure (okResult listOut)
         Just ("kill", [pid]) -> do
           atomicModifyIORef' killRef (\xs -> (xs <> [pid], ()))
           pure (okResult "")
@@ -601,81 +644,113 @@ testSshMkCommandRunnerSuccess = do
           { saoLookupEnv = \_ -> pure Nothing,
             saoSetEnv = \k v -> atomicModifyIORef' setRef (\xs -> (xs <> [(k, v)], ())),
             saoUnsetEnv = \k -> atomicModifyIORef' unsetRef (\xs -> (xs <> [k], ())),
-            saoSshAdd = pure (Right ())
+            saoSshAdd = \path -> do
+              atomicModifyIORef' addRef (\xs -> (xs <> [path], ()))
+              pure (Right ()),
+            saoStartSupervisor = \_ -> pure (Right (pure ()))
           }
-  session <- assertRight "mk fresh success" =<< ensureSshAgent ops
-  assertEq "owned pid" (SshSessionOwned "4242") session
+  session <- assertRight "mk fresh success" =<< ensureSshAgent ops configuredKey
+  case session of
+    SshSessionOwned pid _ -> assertEq "owned pid" "4242" pid
+    SshSessionReused -> do
+      hPutStrLn stderr "expected owned session"
+      exitFailure
   sets <- readIORef setRef
   assertTrue "set sock" (("SSH_AUTH_SOCK", "/tmp/mk-agent.sock") `elem` sets)
   assertTrue "set pid" (("SSH_AGENT_PID", "4242") `elem` sets)
-  lists <- readIORef listRef
-  assertTrue "listed identities" (lists >= 1)
+  assertEq "added the configured path" [configuredKey] =<< readIORef addRef
 
-  -- Reuse path: existing sock + production list HasIdentities
+  -- Reuse: comments differ, the SHA256 token matches, ssh-add is not called.
   let reuseRun req = case execCmd req of
-        Just ("ssh-add", ["-l"]) -> pure (okResult "identity\n")
+        Just ("ssh-keygen", args)
+          | matchesKeygen args ->
+              pure (okResult keygenOut)
+        Just ("ssh-add", args)
+          | matchesList args ->
+              pure (okResult listOut)
         _ -> pure (failResult 1 ("unexpected reuse: " <> show (prMode req)))
       opsReuse =
         (mkSshAgentOps reuseRun)
           { saoLookupEnv = \k ->
               pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/existing" else Nothing,
-            saoSshAdd = pure (Left "should not add")
+            saoSetEnv = \k v -> atomicModifyIORef' setRef (\xs -> (xs <> [(k, v)], ())),
+            saoSshAdd = \_ -> pure (Left "should not add"),
+            saoKillAgent = \pid -> atomicModifyIORef' killRef (\xs -> (xs <> [pid], ()))
           }
-  reused <- assertRight "mk reuse" =<< ensureSshAgent opsReuse
-  assertEq "reused" SshSessionReused reused
+  writeIORef setRef []
+  writeIORef killRef []
+  reused <- assertRight "mk reuse" =<< ensureSshAgent opsReuse configuredKey
+  case reused of
+    SshSessionReused -> pure ()
+    SshSessionOwned pid _ -> do
+      hPutStrLn stderr $ "expected reuse, owned " <> pid
+      exitFailure
+  assertEq "reuse does not setEnv" [] =<< readIORef setRef
+  assertEq "reuse does not kill" [] =<< readIORef killRef
 
-  -- Teardown owned via production kill
   teardownSshSession ops session
-  kills <- readIORef killRef
-  assertEq "killed via CommandRunner" ["4242"] kills
+  assertEq "killed via CommandRunner" ["4242"] =<< readIORef killRef
   unsets <- readIORef unsetRef
   assertTrue "unset sock" ("SSH_AUTH_SOCK" `elem` unsets)
   assertTrue "unset pid" ("SSH_AGENT_PID" `elem` unsets)
 
 testSshMkCommandRunnerFailures :: IO ()
 testSshMkCommandRunnerFailures = do
-  -- run agent fail
   let failAgentRun req = case execCmd req of
+        Just ("ssh-keygen", args)
+          | matchesKeygen args ->
+              pure (okResult keygenOut)
         Just ("ssh-agent", ["-s"]) -> pure (failResult 1 "no ssh-agent binary")
         _ -> pure (failResult 1 "should not run")
       opsAgentFail =
         (mkSshAgentOps failAgentRun)
           { saoLookupEnv = \_ -> pure Nothing,
-            saoSshAdd = pure (Left "should not add")
+            saoSshAdd = \_ -> pure (Left "should not add"),
+            saoStartSupervisor = \_ -> pure (Right (pure ()))
           }
-  errAgent <- assertLeft "run agent fail" =<< ensureSshAgent opsAgentFail
+  errAgent <- assertLeft "run agent fail" =<< ensureSshAgent opsAgentFail configuredKey
   assertTrue "ssh-agent failed" ("ssh-agent failed" `T.isInfixOf` errAgent)
   assertTrue "stderr" ("no ssh-agent binary" `T.isInfixOf` errAgent)
 
-  -- unparseable agent env
   let badEnvRun req = case execCmd req of
+        Just ("ssh-keygen", args)
+          | matchesKeygen args ->
+              pure (okResult keygenOut)
         Just ("ssh-agent", ["-s"]) -> pure (okResult "not an env dump\n")
         _ -> pure (failResult 1 "should not run")
       opsBadEnv =
         (mkSshAgentOps badEnvRun)
           { saoLookupEnv = \_ -> pure Nothing,
-            saoSshAdd = pure (Left "should not add")
+            saoSshAdd = \_ -> pure (Left "should not add"),
+            saoStartSupervisor = \_ -> pure (Right (pure ()))
           }
-  errParse <- assertLeft "parse agent env" =<< ensureSshAgent opsBadEnv
+  errParse <- assertLeft "parse agent env" =<< ensureSshAgent opsBadEnv configuredKey
   assertTrue "parse err" ("could not parse ssh-agent" `T.isInfixOf` errParse)
 
-  -- list fail (unreachable) on reuse path → starts fresh → agent fails
   let listFailRun req = case execCmd req of
-        Just ("ssh-add", ["-l"]) -> pure (failResult 2 "Cannot connect to agent")
+        Just ("ssh-keygen", args)
+          | matchesKeygen args ->
+              pure (okResult keygenOut)
+        Just ("ssh-add", args)
+          | matchesList args ->
+              pure (failResult 2 "Cannot connect to agent")
         Just ("ssh-agent", ["-s"]) -> pure (failResult 127 "ssh-agent: not found")
         _ -> pure (failResult 1 ("unexpected: " <> show (prMode req)))
       opsListFail =
         (mkSshAgentOps listFailRun)
           { saoLookupEnv = \k ->
               pure $ if k == "SSH_AUTH_SOCK" then Just "/tmp/stale" else Nothing,
-            saoSshAdd = pure (Left "should not add")
+            saoSshAdd = \_ -> pure (Left "should not add"),
+            saoStartSupervisor = \_ -> pure (Right (pure ()))
           }
-  errList <- assertLeft "list then agent fail" =<< ensureSshAgent opsListFail
+  errList <- assertLeft "list then agent fail" =<< ensureSshAgent opsListFail configuredKey
   assertTrue "agent after list fail" ("ssh-agent failed" `T.isInfixOf` errList)
 
-  -- kill edge: fresh agent + add fails → production kill runs
   killRef <- newIORef ([] :: [String])
   let killEdgeRun req = case execCmd req of
+        Just ("ssh-keygen", args)
+          | matchesKeygen args ->
+              pure (okResult keygenOut)
         Just ("ssh-agent", ["-s"]) -> pure (okResult agentEnvOut)
         Just ("kill", [pid]) -> do
           atomicModifyIORef' killRef (\xs -> (xs <> [pid], ()))
@@ -686,24 +761,43 @@ testSshMkCommandRunnerFailures = do
           { saoLookupEnv = \_ -> pure Nothing,
             saoSetEnv = \_ _ -> pure (),
             saoUnsetEnv = \_ -> pure (),
-            saoSshAdd = pure (Left "no keys on host")
+            saoSshAdd = \_ -> pure (Left "no keys on host"),
+            saoStartSupervisor = \_ -> pure (Right (pure ()))
           }
-  errAdd <- assertLeft "add fail kills" =<< ensureSshAgent opsKill
+  errAdd <- assertLeft "add fail kills" =<< ensureSshAgent opsKill configuredKey
   assertEq "add error" "no keys on host" errAdd
-  kills <- readIORef killRef
-  assertEq "kill via runner" ["4242"] kills
+  assertEq "kill via runner" ["4242"] =<< readIORef killRef
 
-  -- empty list after add (production list exit 1)
   let stillEmptyRun req = case execCmd req of
+        Just ("ssh-keygen", args)
+          | matchesKeygen args ->
+              pure (okResult keygenOut)
         Just ("ssh-agent", ["-s"]) -> pure (okResult agentEnvOut)
-        Just ("ssh-add", ["-l"]) -> pure (failResult 1 "")
+        Just ("ssh-add", args)
+          | matchesList args ->
+              pure (failResult 1 "")
+        Just ("kill", _) -> pure (okResult "")
         _ -> pure (failResult 1 ("unexpected: " <> show (prMode req)))
       opsEmpty =
         (mkSshAgentOps stillEmptyRun)
           { saoLookupEnv = \_ -> pure Nothing,
             saoSetEnv = \_ _ -> pure (),
             saoUnsetEnv = \_ -> pure (),
-            saoSshAdd = pure (Right ())
+            saoSshAdd = \_ -> pure (Right ()),
+            saoStartSupervisor = \_ -> pure (Right (pure ()))
           }
-  errEmpty <- assertLeft "still empty" =<< ensureSshAgent opsEmpty
-  assertTrue "no identities" ("no identities" `T.isInfixOf` errEmpty)
+  errEmpty <- assertLeft "still empty" =<< ensureSshAgent opsEmpty configuredKey
+  assertTrue "not loaded" ("not loaded" `T.isInfixOf` errEmpty)
+
+  let keygenFailRun req = case execCmd req of
+        Just ("ssh-keygen", args)
+          | matchesKeygen args ->
+              pure (failResult 1 "not a private key")
+        _ -> pure (failResult 1 ("ssh-add or agent ran: " <> show (prMode req)))
+      opsKeygen =
+        (mkSshAgentOps keygenFailRun)
+          { saoLookupEnv = \_ -> pure (Just "/tmp/desktop"),
+            saoSshAdd = \_ -> pure (Left "should not add")
+          }
+  errKeygen <- assertLeft "keygen runner" =<< ensureSshAgent opsKeygen configuredKey
+  assertTrue "keygen stderr" ("not a private key" `T.isInfixOf` errKeygen)
