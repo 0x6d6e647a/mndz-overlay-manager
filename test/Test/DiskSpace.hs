@@ -42,15 +42,18 @@ import Update.DiskSpace
     factorNpmBun,
     factorReuse,
     factorSbcl,
+    factorUv,
     floorCargoTemp,
     floorGitMvDist,
     floorGoTemp,
     floorNpmBunTemp,
     floorReuseTemp,
     floorSbclTemp,
+    floorUvTemp,
     getFreeBytes,
     lookupManifestBaselineBySuffix,
     lookupManifestBaselineForClass,
+    materializeClassForEcosystem,
     maxNeed,
     parseManifestDistEntries,
     presentDistfileNeed,
@@ -102,7 +105,9 @@ testMarginAndFloors = do
   assertEq "cargo floor+margin" (floorCargoTemp + safetyMarginBytes) (estimateNeedBytes FullCargo Nothing)
   assertEq "npm floor+margin" (floorNpmBunTemp + safetyMarginBytes) (estimateNeedBytes FullNpmBun Nothing)
   assertEq "sbcl floor+margin" (floorSbclTemp + safetyMarginBytes) (estimateNeedBytes FullSbcl Nothing)
-  assertEq "reuse floor+margin" (floorReuseTemp + safetyMarginBytes) (estimateNeedBytes ReusePath Nothing)
+  assertEq "uv floor" floorUvTemp giB
+  assertEq "uv floor+margin" (floorUvTemp + safetyMarginBytes) (estimateNeedBytes FullUv Nothing)
+  assertEq "reuse without size" (floorReuseTemp + safetyMarginBytes) (estimateNeedBytes ReusePath Nothing)
   assertEq "gitmv floor+margin" (floorGitMvDist + safetyMarginBytes) (estimateNeedBytes GitMvFetch Nothing)
 
 testFactors :: IO ()
@@ -112,6 +117,8 @@ testFactors = do
   assertEq "cargo factor 12" (12 * base + safetyMarginBytes) (estimateNeedBytes FullCargo (Just base))
   assertEq "npm factor 4" (4 * base + safetyMarginBytes) (estimateNeedBytes FullNpmBun (Just base))
   assertEq "sbcl factor 10" (10 * base + safetyMarginBytes) (estimateNeedBytes FullSbcl (Just base))
+  assertEq "uv factor 4" (4 * base + safetyMarginBytes) (estimateNeedBytes FullUv (Just base))
+  assertEq "uv class" FullUv (materializeClassForEcosystem (Uv Nothing))
   -- 1.1 × base = 110 MiB
   assertEq "reuse 1.1" ((base * 11) `div` 10 + safetyMarginBytes) (estimateNeedBytes ReusePath (Just base))
   -- sanity: named factors match design table
@@ -119,6 +126,7 @@ testFactors = do
   assertEq "factor cargo" 12 (numeratorLike factorCargo)
   assertEq "factor npm" 4 (numeratorLike factorNpmBun)
   assertEq "factor sbcl" 10 (numeratorLike factorSbcl)
+  assertEq "factor uv" 4 (numeratorLike factorUv)
   assertTrue "reuse ~1.1" (factorReuse > 1 && factorReuse < (12 % 10) + (1 % 100))
   where
     numeratorLike r = round (fromRational r :: Double) :: Integer
@@ -376,7 +384,8 @@ mkDepsWork eco needPVs =
             glpUniquePVs = needPVs,
             glpRuntimeAtom = "dev-lang/go",
             glpDirectTagFloors = [],
-            glpFloorPolicy = Nothing
+            glpFloorPolicy = Nothing,
+            glpUvTags = []
           },
       pdLocalPVs = [],
       pdContentFix = [],

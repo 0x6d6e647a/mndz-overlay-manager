@@ -119,6 +119,10 @@ library
       , Update.Resolve
       , Update.Runtime.Ceilings
       , Update.Sbcl.Deps
+      , Update.Uv.Deps
+      , Update.Uv.Lock
+      , Update.Uv.Pack
+      , Update.Uv.Python
       , Update.SshAgent
       , Update.Spine
       , Update.Targets
@@ -260,6 +264,7 @@ test-suite mndz-overlay-manager-test
         Test.Support
         Test.Targets
         Test.TempWorkspace
+        Test.Uv
         Test.Waves
 
     -- LANGUAGE extensions used by modules in this package.

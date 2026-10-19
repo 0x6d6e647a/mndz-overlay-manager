@@ -162,7 +162,8 @@ import Update.EbuildEdit
 import Update.Engines (parseEnginesMinimum)
 import Update.Git (GitOps (..))
 import Update.GitHub
-  ( fetchGitHubWithHttpLbs,
+  ( collateVersionTags,
+    fetchGitHubWithHttpLbs,
     listGitHubVersionsWithHttpLbs,
     stripAndParse,
   )
@@ -300,6 +301,7 @@ import Update.Types
     ecosystemIsGo,
     ecosystemIsNpm,
     ecosystemIsSbcl,
+    ecosystemIsUv,
     mkPackageKey,
     packageKeyText,
     splitPackageKey,
@@ -314,6 +316,8 @@ tests =
       testCase "Hardcoded Grok Bot" testHardcodedGrokBot,
       testCase "Hardcoded Warden" testHardcodedWarden,
       testCase "Policy Classification" testPolicyClassification,
+      testCase "Codex as MCP policy" testCodexAsMcpPolicy,
+      testCase "stripAndParse v prefix" testStripAndParseVPrefix,
       testCase "Photocraft target resolution" testPhotocraftTargets,
       testCase "Craft-fonts target resolution" testCraftFontsTargets,
       testCase "Craft app target resolution" testCraftAppTargets,
@@ -767,6 +771,79 @@ testPolicyClassification = do
     Just (PackagePolicy _ (DepsAndAssets Bun) []) -> pure ()
     other -> do
       hPutStrLn stderr $ "ralph-tui technique: " <> show other
+      exitFailure
+
+testCodexAsMcpPolicy :: IO ()
+testCodexAsMcpPolicy = do
+  let key = PackageKey "dev-util/codex-as-mcp"
+      tech = DepsAndAssets (Uv Nothing)
+  case lookupPolicy key of
+    Just (PackagePolicy (GitHub "kky42" "codex-as-mcp" "v") gotTech [])
+      | gotTech == tech ->
+          pure ()
+    other -> do
+      hPutStrLn stderr $ "codex-as-mcp technique: " <> show other
+      exitFailure
+  assertEq
+    "codex-as-mcp source"
+    (Just (GitHub "kky42" "codex-as-mcp" "v"))
+    (resolveSource key)
+  assertEq "codex-as-mcp arches" [] (lookupLaneArches key)
+  assertTrue "codex-as-mcp publishes assets" (techniqueNeedsAssets tech)
+  let entry =
+        PackageEntry
+          { peKey = key,
+            pePN = "codex-as-mcp",
+            peLocal = parseEbuildVersion "2026.2.2.1",
+            pePath = "/overlay/dev-util/codex-as-mcp/codex-as-mcp-2026.2.2.1.ebuild"
+          }
+      inventory = [entry]
+  assertEq
+    "qualified"
+    (Right [key])
+    (resolveTargets inventory ["dev-util/codex-as-mcp"])
+  assertEq
+    "bare"
+    (Right [key])
+    (resolveTargets inventory ["codex-as-mcp"])
+  case resolveTargets inventory ["2026.2.2.1"] of
+    Left [UnknownPackage "2026.2.2.1"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "codex-as-mcp version token: " <> show other
+      exitFailure
+  case resolveTargets inventory ["codex-as-mcp-2026.2.2.1"] of
+    Left [UnknownPackage "codex-as-mcp-2026.2.2.1"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "codex-as-mcp pv token: " <> show other
+      exitFailure
+
+testStripAndParseVPrefix :: IO ()
+testStripAndParseVPrefix = do
+  assertEq
+    "bare numeric tag"
+    (Right (parseEbuildVersion "2026.2.2.1"))
+    (stripAndParse "v" "2026.2.2.1")
+  assertEq
+    "v prefix tag"
+    (Right (parseEbuildVersion "2026.6.29.1"))
+    (stripAndParse "v" "v2026.6.29.1")
+  case collateVersionTags "v" ["2026.2.2.1", "v2026.2.2.1"] of
+    Left msg ->
+      assertEq
+        "collision"
+        "git tags 2026.2.2.1 and v2026.2.2.1 parse to one PV 2026.2.2.1"
+        msg
+    Right other -> do
+      hPutStrLn stderr $ "expected tag collision, got " <> show other
+      exitFailure
+  case collateVersionTags "v" ["v2026.6.29.1", "v2026.6.29.1", "latest"] of
+    Right pairs ->
+      assertEq
+        "one raw tag"
+        [(parseEbuildVersion "2026.6.29.1", "v2026.6.29.1")]
+        pairs
+    Left err -> do
+      hPutStrLn stderr $ "collate failed: " <> T.unpack err
       exitFailure
 
 testResolveMapOnly :: IO ()
@@ -1472,6 +1549,7 @@ testTypesHelperPredicates = do
     "deps cargo needs assets"
     (techniqueNeedsAssets (DepsAndAssets (Cargo Nothing Nothing CargoGitTag)))
   assertTrue "deps sbcl needs assets" (techniqueNeedsAssets (DepsAndAssets Sbcl))
+  assertTrue "deps uv needs assets" (techniqueNeedsAssets (DepsAndAssets (Uv Nothing)))
   assertTrue "git-mv no assets" (not (techniqueNeedsAssets GitMvAndManifest))
   assertTrue "unsupported no assets" (not (techniqueNeedsAssets (Unsupported "why")))
   -- ecosystem predicates (positive + negative arms)
@@ -1488,6 +1566,9 @@ testTypesHelperPredicates = do
   assertTrue "is sbcl" (ecosystemIsSbcl Sbcl)
   assertTrue "sbcl not cargo" (not (ecosystemIsCargo Sbcl))
   assertTrue "cargo not sbcl" (not (ecosystemIsSbcl (Cargo Nothing Nothing CargoGitTag)))
+  assertTrue "is uv" (ecosystemIsUv (Uv (Just "apps/pkg")))
+  assertTrue "uv not sbcl" (not (ecosystemIsSbcl (Uv Nothing)))
+  assertTrue "sbcl not uv" (not (ecosystemIsUv Sbcl))
   -- splitPackageKey success + Nothing arms
   assertEq
     "split ok"

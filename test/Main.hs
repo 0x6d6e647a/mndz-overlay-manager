@@ -32,6 +32,7 @@ import Test.Ssh qualified as Ssh
 import Test.Targets qualified as Targets
 import Test.Tasty (defaultMain, testGroup)
 import Test.TempWorkspace qualified as TempWorkspace
+import Test.Uv qualified as Uv
 import Test.Waves qualified as Waves
 import Update.GpgAgent (takeGpgSessionSupervisor)
 import Update.SshAgent (takeSshSessionSupervisor)
@@ -72,6 +73,7 @@ main = do
               DiskSpace.tests,
               TempWorkspace.tests,
               Policy.tests,
+              Uv.tests,
               Targets.tests,
               Preflight.tests,
               Assets.tests,

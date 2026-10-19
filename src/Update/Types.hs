@@ -25,6 +25,7 @@ module Update.Types
     ecosystemIsBun,
     ecosystemIsCargo,
     ecosystemIsSbcl,
+    ecosystemIsUv,
   )
 where
 
@@ -163,6 +164,8 @@ data EcosystemSpec
       }
   | -- | Autolith-style SBCL deps tarball (@.qlot/@ + vendored fff) and @sbcl.version@ floor.
     Sbcl
+  | -- | Optional subdirectory containing @uv.lock@. 'Nothing' means repository root.
+    Uv {uvLockSubdir :: Maybe FilePath}
   deriving (Eq, Show)
 
 -- | Materialize provenance for a Cargo package. Version detection and
@@ -205,6 +208,10 @@ ecosystemIsCargo _ = False
 ecosystemIsSbcl :: EcosystemSpec -> Bool
 ecosystemIsSbcl Sbcl = True
 ecosystemIsSbcl _ = False
+
+ecosystemIsUv :: EcosystemSpec -> Bool
+ecosystemIsUv Uv {} = True
+ecosystemIsUv _ = False
 
 -- | Hardcoded per-package source and apply technique.
 data PackagePolicy = PackagePolicy

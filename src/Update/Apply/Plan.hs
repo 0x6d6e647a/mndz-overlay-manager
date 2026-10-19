@@ -499,7 +499,11 @@ loadNpmDonor env eco locals =
     NpmEco ->
       peObserveTree env $ \tree ->
         readNpmDonorBody locals (readEbuild tree)
-    _ -> pure (Right Nothing)
+    Go _ -> pure (Right Nothing)
+    Bun -> pure (Right Nothing)
+    Cargo {} -> pure (Right Nothing)
+    Sbcl -> pure (Right Nothing)
+    Uv _ -> pure (Right Nothing)
 
 -- | On-disk plan without cache store (hypo-path fallback only).
 planDepsOnDiskFallback ::
@@ -636,12 +640,14 @@ planProgress mh key eco =
         Bun -> "discovering bun-bin ceilings"
         Cargo {} -> "discovering rust ceilings"
         Sbcl -> "discovering sbcl ceilings"
+        Uv _ -> "discovering python slot ceilings"
       probeLabel = case eco of
         Go _ -> "probing go.mod"
         NpmEco -> "probing engines.node"
         Bun -> "probing engines.bun"
         Cargo {} -> "probing rust-version"
         Sbcl -> "probing sbcl.version"
+        Uv _ -> "probing requires-python"
    in PlanProgress
         { ppOnCeilingsStart = do
             mhSteps mh key 3

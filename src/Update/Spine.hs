@@ -125,6 +125,7 @@ import Update.Types
     PackagePolicy (..),
     techniqueNeedsAssets,
   )
+import Update.Uv.Deps (mkUvDepsOps)
 
 -- | Injectable dependencies for the update spine (tests override probes/ops).
 data UpdateSpineDeps = UpdateSpineDeps
@@ -581,6 +582,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   aeBunCacheOps = mkBunCacheOps closedRun,
                                   aeCargoOps = mkCargoOps closedRun,
                                   aeSbclDepsOps = mkSbclDepsOps closedRun,
+                                  aeUvDepsOps = mkUvDepsOps closedRun,
                                   aeReleaseOps = releaseOps,
                                   aeAssetsRoot = mAssetsRoot,
                                   aeGitHubToken = resolvedToken,

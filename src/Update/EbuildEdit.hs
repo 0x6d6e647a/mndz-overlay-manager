@@ -44,6 +44,9 @@ module Update.EbuildEdit
     parseEbuildSlot,
     setSlotField,
     ensureSbclAtom,
+    ensurePythonSlot,
+    ensureUvArchiveTag,
+    pythonCompatToken,
     ensureRustMinVer,
     parseQuotedAssignment,
     replaceQuotedAssignment,
@@ -1359,6 +1362,107 @@ splitMatchingBrace = go (1 :: Int) []
             Just (c, xs) ->
               let (chunk, more) = T.break (\x -> x == '{' || x == '}') xs
                in go n (T.cons c chunk : acc) more
+
+-- | @PYTHON_COMPAT@ token for a major.minor slot (@3.14@ → @python3_14@).
+pythonCompatToken :: Text -> Maybe Text
+pythonCompatToken slot =
+  case T.splitOn "." slot of
+    [maj, mn]
+      | not (T.null maj),
+        not (T.null mn),
+        T.all isDigit maj,
+        T.all isDigit mn ->
+          Just ("python" <> maj <> "_" <> mn)
+    _ -> Nothing
+
+-- | Rewrite @dev-lang/python:<slot>@, the two-part @PYTHON_COMPAT@ token, and
+-- @/usr/bin/python<major>.<minor>@. @python3_14t@ stays. The rest of
+-- @src_install@ stays.
+ensurePythonSlot :: Text -> Text -> Text
+ensurePythonSlot slot content =
+  case pythonCompatToken slot of
+    Nothing -> content
+    Just token ->
+      rewritePythonBinPath
+        slot
+        (rewritePythonCompatToken token (rewritePythonSlotAtoms slot content))
+
+-- | Point each @/usr/bin/python<major>.<minor>@ at @slot@.
+rewritePythonBinPath :: Text -> Text -> Text
+rewritePythonBinPath slot = go
+  where
+    marker = "/usr/bin/python"
+    go t =
+      case T.breakOn marker t of
+        (before, rest)
+          | T.null rest -> t
+          | otherwise ->
+              let after = T.drop (T.length marker) rest
+                  (ver, more) = T.span (\c -> c == '.' || isDigit c) after
+               in case T.splitOn "." ver of
+                    [maj, mn]
+                      | not (T.null maj),
+                        not (T.null mn),
+                        T.all isDigit maj,
+                        T.all isDigit mn ->
+                          before <> marker <> slot <> go more
+                    _ -> before <> marker <> ver <> go more
+
+rewritePythonSlotAtoms :: Text -> Text -> Text
+rewritePythonSlotAtoms slot = go
+  where
+    marker = "dev-lang/python:"
+    go t =
+      case T.breakOn marker t of
+        (before, rest)
+          | T.null rest -> t
+          | otherwise ->
+              let after = T.drop (T.length marker) rest
+                  (old, more) = T.span (\c -> c == '.' || isDigit c) after
+               in if T.null old
+                    then before <> marker <> go more
+                    else before <> marker <> slot <> go more
+
+rewritePythonCompatToken :: Text -> Text -> Text
+rewritePythonCompatToken token = go
+  where
+    go t
+      | T.null t = t
+      | otherwise =
+          let (pre, rest) = T.span (not . isTokChar) t
+              (tok, more) = T.span isTokChar rest
+              replaced = if isPyCompatToken tok then token else tok
+           in pre <> replaced <> go more
+    isTokChar c = isAlphaNum c || c == '_'
+
+isPyCompatToken :: Text -> Bool
+isPyCompatToken tok =
+  case T.stripPrefix "python" tok of
+    Nothing -> False
+    Just rest ->
+      case T.breakOn "_" rest of
+        (maj, mn0) ->
+          case T.uncons mn0 of
+            Just ('_', mn) ->
+              not (T.null maj)
+                && T.all isDigit maj
+                && not (T.null mn)
+                && T.all isDigit mn
+            _ -> False
+
+-- | Point the first GitHub @archive/refs/tags/<old>.tar.gz@ at @tag@.
+ensureUvArchiveTag :: Text -> Text -> Text
+ensureUvArchiveTag tag content =
+  let marker = "archive/refs/tags/"
+   in case T.breakOn marker content of
+        (before, rest)
+          | T.null rest -> content
+          | otherwise ->
+              let after = T.drop (T.length marker) rest
+                  (_old, tail') = T.breakOn ".tar.gz" after
+               in if T.null tail'
+                    then content
+                    else before <> marker <> tag <> tail'
 
 -- | Ensure @>=dev-lisp/sbcl-<floor>:=[source]@ (RDEPEND/BDEPEND body).
 -- Replaces every @dev-lisp/sbcl@ atom when present; otherwise inserts BDEPEND.

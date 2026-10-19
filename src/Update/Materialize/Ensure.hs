@@ -128,10 +128,13 @@ import Update.Runtime.Ceilings
     goPackageDir,
     nodejsBinPackageDir,
     nodejsPackageDir,
+    pythonPackageDir,
     rustBinPackageDir,
     rustPackageDir,
     sbclBinPackageDir,
     sbclPackageDir,
+    uvBinPackageDir,
+    uvPackageDir,
   )
 
 -- | Result of a successful ensure (no docker build vs built).
@@ -253,6 +256,9 @@ loadGentooToolchainMetas gentooRoot =
     <*> metasOrEmpty (rustBinPackageDir gentooRoot) (Just "rust-bin-")
     <*> metasOrEmpty (sbclPackageDir gentooRoot) (Just "sbcl-")
     <*> metasOrEmpty (sbclBinPackageDir gentooRoot) (Just "sbcl-bin-")
+    <*> metasOrEmpty (pythonPackageDir gentooRoot) (Just "python-")
+    <*> metasOrEmpty (uvPackageDir gentooRoot) (Just "uv-")
+    <*> metasOrEmpty (uvBinPackageDir gentooRoot) (Just "uv-bin-")
 
 loadBunMetas :: InTree -> FilePath -> IO (Either Text [RuntimeEbuildMeta])
 loadBunMetas tree overlayRoot =

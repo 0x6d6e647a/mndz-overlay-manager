@@ -293,7 +293,9 @@ mkWavePlanOps listVers fetchBun overlay = do
         dpoRustCeilingsCache = rustCache,
         dpoSbclCeilingsCache = sbclCache,
         dpoOverlayRoot = Just overlay,
-        dpoManager = mgr
+        dpoManager = mgr,
+        dpoGitHubToken = Nothing,
+        dpoProbeUvSync = \_ _ _ _ _ -> pure (Left "uv sync probe unused")
       }
 
 initGitDir :: FilePath -> IO ()

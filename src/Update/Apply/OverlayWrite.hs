@@ -45,9 +45,11 @@ import Update.EbuildEdit
     ensureEmptyCrates,
     ensureGoBdepend,
     ensureNodejsBdepend,
+    ensurePythonSlot,
     ensureRustMinVer,
     ensureSbclAtom,
     ensureStorytoldPatchPinHook,
+    ensureUvArchiveTag,
     parameterizeAssetsSrcUriFor,
     rewriteBunExactInvocations,
     setKeywords,
@@ -101,6 +103,8 @@ overlayAfterAssets ::
   -- | Distfile basename + digests pairs (primary first; may include companions).
   [(FilePath, FileDigests)] ->
   Maybe Text ->
+  -- | Raw git tag for a Uv archive URL. 'Nothing' for every other ecosystem.
+  Maybe Text ->
   -- | Optional ebuild body after full-path materialize (cargo pycargoebuild).
   Maybe Text ->
   -- | Codex rusty_v8 pin write; 'Nothing' for every other package.
@@ -108,7 +112,7 @@ overlayAfterAssets ::
   -- | Gas Town tag checkout. Required for @dev-util/gastown@; ignored otherwise.
   Maybe FilePath ->
   IO ApplyOutcome
-overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDigests mReqVer mEbuildBody mCodexV8 mGastownSrc = do
+overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDigests mReqVer mUvTag mEbuildBody mCodexV8 mGastownSrc = do
   let key = peKey entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
@@ -165,6 +169,7 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
                     targetVer
                     distDigests
                     mReqVer
+                    mUvTag
                     mEbuildBody
                     mCodexV8
                     mGastownSrc
@@ -189,6 +194,7 @@ publishPrepared ::
   [(FilePath, FileDigests)] ->
   Maybe Text ->
   Maybe Text ->
+  Maybe Text ->
   Maybe CodexV8Overlay ->
   Maybe FilePath ->
   Text ->
@@ -210,6 +216,7 @@ publishPrepared
   targetVer
   distDigests
   mReqVer
+  mUvTag
   mEbuildBody
   mCodexV8
   mGastownSrc
@@ -221,7 +228,11 @@ publishPrepared
         -- pycargoebuild's multiline CRATES="\\n" as a crate list.
         prepared = case eco of
           Cargo {} -> ensureEmptyCrates content
-          _ -> content
+          Go _ -> content
+          NpmEco -> content
+          Bun -> content
+          Sbcl -> content
+          Uv _ -> content
     let assetsHost =
           AssetsHost
             { ahOwner = aeAssetsOwner env,
@@ -237,13 +248,22 @@ publishPrepared
                   (cargoSource eco)
                   pn
                   prepared
-              _ -> parameterizeAssetsSrcUriFor assetsHost pn prepared
+              Go _ -> parameterizeAssetsSrcUriFor assetsHost pn prepared
+              NpmEco -> parameterizeAssetsSrcUriFor assetsHost pn prepared
+              Bun -> parameterizeAssetsSrcUriFor assetsHost pn prepared
+              Sbcl -> parameterizeAssetsSrcUriFor assetsHost pn prepared
+              Uv _ -> parameterizeAssetsSrcUriFor assetsHost pn prepared
             -- After the git-crate fetch line. A hook error must not write
             -- the ebuild, Manifest, or commit.
             pinnedOrErr = case eco of
               Cargo {cargoSource = CargoGitTag} ->
                 ensureStorytoldPatchPinHook pn withAssets
-              _ -> Right withAssets
+              Cargo {cargoSource = CargoCratesIo} -> Right withAssets
+              Go _ -> Right withAssets
+              NpmEco -> Right withAssets
+              Bun -> Right withAssets
+              Sbcl -> Right withAssets
+              Uv _ -> Right withAssets
         case pinnedOrErr of
           Left err -> pure (ApplyHardFail key err False orphan)
           Right pinned -> do
@@ -280,6 +300,14 @@ publishPrepared
               (Sbcl, Just ver) -> pure (ensureSbclAtom ver withKw)
               (Sbcl, Nothing) ->
                 pure (Left "could not obtain sbcl.version floor for SBCL atom alignment")
+              (Uv _, Just slot) ->
+                case mUvTag of
+                  Nothing ->
+                    pure (Left "could not obtain the raw git tag for Uv archive alignment")
+                  Just tag ->
+                    pure (Right (ensurePythonSlot slot (ensureUvArchiveTag tag withKw)))
+              (Uv _, Nothing) ->
+                pure (Left "could not obtain dev-lang/python slot for Uv alignment")
             case contentFixed of
               Left err -> pure $ ApplyHardFail key err False orphan
               Right fixed -> do

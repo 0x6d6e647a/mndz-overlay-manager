@@ -39,6 +39,7 @@ import Update.Types
     PackageKey (..),
     UpdateTechnique (..),
     mkPackageKey,
+    techniqueNeedsAssets,
   )
 
 tests :: TestTree
@@ -90,6 +91,13 @@ testTechniqueEdges = do
     "Sbcl"
     Nothing
     (overlayCeilingProvider (DepsAndAssets Sbcl))
+  assertEq
+    "Uv"
+    Nothing
+    (overlayCeilingProvider (DepsAndAssets (Uv Nothing)))
+  assertTrue
+    "Uv publishes assets"
+    (techniqueNeedsAssets (DepsAndAssets (Uv Nothing)))
   assertEq "GitMv" Nothing (overlayCeilingProvider GitMvAndManifest)
 
 testHardcodedEdges :: IO ()
@@ -107,6 +115,10 @@ testHardcodedEdges = do
     "autolith"
     Nothing
     (overlayCeilingProviderForKey (mkPackageKey "dev-util" "autolith"))
+  assertEq
+    "codex-as-mcp"
+    Nothing
+    (overlayCeilingProviderForKey (mkPackageKey "dev-util" "codex-as-mcp"))
 
 testNewBunInherits :: IO ()
 testNewBunInherits = do
@@ -249,7 +261,8 @@ emptyPlan pvs =
       glpUniquePVs = pvs,
       glpRuntimeAtom = bunBinRuntimeAtom,
       glpDirectTagFloors = [],
-      glpFloorPolicy = Nothing
+      glpFloorPolicy = Nothing,
+      glpUvTags = []
     }
 
 testDirtyPreflightMessage :: IO ()

@@ -231,7 +231,9 @@ mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
         dpoRustCeilingsCache = rustCache,
         dpoSbclCeilingsCache = sbclCache,
         dpoOverlayRoot = mOverlay,
-        dpoManager = mgr
+        dpoManager = mgr,
+        dpoGitHubToken = Nothing,
+        dpoProbeUvSync = \_ _ _ _ _ -> pure (Left "uv sync probe unused")
       }
 
 unusedGoMod :: GoModKey -> IO (Either T.Text T.Text)

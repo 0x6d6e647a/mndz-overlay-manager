@@ -43,6 +43,7 @@ import Update.Process.Docker (MaterializeDockerCfg)
 import Update.Sbcl.Deps (SbclDepsOps)
 import Update.TempWorkspace (RunRoot)
 import Update.Types (Fetcher)
+import Update.Uv.Deps (UvDepsOps)
 
 type EbuildRunner = FilePath -> FilePath -> IO (Either Text ())
 
@@ -82,6 +83,7 @@ data ApplyEnv = ApplyEnv
     aeBunCacheOps :: BunCacheOps,
     aeCargoOps :: CargoOps,
     aeSbclDepsOps :: SbclDepsOps,
+    aeUvDepsOps :: UvDepsOps,
     aeReleaseOps :: ReleaseOps,
     aeAssetsRoot :: Maybe FilePath,
     aeGitHubToken :: Maybe Text,

@@ -183,7 +183,10 @@ nonEbuildAllowlist =
     "src/Update/Npm/Cache.hs",
     "src/Update/Pack/XzTar.hs",
     "src/Update/Sbcl/Deps.hs",
-    "src/Update/SshAgent.hs"
+    "src/Update/SshAgent.hs",
+    "src/Update/Uv/Deps.hs",
+    "src/Update/Uv/Lock.hs",
+    "src/Update/Uv/Python.hs"
   ]
 
 stripComment :: String -> String

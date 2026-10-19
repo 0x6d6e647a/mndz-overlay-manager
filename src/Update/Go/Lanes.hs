@@ -42,6 +42,7 @@ module Update.Go.Lanes
     PlanError (..),
     planErrorMessage,
     zeroPlannedPVsError,
+    lookupUvRawTag,
   )
 where
 
@@ -49,6 +50,7 @@ import Data.Containers.ListUtils (nubOrd)
 import Data.List (sort, sortBy)
 import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, samePV)
@@ -176,7 +178,10 @@ data RuntimeLanePlan = RuntimeLanePlan
     glpDirectTagFloors :: [CargoTagFloorSnapshot],
     -- | Cargo floor-policy key; 'Nothing' for non-Cargo plans and old cache
     -- entries that lack snapshots.
-    glpFloorPolicy :: Maybe Text
+    glpFloorPolicy :: Maybe Text,
+    -- | Raw git tag that parsed to each probed PV. Empty for non-Uv plans
+    -- and for cache entries written before Uv tags were stored.
+    glpUvTags :: [(EbuildVersion, Text)]
   }
   deriving (Eq, Show)
 
@@ -306,7 +311,8 @@ planFromTargetsWithAtomFor allowlist atom targets =
           glpUniquePVs = map pePV ebuilds,
           glpRuntimeAtom = atom,
           glpDirectTagFloors = [],
-          glpFloorPolicy = Nothing
+          glpFloorPolicy = Nothing,
+          glpUvTags = []
         }
 
 -- | Coverage recorded with a selected Cargo tag-floor snapshot.
@@ -406,10 +412,14 @@ buildGapLines localPVs needsWorkPVs plan =
               else case NE.nonEmpty pool of
                 Nothing -> toPV
                 Just ne -> ne NE.!! (idx `mod` NE.length ne)
+          labelAtom =
+            if atom == "dev-lang/python"
+              then atom <> ":" <> fromMaybe "" (ltGoReq t)
+              else atom
        in GapLine
             { glFrom = stripRev fromPV,
               glTo = stripRev toPV,
-              glLabel = laneLabelWith atom (ltLane t)
+              glLabel = laneLabelWith labelAtom (ltLane t)
             }
     stripRev (Numeric comps _) = Numeric comps Nothing
     stripRev r = r
@@ -452,3 +462,10 @@ filterCandidateVersions localPVs upstream =
 -- | Stable pretty string for 'PlanZeroPlannedPVs' (tests / legacy call sites).
 zeroPlannedPVsError :: Text
 zeroPlannedPVsError = planErrorMessage PlanZeroPlannedPVs
+
+-- | Raw git tag stored for a Uv PV. 'Nothing' when the plan has no tag for it.
+lookupUvRawTag :: RuntimeLanePlan -> EbuildVersion -> Maybe Text
+lookupUvRawTag plan pv =
+  case [tag | (p, tag) <- glpUvTags plan, samePV p pv || p == pv] of
+    (tag : _) -> Just tag
+    [] -> Nothing

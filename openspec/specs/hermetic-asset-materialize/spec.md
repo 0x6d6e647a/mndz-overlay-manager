@@ -201,3 +201,12 @@ When full-path materialize for `DepsAndAssets Sbcl` runs qlot inside the materia
 - **WHEN** full-path Autolith materialize runs qlot in the container
 - **THEN** the language command is `qlot` (install) on the image `PATH`
 - **AND** the invocation does not `--load` `/home/builder/quicklisp/setup.lisp`
+
+### Requirement: Full-path Uv uses image uv
+
+Full-path Uv materialize SHALL run `uv` from the materialize image against the image Python interpreter. The container SHALL NOT use a host `uv` binary and SHALL NOT download a Python interpreter.
+
+#### Scenario: Host uv is unused
+
+- **WHEN** full-path Uv packing runs and the host has a `uv` binary
+- **THEN** the container uses the image `uv` and does not download CPython

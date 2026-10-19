@@ -275,6 +275,7 @@ import Update.Types
     mkPackageKey,
     packageKeyText,
   )
+import Update.Uv.Deps (productionUvDepsOps)
 
 -- | Dual-arch Go ceilings helper for tests.
 dualArchGoCeilings :: Maybe T.Text -> Maybe T.Text -> RuntimeCeilings
@@ -325,6 +326,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeBunCacheOps = productionBunCacheOps,
         aeCargoOps = productionCargoOps,
         aeSbclDepsOps = productionSbclDepsOps,
+        aeUvDepsOps = productionUvDepsOps,
         aeReleaseOps = releaseOps,
         aeAssetsRoot = assetsRoot,
         aeGitHubToken = Just "tok",

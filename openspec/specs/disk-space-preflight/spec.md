@@ -255,3 +255,12 @@ When `update` will `docker build` a materialize image as specified by `ensure-ma
 
 - **WHEN** ensure will `docker build`, image layers and BuildKit cache are on distinct filesystems, and at least one of those filesystems is below its role bound
 - **THEN** the error names both paths, their roles, and free versus need for each
+
+### Requirement: Uv ecosystem floor
+
+When no Manifest `DIST` size and no release-asset size is available, a Uv full-path estimate and a Uv reuse-without-size estimate SHALL use a documented Uv floor. That floor SHALL be a named product constant greater than zero, applied on the same path as the other ecosystem floors, including the fixed 256 MiB safety margin.
+
+#### Scenario: Missing baseline uses the Uv floor
+
+- **WHEN** a Uv full-path unit has no matching Manifest `DIST` size and no release-asset size
+- **THEN** the need estimate uses the Uv floor plus the 256 MiB margin

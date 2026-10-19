@@ -400,7 +400,8 @@ testContentFixManifest =
               glpUniquePVs = [pv],
               glpRuntimeAtom = "dev-lang/go",
               glpDirectTagFloors = [],
-              glpFloorPolicy = Nothing
+              glpFloorPolicy = Nothing,
+              glpUvTags = []
             }
         planOps =
           PlanOps
@@ -1152,7 +1153,8 @@ testGoMultiPvSequentialCommits =
               glpUniquePVs = [tip, pv1, pv2],
               glpRuntimeAtom = "dev-lang/go",
               glpDirectTagFloors = [],
-              glpFloorPolicy = Nothing
+              glpFloorPolicy = Nothing,
+              glpUvTags = []
             }
         assetBytes = encodeUtf8 "vendor-bytes-multi-pv"
         digests0 = hashBytes assetBytes
@@ -1319,7 +1321,8 @@ testGoMultiPvStopOnHardFail =
               glpUniquePVs = [pv1, pv2, pv3],
               glpRuntimeAtom = "dev-lang/go",
               glpDirectTagFloors = [],
-              glpFloorPolicy = Nothing
+              glpFloorPolicy = Nothing,
+              glpUvTags = []
             }
         assetBytes = encodeUtf8 "vendor-bytes-fail-test"
         digests0 = hashBytes assetBytes

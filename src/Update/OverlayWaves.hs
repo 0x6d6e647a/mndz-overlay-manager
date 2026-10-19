@@ -84,7 +84,13 @@ nodeGypPackageKey = PackageKey "dev-build/node-gyp"
 -- | Overlay wait-edge provider for a technique, if any.
 overlayCeilingProvider :: UpdateTechnique -> Maybe PackageKey
 overlayCeilingProvider (DepsAndAssets Bun) = Just bunBinPackageKey
-overlayCeilingProvider _ = Nothing
+overlayCeilingProvider (DepsAndAssets (Go _)) = Nothing
+overlayCeilingProvider (DepsAndAssets NpmEco) = Nothing
+overlayCeilingProvider (DepsAndAssets (Cargo {})) = Nothing
+overlayCeilingProvider (DepsAndAssets Sbcl) = Nothing
+overlayCeilingProvider (DepsAndAssets (Uv _)) = Nothing
+overlayCeilingProvider GitMvAndManifest = Nothing
+overlayCeilingProvider (Unsupported _) = Nothing
 
 -- | Provider for a configured package key (hardcoded policy technique).
 overlayCeilingProviderForKey :: PackageKey -> Maybe PackageKey

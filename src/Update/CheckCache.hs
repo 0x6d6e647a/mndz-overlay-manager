@@ -425,6 +425,25 @@ planToJSON plan =
       "runtime_atom" .= glpRuntimeAtom plan
     ]
       <> cargoPlanFields plan
+      <> uvPlanFields plan
+
+uvPlanFields :: RuntimeLanePlan -> [Pair]
+uvPlanFields plan
+  | null (glpUvTags plan) = []
+  | otherwise = ["uv_tags" .= map uvTagToJSON (glpUvTags plan)]
+
+uvTagToJSON :: (EbuildVersion, Text) -> Value
+uvTagToJSON (pv, tag) =
+  object
+    [ "pv" .= renderPV pv,
+      "tag" .= tag
+    ]
+
+uvTagFromJSON :: Value -> Parser (EbuildVersion, Text)
+uvTagFromJSON = withObject "uv_tag" $ \o -> do
+  pvTxt <- o .: "pv"
+  tag <- o .: "tag"
+  pure (parseEbuildVersion pvTxt, tag)
 
 cargoPlanFields :: RuntimeLanePlan -> [Pair]
 cargoPlanFields plan =
@@ -469,6 +488,8 @@ planFromJSON = withObject "RuntimeLanePlan" $ \o -> do
   floors <- case mFloors of
     Nothing -> pure []
     Just vs -> mapM tagFloorFromJSON vs
+  tagVals <- o .:? "uv_tags" .!= []
+  uvTags <- mapM uvTagFromJSON tagVals
   pure
     RuntimeLanePlan
       { glpLanes = lanes,
@@ -476,7 +497,8 @@ planFromJSON = withObject "RuntimeLanePlan" $ \o -> do
         glpUniquePVs = map parseEbuildVersion uniqueTxt,
         glpRuntimeAtom = atom,
         glpDirectTagFloors = floors,
-        glpFloorPolicy = mPolicy
+        glpFloorPolicy = mPolicy,
+        glpUvTags = uvTags
       }
 
 tagFloorFromJSON :: Value -> Parser CargoTagFloorSnapshot
@@ -752,7 +774,11 @@ cachedCargoPlanUsable eco src plan =
         && snapshotsCover (glpUniquePVs plan) (glpDirectTagFloors plan)
         && all (isJust . ctfsCoverage) (glpDirectTagFloors plan)
     (Cargo {}, _) -> False
-    _ -> True
+    (Uv _, _) -> True
+    (Go _, _) -> True
+    (NpmEco, _) -> True
+    (Bun, _) -> True
+    (Sbcl, _) -> True
   where
     snapshotsCover uniquePVs floors =
       all (\pv -> any (\s -> samePV (ctfsPV s) pv) floors) uniquePVs

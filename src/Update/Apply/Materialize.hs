@@ -147,6 +147,7 @@ import Update.Go.Lanes
     PlannedEbuild (..),
     RuntimeLanePlan (..),
     buildGapLines,
+    lookupUvRawTag,
     missingTargets,
     planErrorMessage,
     planFromTargets,
@@ -214,6 +215,11 @@ import Update.Types
     UpdateTechnique (..),
     packageKeyText,
     splitPackageKey,
+  )
+import Update.Uv.Deps
+  ( UvDepsProgress (..),
+    buildUvDepsTarball,
+    mkUvDepsOps,
   )
 
 applyDepsAndAssets ::
@@ -473,12 +479,14 @@ depsApplyPlanProgress mh key eco doneRef =
         Bun -> "discovering bun-bin ceilings"
         Cargo {} -> "discovering rust ceilings"
         Sbcl -> "discovering sbcl ceilings"
+        Uv _ -> "discovering python slot ceilings"
       probeLabel = case eco of
         Go _ -> "probing go.mod"
         NpmEco -> "probing engines.node"
         Bun -> "probing engines.bun"
         Cargo {} -> "probing rust-version"
         Sbcl -> "probing sbcl.version"
+        Uv _ -> "probing requires-python"
    in PlanProgress
         { ppOnCeilingsStart = do
             mhSteps mh key 3
@@ -596,7 +604,29 @@ fetchRequiredBdependAtom env eco src key pvNoRev =
         Right body -> sbclBdependAtom <$> parseSbclVersionFloor body
         Left _ -> Nothing
     (Cargo {}, _) -> pure Nothing
-    _ -> pure Nothing
+    (Go _, _) -> pure Nothing
+    (NpmEco, _) -> pure Nothing
+    (Bun, _) -> pure Nothing
+    (Sbcl, _) -> pure Nothing
+    (Uv _, _) -> pure Nothing
+
+-- | Version token from a nodejs or bun-bin BDEPEND atom.
+nodeOrBunAtomVersion :: Maybe Text -> Maybe Text
+nodeOrBunAtomVersion mAtom =
+  case mAtom of
+    Just atom
+      | "nodejs-" `T.isInfixOf` atom ->
+          Just
+            ( T.takeWhile
+                (/= '[')
+                ( T.drop
+                    (T.length (">=net-libs/nodejs-" :: Text))
+                    atom
+                )
+            )
+      | "bun-bin-" `T.isInfixOf` atom -> bunAtomVersion atom
+      | otherwise -> Nothing
+    Nothing -> Nothing
 
 -- | Legacy Go-only content fix (tests).
 contentFixNeeded ::
@@ -878,7 +908,11 @@ npmPlanDonor env eco key pn pkgDir =
       pure $ case nested of
         Left err -> Left err
         Right inner -> inner
-    _ -> pure (Right Nothing)
+    Go _ -> pure (Right Nothing)
+    Bun -> pure (Right Nothing)
+    Cargo {} -> pure (Right Nothing)
+    Sbcl -> pure (Right Nothing)
+    Uv _ -> pure (Right Nothing)
 
 -- | Template path and body. 'Left' path means the file is absent.
 readDonorEbuild ::
@@ -1259,6 +1293,7 @@ fullDepsPublishAndOverlay
                             targetVer
                             distDigests
                             mReqVer
+                            (lookupUvRawTag plan targetVer)
                             mEbuildBody
                             mCodexV8
                             (gastownCheckout key (udWork unit </> "src"))
@@ -1506,6 +1541,33 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
     (Bun, _) -> pure (Left "DepsAndAssets Bun requires a GitHub update source")
     (Cargo {}, _) -> pure (Left "DepsAndAssets Cargo requires a GitHub update source")
     (Sbcl, _) -> pure (Left "DepsAndAssets Sbcl requires a GitHub update source")
+    (Uv mSub, GitHub owner repo _prefix) -> do
+      let plannedPv = parseEbuildVersion pvNoRev
+          mSlot = plannedRuntimeReq plan plannedPv
+          mTag = lookupUvRawTag plan plannedPv
+      case (mSlot, mTag) of
+        (Nothing, _) ->
+          pure (Left "Uv plan is missing the python slot for this PV")
+        (_, Nothing) ->
+          pure (Left "Uv plan is missing the raw git tag for this PV")
+        (Just slot, Just tag) -> do
+          let progress = uvDepsProgress stepsDoneRef mh key
+          built <-
+            buildUvDepsTarball
+              (aeUvDepsOps env)
+              progress
+              owner
+              repo
+              tag
+              mSub
+              slot
+              workDir
+              outDir
+              tarballName
+          pure $ case built of
+            Left err -> Left err
+            Right p -> Right (p, Just slot, Nothing)
+    (Uv _, _) -> pure (Left "DepsAndAssets Uv requires a GitHub update source")
 
 -- | After pack, fail closed if harvest exceeds any selecting rust ceiling.
 harvestVsLaneCeiling ::
@@ -1691,7 +1753,8 @@ withFullPathMaterializeSession env unit category pn pv action =
                     aeNpmCacheOps = mkNpmCacheOps runner,
                     aeBunCacheOps = mkBunCacheOps runner,
                     aeCargoOps = mkCargoOps runner,
-                    aeSbclDepsOps = mkSbclDepsOps runner
+                    aeSbclDepsOps = mkSbclDepsOps runner,
+                    aeUvDepsOps = mkUvDepsOps runner
                   }
               )
         )
@@ -1710,6 +1773,17 @@ sbclDepsProgress stepsDoneRef mh key =
       sdpOnFffDone = pure (),
       sdpOnCompressStart = mhStatus mh key "compressing tarball",
       sdpOnCompressDone = markMaterializeStep stepsDoneRef mh key "compressing tarball"
+    }
+
+-- | Full-path Uv materialize syncs inside the pack phase. Only clone and
+-- pack mark the shared counter.
+uvDepsProgress :: IORef Int -> MultiHandle -> PackageKey -> UvDepsProgress
+uvDepsProgress stepsDoneRef mh key =
+  UvDepsProgress
+    { udpOnCloneStart = mhStatus mh key "cloning upstream",
+      udpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
+      udpOnPackStart = mhStatus mh key "packing sdists",
+      udpOnPackDone = markMaterializeStep stepsDoneRef mh key "packing sdists"
     }
 
 reuseDepsReleaseAsset ::
@@ -1752,7 +1826,10 @@ reuseDepsReleaseAsset
         verifyLabel = case eco of
           Go _ -> "verifying vendor asset"
           Cargo {} -> "verifying crates asset"
-          _ -> "verifying deps asset"
+          NpmEco -> "verifying deps asset"
+          Bun -> "verifying deps asset"
+          Sbcl -> "verifying deps asset"
+          Uv _ -> "verifying deps asset"
     unit <-
       ensureUnit (aeTempRun env) category pn pvNoRev UnitReuse
     mhStatus mh key "reusing release assets"
@@ -1826,29 +1903,17 @@ reuseDepsReleaseAsset
                           Right body -> parseSbclVersionFloor body
                           Left _ -> Nothing
                   _ -> pure (Right Nothing)
-              _ -> do
-                mAtom <- case eco of
-                  NpmEco ->
-                    case plannedRuntimeReq plan (parseEbuildVersion pvNoRev) of
-                      Just ver -> pure (Just (nodejsBdependAtom ver))
-                      Nothing -> fetchRequiredBdependAtom env eco src key pvNoRev
-                  _ -> fetchRequiredBdependAtom env eco src key pvNoRev
-                pure $
-                  Right $
-                    case mAtom of
-                      Just atom
-                        | "nodejs-" `T.isInfixOf` atom ->
-                            Just
-                              ( T.takeWhile
-                                  (/= '[')
-                                  ( T.drop
-                                      (T.length (">=net-libs/nodejs-" :: Text))
-                                      atom
-                                  )
-                              )
-                        | "bun-bin-" `T.isInfixOf` atom -> bunAtomVersion atom
-                        | otherwise -> Nothing
-                      Nothing -> Nothing
+              Uv _ ->
+                pure (Right (plannedRuntimeReq plan (parseEbuildVersion pvNoRev)))
+              NpmEco -> do
+                mAtom <-
+                  case plannedRuntimeReq plan (parseEbuildVersion pvNoRev) of
+                    Just ver -> pure (Just (nodejsBdependAtom ver))
+                    Nothing -> fetchRequiredBdependAtom env eco src key pvNoRev
+                pure (Right (nodeOrBunAtomVersion mAtom))
+              Bun -> do
+                mAtom <- fetchRequiredBdependAtom env eco src key pvNoRev
+                pure (Right (nodeOrBunAtomVersion mAtom))
             case reqResult of
               Left failOutcome -> do
                 -- Donor-template hard-fail is structured; attach unit path.
@@ -1885,6 +1950,7 @@ reuseDepsReleaseAsset
                         targetVer
                         distDigests
                         mReq
+                        (lookupUvRawTag plan targetVer)
                         Nothing
                         Nothing
                         mCheckout
@@ -2047,7 +2113,11 @@ cargoLockPath eco pn pv workDir =
       root = case eco of
         Cargo mLock _ CargoGitTag -> maybe srcDir (srcDir </>) mLock
         Cargo _ _ CargoCratesIo -> srcDir </> (T.unpack pn <> "-" <> T.unpack pv)
-        _ -> srcDir
+        Go _ -> srcDir
+        NpmEco -> srcDir
+        Bun -> srcDir
+        Sbcl -> srcDir
+        Uv mSub -> maybe srcDir (srcDir </>) mSub
    in root </> "Cargo.lock"
 
 -- | After crates exist: reuse or harvest rusty_v8 for Codex. Other packages skip.

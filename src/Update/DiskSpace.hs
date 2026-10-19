@@ -13,12 +13,14 @@ module Update.DiskSpace
     factorCargo,
     factorNpmBun,
     factorSbcl,
+    factorUv,
     factorReuse,
     factorDistDirFetch,
     floorGoTemp,
     floorCargoTemp,
     floorNpmBunTemp,
     floorSbclTemp,
+    floorUvTemp,
     floorReuseTemp,
     floorGitMvDist,
     portageWarnFreeThreshold,
@@ -115,6 +117,9 @@ factorNpmBun = 4
 factorSbcl :: Rational
 factorSbcl = 10
 
+factorUv :: Rational
+factorUv = 4
+
 -- | Near-exact reuse / DISTDIR fetch growth (≤ ~10%).
 factorReuse :: Rational
 factorReuse = 11 % 10
@@ -133,6 +138,9 @@ floorNpmBunTemp = (3 * giB) `div` 2
 
 floorSbclTemp :: Integer
 floorSbclTemp = 2 * giB
+
+floorUvTemp :: Integer
+floorUvTemp = giB
 
 floorReuseTemp :: Integer
 floorReuseTemp = 512 * 1024 * 1024
@@ -158,6 +166,7 @@ data MaterializeClass
   | FullCargo
   | FullNpmBun
   | FullSbcl
+  | FullUv
   | ReusePath
   | GitMvFetch
   deriving (Eq, Show)
@@ -170,6 +179,7 @@ materializeClassForEcosystem eco =
     NpmEco -> FullNpmBun
     Bun -> FullNpmBun
     Sbcl -> FullSbcl
+    Uv _ -> FullUv
 
 -- | Full-path class for an ecosystem (never reuse).
 materializeClassFull :: EcosystemSpec -> MaterializeClass
@@ -193,6 +203,7 @@ factorFor = \case
   FullCargo -> factorCargo
   FullNpmBun -> factorNpmBun
   FullSbcl -> factorSbcl
+  FullUv -> factorUv
   ReusePath -> factorReuse
   GitMvFetch -> factorDistDirFetch
 
@@ -202,6 +213,7 @@ floorFor = \case
   FullCargo -> floorCargoTemp
   FullNpmBun -> floorNpmBunTemp
   FullSbcl -> floorSbclTemp
+  FullUv -> floorUvTemp
   ReusePath -> floorReuseTemp
   GitMvFetch -> floorGitMvDist
 
@@ -288,6 +300,7 @@ lookupManifestBaselineForClass content cls =
     FullCargo -> lookupManifestBaselineBySuffix content "-crates.tar.xz"
     FullNpmBun -> lookupManifestBaselineBySuffix content "-deps.tar.xz"
     FullSbcl -> lookupManifestBaselineBySuffix content "-deps.tar.xz"
+    FullUv -> lookupManifestBaselineBySuffix content "-deps.tar.xz"
     ReusePath ->
       firstJust
         [ lookupManifestBaselineBySuffix content "-vendor.tar.xz",
@@ -647,7 +660,12 @@ postCloneRemainingEstimate cls =
   -- (manager-owned pack), so budget ~2× the floor body after clone.
   case cls of
     FullCargo -> 2 * floorCargoTemp + safetyMarginBytes
-    _ -> floorFor cls + safetyMarginBytes
+    FullUv -> floorUvTemp + safetyMarginBytes
+    FullGo -> floorFor cls + safetyMarginBytes
+    FullNpmBun -> floorFor cls + safetyMarginBytes
+    FullSbcl -> floorFor cls + safetyMarginBytes
+    ReusePath -> floorFor cls + safetyMarginBytes
+    GitMvFetch -> floorFor cls + safetyMarginBytes
 
 -- | Production helper: resolve temp root and recheck after clone for @cls@.
 checkPostCloneForClass :: MaterializeClass -> FilePath -> IO (Either Text ())

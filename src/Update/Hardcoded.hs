@@ -140,6 +140,10 @@ hardcodedPolicies =
         "dev-util/autolith"
         (GitHub "luciusmagn" "autolith" "v")
         (DepsAndAssets Sbcl),
+      policy
+        "dev-util/codex-as-mcp"
+        (GitHub "kky42" "codex-as-mcp" "v")
+        (DepsAndAssets (Uv Nothing)),
       policyArches
         "net-analyzer/caddy-analyzer"
         (GitHub "lenny-ts" "caddy-analyzer" "v")

@@ -197,6 +197,7 @@ testNoWrite = do
       (Just "1.25.8")
       Nothing
       Nothing
+      Nothing
       (Just (fixture "renamed"))
   case outcome of
     ApplyHardFail k msg half _ -> do

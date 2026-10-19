@@ -15,7 +15,7 @@ where
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Overlay.Version (EbuildVersion, comparePV, parseEbuildVersion)
+import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import Update.Materialize.Floors (NeededFloors (..))
 import Update.Runtime.Ceilings
   ( Arch,
@@ -44,6 +44,8 @@ data ToolchainKind
   | TkNodeGyp
   | TkGo
   | TkBun
+  | TkPython
+  | TkUv
   deriving (Eq, Ord, Show)
 
 data ResolvedInstall = ResolvedInstall
@@ -62,7 +64,10 @@ data GentooToolchainMetas = GentooToolchainMetas
     gtmRust :: [RuntimeEbuildMeta],
     gtmRustBin :: [RuntimeEbuildMeta],
     gtmSbcl :: [RuntimeEbuildMeta],
-    gtmSbclBin :: [RuntimeEbuildMeta]
+    gtmSbclBin :: [RuntimeEbuildMeta],
+    gtmPython :: [RuntimeEbuildMeta],
+    gtmUv :: [RuntimeEbuildMeta],
+    gtmUvBin :: [RuntimeEbuildMeta]
   }
   deriving (Eq, Show)
 
@@ -104,6 +109,15 @@ qlotAtom = "dev-lisp/qlot"
 
 nodeGypAtom :: Text
 nodeGypAtom = "dev-build/node-gyp"
+
+pythonAtom :: Text
+pythonAtom = "dev-lang/python"
+
+uvBinAtom :: Text
+uvBinAtom = "dev-python/uv-bin"
+
+uvAtom :: Text
+uvAtom = "dev-python/uv"
 
 -- | Prefer @-bin@ when a host-arch ebuild (plain or tilde) meets the floor;
 -- otherwise the source package; otherwise a miss. Prefer @-bin@ even when that
@@ -234,7 +248,57 @@ resolveNeededInstalls arch floors metas bunMetas qlotMetas nodeGypMetas = do
           nodeGypAtom
           []
           mndzRepoName
-  pure (catMaybes [rust, sbcl, qlot, node, nodeGyp, go, bun])
+  pythons <-
+    mapM
+      ( \slot ->
+          ResolvedInstall TkPython
+            <$> resolvePythonSlot arch slot (gtmPython metas)
+      )
+      (nfPythonSlots floors)
+  uv <-
+    forFloor (nfUv floors) $ \fl ->
+      ResolvedInstall TkUv
+        <$> resolveToolchain
+          arch
+          fl
+          uvBinAtom
+          (gtmUvBin metas)
+          uvAtom
+          (gtmUv metas)
+          gentooRepoName
+  pure (catMaybes [rust, sbcl, qlot, node, nodeGyp, go, bun, uv] ++ pythons)
+
+-- | Unversioned @dev-lang/python:<slot>@. Accept keywords only when no
+-- ebuild of that slot has a bare keyword on the host arch. An empty meta
+-- list is not plain-visible.
+resolvePythonSlot ::
+  Arch ->
+  Text ->
+  [RuntimeEbuildMeta] ->
+  Either Text ResolvedToolchain
+resolvePythonSlot arch slot metas =
+  let spec = pythonAtom <> ":" <> slot
+      plain =
+        any
+          ( \m ->
+              keywordsHasBare arch (remKeywords m)
+                && slotOfPV (remPV m) == Just slot
+          )
+          metas
+   in Right
+        ResolvedToolchain
+          { rtAtom = pythonAtom,
+            rtEmergeSpec = spec,
+            rtAcceptLine =
+              if plain
+                then Nothing
+                else Just (spec <> "::" <> gentooRepoName <> " ~" <> arch)
+          }
+
+slotOfPV :: EbuildVersion -> Maybe Text
+slotOfPV (Numeric (maj : mn : _) _) =
+  Just (T.pack (show maj) <> "." <> T.pack (show mn))
+slotOfPV _ = Nothing
 
 forFloor ::
   Maybe Text ->

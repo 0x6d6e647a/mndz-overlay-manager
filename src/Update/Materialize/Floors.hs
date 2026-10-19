@@ -15,7 +15,9 @@ module Update.Materialize.Floors
   )
 where
 
-import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:?), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.!=), (.:?), (.=))
+import Data.Containers.ListUtils (nubOrd)
+import Data.List (sort)
 import Data.Maybe (catMaybes, isJust)
 import Data.Text (Text)
 import Overlay.Version (EbuildVersion, comparePV, renderPV, samePV)
@@ -52,22 +54,32 @@ data NeededFloors = NeededFloors
     -- | Overlay qlot PV the recipe will emerge when SBCL is needed.
     nfQlot :: Maybe Text,
     -- | Overlay node-gyp PV the recipe will emerge when bun or node is needed.
-    nfNodeGyp :: Maybe Text
+    nfNodeGyp :: Maybe Text,
+    -- | Python slots this prepare must emerge (@dev-lang/python:3.14@).
+    -- Exact membership: a 3.15-only image does not satisfy a 3.14 pack.
+    nfPythonSlots :: [Text],
+    -- | @dev-python/uv@ floor. @Just \"0\"@ means any version.
+    nfUv :: Maybe Text
   }
   deriving (Eq, Show)
 
 instance ToJSON NeededFloors where
   toJSON f =
-    object $
-      catMaybes
-        [ ("go" .=) <$> nfGo f,
-          ("node" .=) <$> nfNode f,
-          ("bun" .=) <$> nfBun f,
-          ("rust" .=) <$> nfRust f,
-          ("sbcl" .=) <$> nfSbcl f,
-          ("qlot" .=) <$> nfQlot f,
-          ("nodeGyp" .=) <$> nfNodeGyp f
-        ]
+    let pythonSlotsField = case nfPythonSlots f of
+          [] -> Nothing
+          slots -> Just ("pythonSlots" .= slots)
+     in object $
+          catMaybes
+            [ ("go" .=) <$> nfGo f,
+              ("node" .=) <$> nfNode f,
+              ("bun" .=) <$> nfBun f,
+              ("rust" .=) <$> nfRust f,
+              ("sbcl" .=) <$> nfSbcl f,
+              ("qlot" .=) <$> nfQlot f,
+              ("nodeGyp" .=) <$> nfNodeGyp f,
+              pythonSlotsField,
+              ("uv" .=) <$> nfUv f
+            ]
 
 instance FromJSON NeededFloors where
   parseJSON = withObject "satisfies" $ \o ->
@@ -79,6 +91,8 @@ instance FromJSON NeededFloors where
       <*> o .:? "sbcl"
       <*> o .:? "qlot"
       <*> o .:? "nodeGyp"
+      <*> o .:? "pythonSlots" .!= []
+      <*> o .:? "uv"
 
 emptyFloors :: NeededFloors
 emptyFloors =
@@ -89,14 +103,17 @@ emptyFloors =
       nfRust = Nothing,
       nfSbcl = Nothing,
       nfQlot = Nothing,
-      nfNodeGyp = Nothing
+      nfNodeGyp = Nothing,
+      nfPythonSlots = [],
+      nfUv = Nothing
     }
 
 floorsIsEmpty :: NeededFloors -> Bool
 floorsIsEmpty f =
-  all
-    (== Nothing)
-    [nfGo f, nfNode f, nfBun f, nfRust f, nfSbcl f, nfQlot f, nfNodeGyp f]
+  null (nfPythonSlots f)
+    && all
+      (== Nothing)
+      [nfGo f, nfNode f, nfBun f, nfRust f, nfSbcl f, nfQlot f, nfNodeGyp f, nfUv f]
 
 -- | Monotonic max of two version tokens ('Nothing' loses).
 maxFloor :: Maybe Text -> Maybe Text -> Maybe Text
@@ -117,7 +134,9 @@ unionFloors a b =
       nfRust = maxFloor (nfRust a) (nfRust b),
       nfSbcl = maxFloor (nfSbcl a) (nfSbcl b),
       nfQlot = maxFloor (nfQlot a) (nfQlot b),
-      nfNodeGyp = maxFloor (nfNodeGyp a) (nfNodeGyp b)
+      nfNodeGyp = maxFloor (nfNodeGyp a) (nfNodeGyp b),
+      nfPythonSlots = sort (nubOrd (nfPythonSlots a ++ nfPythonSlots b)),
+      nfUv = maxFloor (nfUv a) (nfUv b)
     }
 
 -- | Recorded image satisfies this prepare when every needed toolchain is
@@ -131,6 +150,8 @@ floorsSatisfy recorded needed =
     && fieldOk (nfSbcl recorded) (nfSbcl needed)
     && fieldOk (nfQlot recorded) (nfQlot needed)
     && fieldOk (nfNodeGyp recorded) (nfNodeGyp needed)
+    && all (`elem` nfPythonSlots recorded) (nfPythonSlots needed)
+    && fieldOk (nfUv recorded) (nfUv needed)
   where
     fieldOk _ Nothing = True
     fieldOk Nothing (Just _) = False
@@ -195,6 +216,7 @@ isFull u = case cpuClass u of
   FullCargo -> True
   FullNpmBun -> True
   FullSbcl -> True
+  FullUv -> True
 
 -- | This-prepare floor from one classified full-path PV: that PV’s lane req,
 -- not the max over unused / reuse sibling lanes.
@@ -212,6 +234,14 @@ floorsForFullUnit plansByKey u =
             Bun -> emptyFloors {nfBun = req}
             Cargo {} -> emptyFloors {nfRust = req}
             Sbcl -> emptyFloors {nfSbcl = req}
+            Uv _ ->
+              emptyFloors
+                { nfPythonSlots = case req of
+                    Just slot | slot /= "0" -> [slot]
+                    _ -> [],
+                  nfRust = Just "0",
+                  nfUv = Just "0"
+                }
     _ -> emptyFloors
 
 reqForPv :: RuntimeLanePlan -> EbuildVersion -> Maybe Text

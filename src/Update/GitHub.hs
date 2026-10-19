@@ -21,6 +21,8 @@ module Update.GitHub
     githubGetJson,
     latchedHttp,
     stripAndParse,
+    collateVersionTags,
+    listGitHubRawTags,
     parseGitHubOrigin,
     gitRemoteOriginUrl,
   )
@@ -52,7 +54,7 @@ import Network.HTTP.Client
   )
 import Network.HTTP.Types (HeaderName, RequestHeaders, ResponseHeaders)
 import Network.HTTP.Types.Status (statusCode)
-import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
+import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPV, samePV)
 import System.Exit (ExitCode (..))
 import System.Process (readProcessWithExitCode)
 import Text.Read (readMaybe)
@@ -293,6 +295,58 @@ listGitHubVersionsWithHttpLbsOn latch http mToken = \case
          in Right ordered
   other ->
     pure (Left ("Update.GitHub: not a GitHub source: " <> T.pack (show other)))
+
+-- | Tag names for a GitHub source. The caller keeps the raw spelling.
+listGitHubRawTags ::
+  Manager ->
+  Maybe Text ->
+  UpdateSource ->
+  IO (Either Text [Text])
+listGitHubRawTags mgr mToken src = do
+  latch <- newGitHubLatch
+  listGitHubRawTagsOn latch (httpLbsEither mgr) mToken src
+
+listGitHubRawTagsOn ::
+  GitHubLatch ->
+  HttpLbs ->
+  Maybe Text ->
+  UpdateSource ->
+  IO (Either Text [Text])
+listGitHubRawTagsOn latch http mToken = \case
+  GitHub owner repo _prefix -> do
+    tags <- fetchAllTagNames latch http (githubHeaders mToken) owner repo 1 []
+    pure $ case tags of
+      Left err -> Left (formatGitHubGetError err)
+      Right names -> Right names
+  other ->
+    pure (Left ("Update.GitHub: not a GitHub source: " <> T.pack (show other)))
+
+-- | Pair each numeric tag with its raw spelling. Two raw tags that parse to
+-- one PV fail, and the message names both tags.
+collateVersionTags :: Text -> [Text] -> Either Text [(EbuildVersion, Text)]
+collateVersionTags prefix tags =
+  foldl' add (Right []) (nubOrd tags)
+  where
+    add (Left err) _ = Left err
+    add (Right acc) tag =
+      case stripAndParse prefix tag of
+        Right ver@(Numeric {}) ->
+          case lookupTag ver acc of
+            Nothing -> Right ((ver, tag) : acc)
+            Just other ->
+              Left
+                ( "git tags "
+                    <> other
+                    <> " and "
+                    <> tag
+                    <> " parse to one PV "
+                    <> renderPV ver
+                )
+        _ -> Right acc
+    lookupTag ver acc =
+      case [t | (v, t) <- acc, samePV v ver] of
+        (t : _) -> Just t
+        [] -> Nothing
 
 data GitHubGetError
   = GitHubErrHttp GitHubHttpError

@@ -267,7 +267,8 @@ emptyDepsPlan =
       glpUniquePVs = [],
       glpRuntimeAtom = "dev-lang/bun-bin",
       glpDirectTagFloors = [],
-      glpFloorPolicy = Nothing
+      glpFloorPolicy = Nothing,
+      glpUvTags = []
     }
 
 setupBunBin :: FilePath -> IO FilePath

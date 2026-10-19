@@ -24,6 +24,8 @@ import Data.ByteString.Lazy qualified as BL
 import Data.List (sortBy)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -40,7 +42,7 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Types (Ebuild)
-import Overlay.Version (EbuildVersion (..), comparePV, renderPVNoRev, samePV)
+import Overlay.Version (EbuildVersion (..), comparePV, renderPV, renderPVNoRev, samePV)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import Update.Bun.Cache
@@ -60,7 +62,13 @@ import Update.EbuildSelection
     inventoryFromEbuild,
     selectHighestNonLive,
   )
-import Update.GitHub (GitHubLatch, listGitHubVersionsWithLatch, newGitHubLatch)
+import Update.GitHub
+  ( GitHubLatch,
+    collateVersionTags,
+    listGitHubRawTags,
+    listGitHubVersionsWithLatch,
+    newGitHubLatch,
+  )
 import Update.Go.Lanes
   ( CargoFloorCoverage (..),
     CargoPathProvenance (..),
@@ -105,6 +113,19 @@ import Update.Runtime.Ceilings
   )
 import Update.Sbcl.Deps (parseSbclVersionFloor)
 import Update.Types (EcosystemSpec (..), UpdateSource (..))
+import Update.Uv.Deps (productionProbeUvSync)
+import Update.Uv.Lock
+  ( lockRequiresPython,
+    parsePyprojectRequiresPython,
+    parseUvLock,
+  )
+import Update.Uv.Python
+  ( UvCandidate (..),
+    discoverPythonSlotInventory,
+    parseRequiresPython,
+    planUvFromCandidates,
+    slotsInProbeOrder,
+  )
 
 -- | Injectable ops for multi-ecosystem deps planning.
 data DepsPlanOps = DepsPlanOps
@@ -126,7 +147,19 @@ data DepsPlanOps = DepsPlanOps
     dpoRustCeilingsCache :: MVar (Maybe RuntimeCeilings),
     dpoSbclCeilingsCache :: MVar (Maybe RuntimeCeilings),
     dpoOverlayRoot :: Maybe FilePath,
-    dpoManager :: Manager
+    dpoManager :: Manager,
+    -- | GitHub token for raw tag and lock probes. 'Nothing' is anonymous.
+    dpoGitHubToken :: Maybe Text,
+    -- | Frozen @uv sync@ on slots in probe order. 'Left' is a missing interpreter
+    -- or another probe failure. 'Right' is the winning slot, or empty when every
+    -- present interpreter rejected the lock.
+    dpoProbeUvSync ::
+      Text ->
+      Text ->
+      Text ->
+      Maybe FilePath ->
+      [Text] ->
+      IO (Either Text (Set Text))
   }
 
 -- | View as Go PlanOps (shared go.mod / portageq / list for GitHub).
@@ -221,7 +254,9 @@ productionDepsPlanOpsWithLatch latch mToken jobs mOverlay = do
         dpoRustCeilingsCache = rustCache,
         dpoSbclCeilingsCache = sbclCache,
         dpoOverlayRoot = mOverlay,
-        dpoManager = mgr
+        dpoManager = mgr,
+        dpoGitHubToken = mToken,
+        dpoProbeUvSync = productionProbeUvSync
       }
 
 planDepsPackageWithProgress ::
@@ -264,6 +299,7 @@ planDepsPackageWithProgressDonor ops progress eco src locals allowlist mDonor =
     Bun -> planBun ops progress src locals Nothing allowlist
     Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals allowlist
     Sbcl -> planSbcl ops progress src locals allowlist
+    Uv mSub -> planUv ops progress src mSub locals allowlist
 
 -- | Plan against caller-supplied ceilings (hypothetical overlay bun-bin)
 -- with a policy runtime-lane arch allowlist.
@@ -284,6 +320,7 @@ planDepsPackageWithCeilingsFor ops progress eco src locals ceilings allowlist =
     NpmEco -> planNpm ops progress src locals allowlist Nothing
     Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals allowlist
     Sbcl -> planSbcl ops progress src locals allowlist
+    Uv mSub -> planUv ops progress src mSub locals allowlist
 
 ------------------------------------------------------------------------
 -- Go
@@ -594,6 +631,193 @@ planSbcl ops progress src locals allowlist =
               Right body -> Right (parseSbclVersionFloor body)
         )
     _ -> pure (Left (PlanFailed "DepsAndAssets Sbcl requires a GitHub update source"))
+
+------------------------------------------------------------------------
+-- Uv
+------------------------------------------------------------------------
+
+planUv ::
+  DepsPlanOps ->
+  PlanProgress ->
+  UpdateSource ->
+  Maybe FilePath ->
+  [EbuildVersion] ->
+  [Text] ->
+  IO (Either PlanError RuntimeLanePlan)
+planUv ops progress src mSub locals allowlist =
+  case src of
+    GitHub owner repo prefix -> do
+      ppOnCeilingsStart progress
+      invE <- discoverPythonSlotInventory (dpoPortageq ops)
+      case invE of
+        Left err -> pure (Left (PlanCeilingFailed err))
+        Right inv -> do
+          ppOnCeilingsDone progress
+          ppOnListStart progress
+          tagsE <-
+            withWorkSlot (dpoWorkBudget ops) $
+              listGitHubRawTags (dpoManager ops) (dpoGitHubToken ops) src
+          case tagsE of
+            Left err -> pure (Left (PlanListVersionsFailed err))
+            Right rawTags -> do
+              ppOnListDone progress (length rawTags)
+              case collateVersionTags prefix rawTags of
+                Left err -> pure (Left (PlanFailed err))
+                Right pairs ->
+                  case filterCandidateVersions locals (map fst pairs) of
+                    Left err -> pure (Left err)
+                    Right wanted ->
+                      case missingTag wanted pairs of
+                        Just pv ->
+                          pure
+                            ( Left
+                                ( PlanFailed
+                                    ( "no git tag parses to PV "
+                                        <> renderPV pv
+                                    )
+                                )
+                            )
+                        Nothing -> do
+                          let ordered = sortNewestFirstPairs pairs wanted
+                          walked <- walk inv owner repo [] ordered
+                          ppOnProbeDone progress
+                          pure walked
+    _ -> pure (Left (PlanFailed "DepsAndAssets Uv requires a GitHub update source"))
+  where
+    walk inv _owner _repo acc [] =
+      pure (planUvFromCandidates inv allowlist locals (reverse acc))
+    walk inv owner repo acc ((pv, tag) : rest) = do
+      one <- withWorkSlot (dpoWorkBudget ops) (probeOne inv owner repo pv tag)
+      case one of
+        Left err -> pure (Left err)
+        Right cand ->
+          let acc' = cand : acc
+              soFar = planUvFromCandidates inv allowlist locals (reverse acc')
+           in case soFar of
+                Right plan
+                  | all (isJust . ltPackagePV) (glpLanes plan) ->
+                      pure (Right plan)
+                _ -> walk inv owner repo acc' rest
+    probeOne inv owner repo pv tag = do
+      lockRes <- fetchUvFile ops owner repo tag mSub "uv.lock"
+      case lockRes of
+        UvMissing ->
+          pure (Left (PlanProbeFailed ("uv.lock is missing at tag " <> tag)))
+        UvFailed err -> pure (Left (PlanProbeFailed err))
+        UvBody body ->
+          case parseUvLock body of
+            Left err ->
+              pure (Left (PlanProbeFailed (err <> " at tag " <> tag)))
+            Right lock -> do
+              spec <- requiresOf owner repo tag lock
+              synced <- syncedSlots inv owner repo tag spec
+              case synced of
+                Left err -> pure (Left (PlanProbeFailed err))
+                Right ok ->
+                  pure
+                    ( Right
+                        ( UvCandidate
+                            { ucPV = pv,
+                              ucTag = tag,
+                              ucRequires = spec,
+                              ucSynced = ok
+                            }
+                        )
+                    )
+    requiresOf owner repo tag lock =
+      case lockRequiresPython lock of
+        Just req -> pure (acceptSpec req)
+        Nothing -> do
+          py <- fetchUvFile ops owner repo tag mSub "pyproject.toml"
+          pure $ case py of
+            UvBody body ->
+              case parsePyprojectRequiresPython body of
+                Right (Just req) -> acceptSpec req
+                _ -> Nothing
+            _ -> Nothing
+    acceptSpec req =
+      case parseRequiresPython req of
+        Right _ -> Just req
+        Left _ -> Nothing
+    syncedSlots inv owner repo tag mSpec =
+      case mSpec >>= eitherToMaybe . parseRequiresPython of
+        Nothing -> pure (Right Set.empty)
+        Just clauses ->
+          let slots = slotsInProbeOrder inv clauses
+           in if null slots
+                then pure (Right Set.empty)
+                else dpoProbeUvSync ops owner repo tag mSub slots
+    eitherToMaybe = either (const Nothing) Just
+
+missingTag :: [EbuildVersion] -> [(EbuildVersion, Text)] -> Maybe EbuildVersion
+missingTag wanted pairs =
+  case [pv | pv <- wanted, not (any (\(p, _) -> samePV p pv) pairs)] of
+    (pv : _) -> Just pv
+    [] -> Nothing
+
+sortNewestFirstPairs ::
+  [(EbuildVersion, Text)] ->
+  [EbuildVersion] ->
+  [(EbuildVersion, Text)]
+sortNewestFirstPairs pairs wanted =
+  [ (pv, tag)
+  | pv <- sortNewestFirst wanted,
+    (p, tag) <- pairs,
+    samePV p pv
+  ]
+
+data UvFetch = UvMissing | UvFailed Text | UvBody Text
+
+fetchUvFile ::
+  DepsPlanOps ->
+  Text ->
+  Text ->
+  Text ->
+  Maybe FilePath ->
+  String ->
+  IO UvFetch
+fetchUvFile ops owner repo tag mSub file = do
+  let rel = case mSub of
+        Nothing -> file
+        Just sub -> sub </> file
+      url =
+        "https://raw.githubusercontent.com/"
+          <> T.unpack owner
+          <> "/"
+          <> T.unpack repo
+          <> "/"
+          <> T.unpack tag
+          <> "/"
+          <> rel
+  fetchUvUrl (dpoManager ops) (dpoGitHubToken ops) url
+
+fetchUvUrl :: Manager -> Maybe Text -> String -> IO UvFetch
+fetchUvUrl mgr mToken url = do
+  req0 <- parseRequest url
+  let req =
+        req0
+          { method = "GET",
+            requestHeaders =
+              [ ("User-Agent", "mndz-overlay-manager"),
+                ("Accept", "text/plain")
+              ]
+                <> case mToken of
+                  Just t -> [("Authorization", "Bearer " <> TE.encodeUtf8 t)]
+                  Nothing -> []
+          }
+  eres <-
+    (Right <$> httpLbs req mgr)
+      `catch` \(e :: SomeException) -> pure (Left (T.pack (show e)))
+  pure $ case eres of
+    Left err -> UvFailed err
+    Right resp ->
+      let code = statusCode (responseStatus resp)
+       in if code >= 200 && code < 300
+            then UvBody (TE.decodeUtf8 (BL.toStrict (responseBody resp)))
+            else
+              if code == 404
+                then UvMissing
+                else UvFailed ("HTTP " <> T.pack (show code) <> " from " <> T.pack url)
 
 ------------------------------------------------------------------------
 -- Shared spine

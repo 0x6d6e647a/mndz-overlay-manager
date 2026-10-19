@@ -136,6 +136,7 @@ unitTests =
       testCase "newer overlay node-gyp rebuilds despite language floors" testNewerNodeGypRebuilds,
       testCase "bun recipe emerges overlay node-gyp after node" testBunRecipeEmergesNodeGypAfterNode,
       testCase "Go-only recipe omits node-gyp" testGoOnlyOmitsNodeGyp,
+      testCase "Uv recipe emerges python slot then uv after rust" testUvRecipePythonAndUv,
       testCase "unmapped uname hard-fails without docker build" testUnmappedDefaultNoBuild,
       testCase "override on unmapped uname skips generate" testOverrideUnmappedNoBuild,
       testCase "override missing hard-fails without build" testOverrideMissingNoBuild,
@@ -858,7 +859,8 @@ bunPlan req =
       glpUniquePVs = [parseEbuildVersion "1.0.0"],
       glpRuntimeAtom = "dev-lang/bun-bin",
       glpDirectTagFloors = [],
-      glpFloorPolicy = Nothing
+      glpFloorPolicy = Nothing,
+      glpUvTags = []
     }
 
 cargoPlan :: EbuildVersion -> Maybe T.Text -> T.Text -> RuntimeLanePlan
@@ -884,7 +886,8 @@ cargoPlan pv mFloor laneReq =
               ctfsProvenance = []
             }
         ],
-      glpFloorPolicy = Just "2|prefix=v|pkg=|lock="
+      glpFloorPolicy = Just "2|prefix=v|pkg=|lock=",
+      glpUvTags = []
     }
 
 goPlan :: [(EbuildVersion, T.Text)] -> RuntimeLanePlan
@@ -903,7 +906,8 @@ goPlan rows =
       glpUniquePVs = [pv | (pv, _) <- rows],
       glpRuntimeAtom = "dev-lang/go",
       glpDirectTagFloors = [],
-      glpFloorPolicy = Nothing
+      glpFloorPolicy = Nothing,
+      glpUvTags = []
     }
 
 testDefaultSidecarPath :: IO ()
@@ -1279,6 +1283,103 @@ testBunRecipeEmergesNodeGypAfterNode = do
   assertTrue
     "overlay bind on node-gyp RUN"
     (all ("from=overlay" `T.isInfixOf`) gypRuns)
+
+testUvRecipePythonAndUv :: IO ()
+testUvRecipePythonAndUv = do
+  let key = mkPackageKey "dev-util" "codex-as-mcp"
+      pv = parseEbuildVersion "2026.2.2.1"
+      classify =
+        [ ClassifyOk
+            key
+            [ ClassifiedPvUnit
+                { cpuKey = key,
+                  cpuPN = "codex-as-mcp",
+                  cpuPV = pv,
+                  cpuEco = Uv Nothing,
+                  cpuClass = FullUv,
+                  cpuTempBaseline = Nothing
+                }
+            ]
+        ]
+      plan =
+        [ PlanNeedsWork
+            key
+            PlannedDeps
+              { pdEco = Uv Nothing,
+                pdSource = GitHub "kky42" "codex-as-mcp" "v",
+                pdPlan =
+                  RuntimeLanePlan
+                    { glpLanes =
+                        [ LaneTarget
+                            { ltLane = LaneAmd64Plain,
+                              ltCeiling = Just (parseEbuildVersion "3.14"),
+                              ltPackagePV = Just pv,
+                              ltGoReq = Just "3.14"
+                            }
+                        ],
+                      glpEbuilds = [],
+                      glpUniquePVs = [pv],
+                      glpRuntimeAtom = "dev-lang/python",
+                      glpDirectTagFloors = [],
+                      glpFloorPolicy = Nothing,
+                      glpUvTags = [(pv, "2026.2.2.1")]
+                    },
+                pdLocalPVs = [],
+                pdContentFix = [],
+                pdForceFull = [pv],
+                pdHypoProvider = Nothing
+              }
+        ]
+      needed = neededFloorsFromClassified classify plan Nothing Nothing Nothing
+  assertEq "python slot" ["3.14"] (nfPythonSlots needed)
+  assertEq "rust floor" (Just "0") (nfRust needed)
+  assertEq "uv floor" (Just "0") (nfUv needed)
+  df <-
+    renderMapped
+      "x86_64"
+      [ rustInstall,
+        pythonInstall "3.14",
+        uvInstall
+      ]
+      "/overlay"
+  assertTrue "python slot emerge" ("dev-lang/python:3.14" `T.isInfixOf` df)
+  assertTrue "rust emerge" ("dev-lang/rust" `T.isInfixOf` df)
+  assertTrue "uv emerge" ("dev-python/uv" `T.isInfixOf` df)
+  let (beforeUv, _) = T.breakOn "dev-python/uv" df
+  assertTrue "rust before uv" ("dev-lang/rust" `T.isInfixOf` beforeUv)
+  assertTrue "no python.org tarball" (not ("python.org" `T.isInfixOf` df))
+  assertTrue "no astral release" (not ("astral.sh" `T.isInfixOf` df))
+  assertTrue "no astral github release" (not ("github.com/astral-sh" `T.isInfixOf` df))
+
+rustInstall :: ResolvedInstall
+rustInstall =
+  ResolvedInstall
+    TkRust
+    ResolvedToolchain
+      { rtAtom = "dev-lang/rust",
+        rtEmergeSpec = "dev-lang/rust",
+        rtAcceptLine = Nothing
+      }
+
+pythonInstall :: T.Text -> ResolvedInstall
+pythonInstall slot =
+  ResolvedInstall
+    TkPython
+    ResolvedToolchain
+      { rtAtom = "dev-lang/python",
+        rtEmergeSpec = "dev-lang/python:" <> slot,
+        rtAcceptLine = Nothing
+      }
+
+uvInstall :: ResolvedInstall
+uvInstall =
+  ResolvedInstall
+    TkUv
+    ResolvedToolchain
+      { rtAtom = "dev-python/uv",
+        rtEmergeSpec = "dev-python/uv",
+        rtAcceptLine = Nothing
+      }
 
 testGoOnlyOmitsNodeGyp :: IO ()
 testGoOnlyOmitsNodeGyp = do

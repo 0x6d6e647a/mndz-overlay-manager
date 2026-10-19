@@ -15,6 +15,7 @@ module Update.Adequacy
 where
 
 import Data.Text (Text)
+import Data.Text qualified as T
 import Overlay.Version (EbuildVersion, renderPVNoRev, samePV)
 import Update.Assets.Layout
   ( distfileKindForEcosystem,
@@ -28,11 +29,14 @@ import Update.Cargo.Msrv
 import Update.EbuildEdit
   ( AssetsHost (..),
     assetsOwnedTagCollisionFor,
+    assetsSrcUriParameterizedFor,
     bunBdependAtomFor,
     ebuildNeedsCargoBodyFixFor,
     ebuildNeedsContentFixAtomFor,
     ebuildNeedsContentFixFor,
+    keywordsMatch,
     nodejsBdependAtom,
+    pythonCompatToken,
     sbclBdependAtom,
   )
 import Update.Go.Lanes
@@ -71,7 +75,9 @@ data PlannedPvFacts = PlannedPvFacts
     -- | RUST_MIN_VER of the canonical selected template (same-PV or fallback).
     ppfTemplateFloor :: Maybe Text,
     -- | Assets GitHub host used for SRC_URI ownership (origin-derived).
-    ppfAssetsHost :: AssetsHost
+    ppfAssetsHost :: AssetsHost,
+    -- | Raw git tag for a Uv PV. 'Nothing' for every other ecosystem.
+    ppfUvTag :: Maybe Text
   }
   deriving (Eq, Show)
 
@@ -141,7 +147,11 @@ assessMissing eco facts =
       case cargoReuseWriteFloor (ppfTagFloor facts) (ppfTemplateFloor facts) of
         Nothing -> NeedsFull
         Just _ -> NeedsRewrite
-    _ -> NeedsRewrite
+    Go _ -> NeedsRewrite
+    NpmEco -> NeedsRewrite
+    Bun -> NeedsRewrite
+    Sbcl -> NeedsRewrite
+    Uv _ -> NeedsRewrite
 
 assessPresent ::
   PackageKey ->
@@ -153,6 +163,7 @@ assessPresent ::
 assessPresent key eco pn facts content =
   let manBad = manifestNeedsWork key eco pn facts
       bodyBad = ebuildBodyNeedsWork key eco pn facts content
+      plain = if manBad || bodyBad then NeedsRewrite else Adequate
    in case eco of
         Cargo {} ->
           case cargoFloorOutcome (ppfTagFloor facts) content of
@@ -161,8 +172,11 @@ assessPresent key eco pn facts content =
             Adequate
               | manBad || bodyBad -> NeedsRewrite
               | otherwise -> Adequate
-        _ ->
-          if manBad || bodyBad then NeedsRewrite else Adequate
+        Go _ -> plain
+        NpmEco -> plain
+        Bun -> plain
+        Sbcl -> plain
+        Uv _ -> plain
 
 cargoFloorOutcome :: Maybe Text -> Text -> PresentPvOutcome
 cargoFloorOutcome mTag content =
@@ -187,8 +201,36 @@ ebuildBodyNeedsWork key eco pn facts content =
           ebuildNeedsContentFixAtomFor host pn kws content (bunBdependAtomFor key <$> ppfRuntimeReq facts)
         Sbcl ->
           ebuildNeedsContentFixAtomFor host pn kws content (sbclBdependAtom <$> ppfRuntimeReq facts)
+        Uv _ ->
+          ebuildNeedsUvBody host pn kws content (ppfRuntimeReq facts) (ppfUvTag facts)
         Cargo {} ->
           ebuildNeedsCargoBodyFixFor host (cargoSource eco) pn kws content
+
+ebuildNeedsUvBody ::
+  AssetsHost ->
+  Text ->
+  [Text] ->
+  Text ->
+  Maybe Text ->
+  Maybe Text ->
+  Bool
+ebuildNeedsUvBody host pn keywords content mSlot mTag =
+  not (assetsSrcUriParameterizedFor host pn content)
+    || not (keywordsMatch keywords content)
+    || slotBad
+    || tagBad
+  where
+    slotBad = case mSlot of
+      Nothing -> True
+      Just slot ->
+        not ((T.pack "dev-lang/python:" <> slot) `T.isInfixOf` content)
+          || case pythonCompatToken slot of
+            Nothing -> True
+            Just token -> not (token `T.isInfixOf` content)
+    tagBad = case mTag of
+      Nothing -> True
+      Just tag ->
+        not ((T.pack "archive/refs/tags/" <> tag <> T.pack ".tar.gz") `T.isInfixOf` content)
 
 manifestNeedsWork :: PackageKey -> EcosystemSpec -> Text -> PlannedPvFacts -> Bool
 manifestNeedsWork key eco pn facts =

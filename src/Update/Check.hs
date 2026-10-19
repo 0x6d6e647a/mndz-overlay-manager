@@ -90,6 +90,7 @@ import Update.Go.Lanes
     RuntimeLanePlan (..),
     buildGapLines,
     extrasToDelete,
+    lookupUvRawTag,
     missingTargets,
     planErrorMessage,
     planNeedsWork,
@@ -342,7 +343,11 @@ npmDonorBody eco locals =
     NpmEco ->
       withNewTreeLock $ \tree ->
         readNpmDonorBody locals (readEbuild tree)
-    _ -> pure (Right Nothing)
+    Go _ -> pure (Right Nothing)
+    Bun -> pure (Right Nothing)
+    Cargo {} -> pure (Right Nothing)
+    Sbcl -> pure (Right Nothing)
+    Uv _ -> pure (Right Nothing)
 
 reportFromDepsPlan ::
   MultiHandle ->
@@ -667,12 +672,14 @@ depsPlanProgress mh key eco =
         Bun -> "discovering bun-bin ceilings"
         Cargo {} -> "discovering rust ceilings"
         Sbcl -> "discovering sbcl ceilings"
+        Uv _ -> "discovering python slot ceilings"
       probeLabel = case eco of
         Go _ -> "probing go.mod"
         NpmEco -> "probing engines.node"
         Bun -> "probing engines.bun"
         Cargo {} -> "probing rust-version"
         Sbcl -> "probing sbcl.version"
+        Uv _ -> "probing requires-python"
    in PlanProgress
         { ppOnCeilingsStart = do
             mhSteps mh key 3
@@ -775,7 +782,19 @@ assessOverlayContent tree eco key pn locals plan = do
       let mTag =
             case eco of
               Cargo {} -> fromMaybe Nothing (lookupDirectTagFloor plan (pePV pe))
-              _ -> Nothing
+              Go _ -> Nothing
+              NpmEco -> Nothing
+              Bun -> Nothing
+              Sbcl -> Nothing
+              Uv _ -> Nothing
+          mUvTag =
+            case eco of
+              Uv _ -> lookupUvRawTag plan (pePV pe)
+              Go _ -> Nothing
+              NpmEco -> Nothing
+              Bun -> Nothing
+              Cargo {} -> Nothing
+              Sbcl -> Nothing
           mTemplate = maybe mFallbackFloor parseRustMinVerFromEbuild mContent
       pure
         PlannedPvFacts
@@ -786,7 +805,8 @@ assessOverlayContent tree eco key pn locals plan = do
             ppfTagFloor = mTag,
             ppfRuntimeReq = plannedRuntimeReq plan (pePV pe),
             ppfTemplateFloor = mTemplate,
-            ppfAssetsHost = defaultAssetsHost
+            ppfAssetsHost = defaultAssetsHost,
+            ppfUvTag = mUvTag
           }
 
 statusFromCompare :: EbuildVersion -> EbuildVersion -> UpdateStatus

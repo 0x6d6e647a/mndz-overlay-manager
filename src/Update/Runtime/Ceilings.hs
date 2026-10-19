@@ -49,6 +49,9 @@ module Update.Runtime.Ceilings
     rustBinPackageDir,
     sbclPackageDir,
     sbclBinPackageDir,
+    pythonPackageDir,
+    uvPackageDir,
+    uvBinPackageDir,
   )
 where
 
@@ -225,6 +228,15 @@ sbclPackageDir gentooRoot = gentooRoot </> "dev-lisp" </> "sbcl"
 
 sbclBinPackageDir :: FilePath -> FilePath
 sbclBinPackageDir gentooRoot = gentooRoot </> "dev-lisp" </> "sbcl-bin"
+
+pythonPackageDir :: FilePath -> FilePath
+pythonPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "python"
+
+uvPackageDir :: FilePath -> FilePath
+uvPackageDir gentooRoot = gentooRoot </> "dev-python" </> "uv"
+
+uvBinPackageDir :: FilePath -> FilePath
+uvBinPackageDir gentooRoot = gentooRoot </> "dev-python" </> "uv-bin"
 
 -- | Parse KEYWORDS=... from ebuild body into token list.
 -- Shell comments after the assignment (@# …@) are stripped so rust-bin lines like

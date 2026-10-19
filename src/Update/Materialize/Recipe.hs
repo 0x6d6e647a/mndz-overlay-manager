@@ -59,10 +59,12 @@ binhostCacheId = "mndz-materialize-binhost"
 -- context named @overlay@; distfiles/binpkgs/binhost use stable-id cache
 -- mounts. Bun is @dev-lang/bun-bin::mndz@ only. Qlot is overlay
 -- @dev-lisp/qlot::mndz@ after @ENV SBCL_HOME@. Node-gyp is overlay
--- @dev-build/node-gyp::mndz@ after Node and before go/bun. No official go.dev /
--- nodejs.org / GitHub zip toolchain URLs. @FROM@ uses the OpenRC Hub tag.
--- Layer order is rust → sbcl → qlot → node → node-gyp → go → bun, then a
--- Portage cache prune @RUN@.
+-- @dev-build/node-gyp::mndz@ after Node and before go/bun. Python is the
+-- slot atom @dev-lang/python:<slot>@ and uv is @dev-python/uv@ (bin, then
+-- source). No official go.dev / nodejs.org / python.org / astral release /
+-- GitHub zip toolchain URLs. @FROM@ uses the OpenRC Hub tag.
+-- Layer order is rust → sbcl → qlot → node → node-gyp → go → bun → python →
+-- uv, then a Portage cache prune @RUN@.
 renderMaterializeDockerfile ::
   RecipeArch ->
   -- | Host overlay path (bind destination and repos.conf location).
@@ -119,6 +121,8 @@ kindRank = \case
   TkNodeGyp -> 4
   TkGo -> 5
   TkBun -> 6
+  TkPython -> 7
+  TkUv -> 8
 
 -- | Gentoo @get_libdir@ for mapped KEYWORDS tokens.
 gentooLibdir :: Text -> Text
@@ -150,6 +154,10 @@ installRuns overlay keywords (ResolvedInstall kind rt) = case kind of
     [runCache (portageCmds rt kind []), ""]
   TkBun ->
     [runCacheOverlay overlay (overlayBindCmds overlay rt kind), ""]
+  TkPython ->
+    [runCache (portageCmds rt kind []), ""]
+  TkUv ->
+    [runCache (portageCmds rt kind []), ""]
 
 portageCmds :: ResolvedToolchain -> ToolchainKind -> [Text] -> [Text]
 portageCmds rt kind extra =
@@ -202,6 +210,8 @@ kindFile = \case
   TkNodeGyp -> "node-gyp"
   TkGo -> "go"
   TkBun -> "bun"
+  TkPython -> "python"
+  TkUv -> "uv"
 
 portageCacheMounts :: Text
 portageCacheMounts =

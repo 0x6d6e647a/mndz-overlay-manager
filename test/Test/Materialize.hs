@@ -182,7 +182,9 @@ mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
         dpoRustCeilingsCache = rustCache,
         dpoSbclCeilingsCache = sbclCache,
         dpoOverlayRoot = mOverlay,
-        dpoManager = mgr
+        dpoManager = mgr,
+        dpoGitHubToken = Nothing,
+        dpoProbeUvSync = \_ _ _ _ _ -> pure (Left "uv sync probe unused")
       }
 
 listFixed :: [T.Text] -> UpdateSource -> IO (Either T.Text [EbuildVersion])
@@ -537,6 +539,7 @@ testMissingTemplateHardFail =
         targetVer
         [("crush-0.88.0-vendor.tar.xz", digests)]
         (Just "1.26.5")
+        Nothing
         Nothing
         Nothing
         Nothing
