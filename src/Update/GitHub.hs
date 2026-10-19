@@ -24,7 +24,10 @@ module Update.GitHub
     collateVersionTags,
     listGitHubRawTags,
     parseGitHubOrigin,
+    AssetsPushTransport (..),
+    classifyAssetsPushUrl,
     gitRemoteOriginUrl,
+    gitRemotePushUrl,
   )
 where
 
@@ -489,18 +492,59 @@ parseGitHubOrigin raw =
             "assets-path origin is not a github.com owner/repo URL \
             \(SSH or HTTPS, optional .git)"
 
+-- | Transport of an assets @git push@ URL.
+--
+-- 'PushSshGitHub' carries the URL user when the URL names one.
+data AssetsPushTransport
+  = PushWeb
+  | PushSshGitHub (Maybe Text)
+  | PushUnsupported Text
+  deriving (Eq, Show)
+
+-- | Classify a push URL using the same host prefixes as 'parseGitHubOrigin'.
+--
+-- A port in the authority does not match those prefixes.
+classifyAssetsPushUrl :: Text -> AssetsPushTransport
+classifyAssetsPushUrl raw
+  | isGithubWeb t = PushWeb
+  | isGithubSshUser t = PushSshGitHub (Just "git")
+  | isGithubSshBare t = PushSshGitHub Nothing
+  | otherwise = PushUnsupported raw
+  where
+    t = T.strip raw
+
+-- | Host prefixes shared with 'parseGitHubOrigin'. A trailing authority port
+-- does not match.
+gitAtGithubPrefix, sshGitAtGithubPrefix, sshGithubPrefix, httpsGithubPrefix, httpGithubPrefix :: Text
+gitAtGithubPrefix = "git@github.com:"
+sshGitAtGithubPrefix = "ssh://git@github.com/"
+sshGithubPrefix = "ssh://github.com/"
+httpsGithubPrefix = "https://github.com/"
+httpGithubPrefix = "http://github.com/"
+
+isGithubWeb :: Text -> Bool
+isGithubWeb t =
+  httpsGithubPrefix `T.isPrefixOf` t || httpGithubPrefix `T.isPrefixOf` t
+
+isGithubSshUser :: Text -> Bool
+isGithubSshUser t =
+  gitAtGithubPrefix `T.isPrefixOf` t || sshGitAtGithubPrefix `T.isPrefixOf` t
+
+isGithubSshBare :: Text -> Bool
+isGithubSshBare t = sshGithubPrefix `T.isPrefixOf` t
+
 extractOwnerRepo :: Text -> Maybe (Text, Text)
 extractOwnerRepo t
-  | "git@github.com:" `T.isPrefixOf` t =
-      splitOwnerRepo (T.drop (T.length ("git@github.com:" :: Text)) t)
-  | "ssh://git@github.com/" `T.isPrefixOf` t =
-      splitOwnerRepo (T.drop (T.length ("ssh://git@github.com/" :: Text)) t)
-  | "ssh://github.com/" `T.isPrefixOf` t =
-      splitOwnerRepo (T.drop (T.length ("ssh://github.com/" :: Text)) t)
-  | "https://github.com/" `T.isPrefixOf` t =
-      splitOwnerRepo (T.drop (T.length ("https://github.com/" :: Text)) t)
-  | "http://github.com/" `T.isPrefixOf` t =
-      splitOwnerRepo (T.drop (T.length ("http://github.com/" :: Text)) t)
+  | Just rest <- dropGithubPrefix gitAtGithubPrefix t = splitOwnerRepo rest
+  | Just rest <- dropGithubPrefix sshGitAtGithubPrefix t = splitOwnerRepo rest
+  | Just rest <- dropGithubPrefix sshGithubPrefix t = splitOwnerRepo rest
+  | Just rest <- dropGithubPrefix httpsGithubPrefix t = splitOwnerRepo rest
+  | Just rest <- dropGithubPrefix httpGithubPrefix t = splitOwnerRepo rest
+  | otherwise = Nothing
+
+dropGithubPrefix :: Text -> Text -> Maybe Text
+dropGithubPrefix prefix t
+  | prefix `T.isPrefixOf` t = Just (T.drop (T.length prefix) t)
   | otherwise = Nothing
 
 splitOwnerRepo :: Text -> Maybe (Text, Text)
@@ -535,11 +579,31 @@ validGitHubName name =
 
 -- | @git remote get-url origin@ in @dir@.
 gitRemoteOriginUrl :: FilePath -> IO (Either Text Text)
-gitRemoteOriginUrl dir = do
+gitRemoteOriginUrl =
+  readGitRemoteUrl
+    ["remote", "get-url", "origin"]
+    "assets-path origin remote is missing or unreadable"
+    "assets-path origin remote URL is empty"
+
+-- | @git remote get-url --push origin@ in @dir@.
+gitRemotePushUrl :: FilePath -> IO (Either Text Text)
+gitRemotePushUrl =
+  readGitRemoteUrl
+    ["remote", "get-url", "--push", "origin"]
+    "assets-path origin push URL is missing or unreadable"
+    "assets-path origin push URL is empty"
+
+readGitRemoteUrl ::
+  [String] ->
+  Text ->
+  Text ->
+  FilePath ->
+  IO (Either Text Text)
+readGitRemoteUrl args missing empty dir = do
   (code, out, err) <-
     readProcessWithExitCode
       "git"
-      ["-C", dir, "remote", "get-url", "origin"]
+      (["-C", dir] <> args)
       ""
   let stdoutT = T.strip (T.pack out)
       errT = T.strip (T.pack err)
@@ -547,12 +611,12 @@ gitRemoteOriginUrl dir = do
     if code /= ExitSuccess
       then
         Left
-          ( "assets-path origin remote is missing or unreadable"
+          ( missing
               <> if T.null errT then "" else ": " <> errT
           )
       else
         if T.null stdoutT
-          then Left "assets-path origin remote URL is empty"
+          then Left empty
           else Right stdoutT
 
 stripAndParse :: Text -> Text -> Either Text EbuildVersion

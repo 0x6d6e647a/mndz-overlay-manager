@@ -35,6 +35,7 @@ import System.Directory
     doesFileExist,
     renameFile,
   )
+import System.Exit (ExitCode (..))
 import System.FilePath (takeBaseName, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (callProcess)
@@ -76,6 +77,12 @@ import Update.GpgAgent
 import Update.Materialize (EnsureOutcome (..), NeededFloors (..))
 import Update.OverlayTree (TreeLock, withNewTreeLock)
 import Update.Preflight (AssetsPreflight (..))
+import Update.Process
+  ( CommandRunner,
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+  )
 import Update.Runtime.Ceilings (RuntimeCeilings (..))
 import Update.Spine
   ( UpdateSpineDeps (..),
@@ -125,6 +132,9 @@ integrationTests =
       testCase
         "missing ssh-identity file fails before ssh-add"
         testMissingSshIdentitySkipsAdd,
+      testCase
+        "offer mismatch fails an assets push before ssh-add"
+        testOfferMismatchSkipsAdd,
       testCase
         "re-entry ensure after bun-bin; failed ensure keeps commit"
         testFailedReEnsureKeepsCommit,
@@ -185,6 +195,16 @@ plentyDisk =
     { dspFreeBytes = \_ -> pure (Right (100 * 1024 * 1024 * 1024)),
       dspDeviceId = \_ -> pure (Right 1)
     }
+
+-- | HTTPS push-URL tests never ask @ssh@. A call here fails the offer check.
+stubCommandRunner :: CommandRunner
+stubCommandRunner req =
+  pure
+    ProcessResult
+      { prExitCode = ExitFailure 99,
+        prStdout = "",
+        prStderr = "spine stub command runner should not run: " <> show (prMode req)
+      }
 
 -- | Reachable agent whose loaded token matches whatever path it is given.
 -- Assets tests reuse this session and do not @ssh-add@.
@@ -421,6 +441,10 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
         usdMkReleaseOps = \_ -> pure releaseOps,
         usdGitOriginUrl =
           \_ -> pure (Right "git@github.com:0x6d6e647a/mndz-overlay-assets.git"),
+        usdGitPushUrl =
+          \_ ->
+            pure (Right "https://github.com/0x6d6e647a/mndz-overlay-assets.git"),
+        usdCommandRunner = stubCommandRunner,
         usdAssetsPathCfg = Just assets,
         usdDistDir = dist,
         usdOverlayRoot = overlay,
@@ -775,6 +799,95 @@ testMissingSshIdentitySkipsAdd =
           (any (T.pack missing `T.isInfixOf`) msgs)
         adds <- readIORef nAdd
         assertEq "missing file does not ssh-add" 0 adds
+
+-- | Restricted GitHub offer set that does not match the configured key.
+testOfferMismatchSkipsAdd :: IO ()
+testOfferMismatchSkipsAdd =
+  withSystemTempDirectory "om-wave-ssh-offer" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+        configured = "/tmp/configured-ssh-key"
+        offered = "/home/mndz/.ssh/keys/shanty_github_id"
+    bunPath <- seedBunBin overlay "1.2.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds =
+          [ Ebuild "dev-lang" "bun-bin" "1.2.0" bunPath,
+            Ebuild "dev-util" "ralph-tui" "1.0.0" ralphPath
+          ]
+        entries = groupNewest ebuilds
+    nAdd <- newIORef (0 :: Int)
+    nAgent <- newIORef (0 :: Int)
+    deps0 <-
+      baseSpine overlay assets dist cleanGit releaseRalphReuse 2 preflightOk
+    let deps =
+          deps0
+            { usdGitPushUrl =
+                \_ -> pure (Right "git@github.com:alice/overlay-assets.git"),
+              usdCommandRunner = offerMismatchRunner,
+              usdSshOps =
+                sshOk
+                  { saoSshAdd = \_ -> do
+                      atomicModifyIORef' nAdd (\n -> (n + 1, ()))
+                      pure (Right ()),
+                    saoRunAgent = do
+                      atomicModifyIORef' nAgent (\n -> (n + 1, ()))
+                      pure (Left "should not start"),
+                    saoFingerprint = \path ->
+                      pure $
+                        if path == configured
+                          then Right "SHA256:configured"
+                          else Right "SHA256:other"
+                  }
+            }
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed closed as Left: " <> T.unpack err
+      Right res -> do
+        let msgs = [m | ApplyHardFail _ m _ _ <- usrOutcomes res]
+        assertEq "only the ssh hard-fail" 1 (length (usrOutcomes res))
+        assertTrue
+          "uses the SSH setup hard-fail"
+          (any ("SSH agent setup failed" `T.isInfixOf`) msgs)
+        assertTrue
+          "names the configured key"
+          (any (T.pack configured `T.isInfixOf`) msgs)
+        assertTrue
+          "names the offered key"
+          (any (T.pack offered `T.isInfixOf`) msgs)
+        adds <- readIORef nAdd
+        assertEq "offer mismatch does not ssh-add" 0 adds
+        agents <- readIORef nAgent
+        assertEq "offer mismatch does not start an agent" 0 agents
+
+offerMismatchRunner :: CommandRunner
+offerMismatchRunner req =
+  case prMode req of
+    ExecCmd "git" ["-C", _, "config", "--get", "core.sshCommand"] ->
+      pure
+        ProcessResult
+          { prExitCode = ExitFailure 1,
+            prStdout = "",
+            prStderr = ""
+          }
+    ExecCmd "ssh" ["-G", "-l", "git", "github.com"] ->
+      pure
+        ProcessResult
+          { prExitCode = ExitSuccess,
+            prStdout =
+              "identitiesonly yes\nidentityfile /home/mndz/.ssh/keys/shanty_github_id\n",
+            prStderr =
+              "Pseudo-terminal will not be allocated because stdin is not a terminal.\n"
+          }
+    other ->
+      pure
+        ProcessResult
+          { prExitCode = ExitFailure 1,
+            prStdout = "",
+            prStderr = "unexpected " <> show other
+          }
 
 testFailedReEnsureKeepsCommit :: IO ()
 testFailedReEnsureKeepsCommit =

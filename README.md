@@ -101,7 +101,7 @@ assets-path = "/path/to/mndz-overlay-assets"
 ssh-identity = "~/.ssh/keys/shanty_github_id"
 ```
 
-`ssh-identity` names the one private key used when `update` will `git push` the assets worktree. A leading `~` is expanded to your home directory. Any other relative path is rejected. `list`, `outdated`, `gencache`, and an `update` that will not push that worktree accept a config that omits the key.
+`ssh-identity` names the one private key used when `update` will `git push` the assets worktree. A leading `~` is expanded to your home directory. Any other relative path is rejected. `list`, `outdated`, `gencache`, and an `update` that will not push that worktree accept a config that omits the key. For an SSH assets push, when OpenSSH will offer only configured identity files, `ssh-identity` must be one of those files, and a mismatch fails before the passphrase prompt.
 
 A reachable agent that already has the key is reused and does not prompt. Otherwise the run prompts once for that key and does not leave it in the desktop agent.
 

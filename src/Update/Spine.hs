@@ -113,7 +113,9 @@ import Update.Process.Docker (resolveMaterializeDockerCfg)
 import Update.Sbcl.Deps (mkSbclDepsOps)
 import Update.SshAgent
   ( SshAgentOps,
+    SshSession,
     ensureSshAgent,
+    guardSshIdentityOffered,
     prepareSshIdentity,
     teardownSshSession,
   )
@@ -146,6 +148,10 @@ data UpdateSpineDeps = UpdateSpineDeps
     usdMkReleaseOps :: Text -> IO ReleaseOps,
     -- | @git remote get-url origin@ in the assets worktree.
     usdGitOriginUrl :: FilePath -> IO (Either Text Text),
+    -- | @git remote get-url --push origin@ in the assets worktree.
+    usdGitPushUrl :: FilePath -> IO (Either Text Text),
+    -- | @ssh -G@ and @git config@ for the offer check.
+    usdCommandRunner :: CommandRunner,
     usdAssetsPathCfg :: Maybe FilePath,
     usdDistDir :: FilePath,
     usdOverlayRoot :: FilePath,
@@ -710,16 +716,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                             if needDeps
                               then
                                 bracket
-                                  ( do
-                                      prepared <-
-                                        prepareSshIdentity
-                                          (usdSshOps deps)
-                                          (usdSshIdentity deps)
-                                      case prepared of
-                                        Left err -> pure (Left err)
-                                        Right path ->
-                                          ensureSshAgent (usdSshOps deps) path
-                                  )
+                                  (openAssetsSsh deps mAssetsRoot)
                                   ( \case
                                       Left _ -> pure ()
                                       Right sess -> teardownSshSession (usdSshOps deps) sess
@@ -746,6 +743,37 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   usrWarnings = warns,
                                   usrCacheSummary = mSummary
                                 }
+
+-- | Resolve the key, reject an offer mismatch, then start or reuse the agent.
+--
+-- 'Left' is the pre-prompt SSH failure. It does not start an agent.
+openAssetsSsh ::
+  UpdateSpineDeps ->
+  Maybe FilePath ->
+  IO (Either Text SshSession)
+openAssetsSsh deps mRoot = do
+  prepared <- prepareSshIdentity (usdSshOps deps) (usdSshIdentity deps)
+  case prepared of
+    Left err -> pure (Left err)
+    Right path ->
+      case mRoot of
+        Nothing ->
+          pure (Left "assets worktree is missing for the SSH offer check")
+        Just root -> do
+          eUrl <- usdGitPushUrl deps root
+          case eUrl of
+            Left err -> pure (Left err)
+            Right url -> do
+              offered <-
+                guardSshIdentityOffered
+                  (usdCommandRunner deps)
+                  (usdSshOps deps)
+                  root
+                  path
+                  url
+              case offered of
+                Left err -> pure (Left err)
+                Right () -> ensureSshAgent (usdSshOps deps) path
 
 -- | Promote classify hard-fails into plan results so mutate skips them.
 mergeClassifyHardFails ::

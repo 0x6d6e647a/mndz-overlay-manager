@@ -10,6 +10,7 @@ module Update.SshAgent
     mkSshAgentOps,
     resolveSshIdentity,
     prepareSshIdentity,
+    guardSshIdentityOffered,
     takeSshSessionSupervisor,
     spawnSshSessionSupervisorIn,
   )
@@ -20,6 +21,7 @@ import Control.Concurrent.Async (race)
 import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Exception (IOException, try)
 import Control.Monad (filterM, unless, void, when)
+import Data.Char (isSpace)
 import Data.List (isPrefixOf, isSuffixOf)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
@@ -60,6 +62,7 @@ import System.Process
     waitForProcess,
     withCreateProcess,
   )
+import Update.GitHub (AssetsPushTransport (..), classifyAssetsPushUrl)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -194,6 +197,178 @@ prepareSshIdentity ops raw = do
         if exists
           then Right path
           else Left ("ssh-identity file not found: " <> T.pack path)
+
+-- | 'GIT_SSH_COMMAND' selects a client this query does not describe.
+gitSshCommandSet :: Text
+gitSshCommandSet =
+  "GIT_SSH_COMMAND is set and selects an SSH client this check does not describe"
+
+-- | @core.sshCommand@ selects a client this query does not describe.
+coreSshCommandSet :: Text
+coreSshCommandSet =
+  "core.sshCommand is set and selects an SSH client this check does not describe"
+
+-- | Before a passphrase prompt, require that an SSH assets push can offer
+-- @keyPath@ when OpenSSH restricts identity files.
+--
+-- A web push URL succeeds without running @ssh@. 'Left' does not start an agent.
+guardSshIdentityOffered ::
+  CommandRunner ->
+  SshAgentOps ->
+  FilePath ->
+  FilePath ->
+  Text ->
+  IO (Either Text ())
+guardSshIdentityOffered run ops root keyPath pushUrl =
+  case classifyAssetsPushUrl pushUrl of
+    PushWeb -> pure (Right ())
+    PushUnsupported url ->
+      pure
+        ( Left
+            ("assets push URL is not a github.com SSH or web URL: " <> url)
+        )
+    PushSshGitHub mUser -> do
+      override <- saoLookupEnv ops "GIT_SSH_COMMAND"
+      case override of
+        Just cmd | not (null cmd) -> pure (Left gitSshCommandSet)
+        _ -> do
+          configured <- readCoreSshCommand run root
+          case configured of
+            Left err -> pure (Left err)
+            Right True -> pure (Left coreSshCommandSet)
+            Right False -> do
+              queried <- runSshDashG run mUser
+              case queried of
+                Left err -> pure (Left err)
+                Right body ->
+                  let (only, files) = parseSshDashG body
+                   in if only
+                        then matchOffered ops keyPath files
+                        else pure (Right ())
+
+-- | Exit 0 with a non-empty value is an override. Exit 1 with empty stdout
+-- is unset. The command text is not returned.
+readCoreSshCommand :: CommandRunner -> FilePath -> IO (Either Text Bool)
+readCoreSshCommand run root = do
+  res <-
+    run
+      ProcessRequest
+        { prMode =
+            ExecCmd "git" ["-C", root, "config", "--get", "core.sshCommand"],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  let stdoutT = T.strip (T.pack (prStdout res))
+  pure $ case prExitCode res of
+    ExitSuccess
+      | not (T.null stdoutT) -> Right True
+      | otherwise ->
+          Left
+            ( "git config --get core.sshCommand failed: "
+                <> T.pack (nullToDash (prStderr res) (prStdout res))
+            )
+    ExitFailure 1
+      | T.null stdoutT -> Right False
+    ExitFailure n ->
+      Left
+        ( "git config --get core.sshCommand failed (exit "
+            <> T.pack (show n)
+            <> "): "
+            <> T.pack (nullToDash (prStderr res) (prStdout res))
+        )
+
+-- | @ssh -G@ for @github.com@, with @-l@ when the push URL names a user.
+-- Does not open a connection. Success ignores stderr.
+runSshDashG :: CommandRunner -> Maybe Text -> IO (Either Text String)
+runSshDashG run mUser = do
+  let args = case mUser of
+        Just user -> ["-G", "-l", T.unpack user, "github.com"]
+        Nothing -> ["-G", "github.com"]
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "ssh" args,
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  pure $
+    if prExitCode res == ExitSuccess
+      then Right (prStdout res)
+      else
+        Left
+          ( "ssh -G failed: "
+              <> T.pack (nullToDash (prStderr res) (prStdout res))
+          )
+
+-- | Restricted flag, then identity files other than @none@, in print order.
+parseSshDashG :: String -> (Bool, [Text])
+parseSshDashG = go False [] . T.lines . T.pack
+  where
+    go only files [] = (only, reverse files)
+    go only files (line : rest) =
+      case T.break isSpace (T.strip line) of
+        ("", _) -> go only files rest
+        ("identitiesonly", value)
+          | T.strip value == "yes" -> go True files rest
+        ("identityfile", value) ->
+          let path = T.strip value
+           in if path == "none" || T.null path
+                then go only files rest
+                else go only (path : files) rest
+        _ -> go only files rest
+
+matchOffered :: SshAgentOps -> FilePath -> [Text] -> IO (Either Text ())
+matchOffered ops keyPath offered = do
+  home <- saoOperatorHome ops
+  wanted <- saoFingerprint ops keyPath
+  case wanted of
+    Left err ->
+      pure
+        ( Left
+            ( "cannot fingerprint ssh-identity "
+                <> T.pack keyPath
+                <> ": "
+                <> err
+            )
+        )
+    Right want -> walk home want offered []
+  where
+    walk _ _ [] errs =
+      pure (Left (offerMismatch keyPath offered (reverse errs)))
+    walk home want (raw : rest) errs =
+      case prepareOffered home (T.unpack raw) of
+        Left err -> walk home want rest (err : errs)
+        Right path -> do
+          got <- saoFingerprint ops path
+          case got of
+            Left err -> walk home want rest ((raw <> ": " <> err) : errs)
+            Right token
+              | token == want -> pure (Right ())
+              | otherwise -> walk home want rest errs
+
+prepareOffered :: FilePath -> FilePath -> Either Text FilePath
+prepareOffered home raw =
+  case expandLeadingHome home raw of
+    Left _ ->
+      Left ("offered identity path does not expand ~user: " <> T.pack raw)
+    Right path
+      | isAbsolute path -> Right path
+      | otherwise ->
+          Left ("offered identity path is not absolute: " <> T.pack raw)
+
+offerMismatch :: FilePath -> [Text] -> [Text] -> Text
+offerMismatch keyPath offered errs =
+  let header =
+        "IdentitiesOnly is set and ssh-identity "
+          <> T.pack keyPath
+          <> " does not match an offered identity file"
+          <> case offered of
+            [] -> ""
+            _ -> ": " <> T.intercalate ", " offered
+      details = T.intercalate "\n" errs
+   in if T.null details then header else header <> "\n" <> details
 
 -- | Ensure the configured private key is available for git push.
 --

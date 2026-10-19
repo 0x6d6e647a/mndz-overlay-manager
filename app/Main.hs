@@ -73,7 +73,12 @@ import Update.Distfiles
     resolveDistfilesPath,
   )
 import Update.Git (isGitWorkTree, productionGitOps)
-import Update.GitHub (GitHubLatch, gitRemoteOriginUrl, newGitHubLatch)
+import Update.GitHub
+  ( GitHubLatch,
+    gitRemoteOriginUrl,
+    gitRemotePushUrl,
+    newGitHubLatch,
+  )
 import Update.GitHubHealth
   ( GitHubHealthScope (..),
     interpretHealthOutcome,
@@ -389,6 +394,8 @@ runUpdate rt refresh pkgArgs = do
                           usdUnlockConfigToken = unlockEnvelope,
                           usdMkReleaseOps = productionReleaseOpsWithLatch latch,
                           usdGitOriginUrl = gitRemoteOriginUrl,
+                          usdGitPushUrl = gitRemotePushUrl,
+                          usdCommandRunner = productionCommandRunner,
                           usdAssetsPathCfg = assetsPath cfg,
                           usdDistDir = distDir,
                           usdOverlayRoot = overlayPath,

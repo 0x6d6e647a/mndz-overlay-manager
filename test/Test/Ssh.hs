@@ -147,7 +147,11 @@ import Update.EbuildEdit
   )
 import Update.Engines (parseEnginesMinimum)
 import Update.Git (GitOps (..))
-import Update.GitHub (stripAndParse)
+import Update.GitHub
+  ( AssetsPushTransport (..),
+    classifyAssetsPushUrl,
+    stripAndParse,
+  )
 import Update.Go.Lanes
   ( GapLine (..),
     LaneId (..),
@@ -256,6 +260,7 @@ import Update.SshAgent
   ( SshAgentOps (..),
     SshSession (..),
     ensureSshAgent,
+    guardSshIdentityOffered,
     mkSshAgentOps,
     prepareSshIdentity,
     resolveSshIdentity,
@@ -296,7 +301,9 @@ tests =
       testCase "Ssh teardown reused and owned" testSshTeardownReusedAndOwned,
       testCase "Go missing among assets tools" testGoMissingAmongAssetsTools,
       testCase "Ssh mk CommandRunner success lifecycle" testSshMkCommandRunnerSuccess,
-      testCase "Ssh mk CommandRunner failure edges" testSshMkCommandRunnerFailures
+      testCase "Ssh mk CommandRunner failure edges" testSshMkCommandRunnerFailures,
+      classifyAssetsPushUrlTests,
+      guardSshIdentityOfferedTests
     ]
 
 configuredKey :: FilePath
@@ -801,3 +808,345 @@ testSshMkCommandRunnerFailures = do
           }
   errKeygen <- assertLeft "keygen runner" =<< ensureSshAgent opsKeygen configuredKey
   assertTrue "keygen stderr" ("not a private key" `T.isInfixOf` errKeygen)
+
+------------------------------------------------------------------------
+-- Push URL class and offer guard
+------------------------------------------------------------------------
+
+classifyAssetsPushUrlTests :: TestTree
+classifyAssetsPushUrlTests =
+  testGroup
+    "classifyAssetsPushUrl"
+    [ testCase "git scp" $
+        assertEq
+          "scp"
+          (PushSshGitHub (Just "git"))
+          (classifyAssetsPushUrl "git@github.com:alice/overlay-assets.git"),
+      testCase "ssh url with user" $
+        assertEq
+          "ssh user"
+          (PushSshGitHub (Just "git"))
+          (classifyAssetsPushUrl "ssh://git@github.com/alice/overlay-assets.git"),
+      testCase "ssh url without user" $
+        assertEq
+          "ssh bare"
+          (PushSshGitHub Nothing)
+          (classifyAssetsPushUrl "ssh://github.com/alice/overlay-assets.git"),
+      testCase "https" $
+        assertEq
+          "https"
+          PushWeb
+          (classifyAssetsPushUrl "https://github.com/alice/overlay-assets.git"),
+      testCase "http" $
+        assertEq
+          "http"
+          PushWeb
+          (classifyAssetsPushUrl "http://github.com/alice/overlay-assets.git"),
+      testCase "non-github ssh" $
+        assertEq
+          "other host"
+          (PushUnsupported "git@git.example:alice/overlay-assets.git")
+          (classifyAssetsPushUrl "git@git.example:alice/overlay-assets.git"),
+      testCase "ssh port" $
+        assertEq
+          "port"
+          (PushUnsupported "ssh://git@github.com:22/alice/overlay-assets.git")
+          (classifyAssetsPushUrl "ssh://git@github.com:22/alice/overlay-assets.git")
+    ]
+
+guardSshIdentityOfferedTests :: TestTree
+guardSshIdentityOfferedTests =
+  testGroup
+    "guardSshIdentityOffered"
+    [ testCase "user git" testOfferUserGit,
+      testCase "URL without a user" testOfferNoUser,
+      testCase "IdentitiesOnly mismatch" testOfferMismatch,
+      testCase "tilde match" testOfferTildeMatch,
+      testCase "any one of several" testOfferAnyMatch,
+      testCase "IdentitiesOnly off" testOfferUnrestricted,
+      testCase "GIT_SSH_COMMAND" testOfferGitSshCommand,
+      testCase "core.sshCommand" testOfferCoreSshCommand,
+      testCase "https ignores GIT_SSH_COMMAND" testOfferHttpsIgnoresOverride,
+      testCase "non-github host" testOfferNonGithub,
+      testCase "ssh -G failure" testOfferSshGFails,
+      testCase "unreadable offered path" testOfferUnreadable
+    ]
+
+data OfferScript = OfferScript
+  { osLookup :: String -> IO (Maybe String),
+    osFingerprint :: FilePath -> IO (Either T.Text T.Text),
+    osGit :: ProcessResult,
+    osSsh :: ProcessResult,
+    osHome :: FilePath
+  }
+
+defaultOfferScript :: OfferScript
+defaultOfferScript =
+  OfferScript
+    { osLookup = \_ -> pure Nothing,
+      osFingerprint = \_ -> pure (Right "SHA256:configured"),
+      osGit =
+        ProcessResult
+          { prExitCode = ExitFailure 1,
+            prStdout = "",
+            prStderr = ""
+          },
+      osSsh = sshGOut "identitiesonly no\n",
+      osHome = "/home/mndz"
+    }
+
+sshGOut :: String -> ProcessResult
+sshGOut body =
+  ProcessResult
+    { prExitCode = ExitSuccess,
+      prStdout = body,
+      prStderr =
+        "Pseudo-terminal will not be allocated because stdin is not a terminal.\n"
+    }
+
+-- | Run the guard. Returns the result, ssh argvs, git argvs, and fingerprinted paths.
+runOffer ::
+  T.Text ->
+  FilePath ->
+  OfferScript ->
+  IO (Either T.Text (), [[String]], [[String]], [FilePath])
+runOffer url keyPath script = do
+  sshSeen <- newIORef ([] :: [[String]])
+  gitSeen <- newIORef ([] :: [[String]])
+  fingers <- newIORef ([] :: [FilePath])
+  let run req = case execCmd req of
+        Just ("git", args) -> do
+          atomicModifyIORef' gitSeen (\xs -> (xs <> [args], ()))
+          pure (osGit script)
+        Just ("ssh", args) -> do
+          atomicModifyIORef' sshSeen (\xs -> (xs <> [args], ()))
+          pure (osSsh script)
+        _ ->
+          pure (failResult 1 ("unexpected command: " <> show (prMode req)))
+      ops =
+        baseSshOps
+          { saoLookupEnv = osLookup script,
+            saoOperatorHome = pure (osHome script),
+            saoFingerprint = \path -> do
+              atomicModifyIORef' fingers (\xs -> (xs <> [path], ()))
+              osFingerprint script path
+          }
+  result <- guardSshIdentityOffered run ops "/work/assets" keyPath url
+  sshs <- readIORef sshSeen
+  gits <- readIORef gitSeen
+  seenF <- readIORef fingers
+  pure (result, sshs, gits, seenF)
+
+assertGitConfig :: [[String]] -> IO ()
+assertGitConfig =
+  assertEq
+    "git config"
+    [["-C", "/work/assets", "config", "--get", "core.sshCommand"]]
+
+testOfferUserGit :: IO ()
+testOfferUserGit = do
+  (result, sshs, gits, _) <-
+    runOffer
+      "git@github.com:alice/overlay-assets.git"
+      configuredKey
+      defaultOfferScript
+  assertEq "pass" (Right ()) result
+  assertEq "ssh -G as git" [["-G", "-l", "git", "github.com"]] sshs
+  assertGitConfig gits
+
+testOfferNoUser :: IO ()
+testOfferNoUser = do
+  (result, sshs, gits, _) <-
+    runOffer
+      "ssh://github.com/alice/overlay-assets.git"
+      configuredKey
+      defaultOfferScript
+  assertEq "pass" (Right ()) result
+  assertEq "ssh -G without a user" [["-G", "github.com"]] sshs
+  assertGitConfig gits
+
+testOfferMismatch :: IO ()
+testOfferMismatch = do
+  let hostel = "/home/mndz/.ssh/keys/shanty_id_ed25519"
+      offered = "~/.ssh/keys/shanty_github_id"
+      script =
+        defaultOfferScript
+          { osSsh =
+              sshGOut
+                "identitiesonly yes\nidentityfile ~/.ssh/keys/shanty_github_id\n",
+            osFingerprint = \path ->
+              pure $
+                if path == hostel
+                  then Right "SHA256:hostel"
+                  else Right "SHA256:github"
+          }
+  (result, _, _, _) <-
+    runOffer "git@github.com:alice/overlay-assets.git" hostel script
+  err <- assertLeft "mismatch" result
+  assertTrue "configured path" (T.pack hostel `T.isInfixOf` err)
+  assertTrue "offered path" (T.pack offered `T.isInfixOf` err)
+
+testOfferTildeMatch :: IO ()
+testOfferTildeMatch = do
+  let key = "/home/mndz/.ssh/keys/shanty_github_id"
+      script =
+        defaultOfferScript
+          { osSsh =
+              sshGOut
+                "identitiesonly yes\nidentityfile none\nidentityfile ~/.ssh/keys/shanty_github_id\n",
+            osFingerprint = \_ -> pure (Right "SHA256:same")
+          }
+  (result, _, _, fingers) <-
+    runOffer "ssh://git@github.com/alice/overlay-assets.git" key script
+  assertEq "pass" (Right ()) result
+  assertTrue "expanded tilde" (key `elem` fingers)
+  assertTrue "skipped none" ("none" `notElem` fingers)
+
+testOfferAnyMatch :: IO ()
+testOfferAnyMatch = do
+  let key = "/keys/cfg"
+      match = "/keys/match"
+      stop = "/keys/stop"
+      script =
+        defaultOfferScript
+          { osSsh =
+              sshGOut
+                ( unlines
+                    [ "identitiesonly yes",
+                      "identityfile /keys/other",
+                      "identityfile /keys/match",
+                      "identityfile /keys/stop"
+                    ]
+                ),
+            osFingerprint = \path ->
+              pure $
+                if path == key || path == match
+                  then Right "SHA256:want"
+                  else Right "SHA256:no"
+          }
+  (result, _, _, fingers) <-
+    runOffer "git@github.com:alice/overlay-assets.git" key script
+  assertEq "pass" (Right ()) result
+  assertTrue "saw the match" (match `elem` fingers)
+  assertTrue "stopped at the first match" (stop `notElem` fingers)
+
+testOfferUnrestricted :: IO ()
+testOfferUnrestricted = do
+  let script =
+        defaultOfferScript
+          { osSsh = sshGOut "identitiesonly no\nidentityfile /keys/other\n",
+            osFingerprint = \path ->
+              pure $
+                if path == configuredKey
+                  then Right "SHA256:configured"
+                  else Right "SHA256:other"
+          }
+  (result, _, _, fingers) <-
+    runOffer "git@github.com:alice/overlay-assets.git" configuredKey script
+  assertEq "pass" (Right ()) result
+  assertEq "does not fingerprint" [] fingers
+
+testOfferGitSshCommand :: IO ()
+testOfferGitSshCommand = do
+  let secret = "ssh -o ProxyCommand=secret-proxy"
+      script =
+        defaultOfferScript
+          { osLookup = \k ->
+              pure $
+                if k == "GIT_SSH_COMMAND"
+                  then Just secret
+                  else Nothing
+          }
+  (result, sshs, gits, _) <-
+    runOffer "git@github.com:alice/overlay-assets.git" configuredKey script
+  err <- assertLeft "env override" result
+  assertTrue "names GIT_SSH_COMMAND" ("GIT_SSH_COMMAND" `T.isInfixOf` err)
+  assertTrue "does not echo the command" (not (T.pack secret `T.isInfixOf` err))
+  assertEq "no ssh" [] sshs
+  assertEq "no git config" [] gits
+
+testOfferCoreSshCommand :: IO ()
+testOfferCoreSshCommand = do
+  let secret = "ssh -o IdentityFile=/tmp/secret-command"
+      script =
+        defaultOfferScript
+          { osGit =
+              ProcessResult
+                { prExitCode = ExitSuccess,
+                  prStdout = secret <> "\n",
+                  prStderr = ""
+                }
+          }
+  (result, sshs, gits, _) <-
+    runOffer "ssh://git@github.com/alice/overlay-assets.git" configuredKey script
+  err <- assertLeft "repo override" result
+  assertTrue "names core.sshCommand" ("core.sshCommand" `T.isInfixOf` err)
+  assertTrue "does not echo the command" (not (T.pack secret `T.isInfixOf` err))
+  assertEq "no ssh" [] sshs
+  assertGitConfig gits
+
+testOfferHttpsIgnoresOverride :: IO ()
+testOfferHttpsIgnoresOverride = do
+  let secret = "ssh -o ProxyCommand=secret-proxy"
+      script =
+        defaultOfferScript
+          { osLookup = \k ->
+              pure $
+                if k == "GIT_SSH_COMMAND"
+                  then Just secret
+                  else Nothing
+          }
+  (result, sshs, gits, _) <-
+    runOffer
+      "https://github.com/alice/overlay-assets.git"
+      configuredKey
+      script
+  assertEq "pass" (Right ()) result
+  assertEq "no ssh" [] sshs
+  assertEq "no git config" [] gits
+
+testOfferNonGithub :: IO ()
+testOfferNonGithub = do
+  let url = "git@git.example:alice/overlay-assets.git"
+  (result, sshs, _, _) <- runOffer url configuredKey defaultOfferScript
+  err <- assertLeft "unsupported" result
+  assertTrue "names the url" (url `T.isInfixOf` err)
+  assertEq "no ssh" [] sshs
+
+testOfferSshGFails :: IO ()
+testOfferSshGFails = do
+  let script =
+        defaultOfferScript
+          { osSsh =
+              ProcessResult
+                { prExitCode = ExitFailure 1,
+                  prStdout = "",
+                  prStderr = "ssh: dump failed\n"
+                }
+          }
+  (result, sshs, _, fingers) <-
+    runOffer "git@github.com:alice/overlay-assets.git" configuredKey script
+  err <- assertLeft "ssh -G" result
+  assertTrue "query failure" ("ssh: dump failed" `T.isInfixOf` err)
+  assertEq "queried" [["-G", "-l", "git", "github.com"]] sshs
+  assertEq "no fingerprint" [] fingers
+
+testOfferUnreadable :: IO ()
+testOfferUnreadable = do
+  let offered = "/no/such/offered"
+      script =
+        defaultOfferScript
+          { osSsh =
+              sshGOut
+                "identitiesonly yes\nidentityfile /no/such/offered\n",
+            osFingerprint = \path ->
+              pure $
+                if path == configuredKey
+                  then Right "SHA256:configured"
+                  else Left "No such file or directory"
+          }
+  (result, _, _, _) <-
+    runOffer "ssh://github.com/alice/overlay-assets.git" configuredKey script
+  err <- assertLeft "unreadable" result
+  assertTrue "offered path" (T.pack offered `T.isInfixOf` err)
+  assertTrue "fingerprint failure" ("No such file or directory" `T.isInfixOf` err)
