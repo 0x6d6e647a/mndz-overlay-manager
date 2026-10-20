@@ -27,7 +27,7 @@ test *pattern:
     if [[ -z "${pattern}" ]]; then
         exec ./scripts/with-flavor dev -- test all
     else
-        exec ./scripts/with-flavor dev -- test all --test-options="-p ${pattern}"
+        exec ./scripts/with-flavor dev -- test all --test-option=-p --test-option="${pattern}"
     fi
 
 # Run the manager from the release flavor. Arguments are the manager's own argv.
@@ -50,7 +50,7 @@ test-release *pattern:
     if [[ -z "${pattern}" ]]; then
         exec ./scripts/with-flavor release -- test all
     else
-        exec ./scripts/with-flavor release -- test all --test-options="-p ${pattern}"
+        exec ./scripts/with-flavor release -- test all --test-option=-p --test-option="${pattern}"
     fi
 
 # Debug coverage flavor. No pattern writes the gate reports; a pattern reruns one test.
@@ -62,7 +62,7 @@ coverage *pattern:
     if [[ -z "${pattern}" ]]; then
         exec ./scripts/coverage
     else
-        exec ./scripts/with-flavor coverage-dev -- test all --test-show-details=direct --test-options="-p ${pattern}"
+        exec ./scripts/with-flavor coverage-dev -- test all --test-show-details=direct --test-option=-p --test-option="${pattern}"
     fi
 
 # Optimized coverage reports. Not part of the quality gate.

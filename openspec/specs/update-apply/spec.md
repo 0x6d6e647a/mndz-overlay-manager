@@ -366,6 +366,17 @@ A `GitMvAndManifest` apply for `net-analyzer/witen-warden-bin` SHALL rename the 
 - **AND** its body still contains `witen-warden-${PV}-linux-amd64-glibc.tar.gz` and `witen-warden_${PV}-1_amd64.deb`
 - **AND** `IUSE` and the `/usr/bin/warden` install layout are unchanged
 
+### Requirement: Kiro CLI GitMv preserves the ebuild body
+
+A `GitMvAndManifest` apply for `dev-util/kiro-cli-bin` SHALL rename the newest ebuild to the remote PV and SHALL NOT rewrite the ebuild body. The `SRC_URI` filename templates, libc conditionals, dependencies, and the install layout SHALL be unchanged aside from `${PV}` expansion at build time.
+
+#### Scenario: Bump from 2.31.1 keeps the headless filenames
+
+- **WHEN** apply bumps `kiro-cli-bin` from `2.31.1` to `2.32.0`
+- **THEN** the new ebuild is `kiro-cli-bin-2.32.0.ebuild`
+- **AND** its body still contains `kirocli-x86_64-linux.tar.xz`, `kirocli-aarch64-linux.tar.xz`, `kirocli-x86_64-linux-musl.tar.xz`, and `kirocli-aarch64-linux-musl.tar.xz`
+- **AND** the `/usr/bin` install of `kiro-cli`, `kiro-cli-chat`, and `kiro-cli-term` is unchanged
+
 ### Requirement: Dirty involved paths block package update
 
 Before mutating an apply unit, the program SHALL check that the unit’s involved paths are clean relative to git HEAD (not modified or staged with uncommitted changes). For `GitMvAndManifest`, involved paths are the newest ebuild file and the package `Manifest`. For each `DepsAndAssets` planned PV unit, involved paths are the template or target ebuild path for that PV and the package `Manifest`. If any involved path is dirty, the unit SHALL hard-fail without mutating. Dirtiness of unrelated paths SHALL NOT fail the unit. After a prior unit in the same package has successfully committed, dirt from that unit SHALL NOT remain uncommitted and therefore SHALL NOT cause the next unit’s dirty check to fail solely due to that prior unit’s work.
@@ -545,6 +556,29 @@ The canonical hardcoded policy map SHALL include `dev-util/cmake-language-server
 #### Scenario: Not an image or wait-edge provider
 
 - **WHEN** policy is resolved for `dev-util/cmake-language-server`
+- **THEN** the package is not an overlay wait-edge provider and is not emerged by the materialize image
+
+### Requirement: kiro-cli-bin policy entry
+
+The canonical hardcoded policy map SHALL include `dev-util/kiro-cli-bin` with HttpJson URL `https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json`, version field `version`, technique `GitMvAndManifest`, and an empty arch allowlist. The package SHALL NOT be an overlay wait-edge provider and SHALL NOT be emerged by the materialize image.
+
+#### Scenario: Policy resolution
+
+- **WHEN** policy is resolved for `dev-util/kiro-cli-bin`
+- **THEN** the technique is `GitMvAndManifest`
+- **AND** the source is that HttpJson manifest URL with field `version`
+- **AND** the arch allowlist is empty
+
+#### Scenario: Target does not select a version
+
+- **WHEN** `outdated` or `update` selects `dev-util/kiro-cli-bin`, or the unambiguous bare name `kiro-cli-bin`
+- **THEN** both tokens resolve to the same inventory key
+- **AND** the remote PV comes from the manifest `version` field
+- **AND** the commands do not interpret a supplied version as a CLI version pin
+
+#### Scenario: Not an image or wait-edge provider
+
+- **WHEN** policy is resolved for `dev-util/kiro-cli-bin`
 - **THEN** the package is not an overlay wait-edge provider and is not emerged by the materialize image
 
 ### Requirement: DepsAndAssets multi-lane apply

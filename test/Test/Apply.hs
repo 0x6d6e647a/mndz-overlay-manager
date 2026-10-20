@@ -315,6 +315,7 @@ integrationTests =
       testCase "Git Mv Commits On Success" testGitMvCommitsOnSuccess,
       testCase "Grok Bot GitMv Commit Rewrite" testGrokBotGitMvCommitRewrite,
       testCase "Warden GitMv Preserves Body" testWardenGitMvPreservesBody,
+      testCase "Kiro CLI GitMv" testKiroCliGitMv,
       testCase "Go Multi Pv Sequential Commits" testGoMultiPvSequentialCommits,
       testCase "Go Multi Pv Stop On Hard Fail" testGoMultiPvStopOnHardFail,
       testCase "Full Path Apply Progress Sequence" testFullPathApplyProgressSequence,
@@ -1103,6 +1104,130 @@ testWardenGitMvPreservesBody = do
   assertTrue "IUSE preserved" (wardenIuse `T.isInfixOf` body)
   assertTrue "install layout preserved" ("doexe usr/bin/warden" `T.isInfixOf` body)
   assertEq "body was not rewritten" wardenEbuild body
+
+kiroEbuild :: T.Text
+kiroEbuild =
+  T.unlines
+    [ "EAPI=8",
+      "SRC_URI=\"",
+      "\tamd64? (",
+      "\t\telibc_glibc? ( https://desktop-release.q.us-east-1.amazonaws.com/${PV}/kirocli-x86_64-linux.tar.xz )",
+      "\t\telibc_musl? ( https://desktop-release.q.us-east-1.amazonaws.com/${PV}/kirocli-x86_64-linux-musl.tar.xz )",
+      "\t)",
+      "\tarm64? (",
+      "\t\telibc_glibc? ( https://desktop-release.q.us-east-1.amazonaws.com/${PV}/kirocli-aarch64-linux.tar.xz )",
+      "\t\telibc_musl? ( https://desktop-release.q.us-east-1.amazonaws.com/${PV}/kirocli-aarch64-linux-musl.tar.xz )",
+      "\t)",
+      "\"",
+      "src_install() {",
+      "\texeinto /usr/bin",
+      "\tdoexe bin/kiro-cli bin/kiro-cli-chat bin/kiro-cli-term",
+      "}"
+    ]
+
+-- | Bump kiro-cli-bin and report manifest activity plus the renamed body.
+runKiroGitMv :: String -> T.Text -> IO (ApplyOutcome, Int, Bool, Bool, T.Text)
+runKiroGitMv label body =
+  withSystemTempDirectory label $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        pkgDir = overlayRoot </> "dev-util" </> "kiro-cli-bin"
+        oldName = "kiro-cli-bin-2.31.1.ebuild"
+        newName = "kiro-cli-bin-2.32.0.ebuild"
+        oldPath = pkgDir </> oldName
+        newPath = pkgDir </> newName
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "kiro-cli-bin",
+              pePN = "kiro-cli-bin",
+              peLocal = parseEbuildVersion "2.31.1",
+              pePath = oldPath
+            }
+    createDirectoryIfMissing True pkgDir
+    TIO.writeFile oldPath body
+    TIO.writeFile (pkgDir </> "Manifest") "DIST x 1\n"
+    writeMatchingCachesForPackage overlayRoot "dev-util" "kiro-cli-bin" pkgDir
+    manifests <- newIORef (0 :: Int)
+    let gitOps =
+          GitOps
+            { goIsWorkTree = \_ -> pure True,
+              goPathsDirty = \_ _ -> pure (Right False),
+              goAddAndCommit = \_ _ _ -> pure (Right ()),
+              goPush = \_ -> pure (Right ()),
+              goRevParseHead = \_ -> pure (Right "test-head")
+            }
+        ebuildRun dir name = do
+          atomicModifyIORef' manifests (\n -> (n + 1, ()))
+          TIO.writeFile (dir </> "Manifest") ("DIST " <> T.pack name <> " 1\n")
+          pure (Right ())
+        planOps =
+          PlanOps
+            { poPortageq = \_ -> pure (Left "unused"),
+              poListVersions = \_ -> pure (Left "unused"),
+              poFetchGoMod = \_ -> pure (Left "unused"),
+              poWorkBudget = error "unused",
+              poCeilingsCache = error "unused"
+            }
+    assetsLock <- newMVar ()
+    overlayLock <- newMVar ()
+    budget <- newWorkBudget 1
+    ceilingsCache <- newMVar Nothing
+    env0 <-
+      mkTestApplyEnv
+        gitOps
+        planOps {poWorkBudget = budget, poCeilingsCache = ceilingsCache}
+        ebuildRun
+        unusedReleaseOps
+        unusedVendorOps
+        Nothing
+        assetsLock
+        overlayLock
+    let env =
+          env0
+            { aeFetcher = \_ -> pure (Right (parseEbuildVersion "2.32.0")),
+              aeHttpLbs = \_ -> do
+                hPutStrLn stderr "kiro GitMv must not fetch the grok-bot commit feed"
+                exitFailure
+            }
+    outcomes <- applyPackagePhase1 env overlayRoot entry
+    nMan <- readIORef manifests
+    oldExists <- doesFileExist oldPath
+    newExists <- doesFileExist newPath
+    newBody <- if newExists then TIO.readFile newPath else pure ""
+    outcome <- case outcomes of
+      [one] -> pure one
+      other -> do
+        hPutStrLn stderr ("expected one kiro outcome, got: " <> show other)
+        exitFailure
+    pure (outcome, nMan, oldExists, newExists, newBody)
+
+testKiroCliGitMv :: IO ()
+testKiroCliGitMv = do
+  (ok, nOk, oldOk, newOk, body) <-
+    runKiroGitMv "mndz-kiro-gitmv-" kiroEbuild
+  case ok of
+    ApplySuccess {} -> pure ()
+    other -> do
+      hPutStrLn stderr ("expected kiro success, got: " <> show other)
+      exitFailure
+  assertEq "manifest ran" 1 nOk
+  assertTrue "old ebuild renamed away" (not oldOk)
+  assertTrue "new ebuild is kiro-cli-bin-2.32.0.ebuild" newOk
+  assertTrue
+    "gnu amd64 archive preserved"
+    ("kirocli-x86_64-linux.tar.xz" `T.isInfixOf` body)
+  assertTrue
+    "gnu arm64 archive preserved"
+    ("kirocli-aarch64-linux.tar.xz" `T.isInfixOf` body)
+  assertTrue
+    "musl amd64 archive preserved"
+    ("kirocli-x86_64-linux-musl.tar.xz" `T.isInfixOf` body)
+  assertTrue
+    "musl arm64 archive preserved"
+    ("kirocli-aarch64-linux-musl.tar.xz" `T.isInfixOf` body)
+  assertTrue
+    "install layout preserved"
+    ("doexe bin/kiro-cli bin/kiro-cli-chat bin/kiro-cli-term" `T.isInfixOf` body)
+  assertEq "body was not rewritten" kiroEbuild body
 
 assertHardNoRename :: String -> ApplyOutcome -> Int -> Bool -> Bool -> IO ()
 assertHardNoRename label outcome nMan oldExists newExists = do

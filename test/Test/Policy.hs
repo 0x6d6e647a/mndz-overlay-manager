@@ -316,6 +316,7 @@ tests =
     [ testCase "Hardcoded Grok" testHardcodedGrok,
       testCase "Hardcoded Grok Bot" testHardcodedGrokBot,
       testCase "Hardcoded Warden" testHardcodedWarden,
+      testCase "Hardcoded Kiro" testHardcodedKiro,
       testCase "Policy Classification" testPolicyClassification,
       testCase "Codex as MCP policy" testCodexAsMcpPolicy,
       testCase "cmake-language-server policy" testCmakeLanguageServerPolicy,
@@ -520,6 +521,45 @@ testHardcodedWarden = do
       hPutStrLn stderr $ "warden policy: " <> show other
       exitFailure
   assertEq "resolve map only" (lookupHardcoded key) (resolveSource key)
+
+testHardcodedKiro :: IO ()
+testHardcodedKiro = do
+  let key = PackageKey "dev-util/kiro-cli-bin"
+      url = "https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json"
+  case lookupPolicy key of
+    Just (PackagePolicy (HttpJson [gotUrl] "version") GitMvAndManifest []) ->
+      assertEq "manifest" url gotUrl
+    other -> do
+      hPutStrLn stderr $ "kiro policy: " <> show other
+      exitFailure
+  assertEq "allowlist" [] (lookupLaneArches key)
+  assertEq "resolve map only" (lookupHardcoded key) (resolveSource key)
+  let entry =
+        PackageEntry
+          { peKey = key,
+            pePN = "kiro-cli-bin",
+            peLocal = parseEbuildVersion "2.31.1",
+            pePath = "/overlay/dev-util/kiro-cli-bin/kiro-cli-bin-2.31.1.ebuild"
+          }
+      inventory = [entry]
+  assertEq
+    "qualified"
+    (Right [key])
+    (resolveTargets inventory ["dev-util/kiro-cli-bin"])
+  assertEq
+    "bare"
+    (Right [key])
+    (resolveTargets inventory ["kiro-cli-bin"])
+  case resolveTargets inventory ["2.31.1"] of
+    Left [UnknownPackage "2.31.1"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "version token: " <> show other
+      exitFailure
+  case resolveTargets inventory ["kiro-cli-bin-2.31.1"] of
+    Left [UnknownPackage "kiro-cli-bin-2.31.1"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "pv token: " <> show other
+      exitFailure
 
 testPolicyClassification :: IO ()
 testPolicyClassification = do
