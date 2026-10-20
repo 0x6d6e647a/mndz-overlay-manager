@@ -64,6 +64,7 @@ distfileKindForEcosystem Bun = DepsDist
 distfileKindForEcosystem Cargo {} = CratesDist
 distfileKindForEcosystem Sbcl = DepsDist
 distfileKindForEcosystem (Uv _) = DepsDist
+distfileKindForEcosystem (Pdm _) = DepsDist
 
 -- | @{pn}-{pv}-vendor|deps|crates.tar.xz@ (overlay PN, never npm scope / Cargo.toml name).
 distfileTarballName :: DistfileKind -> Text -> Text -> FilePath

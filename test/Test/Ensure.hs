@@ -18,7 +18,7 @@ import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
-import Test.Assert (assertEq, assertTrue)
+import Test.Assert (assertEq, assertRight, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Apply
@@ -42,6 +42,7 @@ import Update.Materialize
   ( DockerInfoFacts (..),
     EnsureConfig (..),
     EnsureOutcome (..),
+    GentooToolchainMetas (..),
     ImageSidecar (..),
     ImageStoreLayout (..),
     NeededFloors (..),
@@ -78,6 +79,7 @@ import Update.Materialize
     parseDockerInfoJson,
     prunePreviousMaterializeImage,
     renderMaterializeDockerfile,
+    resolveNeededInstalls,
     resolveToolchain,
     sidecarImageJsonPath,
     unionFloors,
@@ -137,6 +139,7 @@ unitTests =
       testCase "bun recipe emerges overlay node-gyp after node" testBunRecipeEmergesNodeGypAfterNode,
       testCase "Go-only recipe omits node-gyp" testGoOnlyOmitsNodeGyp,
       testCase "Uv recipe emerges python slot then uv after rust" testUvRecipePythonAndUv,
+      testCase "Pdm recipe emerges python slot then pdm" testPdmRecipePythonAndPdm,
       testCase "unmapped uname hard-fails without docker build" testUnmappedDefaultNoBuild,
       testCase "override on unmapped uname skips generate" testOverrideUnmappedNoBuild,
       testCase "override missing hard-fails without build" testOverrideMissingNoBuild,
@@ -198,6 +201,7 @@ testUnionSatisfy = do
     Left err -> assertFailure ("old sidecar decode: " <> err)
     Right side ->
       assertEq "old sidecar nodeGyp missing" Nothing (nfNodeGyp (isSatisfies side))
+        >> assertEq "old sidecar pdm missing" Nothing (nfPdm (isSatisfies side))
 
 testBunOnlyOmitsSbcl :: IO ()
 testBunOnlyOmitsSbcl = do
@@ -1380,6 +1384,113 @@ uvInstall =
         rtEmergeSpec = "dev-python/uv",
         rtAcceptLine = Nothing
       }
+
+testPdmRecipePythonAndPdm :: IO ()
+testPdmRecipePythonAndPdm = do
+  let key = mkPackageKey "dev-util" "cmake-language-server"
+      pv = parseEbuildVersion "0.1.10"
+      classify =
+        [ ClassifyOk
+            key
+            [ ClassifiedPvUnit
+                { cpuKey = key,
+                  cpuPN = "cmake-language-server",
+                  cpuPV = pv,
+                  cpuEco = Pdm Nothing,
+                  cpuClass = FullPdm,
+                  cpuTempBaseline = Nothing
+                }
+            ]
+        ]
+      plan =
+        [ PlanNeedsWork
+            key
+            PlannedDeps
+              { pdEco = Pdm Nothing,
+                pdSource = GitHub "regen100" "cmake-language-server" "v",
+                pdPlan =
+                  RuntimeLanePlan
+                    { glpLanes =
+                        [ LaneTarget
+                            { ltLane = LaneAmd64Plain,
+                              ltCeiling = Just (parseEbuildVersion "3.13"),
+                              ltPackagePV = Just pv,
+                              ltGoReq = Just "3.12"
+                            }
+                        ],
+                      glpEbuilds = [],
+                      glpUniquePVs = [pv],
+                      glpRuntimeAtom = "dev-lang/python",
+                      glpDirectTagFloors = [],
+                      glpFloorPolicy = Nothing,
+                      glpUvTags = [(pv, "v0.1.10")]
+                    },
+                pdLocalPVs = [],
+                pdContentFix = [],
+                pdForceFull = [pv],
+                pdHypoProvider = Nothing
+              }
+        ]
+      needed = neededFloorsFromClassified classify plan Nothing Nothing Nothing
+  assertEq "python slot" ["3.12"] (nfPythonSlots needed)
+  assertEq "pdm floor" (Just "0") (nfPdm needed)
+  assertEq "no rust floor" Nothing (nfRust needed)
+  assertEq "no uv floor" Nothing (nfUv needed)
+  installs <-
+    assertRight "resolve" $
+      resolveNeededInstalls
+        "amd64"
+        needed
+        metas
+        []
+        []
+        []
+  df <- renderMapped "x86_64" installs "/overlay"
+  assertTrue "python slot emerge" ("dev-lang/python:3.12" `T.isInfixOf` df)
+  assertTrue "pdm emerge" ("dev-python/pdm" `T.isInfixOf` df)
+  assertTrue "package accept keywords" ("package.accept_keywords/mndz-pdm" `T.isInfixOf` df)
+  assertTrue "tilde accept line" ("dev-python/pdm::gentoo ~amd64" `T.isInfixOf` df)
+  assertTrue
+    "pdm dep keywords"
+    ( "--autounmask=y --autounmask-continue=y \"dev-python/pdm\""
+        `T.isInfixOf` df
+    )
+  assertTrue
+    "python emerge stays plain"
+    ("emerge -n \"dev-lang/python:3.12\"" `T.isInfixOf` df)
+  assertTrue "no image-wide ACCEPT_KEYWORDS" (not ("ACCEPT_KEYWORDS" `T.isInfixOf` df))
+  assertTrue "no rust emerge" (not ("dev-lang/rust" `T.isInfixOf` df))
+  assertTrue "no uv emerge" (not ("dev-python/uv" `T.isInfixOf` df))
+  assertTrue "no python.org tarball" (not ("python.org" `T.isInfixOf` df))
+  assertTrue "no pdm release url" (not ("pdm-project" `T.isInfixOf` df))
+  let (beforePdm, _) = T.breakOn "dev-python/pdm" df
+  assertTrue "python before pdm" ("dev-lang/python:3.12" `T.isInfixOf` beforePdm)
+  where
+    metas =
+      GentooToolchainMetas
+        { gtmGo = [],
+          gtmGoBin = [],
+          gtmNode = [],
+          gtmNodeBin = [],
+          gtmRust = [],
+          gtmRustBin = [],
+          gtmSbcl = [],
+          gtmSbclBin = [],
+          gtmPython =
+            [ RuntimeEbuildMeta
+                { remPV = parseEbuildVersion "3.12.12",
+                  remKeywords = ["amd64", "arm64"]
+                }
+            ],
+          gtmUv = [],
+          gtmUvBin = [],
+          gtmPdm =
+            [ RuntimeEbuildMeta
+                { remPV = parseEbuildVersion "2.29.2",
+                  remKeywords = ["~amd64", "~arm64"]
+                }
+            ]
+        }
 
 testGoOnlyOmitsNodeGyp :: IO ()
 testGoOnlyOmitsNodeGyp = do

@@ -300,6 +300,7 @@ import Update.Types
     ecosystemIsCargo,
     ecosystemIsGo,
     ecosystemIsNpm,
+    ecosystemIsPdm,
     ecosystemIsSbcl,
     ecosystemIsUv,
     mkPackageKey,
@@ -317,6 +318,7 @@ tests =
       testCase "Hardcoded Warden" testHardcodedWarden,
       testCase "Policy Classification" testPolicyClassification,
       testCase "Codex as MCP policy" testCodexAsMcpPolicy,
+      testCase "cmake-language-server policy" testCmakeLanguageServerPolicy,
       testCase "stripAndParse v prefix" testStripAndParseVPrefix,
       testCase "Photocraft target resolution" testPhotocraftTargets,
       testCase "Craft-fonts target resolution" testCraftFontsTargets,
@@ -817,6 +819,50 @@ testCodexAsMcpPolicy = do
       hPutStrLn stderr $ "codex-as-mcp pv token: " <> show other
       exitFailure
 
+testCmakeLanguageServerPolicy :: IO ()
+testCmakeLanguageServerPolicy = do
+  let key = PackageKey "dev-util/cmake-language-server"
+      tech = DepsAndAssets (Pdm Nothing)
+  case lookupPolicy key of
+    Just (PackagePolicy (GitHub "regen100" "cmake-language-server" "v") gotTech [])
+      | gotTech == tech ->
+          pure ()
+    other -> do
+      hPutStrLn stderr $ "cmake-language-server technique: " <> show other
+      exitFailure
+  assertEq
+    "cmake-language-server source"
+    (Just (GitHub "regen100" "cmake-language-server" "v"))
+    (resolveSource key)
+  assertEq "cmake-language-server arches" [] (lookupLaneArches key)
+  assertTrue "cmake-language-server publishes assets" (techniqueNeedsAssets tech)
+  let entry =
+        PackageEntry
+          { peKey = key,
+            pePN = "cmake-language-server",
+            peLocal = parseEbuildVersion "0.1.10",
+            pePath = "/overlay/dev-util/cmake-language-server/cmake-language-server-0.1.10.ebuild"
+          }
+      inventory = [entry]
+  assertEq
+    "qualified"
+    (Right [key])
+    (resolveTargets inventory ["dev-util/cmake-language-server"])
+  assertEq
+    "bare"
+    (Right [key])
+    (resolveTargets inventory ["cmake-language-server"])
+  case resolveTargets inventory ["0.1.10"] of
+    Left [UnknownPackage "0.1.10"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "cmake-language-server version token: " <> show other
+      exitFailure
+  case resolveTargets inventory ["cmake-language-server-0.1.10"] of
+    Left [UnknownPackage "cmake-language-server-0.1.10"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "cmake-language-server pv token: " <> show other
+      exitFailure
+
 testStripAndParseVPrefix :: IO ()
 testStripAndParseVPrefix = do
   assertEq
@@ -827,6 +873,14 @@ testStripAndParseVPrefix = do
     "v prefix tag"
     (Right (parseEbuildVersion "2026.6.29.1"))
     (stripAndParse "v" "v2026.6.29.1")
+  assertEq
+    "v0.1.10"
+    (Right (parseEbuildVersion "0.1.10"))
+    (stripAndParse "v" "v0.1.10")
+  assertEq
+    "v0.1.11"
+    (Right (parseEbuildVersion "0.1.11"))
+    (stripAndParse "v" "v0.1.11")
   case collateVersionTags "v" ["2026.2.2.1", "v2026.2.2.1"] of
     Left msg ->
       assertEq
@@ -1569,6 +1623,10 @@ testTypesHelperPredicates = do
   assertTrue "is uv" (ecosystemIsUv (Uv (Just "apps/pkg")))
   assertTrue "uv not sbcl" (not (ecosystemIsSbcl (Uv Nothing)))
   assertTrue "sbcl not uv" (not (ecosystemIsUv Sbcl))
+  assertTrue "deps pdm needs assets" (techniqueNeedsAssets (DepsAndAssets (Pdm Nothing)))
+  assertTrue "is pdm" (ecosystemIsPdm (Pdm (Just "apps/pkg")))
+  assertTrue "pdm not uv" (not (ecosystemIsUv (Pdm Nothing)))
+  assertTrue "uv not pdm" (not (ecosystemIsPdm (Uv Nothing)))
   -- splitPackageKey success + Nothing arms
   assertEq
     "split ok"

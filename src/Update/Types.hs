@@ -26,6 +26,7 @@ module Update.Types
     ecosystemIsCargo,
     ecosystemIsSbcl,
     ecosystemIsUv,
+    ecosystemIsPdm,
   )
 where
 
@@ -166,6 +167,8 @@ data EcosystemSpec
     Sbcl
   | -- | Optional subdirectory containing @uv.lock@. 'Nothing' means repository root.
     Uv {uvLockSubdir :: Maybe FilePath}
+  | -- | Optional subdirectory containing @pdm.lock@. 'Nothing' means repository root.
+    Pdm {pdmLockSubdir :: Maybe FilePath}
   deriving (Eq, Show)
 
 -- | Materialize provenance for a Cargo package. Version detection and
@@ -212,6 +215,10 @@ ecosystemIsSbcl _ = False
 ecosystemIsUv :: EcosystemSpec -> Bool
 ecosystemIsUv Uv {} = True
 ecosystemIsUv _ = False
+
+ecosystemIsPdm :: EcosystemSpec -> Bool
+ecosystemIsPdm Pdm {} = True
+ecosystemIsPdm _ = False
 
 -- | Hardcoded per-package source and apply technique.
 data PackagePolicy = PackagePolicy

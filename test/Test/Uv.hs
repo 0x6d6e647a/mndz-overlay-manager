@@ -91,6 +91,7 @@ tests =
       testCase "python PYVER slot" testPythonPyverSlot,
       testCase "requires-python chooses one slot" testRequiresPython,
       testCase "sync filter splits and drops plain" testSyncFilter,
+      testCase "specifier excludes the newer stable slot" testSpecifierCeiling,
       testCase "probe order and missing interpreter" testProbeOrder,
       testCase "keywords and lane labels" testKeywords,
       testCase "raw archive tag rewrite" testArchiveTag,
@@ -673,6 +674,23 @@ testSyncFilter = do
   assertTrue
     "tilde takes 3.15"
     (all ((== Just "3.15") . ltGoReq) (selectedTilde up))
+
+testSpecifierCeiling :: IO ()
+testSpecifierCeiling = do
+  plan <-
+    mustPlanOn
+      richInv
+      "below 3.14"
+      [candSynced "2026.2.2.1" "2026.2.2.1" ">=3.8,<3.14" ["3.13"]]
+  assertTrue "plain selected" (not (null (selectedPlain plan)))
+  assertTrue
+    "plain is 3.13"
+    (all ((== Just "3.13") . ltGoReq) (selectedPlain plan))
+  assertTrue
+    "tilde is 3.13"
+    (all ((== Just "3.13") . ltGoReq) (selected plan))
+  let labels = map glLabel (buildGapLines [] (glpUniquePVs plan) plan)
+  assertTrue "plain label" ("(dev-lang/python:3.13 amd64)" `elem` labels)
 
 testProbeOrder :: IO ()
 testProbeOrder = do

@@ -13,7 +13,7 @@ context: |
     need work (update). Shared resolution via Update.Targets.resolveTargets; unknown
     and ambiguous tokens hard-fail (exit 1) before package work.
   - Update techniques: GitMvAndManifest; DepsAndAssets with ecosystem Go | Npm | Bun |
-    Cargo | Sbcl | Uv; Unsupported. Never use the legacy name GoVendorAndAssets in specs or docs.
+    Cargo | Sbcl | Uv | Pdm; Unsupported. Never use the legacy name GoVendorAndAssets in specs or docs.
   - DepsAndAssets packages use runtime-lane planning (per-arch plain/tilde ceilings);
     apply may materialize vendor/deps/crates assets and publish under assets-path.
   - PV / version is never a CLI argument; package selection ≠ automatic PV selection.

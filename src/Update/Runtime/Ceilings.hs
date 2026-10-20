@@ -52,6 +52,7 @@ module Update.Runtime.Ceilings
     pythonPackageDir,
     uvPackageDir,
     uvBinPackageDir,
+    pdmPackageDir,
   )
 where
 
@@ -237,6 +238,9 @@ uvPackageDir gentooRoot = gentooRoot </> "dev-python" </> "uv"
 
 uvBinPackageDir :: FilePath -> FilePath
 uvBinPackageDir gentooRoot = gentooRoot </> "dev-python" </> "uv-bin"
+
+pdmPackageDir :: FilePath -> FilePath
+pdmPackageDir gentooRoot = gentooRoot </> "dev-python" </> "pdm"
 
 -- | Parse KEYWORDS=... from ebuild body into token list.
 -- Shell comments after the assignment (@# …@) are stripped so rust-bin lines like

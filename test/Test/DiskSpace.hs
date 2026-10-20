@@ -40,6 +40,7 @@ import Update.DiskSpace
     factorCargo,
     factorGoFull,
     factorNpmBun,
+    factorPdm,
     factorReuse,
     factorSbcl,
     factorUv,
@@ -47,6 +48,7 @@ import Update.DiskSpace
     floorGitMvDist,
     floorGoTemp,
     floorNpmBunTemp,
+    floorPdmTemp,
     floorReuseTemp,
     floorSbclTemp,
     floorUvTemp,
@@ -107,6 +109,8 @@ testMarginAndFloors = do
   assertEq "sbcl floor+margin" (floorSbclTemp + safetyMarginBytes) (estimateNeedBytes FullSbcl Nothing)
   assertEq "uv floor" floorUvTemp giB
   assertEq "uv floor+margin" (floorUvTemp + safetyMarginBytes) (estimateNeedBytes FullUv Nothing)
+  assertEq "pdm floor" (512 * 1024 * 1024) floorPdmTemp
+  assertEq "pdm floor+margin" (floorPdmTemp + safetyMarginBytes) (estimateNeedBytes FullPdm Nothing)
   assertEq "reuse without size" (floorReuseTemp + safetyMarginBytes) (estimateNeedBytes ReusePath Nothing)
   assertEq "gitmv floor+margin" (floorGitMvDist + safetyMarginBytes) (estimateNeedBytes GitMvFetch Nothing)
 
@@ -118,7 +122,9 @@ testFactors = do
   assertEq "npm factor 4" (4 * base + safetyMarginBytes) (estimateNeedBytes FullNpmBun (Just base))
   assertEq "sbcl factor 10" (10 * base + safetyMarginBytes) (estimateNeedBytes FullSbcl (Just base))
   assertEq "uv factor 4" (4 * base + safetyMarginBytes) (estimateNeedBytes FullUv (Just base))
+  assertEq "pdm factor 4" (4 * base + safetyMarginBytes) (estimateNeedBytes FullPdm (Just base))
   assertEq "uv class" FullUv (materializeClassForEcosystem (Uv Nothing))
+  assertEq "pdm class" FullPdm (materializeClassForEcosystem (Pdm Nothing))
   -- 1.1 × base = 110 MiB
   assertEq "reuse 1.1" ((base * 11) `div` 10 + safetyMarginBytes) (estimateNeedBytes ReusePath (Just base))
   -- sanity: named factors match design table
@@ -127,6 +133,7 @@ testFactors = do
   assertEq "factor npm" 4 (numeratorLike factorNpmBun)
   assertEq "factor sbcl" 10 (numeratorLike factorSbcl)
   assertEq "factor uv" 4 (numeratorLike factorUv)
+  assertEq "factor pdm" 4 (numeratorLike factorPdm)
   assertTrue "reuse ~1.1" (factorReuse > 1 && factorReuse < (12 % 10) + (1 % 100))
   where
     numeratorLike r = round (fromRational r :: Double) :: Integer

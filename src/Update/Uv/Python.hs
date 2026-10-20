@@ -3,8 +3,9 @@
 -- | Python slot ceilings and Uv runtime-lane selection.
 --
 -- Ceilings are @dev-lang/python@ slots (major.minor), not package versions.
--- Frozen sync filters the slots @requires-python@ already allows. A plain
--- lane accepts a candidate only when that lane's ceiling slot itself synced.
+-- The tree-wide ceiling is the newest slot on an arch. A candidate's lane
+-- ceiling is the newest of those slots its @requires-python@ still admits.
+-- A plain lane accepts the candidate only when that admitted slot synced.
 -- The ebuild slot is the newest bare-keyworded synced slot, else the newest
 -- tilde-keyworded synced slot.
 module Update.Uv.Python
@@ -26,6 +27,7 @@ module Update.Uv.Python
     probeOrdered,
     classifyPythonFind,
     planUvFromCandidates,
+    pdmRecordedSync,
     pythonRuntimeAtom,
   )
 where
@@ -372,6 +374,18 @@ slotsInProbeOrder inv clauses =
   where
     newestFirst = sortBy (\a b -> compare (psVer b) (psVer a))
 
+-- | Slot recorded for a Pdm candidate: the head of 'slotsInProbeOrder', or
+-- empty when the specifier is missing, unrecognized, or matches no slot.
+-- Does not probe a host interpreter.
+pdmRecordedSync :: PythonSlotInventory -> Maybe Text -> Set Text
+pdmRecordedSync inv mSpec =
+  case mSpec >>= eitherToMaybe . parseRequiresPython of
+    Nothing -> Set.empty
+    Just clauses ->
+      case slotsInProbeOrder inv clauses of
+        (slot : _) -> Set.singleton slot
+        [] -> Set.empty
+
 -- | Newest bare-keyworded synced slot, else newest tilde-keyworded synced slot.
 chooseSlot :: PythonSlotInventory -> Set Text -> [PyClause] -> Maybe Text
 chooseSlot inv synced clauses =
@@ -386,8 +400,9 @@ chooseSlot inv synced clauses =
       pool = if null bare then tilde else bare
    in psSlot <$> maxSlot pool
 
--- | Plain eligibility is the ceiling slot itself. Tilde eligibility is any
--- synced slot at or below the ceiling.
+-- | Plain eligibility is the admitted ceiling slot itself. Tilde eligibility
+-- is any synced slot at or below that ceiling. The ceiling is already clipped
+-- to slots the candidate specifier admits.
 laneEligible ::
   PythonSlotInventory ->
   KeywordTier ->
@@ -503,26 +518,45 @@ ceilingForTier inv arch = \case
   Plain -> plainCeilingSlot arch inv
   Tilde -> tildeCeilingSlot arch inv
 
+-- | Newest slot the specifier admits on this arch for this tier.
+admittedCeiling ::
+  PythonSlotInventory ->
+  Arch ->
+  KeywordTier ->
+  [PyClause] ->
+  Maybe Text
+admittedCeiling inv arch tier clauses =
+  psSlot <$> maxSlot [s | s <- psiSlots inv, slotSatisfies (psVer s) clauses, tierAllows arch tier s]
+  where
+    tierAllows a Plain s = a `Set.member` psBare s
+    tierAllows a Tilde s = a `Set.member` psAny s
+
 selectLane :: PythonSlotInventory -> [UvCandidate] -> LaneId -> LaneTarget
 selectLane inv candidates lid =
-  let mCeil = ceilingForTier inv (liArch lid) (liTier lid)
-      eligible = case mCeil of
-        Nothing -> []
-        Just ceil ->
-          [ c
-          | c <- candidates,
-            Just spec <- [ucRequires c],
-            Right clauses <- [parseRequiresPython spec],
-            laneEligible inv (liTier lid) ceil (ucSynced c) clauses
-          ]
+  let arch = liArch lid
+      tier = liTier lid
+      treeCeil = ceilingForTier inv arch tier
+      eligible =
+        [ c
+        | c <- candidates,
+          Just spec <- [ucRequires c],
+          Right clauses <- [parseRequiresPython spec],
+          Just ceil <- [admittedCeiling inv arch tier clauses],
+          laneEligible inv tier ceil (ucSynced c) clauses
+        ]
       best = newest eligible
       chosen = best >>= \c -> chooseParsed inv (ucSynced c) (ucRequires c)
+      mCeil = case best >>= candidateClauses of
+        Just clauses -> admittedCeiling inv arch tier clauses
+        Nothing -> treeCeil
    in LaneTarget
         { ltLane = lid,
           ltCeiling = parseEbuildVersion <$> mCeil,
           ltPackagePV = ucPV <$> best,
           ltGoReq = chosen
         }
+  where
+    candidateClauses c = ucRequires c >>= eitherToMaybe . parseRequiresPython
 
 chooseParsed :: PythonSlotInventory -> Set Text -> Maybe Text -> Maybe Text
 chooseParsed inv synced mSpec =

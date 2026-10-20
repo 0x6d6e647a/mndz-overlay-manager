@@ -60,11 +60,12 @@ binhostCacheId = "mndz-materialize-binhost"
 -- mounts. Bun is @dev-lang/bun-bin::mndz@ only. Qlot is overlay
 -- @dev-lisp/qlot::mndz@ after @ENV SBCL_HOME@. Node-gyp is overlay
 -- @dev-build/node-gyp::mndz@ after Node and before go/bun. Python is the
--- slot atom @dev-lang/python:<slot>@ and uv is @dev-python/uv@ (bin, then
--- source). No official go.dev / nodejs.org / python.org / astral release /
--- GitHub zip toolchain URLs. @FROM@ uses the OpenRC Hub tag.
+-- slot atom @dev-lang/python:<slot>@, uv is @dev-python/uv@ (bin, then
+-- source), and pdm is @dev-python/pdm@. No official go.dev / nodejs.org /
+-- python.org / astral / pdm release / GitHub zip toolchain URLs. @FROM@
+-- uses the OpenRC Hub tag.
 -- Layer order is rust → sbcl → qlot → node → node-gyp → go → bun → python →
--- uv, then a Portage cache prune @RUN@.
+-- uv → pdm, then a Portage cache prune @RUN@.
 renderMaterializeDockerfile ::
   RecipeArch ->
   -- | Host overlay path (bind destination and repos.conf location).
@@ -123,6 +124,7 @@ kindRank = \case
   TkBun -> 6
   TkPython -> 7
   TkUv -> 8
+  TkPdm -> 9
 
 -- | Gentoo @get_libdir@ for mapped KEYWORDS tokens.
 gentooLibdir :: Text -> Text
@@ -158,12 +160,14 @@ installRuns overlay keywords (ResolvedInstall kind rt) = case kind of
     [runCache (portageCmds rt kind []), ""]
   TkUv ->
     [runCache (portageCmds rt kind []), ""]
+  TkPdm ->
+    [runCache (portageCmds rt kind []), ""]
 
 portageCmds :: ResolvedToolchain -> ToolchainKind -> [Text] -> [Text]
 portageCmds rt kind extra =
   ["emerge-webrsync"]
     <> acceptCmds kind rt
-    <> [emergeCmd rt]
+    <> [emergeCmd kind rt]
     <> extra
 
 overlayBindCmds :: Text -> ResolvedToolchain -> ToolchainKind -> [Text]
@@ -175,10 +179,22 @@ overlayBindCmds overlay rt kind =
       <> "\\nmaster = gentoo\\nauto-sync = no\\n' > /etc/portage/repos.conf/mndz.conf"
   ]
     <> overlayAcceptCmds kind rt
-    <> [emergeCmd rt]
+    <> [emergeCmd kind rt]
 
-emergeCmd :: ResolvedToolchain -> Text
-emergeCmd rt = "emerge -n \"" <> rtEmergeSpec rt <> "\""
+-- | Pdm on a stable arch is itself @~arch@, and so are packages it depends on
+-- (@dep-logic@, @hishel@, @unearth@). Continue through package-level keyword
+-- accepts for that emerge only. Do not set image-wide @ACCEPT_KEYWORDS@.
+emergeCmd :: ToolchainKind -> ResolvedToolchain -> Text
+emergeCmd kind rt =
+  "emerge -n "
+    <> pdmUnmask
+    <> "\""
+    <> rtEmergeSpec rt
+    <> "\""
+  where
+    pdmUnmask = case kind of
+      TkPdm -> "--autounmask=y --autounmask-continue=y "
+      _ -> ""
 
 acceptCmds :: ToolchainKind -> ResolvedToolchain -> [Text]
 acceptCmds kind rt = case rtAcceptLine rt of
@@ -212,6 +228,7 @@ kindFile = \case
   TkBun -> "bun"
   TkPython -> "python"
   TkUv -> "uv"
+  TkPdm -> "pdm"
 
 portageCacheMounts :: Text
 portageCacheMounts =

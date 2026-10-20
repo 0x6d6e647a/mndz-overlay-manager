@@ -46,6 +46,7 @@ data ToolchainKind
   | TkBun
   | TkPython
   | TkUv
+  | TkPdm
   deriving (Eq, Ord, Show)
 
 data ResolvedInstall = ResolvedInstall
@@ -67,7 +68,8 @@ data GentooToolchainMetas = GentooToolchainMetas
     gtmSbclBin :: [RuntimeEbuildMeta],
     gtmPython :: [RuntimeEbuildMeta],
     gtmUv :: [RuntimeEbuildMeta],
-    gtmUvBin :: [RuntimeEbuildMeta]
+    gtmUvBin :: [RuntimeEbuildMeta],
+    gtmPdm :: [RuntimeEbuildMeta]
   }
   deriving (Eq, Show)
 
@@ -118,6 +120,9 @@ uvBinAtom = "dev-python/uv-bin"
 
 uvAtom :: Text
 uvAtom = "dev-python/uv"
+
+pdmAtom :: Text
+pdmAtom = "dev-python/pdm"
 
 -- | Prefer @-bin@ when a host-arch ebuild (plain or tilde) meets the floor;
 -- otherwise the source package; otherwise a miss. Prefer @-bin@ even when that
@@ -266,7 +271,18 @@ resolveNeededInstalls arch floors metas bunMetas qlotMetas nodeGypMetas = do
           uvAtom
           (gtmUv metas)
           gentooRepoName
-  pure (catMaybes [rust, sbcl, qlot, node, nodeGyp, go, bun, uv] ++ pythons)
+  pdm <-
+    forFloor (nfPdm floors) $ \fl ->
+      ResolvedInstall TkPdm
+        <$> resolveToolchain
+          arch
+          fl
+          pdmAtom
+          []
+          pdmAtom
+          (gtmPdm metas)
+          gentooRepoName
+  pure (catMaybes [rust, sbcl, qlot, node, nodeGyp, go, bun, uv, pdm] ++ pythons)
 
 -- | Unversioned @dev-lang/python:<slot>@. Accept keywords only when no
 -- ebuild of that slot has a bare keyword on the host arch. An empty meta

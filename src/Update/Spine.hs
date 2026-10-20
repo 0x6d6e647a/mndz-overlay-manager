@@ -102,6 +102,7 @@ import Update.OverlayWaves
     overlayPackageRelDir,
     qlotPackageKey,
   )
+import Update.Pdm.Deps (mkPdmDepsOps)
 import Update.Preflight
   ( AssetsPreflight (..),
     assetsPreflightFromPlan,
@@ -589,6 +590,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   aeCargoOps = mkCargoOps closedRun,
                                   aeSbclDepsOps = mkSbclDepsOps closedRun,
                                   aeUvDepsOps = mkUvDepsOps closedRun,
+                                  aePdmDepsOps = mkPdmDepsOps closedRun,
                                   aeReleaseOps = releaseOps,
                                   aeAssetsRoot = mAssetsRoot,
                                   aeGitHubToken = resolvedToken,

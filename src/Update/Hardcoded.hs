@@ -144,6 +144,10 @@ hardcodedPolicies =
         "dev-util/codex-as-mcp"
         (GitHub "kky42" "codex-as-mcp" "v")
         (DepsAndAssets (Uv Nothing)),
+      policy
+        "dev-util/cmake-language-server"
+        (GitHub "regen100" "cmake-language-server" "v")
+        (DepsAndAssets (Pdm Nothing)),
       policyArches
         "net-analyzer/caddy-analyzer"
         (GitHub "lenny-ts" "caddy-analyzer" "v")

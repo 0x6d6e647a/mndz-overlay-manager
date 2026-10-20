@@ -98,6 +98,13 @@ testTechniqueEdges = do
   assertTrue
     "Uv publishes assets"
     (techniqueNeedsAssets (DepsAndAssets (Uv Nothing)))
+  assertEq
+    "Pdm"
+    Nothing
+    (overlayCeilingProvider (DepsAndAssets (Pdm Nothing)))
+  assertTrue
+    "Pdm publishes assets"
+    (techniqueNeedsAssets (DepsAndAssets (Pdm Nothing)))
   assertEq "GitMv" Nothing (overlayCeilingProvider GitMvAndManifest)
 
 testHardcodedEdges :: IO ()
@@ -119,6 +126,10 @@ testHardcodedEdges = do
     "codex-as-mcp"
     Nothing
     (overlayCeilingProviderForKey (mkPackageKey "dev-util" "codex-as-mcp"))
+  assertEq
+    "cmake-language-server"
+    Nothing
+    (overlayCeilingProviderForKey (mkPackageKey "dev-util" "cmake-language-server"))
 
 testNewBunInherits :: IO ()
 testNewBunInherits = do

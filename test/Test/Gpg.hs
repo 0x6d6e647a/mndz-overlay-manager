@@ -1121,9 +1121,14 @@ testSupervisorSignalKills =
         ]
     setFileMode (bin </> "gpgconf") 0o755
     env0 <- getEnvironment
-    let env1 =
-          ("PATH", bin <> ":" <> fromMaybe "" (lookup "PATH" env0))
-            : filter (\(k, _) -> k /= "PATH") env0
+    -- A private tix path so this child does not rewrite the suite's .tix.
+    -- Parallel coverage runs share one HPCTIXFILE; a second re-exec can
+    -- truncate it while this child is still reading it.
+    let tixPath = tmp </> "child.tix"
+        env1 =
+          ("HPCTIXFILE", tixPath)
+            : ("PATH", bin <> ":" <> fromMaybe "" (lookup "PATH" env0))
+            : filter (\(k, _) -> k /= "PATH" && k /= "HPCTIXFILE") env0
     started <- spawnGpgSessionSupervisorIn env1 home
     sup <- assertRight "supervisor started" started
     supReap sup

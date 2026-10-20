@@ -152,6 +152,7 @@ assessMissing eco facts =
     Bun -> NeedsRewrite
     Sbcl -> NeedsRewrite
     Uv _ -> NeedsRewrite
+    Pdm _ -> NeedsRewrite
 
 assessPresent ::
   PackageKey ->
@@ -177,6 +178,7 @@ assessPresent key eco pn facts content =
         Bun -> plain
         Sbcl -> plain
         Uv _ -> plain
+        Pdm _ -> plain
 
 cargoFloorOutcome :: Maybe Text -> Text -> PresentPvOutcome
 cargoFloorOutcome mTag content =
@@ -202,6 +204,8 @@ ebuildBodyNeedsWork key eco pn facts content =
         Sbcl ->
           ebuildNeedsContentFixAtomFor host pn kws content (sbclBdependAtom <$> ppfRuntimeReq facts)
         Uv _ ->
+          ebuildNeedsUvBody host pn kws content (ppfRuntimeReq facts) (ppfUvTag facts)
+        Pdm _ ->
           ebuildNeedsUvBody host pn kws content (ppfRuntimeReq facts) (ppfUvTag facts)
         Cargo {} ->
           ebuildNeedsCargoBodyFixFor host (cargoSource eco) pn kws content

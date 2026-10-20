@@ -236,6 +236,7 @@ import Update.Md5Cache
   )
 import Update.Npm.Cache (productionNpmCacheOps)
 import Update.OverlayTree (newTreeLock, withNewTreeLock)
+import Update.Pdm.Deps (productionPdmDepsOps)
 import Update.Preflight (checkToolsOnPath, goAssetsRequiredTools, updateRequiredTools)
 import Update.Resolve (resolveSource)
 import Update.Runtime.Ceilings
@@ -327,6 +328,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeCargoOps = productionCargoOps,
         aeSbclDepsOps = productionSbclDepsOps,
         aeUvDepsOps = productionUvDepsOps,
+        aePdmDepsOps = productionPdmDepsOps,
         aeReleaseOps = releaseOps,
         aeAssetsRoot = assetsRoot,
         aeGitHubToken = Just "tok",

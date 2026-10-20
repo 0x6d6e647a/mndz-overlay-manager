@@ -128,6 +128,7 @@ import Update.Runtime.Ceilings
     goPackageDir,
     nodejsBinPackageDir,
     nodejsPackageDir,
+    pdmPackageDir,
     pythonPackageDir,
     rustBinPackageDir,
     rustPackageDir,
@@ -259,6 +260,7 @@ loadGentooToolchainMetas gentooRoot =
     <*> metasOrEmpty (pythonPackageDir gentooRoot) (Just "python-")
     <*> metasOrEmpty (uvPackageDir gentooRoot) (Just "uv-")
     <*> metasOrEmpty (uvBinPackageDir gentooRoot) (Just "uv-bin-")
+    <*> metasOrEmpty (pdmPackageDir gentooRoot) (Just "pdm-")
 
 loadBunMetas :: InTree -> FilePath -> IO (Either Text [RuntimeEbuildMeta])
 loadBunMetas tree overlayRoot =

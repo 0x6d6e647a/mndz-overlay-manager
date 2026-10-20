@@ -14,6 +14,7 @@ module Update.DiskSpace
     factorNpmBun,
     factorSbcl,
     factorUv,
+    factorPdm,
     factorReuse,
     factorDistDirFetch,
     floorGoTemp,
@@ -21,6 +22,7 @@ module Update.DiskSpace
     floorNpmBunTemp,
     floorSbclTemp,
     floorUvTemp,
+    floorPdmTemp,
     floorReuseTemp,
     floorGitMvDist,
     portageWarnFreeThreshold,
@@ -120,6 +122,9 @@ factorSbcl = 10
 factorUv :: Rational
 factorUv = 4
 
+factorPdm :: Rational
+factorPdm = 4
+
 -- | Near-exact reuse / DISTDIR fetch growth (≤ ~10%).
 factorReuse :: Rational
 factorReuse = 11 % 10
@@ -141,6 +146,9 @@ floorSbclTemp = 2 * giB
 
 floorUvTemp :: Integer
 floorUvTemp = giB
+
+floorPdmTemp :: Integer
+floorPdmTemp = 512 * 1024 * 1024
 
 floorReuseTemp :: Integer
 floorReuseTemp = 512 * 1024 * 1024
@@ -167,6 +175,7 @@ data MaterializeClass
   | FullNpmBun
   | FullSbcl
   | FullUv
+  | FullPdm
   | ReusePath
   | GitMvFetch
   deriving (Eq, Show)
@@ -180,6 +189,7 @@ materializeClassForEcosystem eco =
     Bun -> FullNpmBun
     Sbcl -> FullSbcl
     Uv _ -> FullUv
+    Pdm _ -> FullPdm
 
 -- | Full-path class for an ecosystem (never reuse).
 materializeClassFull :: EcosystemSpec -> MaterializeClass
@@ -204,6 +214,7 @@ factorFor = \case
   FullNpmBun -> factorNpmBun
   FullSbcl -> factorSbcl
   FullUv -> factorUv
+  FullPdm -> factorPdm
   ReusePath -> factorReuse
   GitMvFetch -> factorDistDirFetch
 
@@ -214,6 +225,7 @@ floorFor = \case
   FullNpmBun -> floorNpmBunTemp
   FullSbcl -> floorSbclTemp
   FullUv -> floorUvTemp
+  FullPdm -> floorPdmTemp
   ReusePath -> floorReuseTemp
   GitMvFetch -> floorGitMvDist
 
@@ -301,6 +313,7 @@ lookupManifestBaselineForClass content cls =
     FullNpmBun -> lookupManifestBaselineBySuffix content "-deps.tar.xz"
     FullSbcl -> lookupManifestBaselineBySuffix content "-deps.tar.xz"
     FullUv -> lookupManifestBaselineBySuffix content "-deps.tar.xz"
+    FullPdm -> lookupManifestBaselineBySuffix content "-deps.tar.xz"
     ReusePath ->
       firstJust
         [ lookupManifestBaselineBySuffix content "-vendor.tar.xz",
@@ -661,6 +674,7 @@ postCloneRemainingEstimate cls =
   case cls of
     FullCargo -> 2 * floorCargoTemp + safetyMarginBytes
     FullUv -> floorUvTemp + safetyMarginBytes
+    FullPdm -> floorPdmTemp + safetyMarginBytes
     FullGo -> floorFor cls + safetyMarginBytes
     FullNpmBun -> floorFor cls + safetyMarginBytes
     FullSbcl -> floorFor cls + safetyMarginBytes

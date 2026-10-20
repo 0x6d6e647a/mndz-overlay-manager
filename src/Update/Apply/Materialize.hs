@@ -187,6 +187,11 @@ import Update.OverlayWaves
     overlayCeilingProvider,
     overlayProviderPvMismatchMessage,
   )
+import Update.Pdm.Deps
+  ( PdmDepsProgress (..),
+    buildPdmDepsTarball,
+    mkPdmDepsOps,
+  )
 import Update.Process.Docker
   ( MaterializeUnitRef (..),
     withUnitMaterializeSession,
@@ -418,7 +423,12 @@ cargoProvenanceGate env eco entry = case eco of
     pure $ case eErrs of
       Left err -> Just err
       Right errs -> listToMaybe (catMaybes errs)
-  _ -> pure Nothing
+  Go _ -> pure Nothing
+  NpmEco -> pure Nothing
+  Bun -> pure Nothing
+  Sbcl -> pure Nothing
+  Uv _ -> pure Nothing
+  Pdm _ -> pure Nothing
   where
     checkOne tree cargoSrc eb = do
       exists <- doesFileExist (ebuildPath eb)
@@ -480,6 +490,7 @@ depsApplyPlanProgress mh key eco doneRef =
         Cargo {} -> "discovering rust ceilings"
         Sbcl -> "discovering sbcl ceilings"
         Uv _ -> "discovering python slot ceilings"
+        Pdm _ -> "discovering python slot ceilings"
       probeLabel = case eco of
         Go _ -> "probing go.mod"
         NpmEco -> "probing engines.node"
@@ -487,6 +498,7 @@ depsApplyPlanProgress mh key eco doneRef =
         Cargo {} -> "probing rust-version"
         Sbcl -> "probing sbcl.version"
         Uv _ -> "probing requires-python"
+        Pdm _ -> "probing requires-python"
    in PlanProgress
         { ppOnCeilingsStart = do
             mhSteps mh key 3
@@ -609,6 +621,7 @@ fetchRequiredBdependAtom env eco src key pvNoRev =
     (Bun, _) -> pure Nothing
     (Sbcl, _) -> pure Nothing
     (Uv _, _) -> pure Nothing
+    (Pdm _, _) -> pure Nothing
 
 -- | Version token from a nodejs or bun-bin BDEPEND atom.
 nodeOrBunAtomVersion :: Maybe Text -> Maybe Text
@@ -913,6 +926,7 @@ npmPlanDonor env eco key pn pkgDir =
     Cargo {} -> pure (Right Nothing)
     Sbcl -> pure (Right Nothing)
     Uv _ -> pure (Right Nothing)
+    Pdm _ -> pure (Right Nothing)
 
 -- | Template path and body. 'Left' path means the file is absent.
 readDonorEbuild ::
@@ -1568,6 +1582,33 @@ materializePrimaryDistfile env eco src entry key plan pvNoRev workDir outDir tar
             Left err -> Left err
             Right p -> Right (p, Just slot, Nothing)
     (Uv _, _) -> pure (Left "DepsAndAssets Uv requires a GitHub update source")
+    (Pdm mSub, GitHub owner repo _prefix) -> do
+      let plannedPv = parseEbuildVersion pvNoRev
+          mSlot = plannedRuntimeReq plan plannedPv
+          mTag = lookupUvRawTag plan plannedPv
+      case (mSlot, mTag) of
+        (Nothing, _) ->
+          pure (Left "Pdm plan is missing the python slot for this PV")
+        (_, Nothing) ->
+          pure (Left "Pdm plan is missing the raw git tag for this PV")
+        (Just slot, Just tag) -> do
+          let progress = pdmDepsProgress stepsDoneRef mh key
+          built <-
+            buildPdmDepsTarball
+              (aePdmDepsOps env)
+              progress
+              owner
+              repo
+              tag
+              mSub
+              slot
+              workDir
+              outDir
+              tarballName
+          pure $ case built of
+            Left err -> Left err
+            Right p -> Right (p, Just slot, Nothing)
+    (Pdm _, _) -> pure (Left "DepsAndAssets Pdm requires a GitHub update source")
 
 -- | After pack, fail closed if harvest exceeds any selecting rust ceiling.
 harvestVsLaneCeiling ::
@@ -1754,7 +1795,8 @@ withFullPathMaterializeSession env unit category pn pv action =
                     aeBunCacheOps = mkBunCacheOps runner,
                     aeCargoOps = mkCargoOps runner,
                     aeSbclDepsOps = mkSbclDepsOps runner,
-                    aeUvDepsOps = mkUvDepsOps runner
+                    aeUvDepsOps = mkUvDepsOps runner,
+                    aePdmDepsOps = mkPdmDepsOps runner
                   }
               )
         )
@@ -1784,6 +1826,17 @@ uvDepsProgress stepsDoneRef mh key =
       udpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
       udpOnPackStart = mhStatus mh key "packing sdists",
       udpOnPackDone = markMaterializeStep stepsDoneRef mh key "packing sdists"
+    }
+
+-- | Full-path Pdm materialize syncs inside the pack phase. Only clone and
+-- pack mark the shared counter.
+pdmDepsProgress :: IORef Int -> MultiHandle -> PackageKey -> PdmDepsProgress
+pdmDepsProgress stepsDoneRef mh key =
+  PdmDepsProgress
+    { pdpOnCloneStart = mhStatus mh key "cloning upstream",
+      pdpOnCloneDone = markMaterializeStep stepsDoneRef mh key "cloning upstream",
+      pdpOnPackStart = mhStatus mh key "packing dists",
+      pdpOnPackDone = markMaterializeStep stepsDoneRef mh key "packing dists"
     }
 
 reuseDepsReleaseAsset ::
@@ -1830,6 +1883,7 @@ reuseDepsReleaseAsset
           Bun -> "verifying deps asset"
           Sbcl -> "verifying deps asset"
           Uv _ -> "verifying deps asset"
+          Pdm _ -> "verifying deps asset"
     unit <-
       ensureUnit (aeTempRun env) category pn pvNoRev UnitReuse
     mhStatus mh key "reusing release assets"
@@ -1904,6 +1958,8 @@ reuseDepsReleaseAsset
                           Left _ -> Nothing
                   _ -> pure (Right Nothing)
               Uv _ ->
+                pure (Right (plannedRuntimeReq plan (parseEbuildVersion pvNoRev)))
+              Pdm _ ->
                 pure (Right (plannedRuntimeReq plan (parseEbuildVersion pvNoRev)))
               NpmEco -> do
                 mAtom <-
@@ -2118,6 +2174,7 @@ cargoLockPath eco pn pv workDir =
         Bun -> srcDir
         Sbcl -> srcDir
         Uv mSub -> maybe srcDir (srcDir </>) mSub
+        Pdm mSub -> maybe srcDir (srcDir </>) mSub
    in root </> "Cargo.lock"
 
 -- | After crates exist: reuse or harvest rusty_v8 for Codex. Other packages skip.

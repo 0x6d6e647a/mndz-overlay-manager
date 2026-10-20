@@ -545,9 +545,12 @@ testSshSupervisorKill =
         ]
     setFileMode (bin </> "kill") 0o755
     env0 <- getEnvironment
-    let env1 =
-          ("PATH", bin <> ":" <> fromMaybe "" (lookup "PATH" env0))
-            : filter (\(k, _) -> k /= "PATH") env0
+    -- A private tix path so this child does not rewrite the suite's .tix.
+    let tixPath = tmp </> "child.tix"
+        env1 =
+          ("HPCTIXFILE", tixPath)
+            : ("PATH", bin <> ":" <> fromMaybe "" (lookup "PATH" env0))
+            : filter (\(k, _) -> k /= "PATH" && k /= "HPCTIXFILE") env0
     started <- spawnSshSessionSupervisorIn env1 pid
     join (assertRight "supervisor started" started)
     body <- readFile record

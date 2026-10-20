@@ -32,6 +32,7 @@ import Update.Http (HttpLbs)
 import Update.Md5Cache (EgencacheRunner)
 import Update.Npm.Cache (NpmCacheOps)
 import Update.OverlayTree (TreeLock)
+import Update.Pdm.Deps (PdmDepsOps)
 import Update.Process
   ( CommandRunner,
     ProcessMode (..),
@@ -84,6 +85,7 @@ data ApplyEnv = ApplyEnv
     aeCargoOps :: CargoOps,
     aeSbclDepsOps :: SbclDepsOps,
     aeUvDepsOps :: UvDepsOps,
+    aePdmDepsOps :: PdmDepsOps,
     aeReleaseOps :: ReleaseOps,
     aeAssetsRoot :: Maybe FilePath,
     aeGitHubToken :: Maybe Text,

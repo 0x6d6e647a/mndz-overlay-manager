@@ -348,6 +348,7 @@ npmDonorBody eco locals =
     Cargo {} -> pure (Right Nothing)
     Sbcl -> pure (Right Nothing)
     Uv _ -> pure (Right Nothing)
+    Pdm _ -> pure (Right Nothing)
 
 reportFromDepsPlan ::
   MultiHandle ->
@@ -673,6 +674,7 @@ depsPlanProgress mh key eco =
         Cargo {} -> "discovering rust ceilings"
         Sbcl -> "discovering sbcl ceilings"
         Uv _ -> "discovering python slot ceilings"
+        Pdm _ -> "discovering python slot ceilings"
       probeLabel = case eco of
         Go _ -> "probing go.mod"
         NpmEco -> "probing engines.node"
@@ -680,6 +682,7 @@ depsPlanProgress mh key eco =
         Cargo {} -> "probing rust-version"
         Sbcl -> "probing sbcl.version"
         Uv _ -> "probing requires-python"
+        Pdm _ -> "probing requires-python"
    in PlanProgress
         { ppOnCeilingsStart = do
             mhSteps mh key 3
@@ -787,9 +790,11 @@ assessOverlayContent tree eco key pn locals plan = do
               Bun -> Nothing
               Sbcl -> Nothing
               Uv _ -> Nothing
+              Pdm _ -> Nothing
           mUvTag =
             case eco of
               Uv _ -> lookupUvRawTag plan (pePV pe)
+              Pdm _ -> lookupUvRawTag plan (pePV pe)
               Go _ -> Nothing
               NpmEco -> Nothing
               Bun -> Nothing

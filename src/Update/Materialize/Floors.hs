@@ -59,7 +59,9 @@ data NeededFloors = NeededFloors
     -- Exact membership: a 3.15-only image does not satisfy a 3.14 pack.
     nfPythonSlots :: [Text],
     -- | @dev-python/uv@ floor. @Just \"0\"@ means any version.
-    nfUv :: Maybe Text
+    nfUv :: Maybe Text,
+    -- | @dev-python/pdm@ floor. @Just \"0\"@ means any version.
+    nfPdm :: Maybe Text
   }
   deriving (Eq, Show)
 
@@ -78,7 +80,8 @@ instance ToJSON NeededFloors where
               ("qlot" .=) <$> nfQlot f,
               ("nodeGyp" .=) <$> nfNodeGyp f,
               pythonSlotsField,
-              ("uv" .=) <$> nfUv f
+              ("uv" .=) <$> nfUv f,
+              ("pdm" .=) <$> nfPdm f
             ]
 
 instance FromJSON NeededFloors where
@@ -93,6 +96,7 @@ instance FromJSON NeededFloors where
       <*> o .:? "nodeGyp"
       <*> o .:? "pythonSlots" .!= []
       <*> o .:? "uv"
+      <*> o .:? "pdm"
 
 emptyFloors :: NeededFloors
 emptyFloors =
@@ -105,7 +109,8 @@ emptyFloors =
       nfQlot = Nothing,
       nfNodeGyp = Nothing,
       nfPythonSlots = [],
-      nfUv = Nothing
+      nfUv = Nothing,
+      nfPdm = Nothing
     }
 
 floorsIsEmpty :: NeededFloors -> Bool
@@ -113,7 +118,7 @@ floorsIsEmpty f =
   null (nfPythonSlots f)
     && all
       (== Nothing)
-      [nfGo f, nfNode f, nfBun f, nfRust f, nfSbcl f, nfQlot f, nfNodeGyp f, nfUv f]
+      [nfGo f, nfNode f, nfBun f, nfRust f, nfSbcl f, nfQlot f, nfNodeGyp f, nfUv f, nfPdm f]
 
 -- | Monotonic max of two version tokens ('Nothing' loses).
 maxFloor :: Maybe Text -> Maybe Text -> Maybe Text
@@ -136,7 +141,8 @@ unionFloors a b =
       nfQlot = maxFloor (nfQlot a) (nfQlot b),
       nfNodeGyp = maxFloor (nfNodeGyp a) (nfNodeGyp b),
       nfPythonSlots = sort (nubOrd (nfPythonSlots a ++ nfPythonSlots b)),
-      nfUv = maxFloor (nfUv a) (nfUv b)
+      nfUv = maxFloor (nfUv a) (nfUv b),
+      nfPdm = maxFloor (nfPdm a) (nfPdm b)
     }
 
 -- | Recorded image satisfies this prepare when every needed toolchain is
@@ -152,6 +158,7 @@ floorsSatisfy recorded needed =
     && fieldOk (nfNodeGyp recorded) (nfNodeGyp needed)
     && all (`elem` nfPythonSlots recorded) (nfPythonSlots needed)
     && fieldOk (nfUv recorded) (nfUv needed)
+    && fieldOk (nfPdm recorded) (nfPdm needed)
   where
     fieldOk _ Nothing = True
     fieldOk Nothing (Just _) = False
@@ -217,6 +224,7 @@ isFull u = case cpuClass u of
   FullNpmBun -> True
   FullSbcl -> True
   FullUv -> True
+  FullPdm -> True
 
 -- | This-prepare floor from one classified full-path PV: that PV’s lane req,
 -- not the max over unused / reuse sibling lanes.
@@ -241,6 +249,13 @@ floorsForFullUnit plansByKey u =
                     _ -> [],
                   nfRust = Just "0",
                   nfUv = Just "0"
+                }
+            Pdm _ ->
+              emptyFloors
+                { nfPythonSlots = case req of
+                    Just slot | slot /= "0" -> [slot]
+                    _ -> [],
+                  nfPdm = Just "0"
                 }
     _ -> emptyFloors
 

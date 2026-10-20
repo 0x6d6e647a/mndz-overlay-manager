@@ -89,6 +89,7 @@ overlayCeilingProvider (DepsAndAssets NpmEco) = Nothing
 overlayCeilingProvider (DepsAndAssets (Cargo {})) = Nothing
 overlayCeilingProvider (DepsAndAssets Sbcl) = Nothing
 overlayCeilingProvider (DepsAndAssets (Uv _)) = Nothing
+overlayCeilingProvider (DepsAndAssets (Pdm _)) = Nothing
 overlayCeilingProvider GitMvAndManifest = Nothing
 overlayCeilingProvider (Unsupported _) = Nothing
 

@@ -119,6 +119,9 @@ library
       , Update.Resolve
       , Update.Runtime.Ceilings
       , Update.Sbcl.Deps
+      , Update.Pdm.Deps
+      , Update.Pdm.Lock
+      , Update.Pdm.Pack
       , Update.Uv.Deps
       , Update.Uv.Lock
       , Update.Uv.Pack
@@ -256,6 +259,7 @@ test-suite mndz-overlay-manager-test
         Test.Overlay
         Test.OverlayTree
         Test.OverlayWaves
+        Test.Pdm
         Test.Policy
         Test.Preflight
         Test.Progress

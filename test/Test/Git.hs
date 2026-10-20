@@ -94,12 +94,16 @@ testLaunchClearsLinkedWorktreeEnv =
             "GIT_INDEX_FILE",
             probeRootEnv
           ]
+        -- A private tix path so this child does not rewrite the suite's .tix.
         env1 =
           (probeRootEnv, mainRepo)
             : ("GIT_DIR", gitDir)
             : ("GIT_WORK_TREE", linked)
             : ("GIT_COMMON_DIR", commonDir)
-            : filter (\(k, _) -> k `notElem` dropped) env0
+            : ("HPCTIXFILE", tmp </> "child.tix")
+            : filter
+              (\(k, _) -> k `notElem` dropped && k /= "HPCTIXFILE")
+              env0
     (_, _, _, ph) <-
       createProcess
         (proc exe ["-p", "Cleared env temporary init"])

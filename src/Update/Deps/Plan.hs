@@ -101,6 +101,7 @@ import Update.Npm.Cache
     resolveNpmNodeRequirement,
   )
 import Update.OverlayTree (withNewTreeLock)
+import Update.Pdm.Lock (parsePdmLock, pdmLockRequiresPython)
 import Update.Runtime.Ceilings
   ( PortageqRunner,
     RuntimeCeilings (..),
@@ -123,6 +124,7 @@ import Update.Uv.Python
   ( UvCandidate (..),
     discoverPythonSlotInventory,
     parseRequiresPython,
+    pdmRecordedSync,
     planUvFromCandidates,
     slotsInProbeOrder,
   )
@@ -300,6 +302,7 @@ planDepsPackageWithProgressDonor ops progress eco src locals allowlist mDonor =
     Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals allowlist
     Sbcl -> planSbcl ops progress src locals allowlist
     Uv mSub -> planUv ops progress src mSub locals allowlist
+    Pdm mSub -> planPdm ops progress src mSub locals allowlist
 
 -- | Plan against caller-supplied ceilings (hypothetical overlay bun-bin)
 -- with a policy runtime-lane arch allowlist.
@@ -321,6 +324,7 @@ planDepsPackageWithCeilingsFor ops progress eco src locals ceilings allowlist =
     Cargo mLock mPkg _src -> planCargo ops progress src mLock mPkg locals allowlist
     Sbcl -> planSbcl ops progress src locals allowlist
     Uv mSub -> planUv ops progress src mSub locals allowlist
+    Pdm mSub -> planPdm ops progress src mSub locals allowlist
 
 ------------------------------------------------------------------------
 -- Go
@@ -818,6 +822,112 @@ fetchUvUrl mgr mToken url = do
               if code == 404
                 then UvMissing
                 else UvFailed ("HTTP " <> T.pack (show code) <> " from " <> T.pack url)
+
+------------------------------------------------------------------------
+-- Pdm
+------------------------------------------------------------------------
+
+-- | Same tag walk as Uv. The recorded slot is the head of the probe order
+-- for @requires-python@. This does not call @uv python find@ or @pdm@.
+planPdm ::
+  DepsPlanOps ->
+  PlanProgress ->
+  UpdateSource ->
+  Maybe FilePath ->
+  [EbuildVersion] ->
+  [Text] ->
+  IO (Either PlanError RuntimeLanePlan)
+planPdm ops progress src mSub locals allowlist =
+  case src of
+    GitHub owner repo prefix -> do
+      ppOnCeilingsStart progress
+      invE <- discoverPythonSlotInventory (dpoPortageq ops)
+      case invE of
+        Left err -> pure (Left (PlanCeilingFailed err))
+        Right inv -> do
+          ppOnCeilingsDone progress
+          ppOnListStart progress
+          tagsE <-
+            withWorkSlot (dpoWorkBudget ops) $
+              listGitHubRawTags (dpoManager ops) (dpoGitHubToken ops) src
+          case tagsE of
+            Left err -> pure (Left (PlanListVersionsFailed err))
+            Right rawTags -> do
+              ppOnListDone progress (length rawTags)
+              case collateVersionTags prefix rawTags of
+                Left err -> pure (Left (PlanFailed err))
+                Right pairs ->
+                  case filterCandidateVersions locals (map fst pairs) of
+                    Left err -> pure (Left err)
+                    Right wanted ->
+                      case missingTag wanted pairs of
+                        Just pv ->
+                          pure
+                            ( Left
+                                ( PlanFailed
+                                    ( "no git tag parses to PV "
+                                        <> renderPV pv
+                                    )
+                                )
+                            )
+                        Nothing -> do
+                          let ordered = sortNewestFirstPairs pairs wanted
+                          walked <- walk inv owner repo [] ordered
+                          ppOnProbeDone progress
+                          pure walked
+    _ -> pure (Left (PlanFailed "DepsAndAssets Pdm requires a GitHub update source"))
+  where
+    walk inv _owner _repo acc [] =
+      pure (planUvFromCandidates inv allowlist locals (reverse acc))
+    walk inv owner repo acc ((pv, tag) : rest) = do
+      one <- withWorkSlot (dpoWorkBudget ops) (probeOne inv owner repo pv tag)
+      case one of
+        Left err -> pure (Left err)
+        Right cand ->
+          let acc' = cand : acc
+              soFar = planUvFromCandidates inv allowlist locals (reverse acc')
+           in case soFar of
+                Right plan
+                  | all (isJust . ltPackagePV) (glpLanes plan) ->
+                      pure (Right plan)
+                _ -> walk inv owner repo acc' rest
+    probeOne inv owner repo pv tag = do
+      lockRes <- fetchUvFile ops owner repo tag mSub "pdm.lock"
+      case lockRes of
+        UvMissing ->
+          pure (Left (PlanProbeFailed ("pdm.lock is missing at tag " <> tag)))
+        UvFailed err -> pure (Left (PlanProbeFailed err))
+        UvBody body ->
+          case parsePdmLock body of
+            Left err ->
+              pure (Left (PlanProbeFailed (err <> " at tag " <> tag)))
+            Right lock -> do
+              spec <- requiresOf owner repo tag lock
+              pure
+                ( Right
+                    ( UvCandidate
+                        { ucPV = pv,
+                          ucTag = tag,
+                          ucRequires = spec,
+                          ucSynced = pdmRecordedSync inv spec
+                        }
+                    )
+                )
+    requiresOf owner repo tag lock =
+      case pdmLockRequiresPython lock of
+        Just req -> pure (acceptSpec req)
+        Nothing -> do
+          py <- fetchUvFile ops owner repo tag mSub "pyproject.toml"
+          pure $ case py of
+            UvBody body ->
+              case parsePyprojectRequiresPython body of
+                Right (Just req) -> acceptSpec req
+                _ -> Nothing
+            _ -> Nothing
+    acceptSpec req =
+      case parseRequiresPython req of
+        Right _ -> Just req
+        Left _ -> Nothing
 
 ------------------------------------------------------------------------
 -- Shared spine

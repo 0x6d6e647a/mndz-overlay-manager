@@ -24,6 +24,7 @@ import Test.Md5Cache qualified as Md5Cache
 import Test.Overlay qualified as Overlay
 import Test.OverlayTree qualified as OverlayTree
 import Test.OverlayWaves qualified as OverlayWaves
+import Test.Pdm qualified as Pdm
 import Test.Policy qualified as Policy
 import Test.Preflight qualified as Preflight
 import Test.Progress qualified as Progress
@@ -73,6 +74,7 @@ main = do
               DiskSpace.tests,
               TempWorkspace.tests,
               Policy.tests,
+              Pdm.tests,
               Uv.tests,
               Targets.tests,
               Preflight.tests,

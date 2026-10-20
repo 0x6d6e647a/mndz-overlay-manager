@@ -233,6 +233,7 @@ publishPrepared
           Bun -> content
           Sbcl -> content
           Uv _ -> content
+          Pdm _ -> content
     let assetsHost =
           AssetsHost
             { ahOwner = aeAssetsOwner env,
@@ -253,6 +254,7 @@ publishPrepared
               Bun -> parameterizeAssetsSrcUriFor assetsHost pn prepared
               Sbcl -> parameterizeAssetsSrcUriFor assetsHost pn prepared
               Uv _ -> parameterizeAssetsSrcUriFor assetsHost pn prepared
+              Pdm _ -> parameterizeAssetsSrcUriFor assetsHost pn prepared
             -- After the git-crate fetch line. A hook error must not write
             -- the ebuild, Manifest, or commit.
             pinnedOrErr = case eco of
@@ -264,6 +266,7 @@ publishPrepared
               Bun -> Right withAssets
               Sbcl -> Right withAssets
               Uv _ -> Right withAssets
+              Pdm _ -> Right withAssets
         case pinnedOrErr of
           Left err -> pure (ApplyHardFail key err False orphan)
           Right pinned -> do
@@ -308,6 +311,14 @@ publishPrepared
                     pure (Right (ensurePythonSlot slot (ensureUvArchiveTag tag withKw)))
               (Uv _, Nothing) ->
                 pure (Left "could not obtain dev-lang/python slot for Uv alignment")
+              (Pdm _, Just slot) ->
+                case mUvTag of
+                  Nothing ->
+                    pure (Left "could not obtain the raw git tag for Pdm archive alignment")
+                  Just tag ->
+                    pure (Right (ensurePythonSlot slot (ensureUvArchiveTag tag withKw)))
+              (Pdm _, Nothing) ->
+                pure (Left "could not obtain dev-lang/python slot for Pdm alignment")
             case contentFixed of
               Left err -> pure $ ApplyHardFail key err False orphan
               Right fixed -> do

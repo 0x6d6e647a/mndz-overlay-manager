@@ -6,7 +6,7 @@ Shared `DepsAndAssets` technique for Go vendor, npm/Bun dependency assets, Cargo
 
 ### Requirement: DepsAndAssets technique
 
-The program SHALL support an update technique `DepsAndAssets` parameterized by an ecosystem specification that is one of: `Go` with an optional go.mod subdirectory relative to the repository root (unset means root); `Npm` with no extra fields (npm package identity comes from the npm update source); `Bun` (GitHub-sourced, repository-root lockfile); `Cargo` with optional lock and package subdirectories relative to the repository root as specified by the `cargo-crates-assets` capability; `Sbcl` (GitHub-sourced Autolith-style deps tarball and `sbcl.version` floor as specified by the `sbcl-deps-assets` capability); or `Uv` with an optional `uv.lock` subdirectory relative to the repository root (unset means root) as specified by the `uv-deps-assets` capability. Apply logic SHALL dispatch materialization, requirement probes, runtime field rendering (`BDEPEND` or `RUST_MIN_VER` or SBCL atoms or the Python slot atom), and runtime-lane ceiling sources according to the ecosystem.
+The program SHALL support an update technique `DepsAndAssets` parameterized by an ecosystem specification that is one of: `Go` with an optional go.mod subdirectory relative to the repository root (unset means root); `Npm` with no extra fields (npm package identity comes from the npm update source); `Bun` (GitHub-sourced, repository-root lockfile); `Cargo` with optional lock and package subdirectories relative to the repository root as specified by the `cargo-crates-assets` capability; `Sbcl` (GitHub-sourced Autolith-style deps tarball and `sbcl.version` floor as specified by the `sbcl-deps-assets` capability); `Uv` with an optional `uv.lock` subdirectory relative to the repository root (unset means root) as specified by the `uv-deps-assets` capability; or `Pdm` with an optional `pdm.lock` subdirectory relative to the repository root (unset means root) as specified by the `pdm-deps-assets` capability. Apply logic SHALL dispatch materialization, requirement probes, runtime field rendering (`BDEPEND` or `RUST_MIN_VER` or SBCL atoms or the Python slot atom), and runtime-lane ceiling sources according to the ecosystem.
 
 #### Scenario: Go ecosystem with subdirectory
 
@@ -38,9 +38,14 @@ The program SHALL support an update technique `DepsAndAssets` parameterized by a
 - **WHEN** policy for `dev-util/codex-as-mcp` uses `DepsAndAssets Uv` with no lock subdirectory
 - **THEN** apply uses the Uv materializer and `dev-lang/python` runtime lanes
 
+#### Scenario: Pdm ecosystem
+
+- **WHEN** policy for `dev-util/cmake-language-server` uses `DepsAndAssets Pdm` with no lock subdirectory
+- **THEN** apply uses the Pdm materializer and `dev-lang/python` runtime lanes
+
 ### Requirement: techniqueNeedsAssets for all ecosystems
 
-The predicate that detects assets-publishing techniques SHALL return true for every `DepsAndAssets` value (Go, Npm, Bun, Cargo, Sbcl, and Uv) and SHALL NOT require a separate Go-only constructor.
+The predicate that detects assets-publishing techniques SHALL return true for every `DepsAndAssets` value (Go, Npm, Bun, Cargo, Sbcl, Uv, and Pdm) and SHALL NOT require a separate Go-only constructor.
 
 #### Scenario: Npm needs assets path
 
@@ -62,9 +67,14 @@ The predicate that detects assets-publishing techniques SHALL return true for ev
 - **WHEN** a selected package uses `DepsAndAssets Uv` and will attempt apply work that may publish or reuse assets
 - **THEN** preflight and apply treat the package as needing the assets worktree and related auth
 
+#### Scenario: Pdm needs assets path
+
+- **WHEN** a selected package uses `DepsAndAssets Pdm` and will attempt apply work that may publish or reuse assets
+- **THEN** preflight and apply treat the package as needing the assets worktree and related auth
+
 ### Requirement: Distfile naming by ecosystem kind
 
-For a package name PN and version PV (without revision), the program SHALL name Go vendor distfiles `{pn}-{pv}-vendor.tar.xz`, npm/Bun dependency distfiles `{pn}-{pv}-deps.tar.xz`, Cargo crates distfiles `{pn}-{pv}-crates.tar.xz`, Sbcl/Autolith dependency distfiles `{pn}-{pv}-deps.tar.xz`, and Uv dependency distfiles `{pn}-{pv}-deps.tar.xz`. Names SHALL use the overlay package name (PN), never an npm scope segment or a Cargo.toml package name that differs from PN. Release tags SHALL remain `{pn}-{pv}` for all ecosystems.
+For a package name PN and version PV (without revision), the program SHALL name Go vendor distfiles `{pn}-{pv}-vendor.tar.xz`, npm/Bun dependency distfiles `{pn}-{pv}-deps.tar.xz`, Cargo crates distfiles `{pn}-{pv}-crates.tar.xz`, Sbcl/Autolith dependency distfiles `{pn}-{pv}-deps.tar.xz`, Uv dependency distfiles `{pn}-{pv}-deps.tar.xz`, and Pdm dependency distfiles `{pn}-{pv}-deps.tar.xz`. Names SHALL use the overlay package name (PN), never an npm scope segment or a Cargo.toml package name that differs from PN. Release tags SHALL remain `{pn}-{pv}` for all ecosystems.
 
 #### Scenario: openspec deps name
 
@@ -90,6 +100,11 @@ For a package name PN and version PV (without revision), the program SHALL name 
 
 - **WHEN** publishing assets for package `codex-as-mcp` at PV `2026.2.2.1`
 - **THEN** the distfile basename is `codex-as-mcp-2026.2.2.1-deps.tar.xz`
+
+#### Scenario: Pdm deps name
+
+- **WHEN** publishing assets for package `cmake-language-server` at PV `0.1.10`
+- **THEN** the distfile basename is `cmake-language-server-0.1.10-deps.tar.xz`
 
 ### Requirement: Hardcoded packages use DepsAndAssets
 
@@ -124,6 +139,11 @@ Authoritative technique and source assignments for automated packages SHALL live
 
 - **WHEN** policy is resolved for `dev-util/codex-as-mcp` (as defined by `update-apply`)
 - **THEN** the technique is `DepsAndAssets` with ecosystem `Uv` and no lock subdirectory
+
+#### Scenario: cmake-language-server technique
+
+- **WHEN** policy is resolved for `dev-util/cmake-language-server` (as defined by `update-apply`)
+- **THEN** the technique is `DepsAndAssets` with ecosystem `Pdm` and no lock subdirectory
 
 ### Requirement: Non-live local ebuild required
 

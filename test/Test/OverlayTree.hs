@@ -182,6 +182,8 @@ nonEbuildAllowlist =
     "src/Update/Materialize/Ensure.hs",
     "src/Update/Npm/Cache.hs",
     "src/Update/Pack/XzTar.hs",
+    "src/Update/Pdm/Deps.hs",
+    "src/Update/Pdm/Lock.hs",
     "src/Update/Sbcl/Deps.hs",
     "src/Update/SshAgent.hs",
     "src/Update/Uv/Deps.hs",

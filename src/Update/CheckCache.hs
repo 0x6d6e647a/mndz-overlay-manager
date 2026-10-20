@@ -775,6 +775,7 @@ cachedCargoPlanUsable eco src plan =
         && all (isJust . ctfsCoverage) (glpDirectTagFloors plan)
     (Cargo {}, _) -> False
     (Uv _, _) -> True
+    (Pdm _, _) -> True
     (Go _, _) -> True
     (NpmEco, _) -> True
     (Bun, _) -> True
