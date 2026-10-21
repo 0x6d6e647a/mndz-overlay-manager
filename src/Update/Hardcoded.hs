@@ -63,6 +63,17 @@ hardcodedPolicies =
         )
         GitMvAndManifest,
       policy
+        "dev-util/kiro-ide-bin"
+        ( HttpJson
+            { httpJsonUrls =
+                [ "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json",
+                  "https://prod.download.desktop.kiro.dev/stable/metadata-linux-arm64-stable.json"
+                ],
+              httpJsonField = "currentRelease"
+            }
+        )
+        GitMvAndManifest,
+      policy
         "net-analyzer/witen-warden-bin"
         ( Http
             { httpPrimary = "https://www.witenlabs.com/api/releases/warden/version",

@@ -317,6 +317,7 @@ tests =
       testCase "Hardcoded Grok Bot" testHardcodedGrokBot,
       testCase "Hardcoded Warden" testHardcodedWarden,
       testCase "Hardcoded Kiro" testHardcodedKiro,
+      testCase "Hardcoded Kiro IDE" testHardcodedKiroIde,
       testCase "Policy Classification" testPolicyClassification,
       testCase "Codex as MCP policy" testCodexAsMcpPolicy,
       testCase "cmake-language-server policy" testCmakeLanguageServerPolicy,
@@ -557,6 +558,46 @@ testHardcodedKiro = do
       exitFailure
   case resolveTargets inventory ["kiro-cli-bin-2.31.1"] of
     Left [UnknownPackage "kiro-cli-bin-2.31.1"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "pv token: " <> show other
+      exitFailure
+
+testHardcodedKiroIde :: IO ()
+testHardcodedKiroIde = do
+  let key = PackageKey "dev-util/kiro-ide-bin"
+      x64 = "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json"
+      arm = "https://prod.download.desktop.kiro.dev/stable/metadata-linux-arm64-stable.json"
+  case lookupPolicy key of
+    Just (PackagePolicy (HttpJson urls "currentRelease") GitMvAndManifest []) ->
+      assertEq "feeds" [x64, arm] urls
+    other -> do
+      hPutStrLn stderr $ "kiro ide policy: " <> show other
+      exitFailure
+  assertEq "allowlist" [] (lookupLaneArches key)
+  assertEq "resolve map only" (lookupHardcoded key) (resolveSource key)
+  let entry =
+        PackageEntry
+          { peKey = key,
+            pePN = "kiro-ide-bin",
+            peLocal = parseEbuildVersion "1.4.5",
+            pePath = "/overlay/dev-util/kiro-ide-bin/kiro-ide-bin-1.4.5.ebuild"
+          }
+      inventory = [entry]
+  assertEq
+    "qualified"
+    (Right [key])
+    (resolveTargets inventory ["dev-util/kiro-ide-bin"])
+  assertEq
+    "bare"
+    (Right [key])
+    (resolveTargets inventory ["kiro-ide-bin"])
+  case resolveTargets inventory ["1.4.5"] of
+    Left [UnknownPackage "1.4.5"] -> pure ()
+    other -> do
+      hPutStrLn stderr $ "version token: " <> show other
+      exitFailure
+  case resolveTargets inventory ["kiro-ide-bin-1.4.5"] of
+    Left [UnknownPackage "kiro-ide-bin-1.4.5"] -> pure ()
     other -> do
       hPutStrLn stderr $ "pv token: " <> show other
       exitFailure
