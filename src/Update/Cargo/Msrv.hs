@@ -1315,7 +1315,6 @@ atomHolds name mVal fam =
         "sparc64"
       ]
 
--- | Dependency names listed only in windows-only (or wasm-only) target tables.
 -- | Dotted @channel@ from @rust-toolchain.toml@. @stable@/@nightly@ and
 -- missing channel are explicit absence (@Right Nothing@). Unparseable TOML
 -- is @Left@.
@@ -1365,15 +1364,32 @@ applyRustToolchainFloor mLock fetch mFloor =
               -- File exists but channel is not a dotted version.
               pure (Right Nothing)
 
-windowsOnlyDepNames :: Text -> Either Text [Text]
-windowsOnlyDepNames content =
-  case parse content of
-    Left _ -> Left "malformed Cargo.toml"
-    Right tab' ->
-      case collectClassifiedDeps (forgetTableAnns tab') of
-        Left err -> Left err
-        Right classified ->
-          Right (nubOrd [dsName spec | (TIgnore, spec) <- classified])
+-- | Crate names to omit from @GIT_CRATES@. A name is omitted only when some
+-- @collectClassifiedDeps@ edge is @TIgnore@ and every edge for that name,
+-- across every manifest, is @TIgnore@. @TActive@, @TWatched@, and
+-- @TIncomplete@ keep the name. Malformed manifests contribute no edges.
+-- @[dev-dependencies]@ are not edges.
+windowsOnlyDepNames :: [Text] -> [Text]
+windowsOnlyDepNames bodies =
+  [ name
+  | (name, flags) <- Map.toList grouped,
+    and flags
+  ]
+  where
+    grouped =
+      Map.fromListWith
+        (++)
+        [ (dsName spec, [isIgnore klass])
+        | body <- bodies,
+          Right classified <- [classify body],
+          (klass, spec) <- classified
+        ]
+    isIgnore TIgnore = True
+    isIgnore _ = False
+    classify content =
+      case parse content of
+        Left _ -> Left "malformed Cargo.toml"
+        Right tab' -> collectClassifiedDeps (forgetTableAnns tab')
 
 ------------------------------------------------------------------------
 -- Filesystem fetch (clone harvest)

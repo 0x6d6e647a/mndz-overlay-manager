@@ -74,7 +74,6 @@ where
 
 import Control.Applicative ((<|>))
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace)
-import Data.Containers.ListUtils (nubOrd)
 import Data.List (dropWhileEnd)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
@@ -914,17 +913,12 @@ extractGithubSourceArchiveUriFor host content =
               t4 = T.dropWhileEnd (\c -> c == '"' || c == '\r') (T.strip t3)
            in if T.null t4 then Nothing else Just t4
 
--- | Drop @GIT_CRATES@ entries whose crate is a git remote reached only through
--- windows-only (or wasm-only) target tables of the supplied Cargo.toml bodies.
+-- | Drop @GIT_CRATES@ entries whose lock git package is reached only through
+-- windows-only or wasm-only edges of the supplied Cargo.toml bodies. A name
+-- that any other collected edge names stays. Dev-dependencies are not edges.
 stripWindowsOnlyGitCrates :: Text -> [Text] -> Text -> Text
 stripWindowsOnlyGitCrates lockBody tomlBodies ebuild =
-  let winNames =
-        nubOrd $
-          concat
-            [ names
-            | body <- tomlBodies,
-              Right names <- [windowsOnlyDepNames body]
-            ]
+  let winNames = windowsOnlyDepNames tomlBodies
       gitNames = parseGitPackageNames lockBody
       dropNames = [n | n <- gitNames, n `elem` winNames]
    in if null dropNames

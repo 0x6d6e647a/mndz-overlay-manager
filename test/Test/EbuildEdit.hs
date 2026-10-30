@@ -1141,6 +1141,96 @@ testCargoGitCratesWindowsOmit = do
   assertTrue "assoc drops mxc" (not ("microsoft/mxc" `T.isInfixOf` assocFixed))
   assertTrue "assoc keeps crossterm" ("crossterm-rs/crossterm" `T.isInfixOf` assocFixed)
   assertTrue "assoc keeps nucleo" ("helix-editor/nucleo" `T.isInfixOf` assocFixed)
+  let mixedLock =
+        T.unlines
+          [ "[[package]]",
+            "name = \"mxc\"",
+            "version = \"0.1.0\"",
+            "source = \"git+https://github.com/microsoft/mxc?rev=def\"",
+            "",
+            "[[package]]",
+            "name = \"wasm_only\"",
+            "version = \"0.1.0\"",
+            "source = \"git+https://example.com/wasm_only?rev=www\"",
+            "",
+            "[[package]]",
+            "name = \"wasm_dev\"",
+            "version = \"0.1.0\"",
+            "source = \"git+https://example.com/wasm_dev?rev=wdv\"",
+            "",
+            "[[package]]",
+            "name = \"egui\"",
+            "version = \"0.37.0\"",
+            "source = \"git+https://example.com/egui?rev=egg\"",
+            "",
+            "[[package]]",
+            "name = \"eframe\"",
+            "version = \"0.37.0\"",
+            "source = \"git+https://example.com/eframe?rev=efr\"",
+            "",
+            "[[package]]",
+            "name = \"craft-update\"",
+            "version = \"0.1.0\"",
+            "source = \"git+https://example.com/craft-update?rev=cup\"",
+            "",
+            "[[package]]",
+            "name = \"dev_only\"",
+            "version = \"0.1.0\"",
+            "source = \"git+https://example.com/dev_only?rev=dev\""
+          ]
+      linuxToml =
+        T.unlines
+          [ "[package]",
+            "name = \"ui\"",
+            "[dependencies]",
+            "egui = { git = \"https://example.com/egui\" }",
+            "craft-update = { git = \"https://example.com/craft-update\" }"
+          ]
+      wasmToml =
+        T.unlines
+          [ "[package]",
+            "name = \"web\"",
+            "[target.'cfg(target_arch = \"wasm32\")'.dependencies]",
+            "egui = { git = \"https://example.com/egui\" }",
+            "wasm_only = { git = \"https://example.com/wasm_only\" }",
+            "wasm_dev = { git = \"https://example.com/wasm_dev\" }",
+            "[target.'cfg(windows)'.dependencies]",
+            "mxc = { git = \"https://github.com/microsoft/mxc\" }",
+            "craft-update = { git = \"https://example.com/craft-update\" }",
+            "[dev-dependencies]",
+            "wasm_dev = { git = \"https://example.com/wasm_dev\" }",
+            "dev_only = { git = \"https://example.com/dev_only\" }"
+          ]
+      bothToml =
+        T.unlines
+          [ "[package]",
+            "name = \"both\"",
+            "[dependencies]",
+            "eframe = { git = \"https://example.com/eframe\" }",
+            "[target.'cfg(windows)'.dependencies]",
+            "eframe = { git = \"https://example.com/eframe\" }"
+          ]
+      mixed =
+        T.unlines
+          [ "declare -A GIT_CRATES=(",
+            "\t[mxc]='https://github.com/microsoft/mxc;def;mxc-%commit%'",
+            "\t[wasm_only]='https://example.com/wasm_only;www;wasm_only-%commit%'",
+            "\t[wasm_dev]='https://example.com/wasm_dev;wdv;wasm_dev-%commit%'",
+            "\t[egui]='https://example.com/egui;egg;egui-%commit%'",
+            "\t[eframe]='https://example.com/eframe;efr;eframe-%commit%'",
+            "\t[craft-update]='https://example.com/craft-update;cup;craft-update-%commit%'",
+            "\t[dev_only]='https://example.com/dev_only;dev;dev_only-%commit%'",
+            ")"
+          ]
+      mixedFixed = stripWindowsOnlyGitCrates mixedLock [linuxToml, wasmToml, bothToml] mixed
+      kept name = ("[" <> name <> "]=") `T.isInfixOf` mixedFixed
+  assertTrue "mixed drops mxc" (not (kept "mxc"))
+  assertTrue "mixed drops wasm-only" (not (kept "wasm_only"))
+  assertTrue "dev-dependency does not keep wasm crate" (not (kept "wasm_dev"))
+  assertTrue "linux and wasm edges keep egui" (kept "egui")
+  assertTrue "linux and windows edges keep eframe" (kept "eframe")
+  assertTrue "cross-manifest edges keep craft-update" (kept "craft-update")
+  assertTrue "dev-only crate stays" (kept "dev_only")
 
 testGoKeywordsAssembly :: IO ()
 testGoKeywordsAssembly = do
