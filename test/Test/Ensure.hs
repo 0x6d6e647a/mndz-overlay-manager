@@ -238,7 +238,7 @@ testBunOnlyOmitsSbcl = do
   assertEq "no SBCL on first bun-only" Nothing (nfSbcl needed)
   assertEq "no qlot on bun-only" Nothing (nfQlot needed)
   assertEq "no Go on bun-only" Nothing (nfGo needed)
-  df <- renderMapped "x86_64" [bunInstall "1.2.0" "amd64"] "/overlay"
+  df <- renderMapped "x86_64" [bunInstall "1.2.0" "amd64"]
   assertTrue "recipe has bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` df)
   assertTrue "recipe bun-bin is :0" (">=dev-lang/bun-bin-1.2.0:0::mndz" `T.isInfixOf` df)
   assertTrue "recipe omits sbcl emerge" (not ("dev-lisp/sbcl" `T.isInfixOf` df))
@@ -471,7 +471,6 @@ testRenderMndzNoOfficial = do
     renderMapped
       "x86_64"
       [goInstall "1.26.5", bunInstall "1.2.21" "amd64"]
-      "/home/op/overlay"
   assertTrue "::mndz" ("::mndz" `T.isInfixOf` df)
   assertTrue
     "accept_keywords bun-bin"
@@ -500,6 +499,12 @@ testRenderMndzNoOfficial = do
   assertGentoolkitInBase "go+bun" df
   assertTrue "no sbcl-bin ||" (not ("sbcl-bin" `T.isInfixOf` df))
   assertTrue "no shell fallback" (not ("|| emerge" `T.isInfixOf` df))
+  assertMndzReposSnippet df
+  let bunRuns = filter ("dev-lang/bun-bin" `T.isInfixOf`) (dockerfileRuns df)
+  assertTrue "bun has a RUN" (not (null bunRuns))
+  mapM_ (assertOverlayBindRun "bun") bunRuns
+  let goRuns = filter ("dev-lang/go" `T.isInfixOf`) (dockerfileRuns df)
+  mapM_ (assertNoMndzBind "go") goRuns
 
 testLookupRecipeArch :: IO ()
 testLookupRecipeArch = do
@@ -530,7 +535,7 @@ testLookupRecipeArch = do
 
 testAmd64OpenrcRecipe :: IO ()
 testAmd64OpenrcRecipe = do
-  df <- renderMapped "x86_64" [bunInstall "1.2.21" "amd64"] "/overlay"
+  df <- renderMapped "x86_64" [bunInstall "1.2.21" "amd64"]
   assertTrue
     "OpenRC FROM"
     ("FROM gentoo/stage3:amd64-openrc" `T.isInfixOf` df)
@@ -543,7 +548,7 @@ testAmd64OpenrcRecipe = do
 
 testPpc64leOpenrcRecipe :: IO ()
 testPpc64leOpenrcRecipe = do
-  df <- renderMapped "ppc64le" [bunInstall "1.2.21" "ppc64"] "/overlay"
+  df <- renderMapped "ppc64le" [bunInstall "1.2.21" "ppc64"]
   assertTrue
     "OpenRC FROM"
     ("FROM gentoo/stage3:ppc64le-openrc" `T.isInfixOf` df)
@@ -566,8 +571,10 @@ testRenderSbclTestingFloor = do
   df <-
     renderMapped
       "x86_64"
-      [ResolvedInstall TkSbcl rt, overlayQlotInstall "1.8.4" "amd64"]
-      "/overlay"
+      [ rustInstall,
+        ResolvedInstall TkSbcl rt,
+        overlayQlotInstall "1.8.4" "amd64"
+      ]
   assertEq
     "one versioned sbcl emerge"
     1
@@ -600,11 +607,15 @@ testRenderSbclTestingFloor = do
   assertTrue
     "no Quicklisp installer fetch"
     (not ("beta.quicklisp.org" `T.isInfixOf` df))
-  let qlotRuns = filter ("dev-lisp/qlot" `T.isInfixOf`) (T.splitOn "RUN " df)
+  let qlotRuns = filter ("dev-lisp/qlot" `T.isInfixOf`) (dockerfileRuns df)
   assertTrue "qlot has a RUN" (not (null qlotRuns))
-  assertTrue
-    "overlay bind on qlot RUN"
-    (all ("from=overlay" `T.isInfixOf`) qlotRuns)
+  mapM_ (assertOverlayBindRun "qlot") qlotRuns
+  assertMndzReposSnippet df
+  let cargoRuns = filter ("app-portage/pycargoebuild" `T.isInfixOf`) (dockerfileRuns df)
+  assertTrue "pycargoebuild has a RUN" (not (null cargoRuns))
+  mapM_ (assertNoMndzBind "pycargoebuild") cargoRuns
+  let sbclRuns = filter ("dev-lisp/sbcl" `T.isInfixOf`) (dockerfileRuns df)
+  mapM_ (assertNoMndzBind "sbcl") sbclRuns
   assertTrue "base still emerges wget" ("net-misc/wget" `T.isInfixOf` df)
   assertTrue "base still emerges aria2" ("net-misc/aria2" `T.isInfixOf` df)
   assertPortageCacheIds "sbcl+qlot" df
@@ -623,7 +634,6 @@ testRenderSbclX86Libdir = do
     renderMapped
       "i686"
       [ResolvedInstall TkSbcl rt, overlayQlotInstall "1.8.4" "x86"]
-      "/overlay"
   assertTrue
     "ENV SBCL_HOME lib"
     ("ENV SBCL_HOME=/usr/lib/sbcl" `T.isInfixOf` df)
@@ -639,16 +649,16 @@ testRenderSbclX86Libdir = do
   assertTrue
     "no Quicklisp installer fetch"
     (not ("beta.quicklisp.org" `T.isInfixOf` df))
-  let qlotRuns = filter ("dev-lisp/qlot" `T.isInfixOf`) (T.splitOn "RUN " df)
-  assertTrue
-    "overlay bind on qlot RUN"
-    (all ("from=overlay" `T.isInfixOf`) qlotRuns)
+  let qlotRuns = filter ("dev-lisp/qlot" `T.isInfixOf`) (dockerfileRuns df)
+  assertTrue "qlot has a RUN" (not (null qlotRuns))
+  mapM_ (assertOverlayBindRun "qlot") qlotRuns
+  assertMndzReposSnippet df
 
-renderMapped :: String -> [ResolvedInstall] -> FilePath -> IO T.Text
-renderMapped uname installs overlay =
+renderMapped :: String -> [ResolvedInstall] -> IO T.Text
+renderMapped uname installs =
   case lookupRecipeArch uname of
     Nothing -> assertFailure (uname <> " should map")
-    Just arch -> pure (renderMaterializeDockerfile arch overlay installs)
+    Just arch -> pure (renderMaterializeDockerfile arch installs)
 
 threeCacheIds :: [T.Text]
 threeCacheIds =
@@ -659,6 +669,53 @@ threeCacheIds =
 
 dockerfileRuns :: T.Text -> [T.Text]
 dockerfileRuns = T.splitOn "RUN "
+
+overlayRepoMount :: T.Text
+overlayRepoMount =
+  "--mount=type=bind,from=overlay,source=/,target=/var/db/repos/mndz,ro"
+
+overlayConfMount :: T.Text
+overlayConfMount =
+  "--mount=type=bind,from=mndz-repos,source=/mndz.conf,target=/etc/portage/repos.conf/mndz.conf,ro"
+
+-- | Scratch-stage @[mndz]@ snippet sits before the stage3 image and is not
+-- written with a shell redirect.
+assertMndzReposSnippet :: T.Text -> IO ()
+assertMndzReposSnippet df = do
+  let (beforeStage3, _) = T.breakOn "FROM gentoo/stage3:" df
+  assertTrue
+    "scratch stage before stage3"
+    ("FROM scratch AS mndz-repos" `T.isInfixOf` beforeStage3)
+  assertTrue
+    "quoted heredoc copy"
+    ("COPY <<'EOF' /mndz.conf" `T.isInfixOf` beforeStage3)
+  assertTrue
+    "location = /var/db/repos/mndz"
+    ("location = /var/db/repos/mndz" `T.isInfixOf` beforeStage3)
+  assertTrue
+    "master = gentoo"
+    ("master = gentoo" `T.isInfixOf` beforeStage3)
+  assertTrue
+    "auto-sync = no"
+    ("auto-sync = no" `T.isInfixOf` beforeStage3)
+  assertTrue
+    "no shell redirect of mndz.conf"
+    (not ("> /etc/portage/repos.conf/mndz.conf" `T.isInfixOf` df))
+
+assertOverlayBindRun :: String -> T.Text -> IO ()
+assertOverlayBindRun label run = do
+  assertTrue (label <> " from=overlay") ("from=overlay" `T.isInfixOf` run)
+  assertTrue (label <> " mounts /var/db/repos/mndz") (overlayRepoMount `T.isInfixOf` run)
+  assertTrue (label <> " mounts mndz.conf") (overlayConfMount `T.isInfixOf` run)
+
+assertNoMndzBind :: String -> T.Text -> IO ()
+assertNoMndzBind label run = do
+  assertTrue
+    (label <> " does not mount /var/db/repos/mndz")
+    (not ("/var/db/repos/mndz" `T.isInfixOf` run))
+  assertTrue
+    (label <> " does not mount mndz.conf")
+    (not ("/etc/portage/repos.conf/mndz.conf" `T.isInfixOf` run))
 
 isPortageRun :: T.Text -> Bool
 isPortageRun r =
@@ -738,7 +795,6 @@ testRenderPruneAfterToolchains = do
     renderMapped
       "x86_64"
       [goInstall "1.26.5", sbclInstall "2.6.6"]
-      "/overlay"
   assertPortageCacheIds "go+sbcl" df
   assertGentoolkitInBase "go+sbcl" df
   assertPruneRun "go+sbcl" df
@@ -749,6 +805,9 @@ testRenderPruneAfterToolchains = do
   assertTrue
     "SBCL emerge before prune"
     ("dev-lisp/sbcl" `T.isInfixOf` beforePrune)
+  assertTrue "go+sbcl has no [mndz] section" (not ("[mndz]" `T.isInfixOf` df))
+  let pruneRuns = filter ("eclean-pkg --deep" `T.isInfixOf`) (dockerfileRuns df)
+  mapM_ (assertNoMndzBind "prune") pruneRuns
 
 bunInstall :: T.Text -> T.Text -> ResolvedInstall
 bunInstall ver kw =
@@ -1164,8 +1223,8 @@ testGeneratorMismatchRebuilds =
       Right side -> do
         assertEq "records current generator" materializeGeneratorId (isGenerator side)
         assertEq
-          "generator is materialize-7"
-          "mndz-overlay-manager-materialize-7"
+          "generator is materialize-8"
+          "mndz-overlay-manager-materialize-8"
           materializeGeneratorId
     df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
     assertPruneRun "generator rebuild" df
@@ -1272,7 +1331,6 @@ testBunRecipeEmergesNodeGypAfterNode = do
         overlayNodeGypInstall "13.0.0" "amd64",
         bunInstall "1.2.0" "amd64"
       ]
-      "/overlay"
   assertTrue
     "node-gyp emerge spec"
     (">=dev-build/node-gyp-13.0.0::mndz" `T.isInfixOf` df)
@@ -1282,11 +1340,14 @@ testBunRecipeEmergesNodeGypAfterNode = do
   let (beforeGyp, afterGyp) = T.breakOn "dev-build/node-gyp" df
   assertTrue "Node install before node-gyp" ("net-libs/nodejs" `T.isInfixOf` beforeGyp)
   assertTrue "bun after node-gyp" ("dev-lang/bun-bin" `T.isInfixOf` afterGyp)
-  let gypRuns = filter ("dev-build/node-gyp" `T.isInfixOf`) (T.splitOn "RUN " df)
+  let gypRuns = filter ("dev-build/node-gyp" `T.isInfixOf`) (dockerfileRuns df)
   assertTrue "node-gyp has a RUN" (not (null gypRuns))
-  assertTrue
-    "overlay bind on node-gyp RUN"
-    (all ("from=overlay" `T.isInfixOf`) gypRuns)
+  mapM_ (assertOverlayBindRun "node-gyp") gypRuns
+  let bunRuns = filter ("dev-lang/bun-bin" `T.isInfixOf`) (dockerfileRuns df)
+  mapM_ (assertOverlayBindRun "bun") bunRuns
+  let nodeRuns = filter ("net-libs/nodejs" `T.isInfixOf`) (dockerfileRuns df)
+  mapM_ (assertNoMndzBind "node") nodeRuns
+  assertMndzReposSnippet df
 
 testUvRecipePythonAndUv :: IO ()
 testUvRecipePythonAndUv = do
@@ -1345,7 +1406,6 @@ testUvRecipePythonAndUv = do
         pythonInstall "3.14",
         uvInstall
       ]
-      "/overlay"
   assertTrue "python slot emerge" ("dev-lang/python:3.14" `T.isInfixOf` df)
   assertTrue "rust emerge" ("dev-lang/rust" `T.isInfixOf` df)
   assertTrue "uv emerge" ("dev-python/uv" `T.isInfixOf` df)
@@ -1445,7 +1505,7 @@ testPdmRecipePythonAndPdm = do
         []
         []
         []
-  df <- renderMapped "x86_64" installs "/overlay"
+  df <- renderMapped "x86_64" installs
   assertTrue "python slot emerge" ("dev-lang/python:3.12" `T.isInfixOf` df)
   assertTrue "pdm emerge" ("dev-python/pdm" `T.isInfixOf` df)
   assertTrue "package accept keywords" ("package.accept_keywords/mndz-pdm" `T.isInfixOf` df)
@@ -1494,9 +1554,16 @@ testPdmRecipePythonAndPdm = do
 
 testGoOnlyOmitsNodeGyp :: IO ()
 testGoOnlyOmitsNodeGyp = do
-  df <- renderMapped "x86_64" [goInstall "1.26.5"] "/overlay"
+  df <- renderMapped "x86_64" [goInstall "1.26.5"]
   assertTrue "go via portage" ("dev-lang/go" `T.isInfixOf` df)
   assertTrue "Go-only omits node-gyp" (not ("dev-build/node-gyp" `T.isInfixOf` df))
+  assertTrue "Go-only has no [mndz] section" (not ("[mndz]" `T.isInfixOf` df))
+  assertTrue
+    "Go-only does not mount /var/db/repos/mndz"
+    (not ("/var/db/repos/mndz" `T.isInfixOf` df))
+  assertTrue
+    "Go-only does not mount mndz.conf"
+    (not ("/etc/portage/repos.conf/mndz.conf" `T.isInfixOf` df))
 
 testUnmappedDefaultNoBuild :: IO ()
 testUnmappedDefaultNoBuild =

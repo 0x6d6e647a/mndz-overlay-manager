@@ -393,7 +393,7 @@ buildAndRecord cfg tag oldId unioned arch installs = do
       ctxDir = sidecarDir </> "context"
       overlay = ecOverlayRoot cfg
       dockerfile =
-        renderMaterializeDockerfile arch overlay installs
+        renderMaterializeDockerfile arch installs
   createDirectoryIfMissing True ctxDir
   TIO.writeFile dfPath dockerfile
   -- Remember previous id before retag.
