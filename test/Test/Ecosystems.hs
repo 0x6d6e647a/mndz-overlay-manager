@@ -2791,9 +2791,21 @@ testCargoMkCommandRunner =
             pure (okResult "")
           Just ("pycargoebuild", args) -> do
             assertTrue
-              "no-write-crate-tarball flag"
-              ("--no-write-crate-tarball" `elem` args)
-            assertTrue "crate-tarball mode -c" ("-c" `elem` args)
+              "use-crate-tarball mode"
+              ("--use-crate-tarball" `elem` args)
+            for_
+              [ "-u",
+                "-c",
+                "--crate-tarball",
+                "--no-write-crate-tarball",
+                "-w",
+                "--write-crate-tarball"
+              ]
+              ( \flag ->
+                  assertTrue
+                    ("absent " <> flag)
+                    (flag `notElem` args)
+              )
             case dropWhile (/= "-i") args of
               ("-i" : ebuildPath : _) ->
                 TIO.writeFile ebuildPath (donorEbuild <> "\n# pycargo\n")

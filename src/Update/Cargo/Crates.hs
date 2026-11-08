@@ -163,8 +163,8 @@ mkCargoOps run =
 productionCargoOps :: CargoOps
 productionCargoOps = mkCargoOps productionCommandRunner
 
--- | Clone-or-fetch @tag@/@published crate@, run pycargoebuild with no-write
--- crate tarball, pack crates, return tarball + MSRV + ebuild body.
+-- | Clone-or-fetch @tag@/@published crate@, run pycargoebuild with
+-- @--use-crate-tarball@, pack crates, return tarball + MSRV + ebuild body.
 -- Source, distdir, and stage live under unit @workDir@; tarball under @outDir@.
 -- Provenance selects how @workDir/src@ is populated: 'CargoGitTag' clones the
 -- GitHub tag (byte-for-byte legacy flow); 'CargoCratesIo' fetches and unpacks
@@ -432,7 +432,7 @@ maxDirectRustFromFiles paths = do
 runPycargoebuild :: CommandRunner -> FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
 runPycargoebuild run ebuildPath lockRoot tarballPath distDir = do
   let args =
-        [ "-c",
+        [ "--use-crate-tarball",
           "-i",
           ebuildPath,
           "-M",
@@ -441,7 +441,6 @@ runPycargoebuild run ebuildPath lockRoot tarballPath distDir = do
           tarballPath,
           "--crate-tarball-prefix",
           T.unpack crateTarballPrefix,
-          "--no-write-crate-tarball",
           "-d",
           distDir,
           lockRoot
