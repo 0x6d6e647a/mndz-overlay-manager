@@ -11,6 +11,7 @@ module Update.Check
     contentFixPVs,
     assessOverlayContent,
     productionFetcherWithLatch,
+    LiveGitHubMode (..),
     needsLiveGitHubApi,
     finishOutdatedReports,
     statusFromCompare,
@@ -29,7 +30,7 @@ import CLI.Jobs (mapConcurrentlyN)
 import CLI.Progress (MultiHandle (..))
 import Data.List (sortBy, sortOn)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -470,28 +471,24 @@ applyOverlayBlockIndication mh fetch depsOps cache eco src entry locals localPVs
                 Left _ ->
                   pure (failClosed (peKey entry) provider)
                 Right metas ->
-                  case overlayCeilingPlan metas remote of
-                    CeilingsUnchanged ->
+                  case hypotheticalPreviewCeilings provider checkSet remote metas of
+                    Nothing ->
                       attachDisplayed depsOps localPVs onDiskPlan Nothing base
-                    CeilingsChanged hypoCeil
-                      | provider `Set.member` checkSet
-                          && not (providerIsGitMvOutdated remote metas) ->
-                          attachDisplayed depsOps localPVs onDiskPlan Nothing base
-                      | otherwise ->
-                          previewHypothetical
-                            mh
-                            depsOps
-                            eco
-                            src
-                            entry
-                            locals
-                            localPVs
-                            onDiskPlan
-                            onDiskNeed
-                            checkSet
-                            provider
-                            hypoCeil
-                            base
+                    Just hypoCeil ->
+                      previewHypothetical
+                        mh
+                        depsOps
+                        eco
+                        src
+                        entry
+                        locals
+                        localPVs
+                        onDiskPlan
+                        onDiskNeed
+                        checkSet
+                        provider
+                        hypoCeil
+                        base
 
 -- | Fetched remote latest is strictly greater than the newest non-live on-disk PV.
 providerIsGitMvOutdated :: EbuildVersion -> [RuntimeEbuildMeta] -> Bool
@@ -499,6 +496,25 @@ providerIsGitMvOutdated remote metas =
   case newestNonLivePv metas of
     Just local -> comparePV local remote == Just LT
     Nothing -> False
+
+-- | Ceilings for 'previewHypothetical', or 'Nothing' when the check stays on
+-- the on-disk plan. Unchanged ceilings stay on disk. So does a ceiling change
+-- while the provider is selected and is not itself GitMv-outdated.
+hypotheticalPreviewCeilings ::
+  PackageKey ->
+  Set.Set PackageKey ->
+  EbuildVersion ->
+  [RuntimeEbuildMeta] ->
+  Maybe RuntimeCeilings
+hypotheticalPreviewCeilings provider checkSet remote metas =
+  case overlayCeilingPlan metas remote of
+    CeilingsUnchanged -> Nothing
+    CeilingsChanged hypoCeil
+      | provider `Set.member` checkSet
+          && not (providerIsGitMvOutdated remote metas) ->
+          Nothing
+      | otherwise ->
+          Just hypoCeil
 
 previewHypothetical ::
   MultiHandle ->
@@ -846,28 +862,47 @@ productionFetcherWithLatch latch mToken = do
     GitHub {} -> fetchGitHubWithLatch latch mgr mToken src
     Npm {} -> fetchNpmWith mgr src
 
+-- | Which command is deciding whether this run calls @api.github.com@.
+--
+-- 'LiveForOutdated' is not live for a usable deps-plan hit, even when that
+-- plan still needs work or local content assessment fails. It is live for a
+-- miss, @--refresh@, a cold overlay-provider latest, or a hypothetical
+-- consumer plan ('hypotheticalPreviewCeilings').
+--
+-- 'LiveForUpdate' is live for those misses and also when a usable plan still
+-- needs work or content assessment fails. A hypothetical consumer plan does
+-- not by itself make an update live.
+data LiveGitHubMode
+  = LiveForOutdated
+  | LiveForUpdate
+  deriving (Eq, Show)
+
 -- | True when selected GitHub sources will live-call @api.github.com@.
 needsLiveGitHubApi ::
+  LiveGitHubMode ->
   CheckCacheHandle ->
   FilePath ->
   [PackageEntry] ->
   Map.Map PackageKey [Ebuild] ->
   IO Bool
-needsLiveGitHubApi cache overlayRoot entries byPkg =
+needsLiveGitHubApi mode cache overlayRoot entries byPkg =
   go entries
   where
+    checkSet = Set.fromList (map peKey entries)
     go [] = pure False
     go (e : es) = do
-      live <- packageNeedsLiveGitHub cache overlayRoot byPkg e
+      live <- packageNeedsLiveGitHub mode cache overlayRoot byPkg checkSet e
       if live then pure True else go es
 
 packageNeedsLiveGitHub ::
+  LiveGitHubMode ->
   CheckCacheHandle ->
   FilePath ->
   Map.Map PackageKey [Ebuild] ->
+  Set.Set PackageKey ->
   PackageEntry ->
   IO Bool
-packageNeedsLiveGitHub cache overlayRoot byPkg entry =
+packageNeedsLiveGitHub mode cache overlayRoot byPkg checkSet entry =
   case lookupPolicy (peKey entry) of
     Nothing -> pure False
     Just policy ->
@@ -877,7 +912,15 @@ packageNeedsLiveGitHub cache overlayRoot byPkg entry =
            in case policyTechnique policy of
                 GitMvAndManifest -> gitMvNeedsLive cache entry locals (policySource policy)
                 DepsAndAssets eco ->
-                  depsNeedsLive cache overlayRoot entry locals (policySource policy) eco
+                  depsNeedsLive
+                    mode
+                    cache
+                    overlayRoot
+                    entry
+                    locals
+                    (policySource policy)
+                    eco
+                    checkSet
                 Unsupported _ -> pure False
         _ -> pure False
 
@@ -894,14 +937,16 @@ gitMvNeedsLive cache entry locals src = do
   pure (isNothing mCached)
 
 depsNeedsLive ::
+  LiveGitHubMode ->
   CheckCacheHandle ->
   FilePath ->
   PackageEntry ->
   [Ebuild] ->
   UpdateSource ->
   EcosystemSpec ->
+  Set.Set PackageKey ->
   IO Bool
-depsNeedsLive cache overlayRoot entry locals src eco = do
+depsNeedsLive mode cache overlayRoot entry locals src eco checkSet = do
   let tech = DepsAndAssets eco
       localPVs = localNonLivePVs locals
   fp <- withNewTreeLock $ \tree -> computeFingerprint tree src locals
@@ -913,44 +958,87 @@ depsNeedsLive cache overlayRoot entry locals src eco = do
       (Just _, Nothing) -> pure Nothing
       (Just _, Just pfp) -> lookupDeps cache (peKey entry) fp (Just pfp)
       (Nothing, _) -> lookupDeps cache (peKey entry) fp Nothing
-  planLive <- case mCached of
-    Just plan
-      | cachedCargoPlanUsable eco src plan -> do
-          assessed <-
-            withNewTreeLock $ \tree ->
-              assessOverlayContent tree eco (peKey entry) (pePN entry) locals plan
-          pure $ case assessed of
-            Left _ -> True
-            Right (ca, _, _) ->
-              let missing = missingTargets localPVs plan
-                  contentFix =
-                    [ pv
-                    | pv <- caNeedsWorkPVs ca,
-                      not (any (samePV pv) missing)
-                    ]
-               in planNeedsWork localPVs contentFix plan
-    _ -> pure True
-  providerLive <-
-    case overlayCeilingProvider tech of
-      Nothing -> pure False
-      Just provider -> providerLatestMiss cache overlayRoot provider
-  pure (planLive || providerLive)
+  let usablePlan = case mCached of
+        Just plan | cachedCargoPlanUsable eco src plan -> Just plan
+        _ -> Nothing
+  planLive <- case (mode, usablePlan) of
+    (LiveForOutdated, Just _) -> pure False
+    (_, Nothing) -> pure True
+    (LiveForUpdate, Just plan) -> do
+      assessed <-
+        withNewTreeLock $ \tree ->
+          assessOverlayContent tree eco (peKey entry) (pePN entry) locals plan
+      pure $ case assessed of
+        Left _ -> True
+        Right (ca, _, _) ->
+          let missing = missingTargets localPVs plan
+              contentFix =
+                [ pv
+                | pv <- caNeedsWorkPVs ca,
+                  not (any (samePV pv) missing)
+                ]
+           in planNeedsWork localPVs contentFix plan
+  prov <- case overlayCeilingProvider tech of
+    Nothing -> pure ProviderLatestQuiet
+    Just provider -> providerLatestCache cache overlayRoot provider
+  let providerLive = case prov of
+        ProviderLatestMiss -> True
+        _ -> False
+  hypoLive <- case mode of
+    LiveForUpdate -> pure False
+    LiveForOutdated
+      | planLive -> pure False
+      | otherwise ->
+          case prov of
+            ProviderLatestHit provider remote ->
+              outdatedHypotheticalIsLive overlayRoot provider remote checkSet
+            _ -> pure False
+  pure (planLive || providerLive || hypoLive)
 
-providerLatestMiss :: CheckCacheHandle -> FilePath -> PackageKey -> IO Bool
-providerLatestMiss cache overlayRoot providerKey =
+-- | Cached GitMv latest for an overlay ceiling provider.
+-- A missing directory or policy is quiet: the check fail-closes without a
+-- GitHub call. A present directory with no valid latest entry is a miss.
+data ProviderLatestCache
+  = ProviderLatestQuiet
+  | ProviderLatestMiss
+  | ProviderLatestHit PackageKey EbuildVersion
+
+providerLatestCache ::
+  CheckCacheHandle ->
+  FilePath ->
+  PackageKey ->
+  IO ProviderLatestCache
+providerLatestCache cache overlayRoot providerKey =
   case (splitPackageKey providerKey, lookupPolicy providerKey) of
     (Just (cat, pn), Just policy) -> do
       let dir = overlayRoot </> T.unpack cat </> T.unpack pn
       exists <- doesDirectoryExist dir
       if not exists
-        then pure False
+        then pure ProviderLatestQuiet
         else do
           fp <-
             withNewTreeLock $ \tree ->
               computeFingerprintFromDir tree (policySource policy) dir pn
           mCached <- lookupLatest cache providerKey fp
-          pure (isNothing mCached)
-    _ -> pure False
+          pure $ case mCached of
+            Nothing -> ProviderLatestMiss
+            Just remote -> ProviderLatestHit providerKey remote
+    _ -> pure ProviderLatestQuiet
+
+-- | True when cached ceilings would enter 'previewHypothetical'.
+-- An unreadable provider tree is not live: the check fail-closes locally.
+outdatedHypotheticalIsLive ::
+  FilePath ->
+  PackageKey ->
+  EbuildVersion ->
+  Set.Set PackageKey ->
+  IO Bool
+outdatedHypotheticalIsLive overlayRoot provider remote checkSet = do
+  eMetas <- withNewTreeLock $ \tree -> discoverBunBinMetas tree overlayRoot
+  pure $ case eMetas of
+    Left _ -> False
+    Right metas ->
+      isJust (hypotheticalPreviewCeilings provider checkSet remote metas)
 
 syntheticLocals :: PackageEntry -> [Ebuild]
 syntheticLocals entry =

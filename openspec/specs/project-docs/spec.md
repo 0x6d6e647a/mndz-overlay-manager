@@ -449,6 +449,7 @@ Operator-facing `README.md` SHALL document, at operator depth:
 3. That live unauthenticated GitHub fetch is allowed when no token is configured, is limited to 60 requests per hour per IP, and logs a warning.
 4. That GitHub health (Statuspage API Requests, Git Operations before assets push, and `/rate_limit`) runs before live GitHub work, and that remaining `0`, HTTP 401, or API outage hard-fails the command with exit `1`.
 5. That `gencache` does not use this GitHub health gate.
+6. That `outdated` does not prompt when every `api.github.com` read for the run is a valid check-cache hit, including when a cached plan still needs work, and that `update` still prompts when it will look up or publish an assets release.
 
 #### Scenario: README names unattended env token for outdated
 
@@ -459,6 +460,12 @@ Operator-facing `README.md` SHALL document, at operator depth:
 
 - **WHEN** an operator reads GitHub token or `outdated` / `update` usage
 - **THEN** README states that GitHub rate-limit exhaustion and rejected tokens exit `1` rather than only warning per package
+
+#### Scenario: README names the outdated cache-hit skip
+
+- **WHEN** an operator reads how `outdated` and `update` use the encrypted `github-token`
+- **THEN** README states that a full `outdated` check-cache hit does not prompt, including when the cached plan still needs work
+- **AND** README states that `update` still prompts when it will look up or publish an assets release
 
 ### Requirement: README names the Uv ecosystem
 

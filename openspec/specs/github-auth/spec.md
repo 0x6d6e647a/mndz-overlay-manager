@@ -34,7 +34,7 @@ The program SHALL resolve a GitHub API token by checking, in order: (1) environm
 
 When (1) or (2) wins, the program SHALL log a warning that an environment token is used instead of an encrypted config token, and SHALL log an additional warning if that environment value does not start with `github_pat_`. The program SHALL NOT probe environment tokens against GitHub solely for these warnings. Environment values are not required to be fine-grained PATs.
 
-When (3) is the winner, the program SHALL prompt for the wrap password on a controlling TTY when this run will call `api.github.com` (version fetch, tag listing, assets-repository release lookup, download, create, or upload, or `/rate_limit` health). The program SHALL pause interactive activity indicators during that prompt, matching other TTY unlocks, and SHALL keep the decrypted token for the process lifetime of that run. The program SHALL NOT decrypt the envelope when this run will not call `api.github.com` (valid check-cache hits for every selected GitHub source and no assets GitHub work). If decrypt is required and no controlling TTY is available, the program SHALL hard-fail with an error that does not include a secret; it SHALL NOT silently fall back to unauthenticated GitHub fetch. Unattended runs SHALL use environment tokens instead of decrypt.
+When (3) is the winner, the program SHALL prompt for the wrap password on a controlling TTY when this run will call `api.github.com` (version fetch, tag listing, assets-repository release lookup, download, create, or upload, or `/rate_limit` health). The program SHALL pause interactive activity indicators during that prompt, matching other TTY unlocks, and SHALL keep the decrypted token for the process lifetime of that run. The program SHALL NOT decrypt the envelope when this run will not call `api.github.com`. A valid check-cache hit for a stored latest or deps plan SHALL NOT by itself be that call, including when the plan still needs work. An uncached provider latest read, an uncached hypothetical consumer plan, `--refresh` of a GitHub-source package, and assets-repository release lookup, download, create, or upload SHALL count as that call. If decrypt is required and no controlling TTY is available, the program SHALL hard-fail with an error that does not include a secret; it SHALL NOT silently fall back to unauthenticated GitHub fetch. Unattended runs SHALL use environment tokens instead of decrypt.
 
 #### Scenario: Environment overrides config
 
@@ -64,9 +64,15 @@ When (3) is the winner, the program SHALL prompt for the wrap password on a cont
 
 #### Scenario: Outdated does not decrypt config envelope
 
-- **WHEN** the operator runs `outdated` with no env token, an encrypted `github-token` in config, without `--refresh`, and every selected GitHub-source package has a valid check-cache hit
+- **WHEN** the operator runs `outdated` with no env token, an encrypted `github-token` in config, without `--refresh`, and every `api.github.com` read for that run is already a valid check-cache hit
 - **THEN** the program does not prompt for the wrap password
 - **AND** it does not call `api.github.com` solely to decrypt or health-check
+
+#### Scenario: Outdated decrypts for an uncached extra read
+
+- **WHEN** the operator runs `outdated` with no env token, an encrypted `github-token` in config, a valid deps-plan hit, and an uncached provider latest or hypothetical consumer plan
+- **THEN** the program prompts for the wrap password
+- **AND** that read uses the decrypted token
 
 #### Scenario: Missing token when release required
 

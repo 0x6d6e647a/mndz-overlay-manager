@@ -52,7 +52,8 @@ import Update.Auth
     productionSecretPrompt,
   )
 import Update.Check
-  ( PackageEntry (..),
+  ( LiveGitHubMode (..),
+    PackageEntry (..),
     checkOverlayWithDepsPlan,
     finishOutdatedReports,
     groupByPackage,
@@ -215,7 +216,14 @@ runOutdated rt refresh pkgArgs = do
         liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayResolved
       mapM_ logWarning cacheWarn
       willLive <-
-        liftIO (needsLiveGitHubApi cache overlayResolved selectedEntries byPkg)
+        liftIO
+          ( needsLiveGitHubApi
+              LiveForOutdated
+              cache
+              overlayResolved
+              selectedEntries
+              byPkg
+          )
       decryptCache <- liftIO (newIORef Nothing)
       let secretPrompt =
             productionSecretPrompt
@@ -305,7 +313,14 @@ runUpdate rt refresh pkgArgs = do
         liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayPath
       mapM_ logWarning cacheWarn
       willLive <-
-        liftIO (needsLiveGitHubApi cache overlayPath selected (groupByPackage ebuilds))
+        liftIO
+          ( needsLiveGitHubApi
+              LiveForUpdate
+              cache
+              overlayPath
+              selected
+              (groupByPackage ebuilds)
+          )
       decryptCache <- liftIO (newIORef Nothing)
       let pcfg = rtProgress rt
           secretPrompt =

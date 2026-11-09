@@ -34,15 +34,19 @@ import Update.Auth
     unauthenticatedGitHubWarning,
   )
 import Update.Check
-  ( PackageEntry (..),
+  ( LiveGitHubMode (..),
+    PackageEntry (..),
     checkOverlayWithDepsPlan,
     finishOutdatedReports,
     groupByPackage,
     needsLiveGitHubApi,
   )
 import Update.CheckCache
-  ( computeFingerprint,
+  ( CheckCacheHandle,
+    computeFingerprint,
+    computeFingerprintFromDir,
     openCheckCacheAt,
+    storeDeps,
     storeLatest,
   )
 import Update.Deps.Plan (productionDepsPlanOps)
@@ -69,13 +73,17 @@ import Update.GitHubHealth
     runGitHubHealthPreflight,
     runGitOperationsHealth,
   )
+import Update.Go.Lanes (RuntimeLanePlan (..))
 import Update.Http (HttpLbs)
 import Update.Md5Cache (gencachePackages)
 import Update.OverlayTree (withNewTreeLock)
+import Update.OverlayWaves (computeOverlayProviderFingerprint)
 import Update.Types
-  ( UpdateReport (..),
+  ( EcosystemSpec (..),
+    UpdateReport (..),
     UpdateSource (..),
     UpdateStatus (..),
+    UpdateTechnique (..),
     mkPackageKey,
   )
 
@@ -108,6 +116,15 @@ integrationTests =
   testGroup
     "GitHubResilience"
     [ testCase "cache hit skips live GitHub need" testCacheHitSkipsLiveNeed,
+      testCase "needs-work deps hit is live only for update" testNeedsWorkDepsHitModes,
+      testCase "deps plan miss is live for both modes" testDepsPlanMissIsLive,
+      testCase "refresh misses a stored deps plan" testRefreshMissesStoredPlan,
+      testCase "cold provider latest is live" testColdProviderLatestIsLive,
+      testCase "unchanged ceilings skip outdated decrypt" testUnchangedCeilingsSkip,
+      testCase "hypothetical plan is live only for outdated" testHypotheticalPlanIsLive,
+      testCase "selected current provider skips hypothetical" testSelectedProviderNotOutdated,
+      testCase "content assessment failure is live only for update" testContentAssessmentFailureModes,
+      testCase "one miss makes the selection live" testOneMissMakesSelectionLive,
       testCase "outdated abort emits completed lines" testOutdatedAbortEmitsLines,
       testCase "latch concurrent in-flight then stop" testLatchConcurrent
     ]
@@ -610,8 +627,259 @@ testCacheHitSkipsLiveNeed =
       openCheckCacheAt (pure now) (Just cacheDir) (CacheTtl (5 * 60)) False overlay
     fp <- withNewTreeLock $ \tree -> computeFingerprint tree src [eb]
     storeLatest cache key fp (parseEbuildVersion "1.1.0")
-    live <- needsLiveGitHubApi cache overlay [entry] (groupByPackage [eb])
-    assertTrue "full cache hit is not live GitHub" (not live)
+    assertModes
+      "full GitMv cache hit"
+      False
+      False
+      cache
+      overlay
+      [entry]
+      [eb]
+
+------------------------------------------------------------------------
+-- Outdated vs update live-GitHub modes
+------------------------------------------------------------------------
+
+kwBody :: T.Text
+kwBody = "EAPI=8\nKEYWORDS=\"~amd64 ~arm64\"\n"
+
+writePkg :: FilePath -> T.Text -> T.Text -> T.Text -> T.Text -> IO Ebuild
+writePkg overlay cat pn ver body = do
+  let dir = overlay </> T.unpack cat </> T.unpack pn
+      path = dir </> T.unpack (pn <> "-" <> ver <> ".ebuild")
+  createDirectoryIfMissing True dir
+  TIO.writeFile path body
+  pure
+    Ebuild
+      { ebuildCategory = cat,
+        ebuildPackage = pn,
+        ebuildVersion = ver,
+        ebuildPath = path
+      }
+
+entryFor :: Ebuild -> PackageEntry
+entryFor eb =
+  PackageEntry
+    { peKey = mkPackageKey (ebuildCategory eb) (ebuildPackage eb),
+      pePN = ebuildPackage eb,
+      peLocal = parseEbuildVersion (ebuildVersion eb),
+      pePath = ebuildPath eb
+    }
+
+lanePlan :: [T.Text] -> RuntimeLanePlan
+lanePlan pvs =
+  RuntimeLanePlan
+    { glpLanes = [],
+      glpEbuilds = [],
+      glpUniquePVs = map parseEbuildVersion pvs,
+      glpRuntimeAtom = "dev-lang/go",
+      glpDirectTagFloors = [],
+      glpFloorPolicy = Nothing,
+      glpUvTags = []
+    }
+
+openLiveCache :: FilePath -> FilePath -> Bool -> IO CheckCacheHandle
+openLiveCache overlay cacheDir refresh = do
+  now <- getCurrentTime
+  (cache, _) <-
+    openCheckCacheAt (pure now) (Just cacheDir) (CacheTtl (5 * 60)) refresh overlay
+  pure cache
+
+storePlan ::
+  CheckCacheHandle ->
+  FilePath ->
+  UpdateSource ->
+  EcosystemSpec ->
+  [Ebuild] ->
+  RuntimeLanePlan ->
+  IO ()
+storePlan cache overlay src eco (eb : ebuilds) plan = do
+  let key = mkPackageKey (ebuildCategory eb) (ebuildPackage eb)
+  fp <- withNewTreeLock $ \tree -> computeFingerprint tree src (eb : ebuilds)
+  mProv <-
+    withNewTreeLock $ \tree ->
+      computeOverlayProviderFingerprint tree overlay (DepsAndAssets eco)
+  storeDeps cache key fp mProv plan
+storePlan _ _ _ _ [] _ = pure ()
+
+storeBunLatest :: CheckCacheHandle -> FilePath -> T.Text -> IO ()
+storeBunLatest cache overlay ver = do
+  let dir = overlay </> "dev-lang" </> "bun-bin"
+      src = GitHub "oven-sh" "bun" "bun-v"
+      key = mkPackageKey "dev-lang" "bun-bin"
+  fp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src dir "bun-bin"
+  storeLatest cache key fp (parseEbuildVersion ver)
+
+assertModes ::
+  String ->
+  Bool ->
+  Bool ->
+  CheckCacheHandle ->
+  FilePath ->
+  [PackageEntry] ->
+  [Ebuild] ->
+  IO ()
+assertModes label outdatedLive updateLive cache overlay entries ebuilds = do
+  gotOutdated <-
+    needsLiveGitHubApi LiveForOutdated cache overlay entries (groupByPackage ebuilds)
+  gotUpdate <-
+    needsLiveGitHubApi LiveForUpdate cache overlay entries (groupByPackage ebuilds)
+  assertEq (label <> " / outdated") outdatedLive gotOutdated
+  assertEq (label <> " / update") updateLive gotUpdate
+
+beadsSrc :: UpdateSource
+beadsSrc = GitHub "gastownhall" "beads" "v"
+
+ralphSrc :: UpdateSource
+ralphSrc = GitHub "subsy" "ralph-tui" "v"
+
+testNeedsWorkDepsHitModes :: IO ()
+testNeedsWorkDepsHitModes =
+  withSystemTempDirectory "om-gh-need" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    eb <- writePkg overlay "dev-util" "beads" "1.0.0" "EAPI=8\n"
+    cache <- openLiveCache overlay (tmp </> "cc") False
+    storePlan cache overlay beadsSrc (Go Nothing) [eb] (lanePlan ["2.0.0"])
+    assertModes
+      "needs-work plan hit"
+      False
+      True
+      cache
+      overlay
+      [entryFor eb]
+      [eb]
+
+testDepsPlanMissIsLive :: IO ()
+testDepsPlanMissIsLive =
+  withSystemTempDirectory "om-gh-miss" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    eb <- writePkg overlay "dev-util" "beads" "1.0.0" "EAPI=8\n"
+    cache <- openLiveCache overlay (tmp </> "cc") False
+    assertModes "deps plan miss" True True cache overlay [entryFor eb] [eb]
+
+testRefreshMissesStoredPlan :: IO ()
+testRefreshMissesStoredPlan =
+  withSystemTempDirectory "om-gh-refresh" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    eb <- writePkg overlay "dev-util" "beads" "1.0.0" "EAPI=8\n"
+    cache <- openLiveCache overlay (tmp </> "cc") True
+    storePlan cache overlay beadsSrc (Go Nothing) [eb] (lanePlan ["2.0.0"])
+    assertModes "refresh" True True cache overlay [entryFor eb] [eb]
+
+testColdProviderLatestIsLive :: IO ()
+testColdProviderLatestIsLive =
+  withSystemTempDirectory "om-gh-cold" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- writePkg overlay "dev-lang" "bun-bin" "1.1.0" kwBody
+    ralph <- writePkg overlay "dev-util" "ralph-tui" "1.0.0" "EAPI=8\n"
+    cache <- openLiveCache overlay (tmp </> "cc") False
+    storePlan cache overlay ralphSrc Bun [ralph] (lanePlan ["1.0.0"])
+    assertModes
+      "cold provider latest"
+      True
+      True
+      cache
+      overlay
+      [entryFor ralph]
+      [ralph]
+
+testUnchangedCeilingsSkip :: IO ()
+testUnchangedCeilingsSkip =
+  withSystemTempDirectory "om-gh-eq" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- writePkg overlay "dev-lang" "bun-bin" "1.1.0" kwBody
+    ralph <- writePkg overlay "dev-util" "ralph-tui" "1.0.0" "EAPI=8\n"
+    cache <- openLiveCache overlay (tmp </> "cc") False
+    storePlan cache overlay ralphSrc Bun [ralph] (lanePlan ["9.9.9"])
+    storeBunLatest cache overlay "1.1.0"
+    assertModes
+      "unchanged ceilings"
+      False
+      True
+      cache
+      overlay
+      [entryFor ralph]
+      [ralph]
+
+testHypotheticalPlanIsLive :: IO ()
+testHypotheticalPlanIsLive =
+  withSystemTempDirectory "om-gh-hypo" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    _ <- writePkg overlay "dev-lang" "bun-bin" "1.1.0" kwBody
+    ralph <- writePkg overlay "dev-util" "ralph-tui" "1.0.0" "EAPI=8\n"
+    cache <- openLiveCache overlay (tmp </> "cc") False
+    storePlan cache overlay ralphSrc Bun [ralph] (lanePlan ["1.0.0"])
+    storeBunLatest cache overlay "1.2.0"
+    assertModes
+      "hypothetical plan"
+      True
+      False
+      cache
+      overlay
+      [entryFor ralph]
+      [ralph]
+
+testSelectedProviderNotOutdated :: IO ()
+testSelectedProviderNotOutdated =
+  withSystemTempDirectory "om-gh-sel" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    bun <- writePkg overlay "dev-lang" "bun-bin" "1.2.0" kwBody
+    ralph <- writePkg overlay "dev-util" "ralph-tui" "1.0.0" "EAPI=8\n"
+    cache <- openLiveCache overlay (tmp </> "cc") False
+    storePlan cache overlay ralphSrc Bun [ralph] (lanePlan ["1.0.0"])
+    let bunSrc = GitHub "oven-sh" "bun" "bun-v"
+        bunKey = mkPackageKey "dev-lang" "bun-bin"
+        bunDir = overlay </> "dev-lang" </> "bun-bin"
+    fpDir <-
+      withNewTreeLock $ \tree ->
+        computeFingerprintFromDir tree bunSrc bunDir "bun-bin"
+    fpList <- withNewTreeLock $ \tree -> computeFingerprint tree bunSrc [bun]
+    assertEq "bun-bin fingerprints agree" fpDir fpList
+    storeLatest cache bunKey fpDir (parseEbuildVersion "1.1.0")
+    assertModes
+      "selected provider is not GitMv-outdated"
+      False
+      False
+      cache
+      overlay
+      [entryFor bun, entryFor ralph]
+      [bun, ralph]
+
+testContentAssessmentFailureModes :: IO ()
+testContentAssessmentFailureModes =
+  withSystemTempDirectory "om-gh-assess" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    numeric <- writePkg overlay "dev-util" "beads" "1.0.0" "EAPI=8\n"
+    raw <- writePkg overlay "dev-util" "beads" "abc" "EAPI=8\n"
+    cache <- openLiveCache overlay (tmp </> "cc") False
+    storePlan cache overlay beadsSrc (Go Nothing) [numeric, raw] (lanePlan ["1.0.0"])
+    assertModes
+      "content assessment failure"
+      False
+      True
+      cache
+      overlay
+      [entryFor numeric]
+      [numeric, raw]
+
+testOneMissMakesSelectionLive :: IO ()
+testOneMissMakesSelectionLive =
+  withSystemTempDirectory "om-gh-one" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    hit <- writePkg overlay "dev-lang" "bun-bin" "1.1.0" kwBody
+    miss <- writePkg overlay "dev-util" "beads" "1.0.0" "EAPI=8\n"
+    cache <- openLiveCache overlay (tmp </> "cc") False
+    let bunSrc = GitHub "oven-sh" "bun" "bun-v"
+    fp <- withNewTreeLock $ \tree -> computeFingerprint tree bunSrc [hit]
+    storeLatest cache (mkPackageKey "dev-lang" "bun-bin") fp (parseEbuildVersion "1.1.0")
+    assertModes
+      "one miss"
+      True
+      True
+      cache
+      overlay
+      [entryFor hit, entryFor miss]
+      [hit, miss]
 
 testOutdatedAbortEmitsLines :: IO ()
 testOutdatedAbortEmitsLines =
