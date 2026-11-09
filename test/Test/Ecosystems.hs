@@ -215,6 +215,10 @@ unitTests =
           testCase "registry harvest raises build floor" testCargoRegistryHarvestRaisesFloor,
           testCase "buildCargoCratesTarball clone failure" testCargoBuilderCloneFail,
           testCase "buildCargoCratesTarball missing Cargo.lock" testCargoBuilderMissingLock,
+          testCase "GenerateLock missing lock generates then packs" testGenerateLockMissingThenPacks,
+          testCase "GenerateLock existing lock is not regenerated" testGenerateLockKeepsExisting,
+          testCase "GenerateLock generate failure does not pack" testGenerateLockFailureSkipsPack,
+          testCase "GenerateLock cargo generate-lockfile argv" testGenerateLockfileCommand,
           testCase "buildCargoCratesTarball pycargo failure" testCargoBuilderPycargoFail,
           testCase "buildCargoCratesTarball pack failure" testCargoBuilderPackFail,
           testCase "packCratesTarball tiny fixture" testPackCratesTarballFixture,
@@ -1268,6 +1272,8 @@ fakeCargoSuccessOps =
         pure (Right ()),
       coFetchUnpackCrate = \_pn _pv _dist _src ->
         pure (Left "should not fetch published crate"),
+      coGenerateLockfile = \_ ->
+        pure (Left "should not generate lockfile"),
       coPycargoebuild = \ebuildPath _lockRoot _outPath _dist -> do
         -- Simulate inplace ebuild update; pack step writes the tarball.
         TIO.writeFile ebuildPath (donorEbuild <> "\n# pycargoebuild\n")
@@ -1456,6 +1462,7 @@ testCargoBuilderCloneFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
         CargoOps
           { coClone = \_ _ _ -> pure (Left "git clone failed: offline"),
             coFetchUnpackCrate = \_ _ _ _ -> pure (Left "should not fetch"),
+            coGenerateLockfile = \_ -> pure (Left "should not generate"),
             coPycargoebuild = \_ _ _ _ -> pure (Left "should not run"),
             coPackCrates = \_ _ _ _ _ _ -> pure (Left "should not pack"),
             coCloneRecursiveSubmodules = \_ _ _ -> pure (Left "should not harvest"),
@@ -1485,12 +1492,16 @@ testCargoBuilderCloneFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
 
 testCargoBuilderMissingLock :: IO ()
 testCargoBuilderMissingLock = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
+  generateCalls <- newIORef (0 :: Int)
   let ops =
         CargoOps
           { coClone = \_ _ dest -> do
               createDirectoryIfMissing True dest
               pure (Right ()),
             coFetchUnpackCrate = \_ _ _ _ -> pure (Left "should not fetch"),
+            coGenerateLockfile = \_ -> do
+              atomicModifyIORef' generateCalls (\n -> (n + 1, ()))
+              pure (Left "should not generate"),
             coPycargoebuild = \_ _ _ _ -> pure (Left "should not run"),
             coPackCrates = \_ _ _ _ _ _ -> pure (Left "should not pack"),
             coCloneRecursiveSubmodules = \_ _ _ -> pure (Left "should not harvest"),
@@ -1515,8 +1526,217 @@ testCargoBuilderMissingLock = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> 
       tmp
       "x.tar.xz"
   case result of
-    Left err -> assertTrue "mentions Cargo.lock" ("Cargo.lock" `T.isInfixOf` err)
+    Left err -> do
+      assertTrue "mentions Cargo.lock" ("Cargo.lock" `T.isInfixOf` err)
+      assertTrue "names the lock root" (T.pack (tmp </> "src") `T.isInfixOf` err)
+      assertTrue
+        "does not generate"
+        (not ("generate-lockfile" `T.isInfixOf` err))
+      n <- readIORef generateCalls
+      assertEq "generate not called for CargoGitTag" 0 n
     Right _ -> fail "expected missing Cargo.lock failure"
+
+-- | A lockless Git tag generates Cargo.lock, then pycargoebuild and the pack run.
+testGenerateLockMissingThenPacks :: IO ()
+testGenerateLockMissingThenPacks =
+  withSystemTempDirectory "mndz-genlock-" $ \tmp -> do
+    generateCalls <- newIORef (0 :: Int)
+    pycargoCalls <- newIORef (0 :: Int)
+    let lockSentinel = "version = 4\n# generated\n"
+        ops =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> do
+                createDirectoryIfMissing True dest
+                TIO.writeFile
+                  (dest </> "Cargo.toml")
+                  "[package]\nname = \"cargo-llvm-cov\"\nrust-version = \"1.87\"\n"
+                pure (Right ()),
+              coGenerateLockfile = \lockRoot -> do
+                atomicModifyIORef' generateCalls (\n -> (n + 1, ()))
+                TIO.writeFile (lockRoot </> "Cargo.lock") lockSentinel
+                pure (Right ()),
+              coPycargoebuild = \ebuildPath _ _ _ -> do
+                atomicModifyIORef' pycargoCalls (\n -> (n + 1, ()))
+                TIO.writeFile ebuildPath (donorEbuild <> "\n# pycargoebuild\n")
+                pure (Right ())
+            }
+    res <-
+      assertRight "generate then pack"
+        =<< buildCargoCratesTarball
+          ops
+          noopCargoProgress
+          "taiki-e"
+          "cargo-llvm-cov"
+          "v"
+          "0.9.0"
+          Nothing
+          Nothing
+          CargoGitTagGenerateLock
+          donorEbuild
+          Nothing
+          False
+          "cargo-llvm-cov"
+          tmp
+          tmp
+          "cargo-llvm-cov-0.9.0-crates.tar.xz"
+    nGen <- readIORef generateCalls
+    nPy <- readIORef pycargoCalls
+    assertEq "generated once" 1 nGen
+    assertEq "pycargo ran after generate" 1 nPy
+    lock <- TIO.readFile (tmp </> "src" </> "Cargo.lock")
+    assertEq "pack uses the generated lock" lockSentinel lock
+    assertEq "msrv from generated tree" "1.87.0" (crMsrv res)
+    exists <- doesFileExist (crTarballPath res)
+    assertTrue "tarball written" exists
+
+-- | An existing lock is left byte-for-byte and generate is not called.
+testGenerateLockKeepsExisting :: IO ()
+testGenerateLockKeepsExisting =
+  withSystemTempDirectory "mndz-genlock-keep-" $ \tmp -> do
+    generateCalls <- newIORef (0 :: Int)
+    let sentinel = "version = 4\n# existing-lock\n"
+        ops =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> do
+                createDirectoryIfMissing True dest
+                TIO.writeFile (dest </> "Cargo.lock") sentinel
+                TIO.writeFile
+                  (dest </> "Cargo.toml")
+                  "[package]\nname = \"cargo-llvm-cov\"\nrust-version = \"1.87\"\n"
+                pure (Right ()),
+              coGenerateLockfile = \_ -> do
+                atomicModifyIORef' generateCalls (\n -> (n + 1, ()))
+                pure (Left "should not generate")
+            }
+    _ <-
+      assertRight "kept lock"
+        =<< buildCargoCratesTarball
+          ops
+          noopCargoProgress
+          "taiki-e"
+          "cargo-llvm-cov"
+          "v"
+          "0.9.0"
+          Nothing
+          Nothing
+          CargoGitTagGenerateLock
+          donorEbuild
+          Nothing
+          False
+          "cargo-llvm-cov"
+          tmp
+          tmp
+          "cargo-llvm-cov-0.9.0-crates.tar.xz"
+    n <- readIORef generateCalls
+    assertEq "generate not called" 0 n
+    lock <- TIO.readFile (tmp </> "src" </> "Cargo.lock")
+    assertEq "lock bytes unchanged" sentinel lock
+
+-- | A non-zero generate names the lock root and does not run pycargoebuild.
+testGenerateLockFailureSkipsPack :: IO ()
+testGenerateLockFailureSkipsPack =
+  withSystemTempDirectory "mndz-genlock-fail-" $ \tmp -> do
+    pycargoCalls <- newIORef (0 :: Int)
+    packCalls <- newIORef (0 :: Int)
+    let ops =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> do
+                createDirectoryIfMissing True dest
+                TIO.writeFile
+                  (dest </> "Cargo.toml")
+                  "[package]\nname = \"cargo-llvm-cov\"\n"
+                pure (Right ()),
+              coGenerateLockfile = \_ -> pure (Left "resolver offline"),
+              coPycargoebuild = \_ _ _ _ -> do
+                atomicModifyIORef' pycargoCalls (\n -> (n + 1, ()))
+                pure (Left "should not run"),
+              coPackCrates = \_ _ _ _ _ _ -> do
+                atomicModifyIORef' packCalls (\n -> (n + 1, ()))
+                pure (Left "should not pack")
+            }
+    result <-
+      buildCargoCratesTarball
+        ops
+        noopCargoProgress
+        "taiki-e"
+        "cargo-llvm-cov"
+        "v"
+        "0.9.0"
+        Nothing
+        Nothing
+        CargoGitTagGenerateLock
+        donorEbuild
+        Nothing
+        False
+        "cargo-llvm-cov"
+        tmp
+        tmp
+        "x.tar.xz"
+    case result of
+      Left err -> do
+        assertTrue
+          "names generate"
+          ("cargo generate-lockfile failed at " `T.isInfixOf` err)
+        assertTrue
+          "names the lock root"
+          (T.pack (tmp </> "src") `T.isInfixOf` err)
+        assertTrue "keeps the op error" ("resolver offline" `T.isInfixOf` err)
+        nPy <- readIORef pycargoCalls
+        nPack <- readIORef packCalls
+        assertEq "pycargo not called" 0 nPy
+        assertEq "pack not called" 0 nPack
+      Right _ -> fail "expected generate failure"
+
+-- | Production wiring runs @cargo generate-lockfile@ in the lock root.
+testGenerateLockfileCommand :: IO ()
+testGenerateLockfileCommand =
+  withSystemTempDirectory "mndz-genlock-cmd-" $ \tmp -> do
+    let lockRoot = tmp </> "src"
+        run req = case execCmd req of
+          Just ("git", "clone" : args) -> do
+            let dest = last args
+            createDirectoryIfMissing True dest
+            TIO.writeFile
+              (dest </> "Cargo.toml")
+              "[package]\nname = \"cargo-llvm-cov\"\nrust-version = \"1.87\"\n"
+            pure (okResult "")
+          Just ("cargo", ["generate-lockfile"]) -> do
+            assertEq "cwd is the lock root" (Just lockRoot) (prCwd req)
+            case prCwd req of
+              Just dir ->
+                TIO.writeFile (dir </> "Cargo.lock") "version = 4\n# generated\n"
+              Nothing -> fail "generate-lockfile without a working directory"
+            pure (okResult "")
+          Just ("pycargoebuild", args) -> do
+            case dropWhile (/= "-i") args of
+              ("-i" : ebuildPath : _) ->
+                TIO.writeFile ebuildPath (donorEbuild <> "\n# pycargo\n")
+              _ -> pure ()
+            pure (okResult "")
+          Just ("tar", _) -> productionCommandRunner req
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+    res <-
+      assertRight "command generate"
+        =<< buildCargoCratesTarball
+          (mkCargoOps run)
+          noopCargoProgress
+          "taiki-e"
+          "cargo-llvm-cov"
+          "v"
+          "0.9.0"
+          Nothing
+          Nothing
+          CargoGitTagGenerateLock
+          donorEbuild
+          Nothing
+          False
+          "cargo-llvm-cov"
+          tmp
+          tmp
+          "cargo-llvm-cov-0.9.0-crates.tar.xz"
+    assertEq "msrv" "1.87.0" (crMsrv res)
+    exists <- doesFileExist (crTarballPath res)
+    assertTrue "tarball written" exists
 
 testCargoBuilderPycargoFail :: IO ()
 testCargoBuilderPycargoFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
@@ -3239,6 +3459,7 @@ testCargoCratesIoLaneOps =
                       ]
                   )
                 pure (Right ()),
+              coGenerateLockfile = \_ -> pure (Left "should not generate"),
               coPycargoebuild = \ebuildPath _lockRoot _outPath _dist -> do
                 logEv "pycargo"
                 body <- TIO.readFile ebuildPath

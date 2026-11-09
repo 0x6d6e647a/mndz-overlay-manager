@@ -642,6 +642,21 @@ testPolicyClassification = do
     other -> do
       hPutStrLn stderr $ "biodiff technique: " <> show other
       exitFailure
+  case lookupPolicy (PackageKey "dev-util/cargo-llvm-cov") of
+    Just
+      ( PackagePolicy
+          (GitHub "taiki-e" "cargo-llvm-cov" "v")
+          (DepsAndAssets (Cargo Nothing Nothing CargoGitTagGenerateLock))
+          []
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "cargo-llvm-cov technique: " <> show other
+      exitFailure
+  assertEq
+    "cargo-llvm-cov arches"
+    []
+    (lookupLaneArches (PackageKey "dev-util/cargo-llvm-cov"))
   case lookupPolicy (PackageKey "dev-util/codex") of
     Just
       ( PackagePolicy

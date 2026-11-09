@@ -269,6 +269,8 @@ fakeCargoSuccessOps =
         pure (Right ()),
       coFetchUnpackCrate = \_pn _pv _dist _src ->
         pure (Left "should not fetch published crate"),
+      coGenerateLockfile = \_ ->
+        pure (Left "should not generate lockfile"),
       coPycargoebuild = \ebuildPath _lockRoot _outPath _dist -> do
         body <- TIO.readFile ebuildPath
         TIO.writeFile ebuildPath (body <> "\n# pycargoebuild\n")

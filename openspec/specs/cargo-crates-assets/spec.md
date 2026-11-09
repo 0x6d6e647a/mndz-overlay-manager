@@ -1,12 +1,12 @@
 ## Purpose
 
-Cargo ecosystem under `DepsAndAssets`: pycargoebuild crate-tarball materialize, manager-owned crates tarball pack, distfile naming, MSRV probe (including `rust-toolchain.toml` dotted channel), SRC_URI/`RUST_MIN_VER` ownership, rusty_v8 submodule sidecar, policy for hk/mise/usage/biodiff/codex, preflight tools, and reuse vs full path.
+Cargo ecosystem under `DepsAndAssets`: pycargoebuild crate-tarball materialize, manager-owned crates tarball pack, distfile naming, MSRV probe (including `rust-toolchain.toml` dotted channel), SRC_URI/`RUST_MIN_VER` ownership, rusty_v8 submodule sidecar, policy for hk/mise/usage/biodiff/codex, provenance `CargoGitTagGenerateLock`, preflight tools, and reuse vs full path.
 
 ## Requirements
 
 ### Requirement: Cargo ecosystem under DepsAndAssets
 
-The library SHALL support `DepsAndAssets` with ecosystem `Cargo`. Policy SHALL declare a Cargo provenance: `CargoGitTag` or `CargoCratesIo`. Policy MAY supply an optional lock subdirectory (relative to the repository root; `Nothing` means root) where `Cargo.lock` is expected, and an optional package subdirectory for the binary package (`Nothing` means same as lock root). The package subdirectory, when set, is the policy package: tag-floor discovery SHALL start there, and full-path materialize SHALL run `pycargoebuild` with that directory as its argument (workspace members such as usage’s `cli/`). When unset, tag-floor discovery and `pycargoebuild` SHALL start at the lock root. The program SHALL still require `Cargo.lock` at the lock root (Cargo resolves the lockfile by walking parents). Apply SHALL require a `GitHub` update source for provenance `CargoGitTag` Cargo packages and SHALL hard-fail if the source is not GitHub; provenance `CargoCratesIo` packages MAY use a `GitHub` update source for version detection and tag-floor probing while materialization uses the published crates.io crate. A virtual workspace root (`[workspace]` without `[package]`) with no package subdirectory SHALL fail planning with an error that names the missing package subdirectory.
+The library SHALL support `DepsAndAssets` with ecosystem `Cargo`. Policy SHALL declare a Cargo provenance: `CargoGitTag`, `CargoGitTagGenerateLock`, or `CargoCratesIo`. Policy MAY supply an optional lock subdirectory (relative to the repository root; `Nothing` means root) where `Cargo.lock` is expected, and an optional package subdirectory for the binary package (`Nothing` means same as lock root). The package subdirectory, when set, is the policy package: tag-floor discovery SHALL start there, and full-path materialize SHALL run `pycargoebuild` with that directory as its argument (workspace members such as usage’s `cli/`). When unset, tag-floor discovery and `pycargoebuild` SHALL start at the lock root. Provenance `CargoGitTag` and `CargoCratesIo` SHALL require an existing `Cargo.lock` at the lock root. Provenance `CargoGitTagGenerateLock` SHALL use that lock when it exists and SHALL create it when it is absent, as specified by lockless Git tag materialize. Cargo resolves the lockfile by walking parents. Apply SHALL require a `GitHub` update source for provenance `CargoGitTag` and `CargoGitTagGenerateLock` and SHALL hard-fail if the source is not GitHub; provenance `CargoCratesIo` packages MAY use a `GitHub` update source for version detection and tag-floor probing while materialization uses the published crates.io crate. A virtual workspace root (`[workspace]` without `[package]`) with no package subdirectory SHALL fail planning with an error that names the missing package subdirectory.
 
 #### Scenario: usage package subdir
 
@@ -29,6 +29,44 @@ The library SHALL support `DepsAndAssets` with ecosystem `Cargo`. Policy SHALL d
 - **WHEN** policy for `dev-util/biodiff` uses `DepsAndAssets Cargo` with provenance `CargoCratesIo` and source GitHub `8051enthusiast`/`biodiff` with tag prefix `v`
 - **THEN** version detection and tag-floor probing use that GitHub source
 - **AND** full-path materialize uses the published crates.io crate for the target PV, not the git tag
+
+#### Scenario: cargo-llvm-cov generates a missing lock
+
+- **WHEN** policy for `dev-util/cargo-llvm-cov` uses provenance `CargoGitTagGenerateLock` and the tag has no `Cargo.lock`
+- **THEN** version detection uses GitHub `taiki-e`/`cargo-llvm-cov` with tag prefix `v`
+- **AND** full-path materialize creates `Cargo.lock` before `pycargoebuild`
+
+### Requirement: Lockless Git tag materialize
+
+For provenance `CargoGitTagGenerateLock`, full-path materialize SHALL follow the `CargoGitTag` clone, `pycargoebuild`, and pack steps inside the materialize container. Before `pycargoebuild`, an absent `Cargo.lock` at the lock root SHALL be created there with `cargo generate-lockfile`. An existing `Cargo.lock` SHALL be left unchanged. A non-zero `cargo generate-lockfile` SHALL hard-fail the unit and name the lock root.
+
+#### Scenario: Missing lock is generated
+
+- **WHEN** full-path materialize runs for provenance `CargoGitTagGenerateLock` and the tag checkout has no `Cargo.lock` at the lock root
+- **THEN** the materialize container runs `cargo generate-lockfile` in that lock root before `pycargoebuild`
+- **AND** the pack uses the generated `Cargo.lock`
+
+#### Scenario: Existing lock is kept
+
+- **WHEN** full-path materialize runs for provenance `CargoGitTagGenerateLock` and `Cargo.lock` is already at the lock root
+- **THEN** the program does not run `cargo generate-lockfile`
+- **AND** `pycargoebuild` and the pack use that existing lock
+
+#### Scenario: Generate failure hard-fails
+
+- **WHEN** `cargo generate-lockfile` exits non-zero for a `CargoGitTagGenerateLock` unit
+- **THEN** the unit hard-fails and the error names the lock root
+- **AND** `pycargoebuild` does not run
+
+### Requirement: Git tag provenance still requires a lock
+
+Provenance `CargoGitTag` SHALL hard-fail full-path materialize when `Cargo.lock` is absent at the lock root. That provenance SHALL NOT run `cargo generate-lockfile`.
+
+#### Scenario: Missing lock is not generated
+
+- **WHEN** full-path materialize runs for provenance `CargoGitTag` and `Cargo.lock` is absent at the lock root
+- **THEN** the unit hard-fails
+- **AND** the program does not run `cargo generate-lockfile`
 
 ### Requirement: pycargoebuild crate-tarball materialize
 
@@ -438,7 +476,7 @@ When writing or repairing `GIT_CRATES` for a Cargo GitTag ebuild other than `dev
 
 ### Requirement: Manager-owned SRC_URI for cargo
 
-After pycargoebuild inplace update on full path (or on content repair), the program SHALL rewrite the ebuild `SRC_URI` to the provenance-appropriate primary source line plus the assets-repository crates tarball URL for `{pn}-${PV}-crates.tar.xz` (`https://github.com/{owner}/{repo}/releases/download/` using `{owner}/{repo}` from `assets-path` `origin`), and SHALL NOT rely on `${CARGO_CRATE_URIS}` as the **registry** dependency distfile source for steady-state tarball-shaped ebuilds. Provenance `CargoGitTag`: the primary source line is the upstream GitHub source archive for the tag. Provenance `CargoCratesIo`: the primary source line is the canonical crates.io download distfile for the policy crate name and PV, `https://crates.io/api/v1/crates/<crate>/<pv>/download -> <p>.crate`.
+After pycargoebuild inplace update on full path (or on content repair), the program SHALL rewrite the ebuild `SRC_URI` to the provenance-appropriate primary source line plus the assets-repository crates tarball URL for `{pn}-${PV}-crates.tar.xz` (`https://github.com/{owner}/{repo}/releases/download/` using `{owner}/{repo}` from `assets-path` `origin`), and SHALL NOT rely on `${CARGO_CRATE_URIS}` as the **registry** dependency distfile source for steady-state tarball-shaped ebuilds. Provenance `CargoGitTag` and `CargoGitTagGenerateLock`: the primary source line is the upstream GitHub source archive for the tag. Provenance `CargoCratesIo`: the primary source line is the canonical crates.io download distfile for the policy crate name and PV, `https://crates.io/api/v1/crates/<crate>/<pv>/download -> <p>.crate`.
 
 The program SHALL treat `${CARGO_CRATE_URIS}` as list-era registry URIs **only when `CRATES` is non-empty**. When `CRATES` is empty, the rewrite SHALL preserve `GIT_CRATES` URI expansion (`${CARGO_CRATE_URIS}` as used for git crates) and SHALL preserve extra `SRC_URI` lines that are neither the GitHub/crates.io primary source nor the crates tarball (including rusty_v8 snapshot and Chromium GCS clang/rust-toolchain distfiles). The program SHALL NOT collapse those ebuilds to a two-line github-archive-plus-crates form.
 
@@ -464,6 +502,13 @@ The program SHALL treat `${CARGO_CRATE_URIS}` as list-era registry URIs **only w
 
 - **WHEN** `assets-path` `origin` is `https://github.com/alice/overlay-assets.git` and the program writes a crates assets `SRC_URI`
 - **THEN** the URL host path is `github.com/alice/overlay-assets/releases/download/`
+
+#### Scenario: Lockless Git tag keeps the GitHub archive
+
+- **WHEN** the manager rewrites SRC_URI for `dev-util/cargo-llvm-cov` at PV `0.9.1`
+- **THEN** the primary source line is the upstream GitHub tag archive
+- **AND** the assets line references `cargo-llvm-cov-0.9.1-crates.tar.xz`
+- **AND** a `GIT_CRATES` fetch line using `${CARGO_CRATE_URIS}` remains when `CRATES` is empty and `GIT_CRATES` is declared
 
 ### Requirement: Git crate fetch line
 
@@ -514,7 +559,7 @@ If the crates release tag exists but any required **crates-tag** asset is missin
 
 ### Requirement: Manager-owned crates tarball pack
 
-For full-path Cargo materialize after successful pycargoebuild with `--use-crate-tarball`, the program SHALL create `{pn}-{pv}-crates.tar.xz` by: (1) parsing the provenance-appropriate `Cargo.lock` — provenance `CargoGitTag`: the clone’s lock at the policy lock root; provenance `CargoCratesIo`: the unpacked published crate’s `Cargo.lock` — for registry packages that declare a checksum; (2) for each such package, extracting the corresponding `{name}-{version}.crate` from the temporary distdir into a stage tree under `cargo_home/gentoo/{name}-{version}/` and writing `.cargo-checksum.json` with `package` set to the lockfile checksum and `files` an empty object; (3) creating the archive with system `tar` such that member paths are prefixed with `cargo_home/gentoo/…`, packing with the hermetic tar/xz rules specified by `hermetic-asset-materialize` (`XZ_OPT=-T1 -9e`, numeric owner `0/0`); (4) writing the final file atomically (temp then rename) such that the path presented to `tar` for compression **always selects xz** (the program SHALL NOT use a temporary basename whose suffix causes `tar -a` / auto-compress to skip compression—for example a bare `.tmp` suffix on an otherwise `.tar.xz` product name—unless xz is forced by an explicit xz filter flag equivalent to `-J` / `--xz`); (5) after a successful archive write and rename to the final `{pn}-{pv}-crates.tar.xz` path, verifying that the final file is an xz-compressed stream (hard-fail with an error distinct from pycargoebuild failure if the body is plain tar or otherwise not xz). Pack SHALL hard-fail if a lock-listed registry crate file is missing from the distdir or if archive creation fails, with an error distinct from pycargoebuild failure. Git/path packages that are not registry crates with checksums SHALL NOT be required in the tarball (GIT_CRATES remain pycargoebuild’s ebuild concern).
+For full-path Cargo materialize after successful pycargoebuild with `--use-crate-tarball`, the program SHALL create `{pn}-{pv}-crates.tar.xz` by: (1) parsing the provenance-appropriate `Cargo.lock` — provenance `CargoGitTag` and `CargoGitTagGenerateLock`: the clone’s lock at the policy lock root; provenance `CargoCratesIo`: the unpacked published crate’s `Cargo.lock` — for registry packages that declare a checksum; (2) for each such package, extracting the corresponding `{name}-{version}.crate` from the temporary distdir into a stage tree under `cargo_home/gentoo/{name}-{version}/` and writing `.cargo-checksum.json` with `package` set to the lockfile checksum and `files` an empty object; (3) creating the archive with system `tar` such that member paths are prefixed with `cargo_home/gentoo/…`, packing with the hermetic tar/xz rules specified by `hermetic-asset-materialize` (`XZ_OPT=-T1 -9e`, numeric owner `0/0`); (4) writing the final file atomically (temp then rename) such that the path presented to `tar` for compression **always selects xz** (the program SHALL NOT use a temporary basename whose suffix causes `tar -a` / auto-compress to skip compression—for example a bare `.tmp` suffix on an otherwise `.tar.xz` product name—unless xz is forced by an explicit xz filter flag equivalent to `-J` / `--xz`); (5) after a successful archive write and rename to the final `{pn}-{pv}-crates.tar.xz` path, verifying that the final file is an xz-compressed stream (hard-fail with an error distinct from pycargoebuild failure if the body is plain tar or otherwise not xz). Pack SHALL hard-fail if a lock-listed registry crate file is missing from the distdir or if archive creation fails, with an error distinct from pycargoebuild failure. Git/path packages that are not registry crates with checksums SHALL NOT be required in the tarball (GIT_CRATES remain pycargoebuild’s ebuild concern).
 
 #### Scenario: Checksum JSON from lock
 
@@ -634,6 +679,18 @@ Policy for `app-office/deckcraft`, `app-office/designcraft`, `app-office/gridcra
 - **AND** the source is GitHub `storytold/<package-name>` with tag prefix `v`
 - **AND** the runtime-lane allowlist is `amd64`, `x86`, `arm`, `arm64`, `ppc64`, `loong`, `riscv`, `sparc`, and `s390`
 
+### Requirement: cargo-llvm-cov policy
+
+The hardcoded policy map SHALL set `dev-util/cargo-llvm-cov` to `DepsAndAssets` Cargo with provenance `CargoGitTagGenerateLock`, GitHub source `taiki-e`/`cargo-llvm-cov`, tag prefix `v`, no lock subdirectory, and no package subdirectory. The runtime-lane arch allowlist SHALL be empty, admitting every discovered runtime arch.
+
+#### Scenario: Policy lookup
+
+- **WHEN** policy is resolved for `dev-util/cargo-llvm-cov`
+- **THEN** the technique is `DepsAndAssets` Cargo with provenance `CargoGitTagGenerateLock`
+- **AND** the source is GitHub `taiki-e`/`cargo-llvm-cov` with tag prefix `v`
+- **AND** there is no lock subdirectory and no package subdirectory
+- **AND** the runtime-lane arch allowlist is empty
+
 ### Requirement: Photocraft donor body survives Cargo rewrite
 
 A Cargo full-path or reuse rewrite of `media-gfx/photocraft` SHALL preserve `IUSE`, `REQUIRED_USE`, conditional dependencies, `src_compile`, `src_install`, `src_test`, the desktop integration install, and every `LICENSE` term outside the generated crate-license block. The rewrite SHALL still update the PV filename, KEYWORDS, `RUST_MIN_VER`, `CRATES`, the generated crate-license block, and the assets `SRC_URI` as specified for Cargo.
@@ -667,6 +724,18 @@ A Cargo rewrite of a Storytold craft app SHALL preserve `IUSE`, `REQUIRED_USE`, 
 - **WHEN** the newer tag's lock changes the generated crate-license block
 - **THEN** that generated block, `CRATES`, `RUST_MIN_VER`, `KEYWORDS`, and the assets `SRC_URI` are updated
 - **AND** `LICENSE` terms outside the generated block remain
+
+### Requirement: cargo-llvm-cov donor body survives Cargo rewrite
+
+A Cargo rewrite of `dev-util/cargo-llvm-cov` SHALL preserve `IUSE`, `RESTRICT`, `RDEPEND`, `BDEPEND`, the `/usr/bin/cargo-llvm-cov` wrapper install, `src_prepare`'s `test-helper` path rewrite, `src_test` including the `trybuild` and `ui_test` skips, and `QA_FLAGS_IGNORED`. The rewrite SHALL still update the PV filename, `KEYWORDS`, `RUST_MIN_VER`, `CRATES`, `GIT_CRATES`, the generated crate-license block, and the assets `SRC_URI`.
+
+#### Scenario: Bump keeps the wrapper and the test phase
+
+- **WHEN** apply rewrites the `0.9.0` donor into PV `0.9.1`
+- **THEN** the new ebuild still installs the wrapper at `/usr/bin/cargo-llvm-cov` and the binary at `/usr/libexec/cargo-llvm-cov/cargo-llvm-cov`
+- **AND** `src_test` still skips `trybuild` and `ui_test`
+- **AND** `src_prepare` still rewrites the `test-helper` git pin to a local path
+- **AND** `RDEPEND` still includes unslotted `llvm-core/llvm`
 
 ### Requirement: CratesIo materialize from the published crate
 
@@ -703,7 +772,7 @@ For `DepsAndAssets Cargo` with provenance `CargoCratesIo`, full-path materializa
 
 ### Requirement: Cargo provenance coherence
 
-Apply-time content checks SHALL enforce provenance coherence for `DepsAndAssets` Cargo packages: the policy provenance, the ebuild primary source line form, and the materialize/pack provenance SHALL agree. Provenance `CargoGitTag` requires a primary `github.com/…/archive/` source line; provenance `CargoCratesIo` requires the canonical crates.io download source line. A mismatch SHALL hard-fail the package before ebuild, Manifest, asset-publication, or commit mutation, naming the policy provenance and the observed source form.
+Apply-time content checks SHALL enforce provenance coherence for `DepsAndAssets` Cargo packages: the policy provenance, the ebuild primary source line form, and the materialize/pack provenance SHALL agree. Provenance `CargoGitTag` and `CargoGitTagGenerateLock` require a primary `github.com/…/archive/` source line; provenance `CargoCratesIo` requires the canonical crates.io download source line. A mismatch SHALL hard-fail the package before ebuild, Manifest, asset-publication, or commit mutation, naming the policy provenance and the observed source form.
 
 #### Scenario: Coherent CratesIo ebuild admitted
 
@@ -713,6 +782,16 @@ Apply-time content checks SHALL enforce provenance coherence for `DepsAndAssets`
 #### Scenario: Coherence mismatch hard-fails before commit
 
 - **WHEN** a biodiff ebuild carries a GitHub archive source line while policy provenance is `CargoCratesIo` (or the reverse mismatch)
+- **THEN** apply hard-fails the package naming the expected and observed source form, before Manifest, assets publication, or commit
+
+#### Scenario: Lockless Git tag admits a GitHub archive
+
+- **WHEN** apply assesses a `dev-util/cargo-llvm-cov` ebuild whose primary source line is a `github.com/…/archive/` line and policy provenance is `CargoGitTagGenerateLock`
+- **THEN** the coherence check passes and apply proceeds
+
+#### Scenario: Lockless Git tag rejects a crates.io primary source
+
+- **WHEN** a `dev-util/cargo-llvm-cov` ebuild's primary source line is the crates.io download distfile while policy provenance is `CargoGitTagGenerateLock`
 - **THEN** apply hard-fails the package naming the expected and observed source form, before Manifest, assets publication, or commit
 
 ### Requirement: Storytold patch-pin rewrite hook

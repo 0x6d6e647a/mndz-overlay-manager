@@ -121,6 +121,11 @@ data CargoOps = CargoOps
       -- \| Unit work source area receiving @{crate}-{pv}\/@.
       FilePath ->
       IO (Either Text ()),
+    -- | Run @cargo generate-lockfile@ in the lock root. Used only when
+    -- provenance is 'CargoGitTagGenerateLock' and @Cargo.lock@ is absent.
+    -- A non-zero exit is 'Left' and does not include the lock-root prefix;
+    -- the caller adds that path.
+    coGenerateLockfile :: FilePath -> IO (Either Text ()),
     -- | Run pycargoebuild: ebuild path, lock root / pkg dir, tarball out path, temp distdir.
     coPycargoebuild :: FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ()),
     -- | Pack registry crates: staging callback @k N@, archive-start, lock
@@ -156,6 +161,7 @@ mkCargoOps run =
   CargoOps
     { coClone = gitCloneTag run,
       coFetchUnpackCrate = fetchAndUnpackCrate run,
+      coGenerateLockfile = runGenerateLockfile run,
       coPycargoebuild = runPycargoebuild run,
       coPackCrates = packCratesTarballWith run,
       coCloneRecursiveSubmodules = gitCloneRecursiveSubmodules run,
@@ -168,9 +174,11 @@ productionCargoOps = mkCargoOps productionCommandRunner
 -- | Clone-or-fetch @tag@/@published crate@, run pycargoebuild with
 -- @--use-crate-tarball@, pack crates, return tarball + MSRV + ebuild body.
 -- Source, distdir, and stage live under unit @workDir@; tarball under @outDir@.
--- Provenance selects how @workDir/src@ is populated: 'CargoGitTag' clones the
--- GitHub tag (byte-for-byte legacy flow); 'CargoCratesIo' fetches and unpacks
--- the published crates.io @.crate@ for @pn@ at the target PV.
+-- Provenance selects how @workDir/src@ is populated: 'CargoGitTag' and
+-- 'CargoGitTagGenerateLock' clone the GitHub tag; 'CargoCratesIo' fetches and
+-- unpacks the published crates.io @.crate@ for @pn@ at the target PV.
+-- 'CargoGitTagGenerateLock' runs @cargo generate-lockfile@ in the lock root
+-- when that clone has no @Cargo.lock@. 'CargoGitTag' still hard-fails then.
 buildCargoCratesTarball ::
   CargoOps ->
   CargoProgress ->
@@ -223,15 +231,17 @@ buildCargoCratesTarball
         ebuildName = T.unpack pn <> "-" <> T.unpack pv <> ".ebuild"
         ebuildPath = workDir </> ebuildName
     createDirectoryIfMissing True distDir
+    let cloneTag = do
+          cgpOnCloneStart progress
+          cloned <- coClone ops url tag srcDir
+          case cloned of
+            Left err -> pure (Left err)
+            Right () -> do
+              cgpOnCloneDone progress
+              pure (Right ())
     populated <- case cargoSrc of
-      CargoGitTag -> do
-        cgpOnCloneStart progress
-        cloned <- coClone ops url tag srcDir
-        case cloned of
-          Left err -> pure (Left err)
-          Right () -> do
-            cgpOnCloneDone progress
-            pure (Right ())
+      CargoGitTag -> cloneTag
+      CargoGitTagGenerateLock -> cloneTag
       CargoCratesIo -> do
         cgpOnCloneStart progress
         fetched <- coFetchUnpackCrate ops pn pv distDir srcDir
@@ -250,26 +260,23 @@ buildCargoCratesTarball
           Left err -> pure (Left err)
           Right () -> do
             let unpackedCrateRoot = srcDir </> (T.unpack pn <> "-" <> T.unpack pv)
-                lockRoot = case (cargoSrc, mLockSub) of
-                  (CargoCratesIo, _) -> unpackedCrateRoot
-                  (CargoGitTag, Just sub) -> srcDir </> sub
-                  (CargoGitTag, Nothing) -> srcDir
+                gitLockRoot = maybe srcDir (srcDir </>) mLockSub
+                lockRoot = case cargoSrc of
+                  CargoCratesIo -> unpackedCrateRoot
+                  CargoGitTag -> gitLockRoot
+                  CargoGitTagGenerateLock -> gitLockRoot
                 -- pycargoebuild rejects workspace roots; run in the package member
                 -- when set (e.g. usage's cli/). Cargo.lock is still resolved upward.
                 -- CratesIo: the published crate root is the package.
-                pycargoDir = case (cargoSrc, mPkgSub) of
-                  (CargoGitTag, Just sub) -> srcDir </> sub
-                  (CargoCratesIo, _) -> unpackedCrateRoot
-                  (CargoGitTag, Nothing) -> lockRoot
-            hasLock <- doesFileExist (lockRoot </> "Cargo.lock")
-            if not hasLock
-              then
-                pure $
-                  Left
-                    ( "Cargo.lock not found at "
-                        <> T.pack lockRoot
-                    )
-              else do
+                gitPkgDir = maybe lockRoot (srcDir </>) mPkgSub
+                pycargoDir = case cargoSrc of
+                  CargoCratesIo -> unpackedCrateRoot
+                  CargoGitTag -> gitPkgDir
+                  CargoGitTagGenerateLock -> gitPkgDir
+            lockReady <- requireOrGenerateLock ops cargoSrc lockRoot
+            case lockReady of
+              Left err -> pure (Left err)
+              Right () -> do
                 TIO.writeFile ebuildPath donorContent
                 cgpOnPycargoStart progress
                 tool <-
@@ -311,8 +318,9 @@ buildCargoCratesTarball
                             let ebuildBody =
                                   stripWindowsOnlyGitCrates pn lockBody tomlBodies ebuildBody0
                             srcH <- case cargoSrc of
-                              -- GitTag: active-set clone harvest (policy closure).
+                              -- Git tag clones: active-set harvest (policy closure).
                               CargoGitTag -> harvestCloneFloor srcDir mPkgSub mLockSub
+                              CargoGitTagGenerateLock -> harvestCloneFloor srcDir mPkgSub mLockSub
                               -- CratesIo: published crate manifests declare no
                               -- in-tree path deps; walk the unpacked crate root.
                               CargoCratesIo -> harvestCloneFloor unpackedCrateRoot Nothing Nothing
@@ -343,6 +351,58 @@ buildCargoCratesTarball
                                                 crEbuildBody = ebuildBody,
                                                 crHarvestFloor = harvest
                                               }
+
+-- | Keep an existing @Cargo.lock@. For 'CargoGitTagGenerateLock' only, create
+-- a missing lock with @cargo generate-lockfile@. Other provenances hard-fail
+-- and do not generate. A failed generate names the lock root and does not
+-- continue to @pycargoebuild@.
+requireOrGenerateLock :: CargoOps -> CargoSource -> FilePath -> IO (Either Text ())
+requireOrGenerateLock ops cargoSrc lockRoot = do
+  let lockPath = lockRoot </> "Cargo.lock"
+  hasLock <- doesFileExist lockPath
+  let missing = Left ("Cargo.lock not found at " <> T.pack lockRoot)
+  case (cargoSrc, hasLock) of
+    (_, True) -> pure (Right ())
+    (CargoGitTagGenerateLock, False) -> do
+      generated <- coGenerateLockfile ops lockRoot
+      case generated of
+        Left err ->
+          pure $
+            Left
+              ( "cargo generate-lockfile failed at "
+                  <> T.pack lockRoot
+                  <> ": "
+                  <> err
+              )
+        Right () -> do
+          wrote <- doesFileExist lockPath
+          pure $
+            if wrote
+              then Right ()
+              else missing
+    (CargoGitTag, False) -> pure missing
+    (CargoCratesIo, False) -> pure missing
+
+-- | @cargo generate-lockfile@ in @lockRoot@. The caller's error adds the path.
+runGenerateLockfile :: CommandRunner -> FilePath -> IO (Either Text ())
+runGenerateLockfile run lockRoot = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "cargo" ["generate-lockfile"],
+          prCwd = Just lockRoot,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+  pure $ case prExitCode res of
+    ExitSuccess -> Right ()
+    ExitFailure code ->
+      Left
+        ( "exit "
+            <> T.pack (show code)
+            <> ": "
+            <> T.strip (T.pack (prStderr res))
+        )
 
 collectCargoTomlBodies :: FilePath -> IO [Text]
 collectCargoTomlBodies root = do

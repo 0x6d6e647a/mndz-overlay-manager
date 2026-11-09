@@ -1746,6 +1746,7 @@ cargoCratesProgress :: IORef Int -> MultiHandle -> PackageKey -> CargoSource -> 
 cargoCratesProgress stepsDoneRef mh key cargoSrc =
   let cloneLabel = case cargoSrc of
         CargoGitTag -> "cloning upstream"
+        CargoGitTagGenerateLock -> "cloning upstream"
         CargoCratesIo -> "fetching published crate"
    in CargoProgress
         { cgpOnCloneStart = mhStatus mh key cloneLabel,
@@ -2168,6 +2169,7 @@ cargoLockPath eco pn pv workDir =
   let srcDir = workDir </> "src"
       root = case eco of
         Cargo mLock _ CargoGitTag -> maybe srcDir (srcDir </>) mLock
+        Cargo mLock _ CargoGitTagGenerateLock -> maybe srcDir (srcDir </>) mLock
         Cargo _ _ CargoCratesIo -> srcDir </> (T.unpack pn <> "-" <> T.unpack pv)
         Go _ -> srcDir
         NpmEco -> srcDir

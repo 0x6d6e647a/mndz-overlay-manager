@@ -172,10 +172,14 @@ data EcosystemSpec
   deriving (Eq, Show)
 
 -- | Materialize provenance for a Cargo package. Version detection and
--- tag-floor probing stay GitHub-based for both provenances.
+-- tag-floor probing stay GitHub-based for every provenance.
 data CargoSource
-  = -- | Clone the GitHub tag (hk, mise, usage).
+  = -- | Clone the GitHub tag and require an existing @Cargo.lock@
+    -- (hk, mise, usage, codex, Storytold craft apps).
     CargoGitTag
+  | -- | Clone the GitHub tag. When @Cargo.lock@ is absent at the lock root,
+    -- create it with @cargo generate-lockfile@ before @pycargoebuild@.
+    CargoGitTagGenerateLock
   | -- | Fetch and unpack the published crates.io @.crate@ for the target PV.
     CargoCratesIo
   deriving (Eq, Show)

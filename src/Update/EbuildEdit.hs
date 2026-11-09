@@ -365,6 +365,14 @@ ebuildNeedsCargoBodyFixFor host CargoCratesIo pn keywords content =
     || hasListEraCargoDepsFor CargoCratesIo content
     || cratesFieldNonEmpty content
 ebuildNeedsCargoBodyFixFor host CargoGitTag pn keywords content =
+  cargoGitTagBodyNeedsFix host pn keywords content
+ebuildNeedsCargoBodyFixFor host CargoGitTagGenerateLock pn keywords content =
+  cargoGitTagBodyNeedsFix host pn keywords content
+
+-- | GitHub-archive Cargo body: parameterized assets URL, planned KEYWORDS,
+-- crates tarball line, no list-era registry URIs, and an empty @CRATES@.
+cargoGitTagBodyNeedsFix :: AssetsHost -> Text -> [Text] -> Text -> Bool
+cargoGitTagBodyNeedsFix host pn keywords content =
   not (assetsSrcUriParameterizedFor host pn content)
     || not (keywordsMatch keywords content)
     || not (hasCratesAssetsSrcUriFor host content)
@@ -399,6 +407,7 @@ hasListEraCargoDeps content =
 
 hasListEraCargoDepsFor :: CargoSource -> Text -> Bool
 hasListEraCargoDepsFor CargoGitTag = hasListEraCargoDeps
+hasListEraCargoDepsFor CargoGitTagGenerateLock = hasListEraCargoDeps
 hasListEraCargoDepsFor CargoCratesIo = \content ->
   cratesFieldNonEmpty content && "CARGO_CRATE_URIS" `T.isInfixOf` content
 
@@ -481,6 +490,7 @@ ensureCargoAssetsSrcUriForHost ::
   AssetsHost -> CargoSource -> Text -> Text -> Text
 ensureCargoAssetsSrcUriForHost host cargoSrc pn content = case cargoSrc of
   CargoGitTag -> ensureCargoAssetsSrcUriHost host pn content
+  CargoGitTagGenerateLock -> ensureCargoAssetsSrcUriHost host pn content
   CargoCratesIo ->
     -- Already in clean single-line crates.io + crates form: only parameterize.
     if hasCratesAssetsSrcUriFor host content
@@ -524,6 +534,7 @@ cargoProvenanceMismatch cargoSrc name content =
   let observed = ebuildCargoSourceForm content
       expected = case cargoSrc of
         CargoGitTag -> SourceFormGithubArchive
+        CargoGitTagGenerateLock -> SourceFormGithubArchive
         CargoCratesIo -> SourceFormCratesIo
    in if observed == expected || observed == SourceFormOther
         then Nothing
@@ -539,11 +550,13 @@ cargoProvenanceMismatch cargoSrc name content =
               <> observedForm
   where
     expectedForm = case cargoSrc of
-      CargoGitTag ->
-        "the upstream GitHub source archive (github.com/.../archive/)"
+      CargoGitTag -> githubArchiveForm
+      CargoGitTagGenerateLock -> githubArchiveForm
       CargoCratesIo ->
         "the canonical crates.io download distfile \
         \(crates.io/api/v1/crates/<crate>/<pv>/download)"
+    githubArchiveForm =
+      "the upstream GitHub source archive (github.com/.../archive/)"
     observedForm = case ebuildCargoSourceForm content of
       SourceFormGithubArchive -> "a GitHub archive source line"
       SourceFormCratesIo -> "a crates.io download source line"
@@ -551,6 +564,7 @@ cargoProvenanceMismatch cargoSrc name content =
 
 cargoSourceName :: CargoSource -> Text
 cargoSourceName CargoGitTag = "CargoGitTag"
+cargoSourceName CargoGitTagGenerateLock = "CargoGitTagGenerateLock"
 cargoSourceName CargoCratesIo = "CargoCratesIo"
 
 -- | Ensure assets crates SRC_URI form; strip list-era crate URI patterns.

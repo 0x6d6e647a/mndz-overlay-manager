@@ -319,6 +319,8 @@ tests =
       testCase "Cargo GitCrates Windows Omit" testCargoGitCratesWindowsOmit,
       testCase "Cargo CratesIo SrcUri" testCargoCratesIoSrcUri,
       testCase "Cargo Provenance Coherence" testCargoProvenanceCoherence,
+      testCase "cargo-llvm-cov GitHub source and GIT_CRATES" testCargoLlvmCovSrcUri,
+      testCase "cargo-llvm-cov donor body survives rewrite" testCargoLlvmCovDonorPreservation,
       testCase "Go Keywords Assembly" testGoKeywordsAssembly,
       testCase "Set Keywords" testSetKeywords,
       testCase "Origin-derived assets SRC_URI" testOriginAssetsSrcUri,
@@ -1437,6 +1439,227 @@ testCargoProvenanceCoherence = do
         CargoCratesIo
         "biodiff-1.2.0"
         "SRC_URI=\"https://example.com/something.tar.gz\"\n"
+    )
+
+-- | Lockless Git tag provenance admits a GitHub archive, rejects a crates.io
+-- primary line, and keeps the empty-CRATES git-crate fetch line.
+testCargoLlvmCovSrcUri :: IO ()
+testCargoLlvmCovSrcUri = do
+  let github =
+        T.unlines
+          [ "CRATES=\"\"",
+            "declare -A GIT_CRATES=(",
+            "\t[test-helper]='https://github.com/taiki-e/test-helper.git;82e3b012a49fb16587e165986674290ef682a5b0;test-helper-%commit%'",
+            ")",
+            "SRC_URI=\"https://github.com/taiki-e/cargo-llvm-cov/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/cargo-llvm-cov-${PV}/cargo-llvm-cov-${PV}-crates.tar.xz\"",
+            "SRC_URI+=\" ${CARGO_CRATE_URIS}\""
+          ]
+      cratesIo =
+        T.unlines
+          [ "CRATES=\"\"",
+            "SRC_URI=\"https://crates.io/api/v1/crates/cargo-llvm-cov/${PV}/download -> cargo-llvm-cov-${PV}.crate\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/cargo-llvm-cov-${PV}/cargo-llvm-cov-${PV}-crates.tar.xz\""
+          ]
+  assertEq
+    "github archive admitted"
+    Nothing
+    (cargoProvenanceMismatch CargoGitTagGenerateLock "cargo-llvm-cov-0.9.1.ebuild" github)
+  case cargoProvenanceMismatch CargoGitTagGenerateLock "cargo-llvm-cov-0.9.1.ebuild" cratesIo of
+    Nothing -> fail "expected crates.io mismatch"
+    Just err -> do
+      assertTrue "names provenance" ("CargoGitTagGenerateLock" `T.isInfixOf` err)
+      assertTrue "names expected form" ("github.com" `T.isInfixOf` err)
+      assertTrue "names observed form" ("crates.io download" `T.isInfixOf` err)
+      assertTrue "names the ebuild" ("cargo-llvm-cov-0.9.1.ebuild" `T.isInfixOf` err)
+      assertTrue "not classified as crates.io provenance" (not ("CargoCratesIo" `T.isInfixOf` err))
+  let gained =
+        T.unlines
+          [ "CRATES=\"\"",
+            "declare -A GIT_CRATES=(",
+            "\t[test-helper]='https://github.com/taiki-e/test-helper.git;82e3b012a49fb16587e165986674290ef682a5b0;test-helper-%commit%'",
+            ")",
+            "SRC_URI=\"https://github.com/taiki-e/cargo-llvm-cov/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/cargo-llvm-cov-0.9.0/cargo-llvm-cov-0.9.0-crates.tar.xz\""
+          ]
+      fixed = ensureCargoAssetsSrcUriFor CargoGitTagGenerateLock "cargo-llvm-cov" gained
+  assertTrue
+    "primary stays the GitHub tag archive"
+    ( "https://github.com/taiki-e/cargo-llvm-cov/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz"
+        `T.isInfixOf` fixed
+    )
+  assertTrue
+    "assets crates line"
+    ("cargo-llvm-cov-${PV}/cargo-llvm-cov-${PV}-crates.tar.xz" `T.isInfixOf` fixed)
+  assertTrue "frozen 0.9.0 URL is parameterized" (not ("cargo-llvm-cov-0.9.0" `T.isInfixOf` fixed))
+  assertTrue
+    "GIT_CRATES fetch line stays"
+    ("SRC_URI+=\" ${CARGO_CRATE_URIS}\"" `T.isInfixOf` fixed)
+  assertTrue "GIT_CRATES declaration stays" ("test-helper" `T.isInfixOf` fixed)
+  assertTrue "not a crates.io primary" (not ("crates.io/api/v1/crates" `T.isInfixOf` fixed))
+
+-- | A 0.9.0-shaped donor rewritten the way Cargo apply does for PV 0.9.1.
+-- pycargoebuild replaces CRATES, GIT_CRATES, and the crate-license block;
+-- the manager empties CRATES, parameterizes SRC_URI, and rewrites KEYWORDS
+-- and RUST_MIN_VER. The wrapper, test phase, and dependency lines stay.
+testCargoLlvmCovDonorPreservation :: IO ()
+testCargoLlvmCovDonorPreservation = do
+  let oldGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tMIT",
+            "\tZLIB",
+            "\""
+          ]
+      newGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tApache-2.0",
+            "\tUnicode-3.0",
+            "\""
+          ]
+      oldGit =
+        T.unlines
+          [ "declare -A GIT_CRATES=(",
+            "\t[old-helper]='https://github.com/example/old-helper;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;old-helper-%commit%'",
+            ")"
+          ]
+      newGit =
+        T.unlines
+          [ "declare -A GIT_CRATES=(",
+            "\t[test-helper]='https://github.com/taiki-e/test-helper.git;82e3b012a49fb16587e165986674290ef682a5b0;test-helper-%commit%'",
+            ")"
+          ]
+      donor =
+        T.unlines
+          [ "EAPI=8",
+            "",
+            "RUST_MIN_VER=\"1.87.0\"",
+            "",
+            "CRATES=\"",
+            "\toldcrate@1.0.0",
+            "\"",
+            "",
+            oldGit,
+            "inherit cargo",
+            "",
+            "DESCRIPTION=\"Cargo subcommand for LLVM source-based code coverage\"",
+            "HOMEPAGE=\"https://github.com/taiki-e/cargo-llvm-cov\"",
+            "SRC_URI=\"https://github.com/taiki-e/cargo-llvm-cov/archive/refs/tags/v${PV}.tar.gz -> ${P}.tar.gz\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/cargo-llvm-cov-0.9.0/cargo-llvm-cov-0.9.0-crates.tar.xz\"",
+            "",
+            "LICENSE=\"|| ( Apache-2.0 MIT )\"",
+            oldGen,
+            "SLOT=\"0\"",
+            "KEYWORDS=\"~amd64\"",
+            "IUSE=\"test\"",
+            "RESTRICT=\"!test? ( test )\"",
+            "",
+            "RDEPEND=\"llvm-core/llvm\"",
+            "BDEPEND=\"test? ( dev-vcs/git )\"",
+            "",
+            "QA_FLAGS_IGNORED=\"usr/libexec/cargo-llvm-cov/cargo-llvm-cov\"",
+            "",
+            "src_prepare() {",
+            "\tdefault",
+            "\tsed -i -e 's|git = \"https://github.com/taiki-e/test-helper.git\"|path = \"${WORKDIR}/test-helper\"|' Cargo.toml || die",
+            "}",
+            "",
+            "src_test() {",
+            "\tgit init",
+            "\tsource \"${FILESDIR}/cargo-llvm-cov\"",
+            "\tlocal CARGO_SKIP_TESTS=( trybuild ui_test )",
+            "\tcargo_src_test",
+            "}",
+            "",
+            "src_install() {",
+            "\texeinto /usr/libexec/cargo-llvm-cov",
+            "\tnewexe target/release/cargo-llvm-cov cargo-llvm-cov",
+            "\tdobin \"${FILESDIR}/cargo-llvm-cov\"",
+            "}"
+          ]
+      simulated = T.replace oldGit newGit (T.replace oldGen newGen donor)
+      keywords =
+        [ "~amd64",
+          "~arm",
+          "~arm64",
+          "~loong",
+          "~mips",
+          "~ppc",
+          "~ppc64",
+          "~riscv",
+          "~s390",
+          "~sparc",
+          "~x86"
+        ]
+      rewritten0 =
+        setKeywords
+          keywords
+          ( ensureCargoAssetsSrcUriFor
+              CargoGitTagGenerateLock
+              "cargo-llvm-cov"
+              (ensureEmptyCrates simulated)
+          )
+  rewritten <- assertRight "rust min" (ensureRustMinVer "1.88" rewritten0)
+  assertTrue "IUSE survives" ("IUSE=\"test\"" `T.isInfixOf` rewritten)
+  assertTrue "RESTRICT survives" ("RESTRICT=\"!test? ( test )\"" `T.isInfixOf` rewritten)
+  assertTrue "unslotted llvm survives" ("RDEPEND=\"llvm-core/llvm\"" `T.isInfixOf` rewritten)
+  assertTrue "git test dep survives" ("BDEPEND=\"test? ( dev-vcs/git )\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "wrapper install survives"
+    ("dobin \"${FILESDIR}/cargo-llvm-cov\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "libexec directory survives"
+    ("exeinto /usr/libexec/cargo-llvm-cov" `T.isInfixOf` rewritten)
+  assertTrue
+    "libexec binary survives"
+    ("usr/libexec/cargo-llvm-cov/cargo-llvm-cov" `T.isInfixOf` rewritten)
+  assertTrue
+    "src_test skips survive"
+    ("CARGO_SKIP_TESTS=( trybuild ui_test )" `T.isInfixOf` rewritten)
+  assertTrue
+    "QA_FLAGS_IGNORED survives"
+    ( "QA_FLAGS_IGNORED=\"usr/libexec/cargo-llvm-cov/cargo-llvm-cov\""
+        `T.isInfixOf` rewritten
+    )
+  assertTrue
+    "test-helper path rewrite survives"
+    ("taiki-e/test-helper.git" `T.isInfixOf` rewritten && "src_prepare()" `T.isInfixOf` rewritten)
+  assertTrue "CRATES emptied" ("CRATES=\"\"" `T.isInfixOf` rewritten)
+  assertTrue "old crate list dropped" (not ("oldcrate@1.0.0" `T.isInfixOf` rewritten))
+  assertTrue
+    "GIT_CRATES updated"
+    ( "82e3b012a49fb16587e165986674290ef682a5b0" `T.isInfixOf` rewritten
+        && "test-helper" `T.isInfixOf` rewritten
+    )
+  assertTrue "old git pin dropped" (not ("old-helper" `T.isInfixOf` rewritten))
+  assertTrue
+    "git crate fetch line added"
+    ("SRC_URI+=\" ${CARGO_CRATE_URIS}\"" `T.isInfixOf` rewritten)
+  let (generated, _after) = T.breakOn "SLOT=\"0\"" rewritten
+  assertTrue "generated license block changed" ("Unicode-3.0" `T.isInfixOf` generated)
+  assertTrue "old generated license dropped" (not ("ZLIB" `T.isInfixOf` generated))
+  assertTrue
+    "primary license stays"
+    ("LICENSE=\"|| ( Apache-2.0 MIT )\"" `T.isInfixOf` rewritten)
+  assertTrue "RUST_MIN_VER updated" ("RUST_MIN_VER=\"1.88.0\"" `T.isInfixOf` rewritten)
+  assertTrue "old floor dropped" (not ("RUST_MIN_VER=\"1.87.0\"" `T.isInfixOf` rewritten))
+  assertTrue
+    "KEYWORDS updated"
+    ( "KEYWORDS=\"~amd64 ~arm ~arm64 ~loong ~mips ~ppc ~ppc64 ~riscv ~s390 ~sparc ~x86\""
+        `T.isInfixOf` rewritten
+    )
+  assertTrue
+    "assets SRC_URI parameterized to the new PV"
+    ( "cargo-llvm-cov-${PV}/cargo-llvm-cov-${PV}-crates.tar.xz" `T.isInfixOf` rewritten
+        && not ("cargo-llvm-cov-0.9.0" `T.isInfixOf` rewritten)
+    )
+  assertTrue
+    "primary source stays the GitHub tag archive"
+    ( "github.com/taiki-e/cargo-llvm-cov/archive/refs/tags/v${PV}.tar.gz"
+        `T.isInfixOf` rewritten
     )
 
 testOriginAssetsSrcUri :: IO ()

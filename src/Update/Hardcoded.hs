@@ -151,6 +151,10 @@ hardcodedPolicies =
         "dev-util/biodiff"
         (GitHub "8051enthusiast" "biodiff" "v")
         (DepsAndAssets (Cargo Nothing Nothing CargoCratesIo)),
+      policy
+        "dev-util/cargo-llvm-cov"
+        (GitHub "taiki-e" "cargo-llvm-cov" "v")
+        (DepsAndAssets (Cargo Nothing Nothing CargoGitTagGenerateLock)),
       policyArches
         "dev-util/codex"
         (GitHub "openai" "codex" "rust-v")

@@ -260,6 +260,10 @@ publishPrepared
             pinnedOrErr = case eco of
               Cargo {cargoSource = CargoGitTag} ->
                 ensureStorytoldPatchPinHook pn withAssets
+              -- Same hook call as CargoGitTag. The package set is still
+              -- GitTag-only, so cargo-llvm-cov is returned unchanged.
+              Cargo {cargoSource = CargoGitTagGenerateLock} ->
+                ensureStorytoldPatchPinHook pn withAssets
               Cargo {cargoSource = CargoCratesIo} -> Right withAssets
               Go _ -> Right withAssets
               NpmEco -> Right withAssets
