@@ -309,7 +309,7 @@ buildCargoCratesTarball
                             lockBody <- TIO.readFile (lockRoot </> "Cargo.lock")
                             tomlBodies <- collectCargoTomlBodies lockRoot
                             let ebuildBody =
-                                  stripWindowsOnlyGitCrates lockBody tomlBodies ebuildBody0
+                                  stripWindowsOnlyGitCrates pn lockBody tomlBodies ebuildBody0
                             srcH <- case cargoSrc of
                               -- GitTag: active-set clone harvest (policy closure).
                               CargoGitTag -> harvestCloneFloor srcDir mPkgSub mLockSub

@@ -1125,7 +1125,7 @@ testCargoGitCratesWindowsOmit = do
             "\tnucleo;https://github.com/helix-editor/nucleo;aaa",
             "\""
           ]
-      fixed = stripWindowsOnlyGitCrates lock [toml] ebuild
+      fixed = stripWindowsOnlyGitCrates "codex" lock [toml] ebuild
   assertTrue "drops mxc" (not ("microsoft/mxc" `T.isInfixOf` fixed))
   assertTrue "keeps crossterm" ("crossterm-rs/crossterm" `T.isInfixOf` fixed)
   assertTrue "keeps nucleo" ("helix-editor/nucleo" `T.isInfixOf` fixed)
@@ -1137,7 +1137,7 @@ testCargoGitCratesWindowsOmit = do
             "\t[nucleo]='https://github.com/helix-editor/nucleo;aaa;nucleo-%commit%'",
             ")"
           ]
-      assocFixed = stripWindowsOnlyGitCrates lock [toml] assoc
+      assocFixed = stripWindowsOnlyGitCrates "codex" lock [toml] assoc
   assertTrue "assoc drops mxc" (not ("microsoft/mxc" `T.isInfixOf` assocFixed))
   assertTrue "assoc keeps crossterm" ("crossterm-rs/crossterm" `T.isInfixOf` assocFixed)
   assertTrue "assoc keeps nucleo" ("helix-editor/nucleo" `T.isInfixOf` assocFixed)
@@ -1222,8 +1222,9 @@ testCargoGitCratesWindowsOmit = do
             "\t[dev_only]='https://example.com/dev_only;dev;dev_only-%commit%'",
             ")"
           ]
-      mixedFixed = stripWindowsOnlyGitCrates mixedLock [linuxToml, wasmToml, bothToml] mixed
-      kept name = ("[" <> name <> "]=") `T.isInfixOf` mixedFixed
+      codexFixed = stripWindowsOnlyGitCrates "codex" mixedLock [linuxToml, wasmToml, bothToml] mixed
+      keptIn body name = ("[" <> name <> "]=") `T.isInfixOf` body
+      kept = keptIn codexFixed
   assertTrue "mixed drops mxc" (not (kept "mxc"))
   assertTrue "mixed drops wasm-only" (not (kept "wasm_only"))
   assertTrue "dev-dependency does not keep wasm crate" (not (kept "wasm_dev"))
@@ -1231,6 +1232,13 @@ testCargoGitCratesWindowsOmit = do
   assertTrue "linux and windows edges keep eframe" (kept "eframe")
   assertTrue "cross-manifest edges keep craft-update" (kept "craft-update")
   assertTrue "dev-only crate stays" (kept "dev_only")
+  let resolved = stripWindowsOnlyGitCrates "filmcraft" mixedLock [linuxToml, wasmToml, bothToml] mixed
+      keptResolved = keptIn resolved
+  assertTrue "resolved target edge keeps mxc" (keptResolved "mxc")
+  assertTrue "resolved target edge keeps wasm-only" (keptResolved "wasm_only")
+  assertTrue "wasm target edge keeps wasm_dev" (keptResolved "wasm_dev")
+  assertTrue "resolved edges keep egui" (keptResolved "egui")
+  assertTrue "dev-only crate stays for a resolved package" (keptResolved "dev_only")
 
 testGoKeywordsAssembly :: IO ()
 testGoKeywordsAssembly = do

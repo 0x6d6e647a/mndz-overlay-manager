@@ -412,7 +412,7 @@ A 150.4.0 `v8/DEPS` SHALL yield `clang-llvmorg-23-init-10931-g20b6ec66-11.tar.xz
 
 ### Requirement: Windows-only git remotes omitted from GIT_CRATES
 
-When writing or repairing `GIT_CRATES` for a Cargo GitTag ebuild, the program SHALL omit a lock git package only when every dependency edge for that package in the active Linux set's manifests is windows-only or wasm-only. A package that any non-windows, non-wasm dependency of that set names SHALL remain. `microsoft/mxc` / `appcontainer_common` for Codex SHALL be omitted.
+When writing or repairing `GIT_CRATES` for a Cargo GitTag ebuild other than `dev-util/codex`, the program SHALL keep a lock git package that any manifest edge names, including an edge that sits only under a windows-only or wasm-only target table. Dev-dependencies are not edges. For `dev-util/codex`, the program SHALL omit a lock git package when every such edge is windows-only or wasm-only. That omit includes `microsoft/mxc` and `appcontainer_common`.
 
 #### Scenario: mxc dumped
 
@@ -428,8 +428,13 @@ When writing or repairing `GIT_CRATES` for a Cargo GitTag ebuild, the program SH
 
 #### Scenario: A wasm-only git package is omitted
 
-- **WHEN** a lock git package is named only from a `wasm32` target table of the active Linux set
+- **WHEN** a Cargo GitTag rewrite for `dev-util/codex` sees a lock git package named only from a `wasm32` target table
 - **THEN** `GIT_CRATES` omits that package
+
+#### Scenario: A wasm-only git package stays
+
+- **WHEN** a Cargo GitTag rewrite for a package other than `dev-util/codex` sees a lock git package named only from a `wasm32` target table
+- **THEN** `GIT_CRATES` includes that package
 
 ### Requirement: Manager-owned SRC_URI for cargo
 

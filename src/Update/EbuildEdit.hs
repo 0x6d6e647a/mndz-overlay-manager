@@ -913,14 +913,21 @@ extractGithubSourceArchiveUriFor host content =
               t4 = T.dropWhileEnd (\c -> c == '"' || c == '\r') (T.strip t3)
            in if T.null t4 then Nothing else Just t4
 
--- | Drop @GIT_CRATES@ entries whose lock git package is reached only through
--- windows-only or wasm-only edges of the supplied Cargo.toml bodies. A name
--- that any other collected edge names stays. Dev-dependencies are not edges.
-stripWindowsOnlyGitCrates :: Text -> [Text] -> Text -> Text
-stripWindowsOnlyGitCrates lockBody tomlBodies ebuild =
+-- | Drop @GIT_CRATES@ entries for @dev-util/codex@ whose lock git package is
+-- reached only through windows-only or wasm-only edges. Every other package
+-- keeps a git crate that any manifest edge names, including those target
+-- tables, because Cargo resolves them on Linux. Dev-dependencies are not
+-- edges. A name that any non-ignored edge names stays for Codex too.
+stripWindowsOnlyGitCrates :: Text -> Text -> [Text] -> Text -> Text
+stripWindowsOnlyGitCrates pn lockBody tomlBodies ebuild =
   let winNames = windowsOnlyDepNames tomlBodies
       gitNames = parseGitPackageNames lockBody
-      dropNames = [n | n <- gitNames, n `elem` winNames]
+      dropNames =
+        [ n
+        | pn == "codex",
+          n <- gitNames,
+          n `elem` winNames
+        ]
    in if null dropNames
         then ebuild
         else filterGitCratesNames dropNames ebuild

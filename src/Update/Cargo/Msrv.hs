@@ -1364,11 +1364,12 @@ applyRustToolchainFloor mLock fetch mFloor =
               -- File exists but channel is not a dotted version.
               pure (Right Nothing)
 
--- | Crate names to omit from @GIT_CRATES@. A name is omitted only when some
--- @collectClassifiedDeps@ edge is @TIgnore@ and every edge for that name,
--- across every manifest, is @TIgnore@. @TActive@, @TWatched@, and
--- @TIncomplete@ keep the name. Malformed manifests contribute no edges.
--- @[dev-dependencies]@ are not edges.
+-- | Crate names @dev-util/codex@ omits from @GIT_CRATES@. A name is included
+-- only when some @collectClassifiedDeps@ edge is @TIgnore@ and every edge
+-- for that name, across every manifest, is @TIgnore@. @TActive@, @TWatched@,
+-- and @TIncomplete@ keep the name. Other packages keep these names, because
+-- Cargo resolves a target-table git dependency on Linux. Malformed manifests
+-- contribute no edges. @[dev-dependencies]@ are not edges.
 windowsOnlyDepNames :: [Text] -> [Text]
 windowsOnlyDepNames bodies =
   [ name
