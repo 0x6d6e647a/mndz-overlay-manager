@@ -29,6 +29,7 @@ module Update.Cargo.Crates
   )
 where
 
+import Control.Exception (IOException, try)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -37,9 +38,10 @@ import System.Directory
     doesDirectoryExist,
     doesFileExist,
     listDirectory,
+    makeAbsolute,
   )
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import Update.Assets.Layout
   ( rustyV8ReleaseTag,
     rustyV8SnapshotBasename,
@@ -453,18 +455,64 @@ runPycargoebuild run ebuildPath lockRoot tarballPath distDir = do
           prEnv = Nothing,
           prStdin = ""
         }
-  pure $
-    if prExitCode res == ExitSuccess
-      then Right ()
-      else
-        Left
-          ( "pycargoebuild failed: "
-              <> T.strip (T.pack (prStderr res))
-              <> ( if T.null (T.strip (T.pack (prStdout res)))
-                     then ""
-                     else "\n" <> T.strip (T.pack (prStdout res))
-                 )
-          )
+  case prExitCode res of
+    ExitSuccess -> pure (Right ())
+    ExitFailure code ->
+      summarizePycargoFailure distDir code (prStderr res) (prStdout res)
+
+-- | @distDir@ is @<unit>/work/distdir@. The transcript is written on the host
+-- in @<unit>@, beside @work/@ and @out/@, which are the only container mounts.
+summarizePycargoFailure :: FilePath -> Int -> String -> String -> IO (Either Text ())
+summarizePycargoFailure distDir code err out = do
+  let logPath = takeDirectory (takeDirectory distDir) </> "pycargoebuild.log"
+  logPathAbs <- makeAbsolute logPath
+  written <-
+    try @IOException $
+      TIO.writeFile logPathAbs (pycargoTranscript code err out)
+  pure (Left (pycargoFailureMessage code logPathAbs err out written))
+
+pycargoFailureMessage :: Int -> FilePath -> String -> String -> Either IOException () -> Text
+pycargoFailureMessage code logPath err out written =
+  T.intercalate "\n" $
+    ("pycargoebuild failed (exit " <> T.pack (show code) <> ")")
+      : quotedErrorLines err out
+      ++ [logLine]
+  where
+    logLine = case written of
+      Right () -> "log: " <> T.pack logPath
+      Left ex ->
+        "log: "
+          <> T.pack logPath
+          <> " was not written: "
+          <> T.pack (show ex)
+
+-- | Stderr matches first, then stdout matches. A line matches when its
+-- case-folded text contains @error@.
+quotedErrorLines :: String -> String -> [Text]
+quotedErrorLines err out =
+  quoteStream err <> quoteStream out
+  where
+    quoteStream stream =
+      [ "    " <> line
+      | line <- T.lines (T.pack stream),
+        "error" `T.isInfixOf` T.toCaseFold line
+      ]
+
+pycargoTranscript :: Int -> String -> String -> Text
+pycargoTranscript code err out =
+  "exit: "
+    <> T.pack (show code)
+    <> "\nstderr:\n"
+    <> streamBlock err
+    <> "stdout:\n"
+    <> streamBlock out
+  where
+    streamBlock stream =
+      case T.pack stream of
+        t
+          | T.null t -> "\n"
+          | "\n" `T.isSuffixOf` t -> t
+          | otherwise -> t <> "\n"
 
 ------------------------------------------------------------------------
 -- Manager-owned crates tarball pack

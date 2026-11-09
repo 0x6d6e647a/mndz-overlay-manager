@@ -5,7 +5,7 @@
 module Test.Ecosystems (unitTests, integrationTests) where
 
 import Control.Concurrent.MVar (newMVar)
-import Control.Exception (SomeException, throwIO, try)
+import Control.Exception (SomeException, bracket_, throwIO, try)
 import Control.Monad (forM_, void, when)
 import Data.ByteString qualified as BS
 import Data.Foldable (for_)
@@ -15,14 +15,17 @@ import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory
-  ( copyFile,
+  ( Permissions (executable, readable, searchable, writable),
+    copyFile,
     createDirectoryIfMissing,
     createFileLink,
     doesDirectoryExist,
     doesFileExist,
+    emptyPermissions,
     getSymbolicLinkTarget,
     pathIsSymbolicLink,
     removePathForcibly,
+    setPermissions,
   )
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, takeDirectory, (</>))
@@ -235,6 +238,7 @@ unitTests =
           testCase "bun mk path success + failure" testBunMkCommandRunner,
           testCase "vendor mk path success + failure" testVendorMkCommandRunner,
           testCase "cargo mk path success + failure" testCargoMkCommandRunner,
+          testCase "pycargoFailureSummary" pycargoFailureSummary,
           testCase "ebuild/egencache/portageq mk runners" testSimpleRunnersMk,
           testCase "docker create binds unit work/out not run root" testDockerCreateArgs,
           testCase "docker exec go version keeps GOMODCACHE strips secrets" testDockerExecGoVersion,
@@ -2769,6 +2773,176 @@ testVendorMkCommandRunner =
     case vendorFail of
       Left err -> assertTrue "clone error" ("git clone failed" `T.isInfixOf` err)
       Right _ -> fail "expected vendor clone failure"
+
+pycargoFailureSummary :: IO ()
+pycargoFailureSummary =
+  withSystemTempDirectory "mndz-pycargo-fail-" $ \tmp -> do
+    downloadFailure tmp
+    checksumFailure tmp
+    stdoutAfterStderr tmp
+    noErrorSubstring tmp
+    successLeavesNoLog tmp
+    unwritableLog tmp
+  where
+    scripted code out err _req =
+      pure
+        ProcessResult
+          { prExitCode = code,
+            prStdout = out,
+            prStderr = err
+          }
+    invoke unit code out err = do
+      let work = unit </> "work"
+          distDir = work </> "distdir"
+          logPath = unit </> "pycargoebuild.log"
+      createDirectoryIfMissing True distDir
+      result <-
+        coPycargoebuild
+          (mkCargoOps (scripted code out err))
+          (work </> "pkg.ebuild")
+          (work </> "src")
+          (unit </> "out" </> "pkg-crates.tar.xz")
+          distDir
+      pure (result, logPath)
+    assertHas label needle hay =
+      assertTrue label (needle `T.isInfixOf` hay)
+    assertLacks label needle hay =
+      assertTrue label (not (needle `T.isInfixOf` hay))
+    assertOrder label earlier later hay = do
+      let earlierAt = T.length (fst (T.breakOn earlier hay))
+          laterAt = T.length (fst (T.breakOn later hay))
+      assertHas (label <> " earlier") earlier hay
+      assertHas (label <> " later") later hay
+      assertTrue label (earlierAt < laterAt)
+    downloadStderr =
+      unlines
+        [ "!!! Section 'mndz' in repos.conf refers to a nonexistent directory: /var/db/repos/mndz",
+          "[#a1b2c3 1.2MiB/3.4MiB(35%)] NOTICE: Download of https://github.com/storytold/egui started",
+          "[#a1b2c3 0B/0B(0%)] NOTICE: Download aborted.",
+          "[ERROR] CUID#31 - Download aborted.",
+          "URI=https://github.com/storytold/egui/archive/6d518fc.tar.gz",
+          "Failed to resolve the hostname github.com, cause: Temporary failure in name resolution",
+          "subprocess.CalledProcessError: Command 'aria2c' returned non-zero exit status 19."
+        ]
+    downloadFailure tmp = do
+      (result, logPath) <-
+        invoke (tmp </> "download") (ExitFailure 1) "" downloadStderr
+      err <- assertLeft "download" result
+      assertTrue "exit 1" ("pycargoebuild failed (exit 1)" `T.isPrefixOf` err)
+      assertHas "indented error" "    [ERROR] CUID#31 - Download aborted." err
+      assertHas
+        "indented called"
+        "    subprocess.CalledProcessError: Command 'aria2c' returned non-zero exit status 19."
+        err
+      assertOrder
+        "error before called"
+        "    [ERROR] CUID#31 - Download aborted."
+        "CalledProcessError"
+        err
+      assertHas "log path" ("log: " <> T.pack logPath) err
+      assertLacks "no notice" "NOTICE" err
+      assertLacks "no section" "!!! Section" err
+      assertLacks "no resolve" "Failed to resolve" err
+      logged <- TIO.readFile logPath
+      assertHas "log notice" "NOTICE" logged
+      assertHas "log section" "!!! Section" logged
+      assertHas "log resolve" "Failed to resolve" logged
+      assertHas "log error" "[ERROR] CUID#31 - Download aborted." logged
+      assertHas "log called" "CalledProcessError" logged
+      assertHas "log status" "status 19" logged
+      assertOrder "stderr before stdout label" "Failed to resolve" "stdout:" logged
+    checksumFailure tmp = do
+      let stderrOut =
+            unlines
+              [ "NOTICE: checksum fetch",
+                "ChecksumMismatchError: Checksum mismatch for /work/distdir/serde-1.0.200.crate",
+                "current: deadbeef",
+                "expected: cafebabe"
+              ]
+      (result, logPath) <-
+        invoke (tmp </> "checksum") (ExitFailure 1) "" stderrOut
+      err <- assertLeft "checksum" result
+      assertHas
+        "indented checksum"
+        "    ChecksumMismatchError: Checksum mismatch for /work/distdir/serde-1.0.200.crate"
+        err
+      assertLacks "no notice" "NOTICE" err
+      assertLacks "no current" "current:" err
+      assertLacks "no expected" "expected:" err
+      logged <- TIO.readFile logPath
+      assertHas "log keeps checksum context" "expected:" logged
+    stdoutAfterStderr tmp = do
+      (result, _) <-
+        invoke
+          (tmp </> "stdout")
+          (ExitFailure 1)
+          "tool error on stdout\n"
+          "[ERROR] Download aborted.\n"
+      err <- assertLeft "stdout order" result
+      assertOrder
+        "stderr quote before stdout quote"
+        "    [ERROR] Download aborted."
+        "    tool error on stdout"
+        err
+    noErrorSubstring tmp = do
+      (result, logPath) <-
+        invoke
+          (tmp </> "nosub")
+          (ExitFailure 7)
+          ""
+          "materialize session is not running\n"
+      err <- assertLeft "no substring" result
+      assertTrue
+        "headline"
+        ("pycargoebuild failed (exit 7)" `T.isPrefixOf` err)
+      assertTrue
+        "no indented quote"
+        (not (any (T.isPrefixOf "    ") (T.lines err)))
+      assertHas "names log" ("log: " <> T.pack logPath) err
+      logged <- TIO.readFile logPath
+      assertHas "log keeps session line" "materialize session is not running" logged
+    successLeavesNoLog tmp = do
+      (result, logPath) <-
+        invoke (tmp </> "ok") ExitSuccess "error on success is not a failure\n" ""
+      assertEq "exit zero" (Right ()) result
+      exists <- doesFileExist logPath
+      assertTrue "success writes no log" (not exists)
+    unwritableLog tmp = do
+      let unit = tmp </> "unwritable"
+          logPath = unit </> "pycargoebuild.log"
+          work = unit </> "work"
+          distDir = work </> "distdir"
+      createDirectoryIfMissing True distDir
+      bracket_
+        (setPermissions unit (dirPerms False))
+        (setPermissions unit (dirPerms True))
+        $ do
+          result <-
+            coPycargoebuild
+              ( mkCargoOps
+                  ( scripted
+                      (ExitFailure 1)
+                      ""
+                      "NOTICE: aria2c notice only\n[ERROR] Download aborted.\n"
+                  )
+              )
+              (work </> "pkg.ebuild")
+              (work </> "src")
+              (unit </> "out" </> "pkg-crates.tar.xz")
+              distDir
+          err <- assertLeft "unwritable" result
+          assertHas "not written" "was not written" err
+          assertHas "still quotes error" "    [ERROR] Download aborted." err
+          assertLacks "notice stays out" "NOTICE" err
+          exists <- doesFileExist logPath
+          assertTrue "log was not created" (not exists)
+    dirPerms canWrite =
+      emptyPermissions
+        { readable = True,
+          writable = canWrite,
+          executable = True,
+          searchable = True
+        }
 
 testCargoMkCommandRunner :: IO ()
 testCargoMkCommandRunner =

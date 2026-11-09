@@ -217,7 +217,7 @@ $TMPDIR/mndz/overlay-manager/<run-id>/
 Lifecycle:
 
 - A unit that **succeeds** or **soft-skips** is deleted immediately (so concurrent `--jobs` reclaim space as packages finish).
-- A unit that **hard-fails** is **retained**; the error message includes the absolute unit path for investigation.
+- A unit that **hard-fails** is **retained**; the error message includes the absolute unit path for investigation. A `pycargoebuild` hard-fail leaves `pycargoebuild.log` in that retained unit directory and names that path in the error.
 - If the whole run has **no hard-fail**, the run root is removed and empty `mndz/overlay-manager` / `mndz` brand directories under the temp root are pruned.
 - Residuals after a hard-fail or process crash may be removed manually (for example `rm -rf "$TMPDIR/mndz/overlay-manager/<run-id>"`).
 
