@@ -235,7 +235,7 @@ When the spine succeeds and the per-package check loop completes without a GitHu
 
 ### Requirement: Outdated package targets
 
-The `outdated` subcommand SHALL accept zero or more package targets and MAY accept the subcommand-local flag `--refresh` (see outdated refresh requirement). It SHALL NOT accept other subcommand-local flags beyond `--refresh`. Each target SHALL be either a full key `category/package` or a package name `package` that is unambiguous among discovered packages. With zero targets, the program SHALL check every package key present in the discovered inventory. With one or more targets, the program SHALL resolve tokens with the same rules as `update` and `gencache` (shared target resolution): unknown package tokens and ambiguous bare package names SHALL be hard failures that abort the command before per-package checks (exit status `1`). After successful resolution, the program SHALL run outdated checks only for the selected package keys; packages not in the selection SHALL produce neither stdout outdated lines nor soft-warning outcomes for this run. Version or PV values SHALL NOT be accepted as CLI arguments. Global options such as `--config`, `--overlay-path`, `--jobs`, and log verbosity still apply.
+The `outdated` subcommand SHALL accept zero or more package targets and MAY accept the subcommand-local flags `--refresh` (see the outdated refresh requirement) and `--exclude` (see `package-exclude`). It SHALL NOT accept other subcommand-local flags beyond `--refresh` and `--exclude`. Each target SHALL be either a full key `category/package` or a package name `package` that is unambiguous among discovered packages. The packages checked SHALL be the selection specified by `package-exclude`: with zero positional targets the base is every discovered package, and with one or more positional targets the program SHALL resolve those tokens with the same rules as `update` and `gencache` (shared target resolution). Unknown package tokens and ambiguous bare names, whether positional or excluded, SHALL be hard failures that abort the command before per-package checks (exit status `1`). After successful resolution, the program SHALL run outdated checks only for the selected package keys; packages not in the selection SHALL produce neither stdout outdated lines nor soft-warning outcomes for this run. Version or PV values SHALL NOT be accepted as CLI arguments. Global options such as `--config`, `--overlay-path`, `--jobs`, and log verbosity still apply.
 
 #### Scenario: Zero targets checks full inventory
 
@@ -266,6 +266,18 @@ The `outdated` subcommand SHALL accept zero or more package targets and MAY acce
 
 - **WHEN** the user runs `outdated --refresh dev-util/crush`
 - **THEN** the program resolves the target and forces live check work for that package only
+
+#### Scenario: Exclude removes a package from the check set
+
+- **WHEN** the user runs `outdated --exclude dev-util/codex` and other packages are discovered
+- **THEN** the program does not check `dev-util/codex`
+- **AND** it checks the other discovered packages
+
+#### Scenario: Excluding the ceiling provider leaves it out of the check set
+
+- **WHEN** the user runs `outdated --exclude dev-lang/bun-bin` and a DepsAndAssets Bun consumer remains selected
+- **THEN** `dev-lang/bun-bin` is not in the check set
+- **AND** the consumer is still checked
 
 ### Requirement: Concurrent outdated checks
 

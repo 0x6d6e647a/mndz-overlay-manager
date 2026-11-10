@@ -250,7 +250,15 @@ import Update.SshAgent
     SshSession (..),
     ensureSshAgent,
   )
-import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
+import Update.Targets
+  ( PackageSelection (..),
+    TargetError (..),
+    emptySelectionError,
+    exclusionWarning,
+    resolveTargetToken,
+    resolveTargets,
+    selectExcluding,
+  )
 import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
@@ -270,7 +278,8 @@ tests :: TestTree
 tests =
   testGroup
     "Targets"
-    [ testCase "Target Resolution" testTargetResolution
+    [ testCase "Target Resolution" testTargetResolution,
+      testCase "ExcludeSelection" testExcludeSelection
     ]
 
 ------------------------------------------------------------------------
@@ -378,3 +387,151 @@ testTargetResolution = do
     isUnknown _ = False
     isAmbiguous (AmbiguousPackage _ _) = True
     isAmbiguous _ = False
+
+testExcludeSelection :: IO ()
+testExcludeSelection = do
+  let key = PackageKey
+  -- Untargeted subtraction keeps inventory order, and duplicate exclude
+  -- tokens collapse. Removed keys are inventory order, not token order.
+  untargeted <-
+    assertRight "untargeted" $
+      selectExcluding
+        sampleEntries
+        []
+        ["baz/foo", "dev-lang/deno-bin", "baz/foo"]
+  assertEq
+    "untargeted selected"
+    [key "dev-util/grok-build-bin", key "bar/foo"]
+    (selectedKeys untargeted)
+  assertEq
+    "untargeted removed"
+    [key "dev-lang/deno-bin", key "baz/foo"]
+    (removedKeys untargeted)
+  assertEq
+    "multi-key warning"
+    (Just "excluding 2 packages: dev-lang/deno-bin, baz/foo")
+    (exclusionWarning (removedKeys untargeted))
+  -- One dropped key leaves the packages before and after it in place.
+  oneDrop <-
+    assertRight "one drop" $
+      selectExcluding sampleEntries [] ["grok-build-bin"]
+  assertEq
+    "one drop selected"
+    [ key "dev-lang/deno-bin",
+      key "bar/foo",
+      key "baz/foo"
+    ]
+    (selectedKeys oneDrop)
+  assertEq
+    "one-key warning"
+    (Just "excluding dev-util/grok-build-bin")
+    (exclusionWarning (removedKeys oneDrop))
+  -- Explicit positional order survives deletion of one key.
+  positional <-
+    assertRight "positional" $
+      selectExcluding
+        sampleEntries
+        ["baz/foo", "dev-util/grok-build-bin", "dev-lang/deno-bin"]
+        ["dev-util/grok-build-bin"]
+  assertEq
+    "explicit order kept"
+    [key "baz/foo", key "dev-lang/deno-bin"]
+    (selectedKeys positional)
+  assertEq
+    "positional removed"
+    [key "dev-util/grok-build-bin"]
+    (removedKeys positional)
+  -- Duplicate positional tokens collapse, and a repeated exclude key is one key.
+  collapsed <-
+    assertRight "duplicates" $
+      selectExcluding
+        sampleEntries
+        [ "deno-bin",
+          "dev-lang/deno-bin",
+          "bar/foo",
+          "bar/foo",
+          "grok-build-bin",
+          "dev-util/grok-build-bin"
+        ]
+        ["grok-build-bin", "dev-util/grok-build-bin"]
+  assertEq
+    "duplicate positionals collapsed"
+    [key "dev-lang/deno-bin", key "bar/foo"]
+    (selectedKeys collapsed)
+  assertEq
+    "duplicate exclude collapsed"
+    [key "dev-util/grok-build-bin"]
+    (removedKeys collapsed)
+  -- Unknown and ambiguous tokens from both sides are reported together.
+  errs <-
+    assertLeft "bad tokens" $
+      selectExcluding
+        sampleEntries
+        ["missing/pkg", "foo"]
+        ["not-there"]
+  assertEq
+    "unknown and ambiguous with bad positionals"
+    [ UnknownPackage "missing/pkg",
+      AmbiguousPackage "foo" [key "bar/foo", key "baz/foo"],
+      UnknownPackage "not-there"
+    ]
+    errs
+  -- A PV token is not a package key.
+  pvErrs <-
+    assertLeft "pv token" $
+      selectExcluding sampleEntries [] ["deno-bin-2.9.2"]
+  assertEq
+    "pv rejected"
+    [UnknownPackage "deno-bin-2.9.2"]
+    pvErrs
+  -- A resolved exclude outside the base is not a removed key and is not named.
+  outside <-
+    assertRight "outside base" $
+      selectExcluding
+        sampleEntries
+        ["dev-lang/deno-bin", "bar/foo"]
+        ["baz/foo", "dev-lang/deno-bin"]
+  assertEq
+    "outside selected"
+    [key "bar/foo"]
+    (selectedKeys outside)
+  assertEq
+    "outside omitted from removed"
+    [key "dev-lang/deno-bin"]
+    (removedKeys outside)
+  assertEq
+    "warning omits key outside the base"
+    (Just "excluding dev-lang/deno-bin")
+    (exclusionWarning (removedKeys outside))
+  assertEq "no removal has no warning" Nothing (exclusionWarning [])
+  -- Empty selection names the removed keys in inventory order.
+  emptied <-
+    assertRight "emptied" $
+      selectExcluding
+        sampleEntries
+        ["baz/foo", "bar/foo"]
+        ["baz/foo", "bar/foo"]
+  assertEq "emptied selected" [] (selectedKeys emptied)
+  assertEq
+    "emptied removed order"
+    [key "bar/foo", key "baz/foo"]
+    (removedKeys emptied)
+  assertEq
+    "empty-selection error"
+    "exclusions removed every selected package: bar/foo, baz/foo"
+    (emptySelectionError (removedKeys emptied))
+  oneEmpty <-
+    assertRight "one empty" $
+      selectExcluding
+        sampleEntries
+        ["dev-util/grok-build-bin"]
+        ["grok-build-bin"]
+  assertEq
+    "one-key empty-selection error"
+    "exclusions removed every selected package: dev-util/grok-build-bin"
+    (emptySelectionError (removedKeys oneEmpty))
+  assertTrue
+    "empty-selection error is not the warning"
+    ( emptySelectionError (removedKeys oneEmpty)
+        /= "excluding dev-util/grok-build-bin"
+    )

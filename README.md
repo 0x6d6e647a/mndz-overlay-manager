@@ -154,7 +154,7 @@ Bun packages whose runtime ceiling comes from overlay `dev-lang/bun-bin` are pre
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name (same form as `update` / `gencache`). With no arguments, every discovered package is checked. With one or more targets, only the selected packages are checked.
 
-**Flags:** `--refresh` forces live check/plan work (ignores the check cache for reads).
+**Flags:** `--refresh` forces live check/plan work (ignores the check cache for reads). `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens in that same form. Those tokens are subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error.
 
 ```bash
 # All discovered packages
@@ -168,6 +168,9 @@ just run outdated caddy-analyzer
 
 # Force live network checks
 just run outdated --refresh
+
+# Skip one package
+just run outdated --exclude dev-util/codex
 ```
 
 ### `update`
@@ -176,7 +179,7 @@ Apply updates for packages that need work: rename or rewrite ebuilds, regenerate
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every inventory package is planned; packages that need work are mutated and others soft-skipped. Explicit targets that do not need work are soft-skipped.
 
-**Flags:** `--refresh` forces live latest fetch / deps plan (ignores the check cache for reads). After a successful apply, the package’s cache entry is rewritten with the post-apply fingerprint when caching is enabled.
+**Flags:** `--refresh` forces live latest fetch / deps plan (ignores the check cache for reads). After a successful apply, the package’s cache entry is rewritten with the post-apply fingerprint when caching is enabled. `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens (`category/package` or an unambiguous package name), subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error. `update` does not pull an excluded package back into the selection. `--exclude dev-lang/bun-bin` leaves bun-bin an unselected ceiling provider and does not add bun-bin back. A dirty ensure-emerge atom is still checked when the materialize recipe will emerge it.
 
 ```bash
 # All packages that need work
@@ -191,6 +194,10 @@ just run update net-analyzer/caddy-analyzer
 just run --jobs 2 -v update
 just run --no-progress update category/package
 just run update --refresh
+
+# Skip one package. bun-bin stays out of the selection.
+just run update --exclude dev-util/codex
+just run update --exclude dev-lang/bun-bin
 ```
 
 `update` runs a **plan phase** first (using the check cache when enabled, same needs-work rules as `outdated` / apply), then an overlay **dirty preflight** on selected package directories and on overlay atoms the materialize image will emerge (`dev-lang/bun-bin` when the image installs overlay bun-bin, `dev-lisp/qlot` when the image installs overlay qlot, `dev-build/node-gyp` when the image installs overlay node-gyp): dirty, staged, untracked, or deleted paths there hard-fail with exit `1` before mutate or `docker build`. Restore or finish that tree relative to git HEAD (unrelated overlay-root files such as `README.md` do not fail this check). Then conditional assets/token checks for packages that need work, reuse vs full classification, `docker` + materialize-image checks when any unit is full path, the free-space gate, then concurrent mutate/apply. Spine tools (`git`, `ebuild`, `egencache`, `gpg`) and layout / manager-distfiles probes run before plan. When at least one package that needs work will attempt `DepsAndAssets`, it also checks that `assets-path` is a git work tree, that `origin` parses as `github.com/{owner}/{repo}` (SSH or HTTPS), and that a GitHub token can be resolved. GitHub Releases and assets `SRC_URI` use that origin `{owner}/{repo}` (not a hardcoded GitHub owner or repository name). Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
@@ -243,7 +250,7 @@ If md5-cache is **missing**, hard-fail recovery is `gencache category/package`. 
 
 Generate or repair Portage **md5-dict** cache under `metadata/md5-cache/` via `egencache`, then create **one** GPG-signed overlay commit of changed cache paths (message `metadata: regenerate md5-cache`). No empty commit when nothing changes.
 
-**Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every package that has at least one ebuild is selected.
+**Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every package that has at least one ebuild is selected. `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens in that same form, subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error. `--force` regenerates only the packages that remain.
 
 **Strict-strict policy:** without `--force`, missing cache is generated (bootstrap), matching packages are skipped, and `_md5_` mismatches hard-fail. With `--force`, every selected package is regenerated.
 
@@ -257,6 +264,9 @@ just run gencache dev-util/crush
 # Overwrite mismatched or force-refresh after eclass bumps
 just run gencache --force
 just run gencache --force crush
+
+# Skip one package
+just run gencache --exclude dev-util/crush
 ```
 
 ### md5-cache bootstrap and recovery

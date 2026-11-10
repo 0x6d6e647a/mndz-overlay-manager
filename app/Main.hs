@@ -33,7 +33,9 @@ import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.Foldable (for_)
 import Data.IORef (newIORef)
+import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
 import Logging.Bootstrap (LogHold, mkLogHold, mkLogger)
@@ -129,7 +131,13 @@ import Update.Spine
     runUpdatePhases,
   )
 import Update.SshAgent (productionSshAgentOps, takeSshSessionSupervisor)
-import Update.Targets (resolveTargets, targetErrorMessage)
+import Update.Targets
+  ( PackageSelection (..),
+    emptySelectionError,
+    exclusionWarning,
+    selectExcluding,
+    targetErrorMessage,
+  )
 import Update.TempWorkspace (openRunRoot, rrPath)
 import Update.Types
   ( ApplyOutcome (..),
@@ -181,9 +189,12 @@ runProgram = do
       usingLoggerT logger $
         case cmd of
           Cmd.List -> runList rt
-          Cmd.Outdated refresh pkgs -> runOutdated rt refresh pkgs
-          Cmd.Update refresh pkgs -> runUpdate rt refresh pkgs
-          Cmd.Gencache targets force -> runGencache rt targets force
+          Cmd.Outdated refresh pkgs excludeArgs ->
+            runOutdated rt refresh pkgs excludeArgs
+          Cmd.Update refresh pkgs excludeArgs ->
+            runUpdate rt refresh pkgs excludeArgs
+          Cmd.Gencache targets force excludeArgs ->
+            runGencache rt targets force excludeArgs
           Cmd.Eclean -> runEclean rt
           Cmd.GitHubToken force -> runGitHubToken rt force
 
@@ -192,272 +203,294 @@ runList rt = do
   ebuilds <- loadValidatedEbuilds (rtOptions rt)
   liftIO $ mapM_ (T.putStrLn . ebuildAtom) ebuilds
 
+-- | Resolve positionals minus exclusions. Target errors exit before the
+-- warning. An empty selection logs only the empty-selection error.
+resolveCommandSelection ::
+  (WithLog env Message m, MonadIO m) =>
+  [PackageEntry] ->
+  [Text] ->
+  [Text] ->
+  m [PackageKey]
+resolveCommandSelection entries positionals excludes =
+  case selectExcluding entries positionals excludes of
+    Left errs -> do
+      mapM_ (logError . targetErrorMessage) errs
+      liftIO $ exitWith (ExitFailure 1)
+    Right PackageSelection {selectedKeys, removedKeys}
+      | null selectedKeys && not (null removedKeys) -> do
+          logError (emptySelectionError removedKeys)
+          liftIO $ exitWith (ExitFailure 1)
+      | otherwise -> do
+          for_ (exclusionWarning removedKeys) logWarning
+          pure selectedKeys
+
 runOutdated ::
-  (WithLog env Message m, MonadIO m) => Runtime -> Bool -> [String] -> m ()
-runOutdated rt refresh pkgArgs = do
+  (WithLog env Message m, MonadIO m) =>
+  Runtime ->
+  Bool ->
+  [String] ->
+  [String] ->
+  m ()
+runOutdated rt refresh pkgArgs excludeArgs = do
   (cfg, overlayResolved, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
-  case resolveTargets entries tokens of
-    Left errs -> do
-      mapM_ (logError . targetErrorMessage) errs
-      liftIO $ exitWith (ExitFailure 1)
-    Right keys -> do
-      let selectedEntries = [e | e <- entries, peKey e `elem` keys]
-          filteredEbuilds =
-            filter
-              ( \eb ->
-                  mkPackageKey (ebuildCategory eb) (ebuildPackage eb) `elem` keys
-              )
-              ebuilds
-          total = length selectedEntries
-          byPkg = groupByPackage ebuilds
-      (cache, cacheWarn) <-
-        liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayResolved
-      mapM_ logWarning cacheWarn
-      willLive <-
-        liftIO
-          ( needsLiveGitHubApi
-              LiveForOutdated
-              cache
-              overlayResolved
-              selectedEntries
-              byPkg
-          )
-      decryptCache <- liftIO (newIORef Nothing)
-      let secretPrompt =
-            productionSecretPrompt
-              (pauseActivePanel (rtProgress rt))
-              (resumeActivePanel (rtProgress rt))
-      prepared <-
-        liftIO (prepareGitHubToken cfg secretPrompt decryptCache willLive)
-      (token, latch) <- case prepared of
-        Left err -> dieError (T.unpack err)
-        Right (tok, warns) -> do
-          mapM_ logWarning warns
-          l <- liftIO newGitHubLatch
-          when willLive $ runGitHubHealth l tok
-          pure (tok, l)
-      fetch <- liftIO (productionFetcherWithLatch latch token)
-      depsOps <-
-        liftIO
-          ( productionDepsPlanOpsWithLatch
-              latch
-              token
-              (rtJobs rt)
-              (Just overlayResolved)
-          )
-      reports <-
-        liftIO $
-          withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
-            checkOverlayWithDepsPlan
-              (rtJobs rt)
-              mh
-              fetch
-              depsOps
-              cache
-              filteredEbuilds
-      liftIO (flushCheckCache cache)
-      mSummary <- liftIO (cacheSummaryLine cache)
-      mapM_ logInfo mSummary
-      (keep, mAbort) <- liftIO (finishOutdatedReports latch reports)
-      mapM_ emitReport keep
-      case mAbort of
-        Just err -> dieError (T.unpack err)
-        Nothing -> pure ()
+      excludes = map T.pack excludeArgs
+  resolveCommandSelection entries tokens excludes >>= \keys -> do
+    let selectedEntries = [e | e <- entries, peKey e `elem` keys]
+        filteredEbuilds =
+          filter
+            ( \eb ->
+                mkPackageKey (ebuildCategory eb) (ebuildPackage eb) `elem` keys
+            )
+            ebuilds
+        total = length selectedEntries
+        byPkg = groupByPackage ebuilds
+    (cache, cacheWarn) <-
+      liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayResolved
+    mapM_ logWarning cacheWarn
+    willLive <-
+      liftIO
+        ( needsLiveGitHubApi
+            LiveForOutdated
+            cache
+            overlayResolved
+            selectedEntries
+            byPkg
+        )
+    decryptCache <- liftIO (newIORef Nothing)
+    let secretPrompt =
+          productionSecretPrompt
+            (pauseActivePanel (rtProgress rt))
+            (resumeActivePanel (rtProgress rt))
+    prepared <-
+      liftIO (prepareGitHubToken cfg secretPrompt decryptCache willLive)
+    (token, latch) <- case prepared of
+      Left err -> dieError (T.unpack err)
+      Right (tok, warns) -> do
+        mapM_ logWarning warns
+        l <- liftIO newGitHubLatch
+        when willLive $ runGitHubHealth l tok
+        pure (tok, l)
+    fetch <- liftIO (productionFetcherWithLatch latch token)
+    depsOps <-
+      liftIO
+        ( productionDepsPlanOpsWithLatch
+            latch
+            token
+            (rtJobs rt)
+            (Just overlayResolved)
+        )
+    reports <-
+      liftIO $
+        withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
+          checkOverlayWithDepsPlan
+            (rtJobs rt)
+            mh
+            fetch
+            depsOps
+            cache
+            filteredEbuilds
+    liftIO (flushCheckCache cache)
+    mSummary <- liftIO (cacheSummaryLine cache)
+    mapM_ logInfo mSummary
+    (keep, mAbort) <- liftIO (finishOutdatedReports latch reports)
+    mapM_ emitReport keep
+    case mAbort of
+      Just err -> dieError (T.unpack err)
+      Nothing -> pure ()
 
 runUpdate ::
-  (WithLog env Message m, MonadIO m) => Runtime -> Bool -> [String] -> m ()
-runUpdate rt refresh pkgArgs = do
+  (WithLog env Message m, MonadIO m) =>
+  Runtime ->
+  Bool ->
+  [String] ->
+  [String] ->
+  m ()
+runUpdate rt refresh pkgArgs excludeArgs = do
   (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
-  case resolveTargets entries tokens of
-    Left errs -> do
-      mapM_ (logError . targetErrorMessage) errs
-      liftIO $ exitWith (ExitFailure 1)
-    Right keys -> do
-      let selected =
-            if null pkgArgs
-              then entries
-              else [e | e <- entries, peKey e `elem` keys]
-          -- Spine tools only; language/assets tools come after plan.
-          spinePf =
-            AssetsPreflight
-              { apNeedAssets = False,
-                apNeedGo = False,
-                apNeedNpm = False,
-                apNeedBun = False,
-                apNeedCargo = False,
-                apNeedDocker = False
-              }
-      preflightOk <- liftIO $ runSpineToolSteps (rtProgress rt) spinePf
-      case preflightOk of
-        Left err -> dieError (T.unpack err)
-        Right () -> pure ()
-      layoutOk <- liftIO $ checkLayoutCacheFormats overlayPath
-      case layoutOk of
-        Left err -> dieError (T.unpack err)
-        Right () -> pure ()
-      distDir <-
-        liftIO $
-          resolveDistfilesPath
-            (optDistfilesPath (rtOptions rt))
-            (distfilesPath cfg)
-      probeOk <- liftIO $ probeDistfilesDir distDir
-      case probeOk of
-        Left err -> dieError (T.unpack err)
-        Right () -> pure ()
-      -- Open check cache before plan phase.
-      (cache, cacheWarn) <-
-        liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayPath
-      mapM_ logWarning cacheWarn
-      willLive <-
-        liftIO
-          ( needsLiveGitHubApi
-              LiveForUpdate
-              cache
-              overlayPath
-              selected
-              (groupByPackage ebuilds)
+      excludes = map T.pack excludeArgs
+  resolveCommandSelection entries tokens excludes >>= \keys -> do
+    let selected = [e | e <- entries, peKey e `elem` keys]
+        -- Spine tools only; language/assets tools come after plan.
+        spinePf =
+          AssetsPreflight
+            { apNeedAssets = False,
+              apNeedGo = False,
+              apNeedNpm = False,
+              apNeedBun = False,
+              apNeedCargo = False,
+              apNeedDocker = False
+            }
+    preflightOk <- liftIO $ runSpineToolSteps (rtProgress rt) spinePf
+    case preflightOk of
+      Left err -> dieError (T.unpack err)
+      Right () -> pure ()
+    layoutOk <- liftIO $ checkLayoutCacheFormats overlayPath
+    case layoutOk of
+      Left err -> dieError (T.unpack err)
+      Right () -> pure ()
+    distDir <-
+      liftIO $
+        resolveDistfilesPath
+          (optDistfilesPath (rtOptions rt))
+          (distfilesPath cfg)
+    probeOk <- liftIO $ probeDistfilesDir distDir
+    case probeOk of
+      Left err -> dieError (T.unpack err)
+      Right () -> pure ()
+    -- Open check cache before plan phase.
+    (cache, cacheWarn) <-
+      liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayPath
+    mapM_ logWarning cacheWarn
+    willLive <-
+      liftIO
+        ( needsLiveGitHubApi
+            LiveForUpdate
+            cache
+            overlayPath
+            selected
+            (groupByPackage ebuilds)
+        )
+    decryptCache <- liftIO (newIORef Nothing)
+    let pcfg = rtProgress rt
+        secretPrompt =
+          productionSecretPrompt
+            (pauseActivePanel pcfg)
+            (resumeActivePanel pcfg)
+    prepared <-
+      liftIO (prepareGitHubToken cfg secretPrompt decryptCache willLive)
+    (token, latch) <- case prepared of
+      Left err -> dieError (T.unpack err)
+      Right (tok, warns) -> do
+        mapM_ logWarning warns
+        l <- liftIO newGitHubLatch
+        when willLive $ runGitHubHealth l tok
+        pure (tok, l)
+    fetch <- liftIO (productionFetcherWithLatch latch token)
+    depsOps <-
+      liftIO
+        ( productionDepsPlanOpsWithLatch
+            latch
+            token
+            (rtJobs rt)
+            (Just overlayPath)
+        )
+    dummyReleaseOps <-
+      liftIO $
+        case token of
+          Just t -> productionReleaseOpsWithLatch latch t
+          Nothing ->
+            pure
+              ReleaseOps
+                { roGetReleaseByTag = \_ _ _ -> pure (Left "GitHub token required"),
+                  roDownloadAsset = \_ _ -> pure (Left "GitHub token required"),
+                  roCreateReleaseWithAssets = \_ _ -> pure (Left "GitHub token required")
+                }
+    let gpgOps =
+          productionGpgAgentOps
+            (pauseActivePanel pcfg)
+            (resumeActivePanel pcfg)
+    spineResult <-
+      liftIO $
+        bracket
+          (newGpgHandle gpgOps)
+          teardownGpgHandle
+          ( \gpg -> do
+              sidecarDir <- defaultMaterializeSidecarDir
+              uname <- hostMachineArch
+              mOvr <- lookupEnv materializeImageEnvVar
+              prev <- newMVar Nothing
+              let ovr = case mOvr of
+                    Just s | not (null s) -> Just s
+                    _ -> Nothing
+                  ensureCfg =
+                    EnsureConfig
+                      { ecRun = productionCommandRunner,
+                        ecProbe = productionDiskSpaceProbe,
+                        ecOverlayRoot = overlayPath,
+                        ecSidecarDir = sidecarDir,
+                        ecNow = productionEnsureNow,
+                        ecUname = uname,
+                        ecOverrideTag = ovr,
+                        ecPrevImageId = prev,
+                        ecGentooRoot = gentooRepoPath productionPortageqRunner
+                      }
+                  unlockEnvelope =
+                    case githubToken cfg of
+                      Nothing ->
+                        pure $
+                          Left
+                            "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
+                      Just envelope ->
+                        decryptConfigEnvelope secretPrompt decryptCache envelope
+                  deps =
+                    UpdateSpineDeps
+                      { usdJobs = rtJobs rt,
+                        usdProgress = pcfg,
+                        usdFetcher = fetch,
+                        usdDepsPlanOps = depsOps,
+                        usdReleaseOps = dummyReleaseOps,
+                        usdDiskProbe = productionDiskSpaceProbe,
+                        usdGitOps = productionGitOps gpg,
+                        usdCheckCache = cache,
+                        usdAssetsOwner = "0x6d6e647a",
+                        usdAssetsRepo = "mndz-overlay-assets",
+                        usdGitHubToken = token,
+                        usdUnlockConfigToken = unlockEnvelope,
+                        usdMkReleaseOps = productionReleaseOpsWithLatch latch,
+                        usdGitOriginUrl = gitRemoteOriginUrl,
+                        usdGitPushUrl = gitRemotePushUrl,
+                        usdCommandRunner = productionCommandRunner,
+                        usdAssetsPathCfg = assetsPath cfg,
+                        usdDistDir = distDir,
+                        usdOverlayRoot = overlayPath,
+                        usdSshOps = productionSshAgentOps,
+                        usdSshIdentity = sshIdentity cfg,
+                        usdEbuildRunner = productionEbuildRunner distDir,
+                        usdEgencacheRunner = productionEgencacheRunner,
+                        usdPreflightTools = preflightUpdateTools,
+                        usdEnsureImage = (`ensureMaterializeImage` ensureCfg),
+                        usdPruneMaterialize =
+                          prunePreviousMaterializeImage ensureCfg,
+                        usdSweepMaterialize =
+                          sweepStaleMaterializeSessions
+                            productionCommandRunner
+                            isLiveOverlayManagerPid,
+                        usdMaterializeDockerRunner =
+                          Just productionCommandRunner,
+                        usdGitHubLatch = latch,
+                        usdGitOperationsHealth = productionGitOperationsHealth,
+                        usdPrepareSigning =
+                          \runRoot mayAssets overlay mAssets ->
+                            prepareSigningSession
+                              gpg
+                              runRoot
+                              ( overlay
+                                  : [ assets
+                                    | mayAssets,
+                                      Just assets <- [mAssets]
+                                    ]
+                              ),
+                        usdReleaseSigning = teardownGpgHandle gpg
+                      }
+              runUpdatePhases deps entries ebuilds selected
           )
-      decryptCache <- liftIO (newIORef Nothing)
-      let pcfg = rtProgress rt
-          secretPrompt =
-            productionSecretPrompt
-              (pauseActivePanel pcfg)
-              (resumeActivePanel pcfg)
-      prepared <-
-        liftIO (prepareGitHubToken cfg secretPrompt decryptCache willLive)
-      (token, latch) <- case prepared of
-        Left err -> dieError (T.unpack err)
-        Right (tok, warns) -> do
-          mapM_ logWarning warns
-          l <- liftIO newGitHubLatch
-          when willLive $ runGitHubHealth l tok
-          pure (tok, l)
-      fetch <- liftIO (productionFetcherWithLatch latch token)
-      depsOps <-
-        liftIO
-          ( productionDepsPlanOpsWithLatch
-              latch
-              token
-              (rtJobs rt)
-              (Just overlayPath)
-          )
-      dummyReleaseOps <-
-        liftIO $
-          case token of
-            Just t -> productionReleaseOpsWithLatch latch t
-            Nothing ->
-              pure
-                ReleaseOps
-                  { roGetReleaseByTag = \_ _ _ -> pure (Left "GitHub token required"),
-                    roDownloadAsset = \_ _ -> pure (Left "GitHub token required"),
-                    roCreateReleaseWithAssets = \_ _ -> pure (Left "GitHub token required")
-                  }
-      let gpgOps =
-            productionGpgAgentOps
-              (pauseActivePanel pcfg)
-              (resumeActivePanel pcfg)
-      spineResult <-
-        liftIO $
-          bracket
-            (newGpgHandle gpgOps)
-            teardownGpgHandle
-            ( \gpg -> do
-                sidecarDir <- defaultMaterializeSidecarDir
-                uname <- hostMachineArch
-                mOvr <- lookupEnv materializeImageEnvVar
-                prev <- newMVar Nothing
-                let ovr = case mOvr of
-                      Just s | not (null s) -> Just s
-                      _ -> Nothing
-                    ensureCfg =
-                      EnsureConfig
-                        { ecRun = productionCommandRunner,
-                          ecProbe = productionDiskSpaceProbe,
-                          ecOverlayRoot = overlayPath,
-                          ecSidecarDir = sidecarDir,
-                          ecNow = productionEnsureNow,
-                          ecUname = uname,
-                          ecOverrideTag = ovr,
-                          ecPrevImageId = prev,
-                          ecGentooRoot = gentooRepoPath productionPortageqRunner
-                        }
-                    unlockEnvelope =
-                      case githubToken cfg of
-                        Nothing ->
-                          pure $
-                            Left
-                              "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
-                        Just envelope ->
-                          decryptConfigEnvelope secretPrompt decryptCache envelope
-                    deps =
-                      UpdateSpineDeps
-                        { usdJobs = rtJobs rt,
-                          usdProgress = pcfg,
-                          usdFetcher = fetch,
-                          usdDepsPlanOps = depsOps,
-                          usdReleaseOps = dummyReleaseOps,
-                          usdDiskProbe = productionDiskSpaceProbe,
-                          usdGitOps = productionGitOps gpg,
-                          usdCheckCache = cache,
-                          usdAssetsOwner = "0x6d6e647a",
-                          usdAssetsRepo = "mndz-overlay-assets",
-                          usdGitHubToken = token,
-                          usdUnlockConfigToken = unlockEnvelope,
-                          usdMkReleaseOps = productionReleaseOpsWithLatch latch,
-                          usdGitOriginUrl = gitRemoteOriginUrl,
-                          usdGitPushUrl = gitRemotePushUrl,
-                          usdCommandRunner = productionCommandRunner,
-                          usdAssetsPathCfg = assetsPath cfg,
-                          usdDistDir = distDir,
-                          usdOverlayRoot = overlayPath,
-                          usdSshOps = productionSshAgentOps,
-                          usdSshIdentity = sshIdentity cfg,
-                          usdEbuildRunner = productionEbuildRunner distDir,
-                          usdEgencacheRunner = productionEgencacheRunner,
-                          usdPreflightTools = preflightUpdateTools,
-                          usdEnsureImage = (`ensureMaterializeImage` ensureCfg),
-                          usdPruneMaterialize =
-                            prunePreviousMaterializeImage ensureCfg,
-                          usdSweepMaterialize =
-                            sweepStaleMaterializeSessions
-                              productionCommandRunner
-                              isLiveOverlayManagerPid,
-                          usdMaterializeDockerRunner =
-                            Just productionCommandRunner,
-                          usdGitHubLatch = latch,
-                          usdGitOperationsHealth = productionGitOperationsHealth,
-                          usdPrepareSigning =
-                            \runRoot mayAssets overlay mAssets ->
-                              prepareSigningSession
-                                gpg
-                                runRoot
-                                ( overlay
-                                    : [ assets
-                                      | mayAssets,
-                                        Just assets <- [mAssets]
-                                      ]
-                                ),
-                          usdReleaseSigning = teardownGpgHandle gpg
-                        }
-                runUpdatePhases deps entries ebuilds selected
-            )
-      case spineResult of
-        Left err -> dieError (T.unpack err)
-        Right res -> do
-          mapM_ logWarning (usrWarnings res)
-          mapM_ logInfo (usrCacheSummary res)
-          case usrOutcomes res of
-            [ApplyHardFail (PackageKey "") msg _ _] ->
-              dieError (T.unpack msg)
-            outcomes -> do
-              mapM_ emitOutcome outcomes
-              when (foldExitHardFail outcomes) $
-                liftIO $
-                  exitWith (ExitFailure 1)
+    case spineResult of
+      Left err -> dieError (T.unpack err)
+      Right res -> do
+        mapM_ logWarning (usrWarnings res)
+        mapM_ logInfo (usrCacheSummary res)
+        case usrOutcomes res of
+          [ApplyHardFail (PackageKey "") msg _ _] ->
+            dieError (T.unpack msg)
+          outcomes -> do
+            mapM_ emitOutcome outcomes
+            when (foldExitHardFail outcomes) $
+              liftIO $
+                exitWith (ExitFailure 1)
 
 -- | Spine-tool preflight step (git/ebuild/egencache/gpg only).
 runSpineToolSteps :: ProgressConfig -> AssetsPreflight -> IO (Either T.Text ())
@@ -565,8 +598,14 @@ runEclean rt = do
     Right () ->
       logInfo $ "eclean: cleaned manager distfiles cache at " <> T.pack distDir
 
-runGencache :: (WithLog env Message m, MonadIO m) => Runtime -> [String] -> Bool -> m ()
-runGencache rt pkgArgs force = do
+runGencache ::
+  (WithLog env Message m, MonadIO m) =>
+  Runtime ->
+  [String] ->
+  Bool ->
+  [String] ->
+  m ()
+runGencache rt pkgArgs force excludeArgs = do
   (_cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   isGit <- liftIO (isGitWorkTree overlayPath)
   unless isGit $
@@ -581,43 +620,40 @@ runGencache rt pkgArgs force = do
     Right () -> pure ()
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
-  case resolveTargets entries tokens of
-    Left errs -> do
-      mapM_ (logError . targetErrorMessage) errs
-      liftIO $ exitWith (ExitFailure 1)
-    Right keys -> do
-      let pcfg = rtProgress rt
-          gpgOps =
-            productionGpgAgentOps
-              (pauseActivePanel pcfg)
-              (resumeActivePanel pcfg)
-      result <-
-        liftIO $
-          bracket
-            (newGpgHandle gpgOps)
-            teardownGpgHandle
-            ( \gpg ->
-                gencachePackages
-                  productionEgencacheRunner
-                  (productionGitOps gpg)
-                  overlayPath
-                  keys
-                  force
-                  (Just (rtJobs rt))
-                  ( do
-                      runRoot <- openRunRoot
-                      prepareSigningSession gpg (rrPath runRoot) [overlayPath]
-                  )
-            )
-      case result of
-        Left err -> dieError (T.unpack err)
-        Right Nothing ->
-          logInfo "gencache: no md5-cache changes; no commit created"
-        Right (Just paths) ->
-          logInfo $
-            "gencache: signed commit of "
-              <> T.pack (show (length paths))
-              <> " cache path(s)"
+      excludes = map T.pack excludeArgs
+  resolveCommandSelection entries tokens excludes >>= \keys -> do
+    let pcfg = rtProgress rt
+        gpgOps =
+          productionGpgAgentOps
+            (pauseActivePanel pcfg)
+            (resumeActivePanel pcfg)
+    result <-
+      liftIO $
+        bracket
+          (newGpgHandle gpgOps)
+          teardownGpgHandle
+          ( \gpg ->
+              gencachePackages
+                productionEgencacheRunner
+                (productionGitOps gpg)
+                overlayPath
+                keys
+                force
+                (Just (rtJobs rt))
+                ( do
+                    runRoot <- openRunRoot
+                    prepareSigningSession gpg (rrPath runRoot) [overlayPath]
+                )
+          )
+    case result of
+      Left err -> dieError (T.unpack err)
+      Right Nothing ->
+        logInfo "gencache: no md5-cache changes; no commit created"
+      Right (Just paths) ->
+        logInfo $
+          "gencache: signed commit of "
+            <> T.pack (show (length paths))
+            <> " cache path(s)"
 
 -- | @{pn}-{pv}@ release tag label for deferred reuse logs.
 packageAssetLabel :: PackageKey -> EbuildVersion -> T.Text

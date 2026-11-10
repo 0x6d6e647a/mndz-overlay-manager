@@ -14,6 +14,8 @@ module CLI.Parser
   )
 where
 
+import Data.Char (isAscii, isSpace)
+import Data.List (dropWhileEnd)
 import GHC.Conc (getNumProcessors)
 import Options.Applicative
 import System.Environment (getProgName, lookupEnv)
@@ -36,15 +38,18 @@ data Command
   = List
   | Outdated
       { outdatedRefresh :: Bool,
-        outdatedTargets :: [String]
+        outdatedTargets :: [String],
+        outdatedExcludeTokens :: [String]
       }
   | Update
       { updateRefresh :: Bool,
-        updateTargets :: [String]
+        updateTargets :: [String],
+        updateExcludeTokens :: [String]
       }
   | Gencache
       { gencacheTargets :: [String],
-        gencacheForce :: Bool
+        gencacheForce :: Bool,
+        gencacheExcludeTokens :: [String]
       }
   | Eclean
   | GitHubToken
@@ -177,6 +182,52 @@ refreshParser =
           \(writes fresh cache entries when caching is enabled)"
     )
 
+-- | Repeatable long-only @--exclude PACKAGE,...@.
+-- Each value is split on commas and ASCII whitespace is trimmed.
+-- An empty piece fails the reader before configuration is loaded.
+excludeTokens :: Parser [String]
+excludeTokens =
+  concat
+    <$> many
+      ( option
+          (eitherReader readExcludeList)
+          ( long "exclude"
+              <> metavar "PACKAGE,..."
+              <> help
+                "Comma-separated, repeatable package tokens (same form as \
+                \PACKAGE) removed from the positional selection, or from the \
+                \whole inventory when no PACKAGE arguments are given. An empty \
+                \selection is an error"
+          )
+      )
+
+readExcludeList :: String -> Either String [String]
+readExcludeList raw =
+  let tokens = map trimAscii (splitOn ',' raw)
+   in if any null tokens
+        then Left "empty --exclude package token"
+        else Right tokens
+
+splitOn :: Char -> String -> [String]
+splitOn sep = go
+  where
+    go s = case break (== sep) s of
+      (piece, _ : rest) -> piece : go rest
+      (piece, []) -> [piece]
+
+trimAscii :: String -> String
+trimAscii = dropWhile isAsciiSpace . dropWhileEnd isAsciiSpace
+
+isAsciiSpace :: Char -> Bool
+isAsciiSpace c = isAscii c && isSpace c
+
+excludeFooter :: String
+excludeFooter =
+  "--exclude PACKAGE,... is a repeatable comma-separated list of package \
+  \tokens in the same form as PACKAGE. Those tokens are removed from the \
+  \positional selection, or from the whole inventory when no PACKAGE \
+  \arguments are given. An empty selection is an error. "
+
 updateParser :: Parser Command
 updateParser =
   Update
@@ -189,6 +240,7 @@ updateParser =
                 \name; omit to update all packages that need work"
           )
       )
+    <*> excludeTokens
 
 gencacheParser :: Parser Command
 gencacheParser =
@@ -207,6 +259,7 @@ gencacheParser =
             "Regenerate md5-cache for every selected package even when \
             \_md5_ already matches (required to overwrite mismatches)"
       )
+    <*> excludeTokens
 
 listInfo :: ParserInfo Command
 listInfo =
@@ -234,6 +287,7 @@ outdatedParser =
                 \name; omit to check all discovered packages"
           )
       )
+    <*> excludeTokens
 
 outdatedInfo :: ParserInfo Command
 outdatedInfo =
@@ -248,6 +302,7 @@ outdatedInfo =
             \discovered packages. Empty inventory is an error. Successful checks \
             \are cached briefly (see check-cache-ttl); use --refresh to force \
             \live network checks. "
+              <> excludeFooter
               <> globalsFooter
           )
     )
@@ -265,6 +320,7 @@ updateInfo =
             \packages that need work (outdated non-Go packages and Go packages \
             \with tree-lane gaps). Uses the shared check cache when valid; \
             \--refresh forces live fetch/plan. "
+              <> excludeFooter
               <> globalsFooter
           )
     )
@@ -282,6 +338,7 @@ gencacheInfo =
             \With no PACKAGE arguments, regenerate cache for all packages that \
             \have ebuilds. Without --force, matching packages are skipped and \
             \_md5_ mismatches hard-fail (use --force to overwrite). "
+              <> excludeFooter
               <> globalsFooter
           )
     )

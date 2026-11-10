@@ -304,6 +304,8 @@ tests =
       testCase "Parser Pure Commands" testParserPureCommands,
       testCase "Parser github-token" testParserGitHubToken,
       testCase "Parser Residual Edges" testParserResidualEdges,
+      testCase "ExcludeParser" testExcludeParser,
+      testCase "ExcludeHelp" testExcludeHelp,
       testCase "Help Catalogs Eclean And Distfiles" testHelpCatalogDistfiles,
       testCase "Show Top Level Help Exit 1" testShowTopLevelHelpExit1,
       testCase "Logger Hold And Filter" testLoggerHoldAndFilter
@@ -477,13 +479,13 @@ testParserPureCommands = do
     Just opts ->
       assertEq
         "outdated targets"
-        (Just (CLI.Outdated {CLI.outdatedRefresh = False, CLI.outdatedTargets = ["dev-lang/go", "mise"]}))
+        (Just (CLI.Outdated {CLI.outdatedRefresh = False, CLI.outdatedTargets = ["dev-lang/go", "mise"], CLI.outdatedExcludeTokens = []}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse outdated failed"
       exitFailure
   case parse ["update"] of
-    Just opts -> assertEq "update all" (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = []})) (optCommand opts)
+    Just opts -> assertEq "update all" (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = [], CLI.updateExcludeTokens = []})) (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update failed"
       exitFailure
@@ -491,7 +493,7 @@ testParserPureCommands = do
     Just opts ->
       assertEq
         "update one"
-        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["dev-util/hk"]}))
+        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["dev-util/hk"], CLI.updateExcludeTokens = []}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update target failed"
@@ -500,7 +502,7 @@ testParserPureCommands = do
     Just opts ->
       assertEq
         "gencache default"
-        (Just (CLI.Gencache {CLI.gencacheTargets = [], CLI.gencacheForce = False}))
+        (Just (CLI.Gencache {CLI.gencacheTargets = [], CLI.gencacheForce = False, CLI.gencacheExcludeTokens = []}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse gencache failed"
@@ -509,7 +511,7 @@ testParserPureCommands = do
     Just opts ->
       assertEq
         "gencache force"
-        (Just (CLI.Gencache {CLI.gencacheTargets = ["dev-lang/go"], CLI.gencacheForce = True}))
+        (Just (CLI.Gencache {CLI.gencacheTargets = ["dev-lang/go"], CLI.gencacheForce = True, CLI.gencacheExcludeTokens = []}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse gencache --force failed"
@@ -606,7 +608,7 @@ testParserResidualEdges = do
       hPutStrLn stderr $ "expected invalid log-level failure, got " <> show opts
       exitFailure
   case parse ["outdated"] of
-    Just opts -> assertEq "outdated all" (Just (CLI.Outdated {CLI.outdatedRefresh = False, CLI.outdatedTargets = []})) (optCommand opts)
+    Just opts -> assertEq "outdated all" (Just (CLI.Outdated {CLI.outdatedRefresh = False, CLI.outdatedTargets = [], CLI.outdatedExcludeTokens = []})) (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse outdated bare failed"
       exitFailure
@@ -614,7 +616,7 @@ testParserResidualEdges = do
     Just opts ->
       assertEq
         "gencache force after target"
-        (Just (CLI.Gencache {CLI.gencacheTargets = ["dev-lang/go"], CLI.gencacheForce = True}))
+        (Just (CLI.Gencache {CLI.gencacheTargets = ["dev-lang/go"], CLI.gencacheForce = True, CLI.gencacheExcludeTokens = []}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse gencache target --force failed"
@@ -623,7 +625,7 @@ testParserResidualEdges = do
     Just opts ->
       assertEq
         "update multi"
-        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["a/b", "c/d"]}))
+        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["a/b", "c/d"], CLI.updateExcludeTokens = []}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update multi failed"
@@ -632,7 +634,7 @@ testParserResidualEdges = do
     Just opts ->
       assertEq
         "outdated refresh"
-        (Just (CLI.Outdated {CLI.outdatedRefresh = True, CLI.outdatedTargets = ["crush"]}))
+        (Just (CLI.Outdated {CLI.outdatedRefresh = True, CLI.outdatedTargets = ["crush"], CLI.outdatedExcludeTokens = []}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse outdated --refresh failed"
@@ -641,11 +643,144 @@ testParserResidualEdges = do
     Just opts ->
       assertEq
         "update refresh"
-        (Just (CLI.Update {CLI.updateRefresh = True, CLI.updateTargets = []}))
+        (Just (CLI.Update {CLI.updateRefresh = True, CLI.updateTargets = [], CLI.updateExcludeTokens = []}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update --refresh failed"
       exitFailure
+
+testExcludeParser :: IO ()
+testExcludeParser = do
+  let commandOf label args =
+        case execParserPure defaultPrefs parserInfo args of
+          Success opts -> pure (optCommand opts)
+          Failure failure -> do
+            let (msg, _) = renderFailure failure "mndz-overlay-manager"
+            hPutStrLn stderr $ label <> " expected success: " <> msg
+            exitFailure
+          CompletionInvoked _ -> do
+            hPutStrLn stderr $ label <> " expected success, got completion"
+            exitFailure
+      assertFail label args =
+        case execParserPure defaultPrefs parserInfo args of
+          Failure failure -> do
+            let (_, code) = renderFailure failure "mndz-overlay-manager"
+            assertEq (label <> " exit") (ExitFailure 1) code
+          Success opts -> do
+            hPutStrLn stderr $ label <> ": expected failure, got " <> show opts
+            exitFailure
+          CompletionInvoked _ -> do
+            hPutStrLn stderr $ label <> ": expected failure, got completion"
+            exitFailure
+  comma <- commandOf "comma" ["outdated", "--exclude", "dev-util/codex, dev-util/crush"]
+  assertEq
+    "comma split and trim"
+    ( Just
+        ( CLI.Outdated
+            { CLI.outdatedRefresh = False,
+              CLI.outdatedTargets = [],
+              CLI.outdatedExcludeTokens = ["dev-util/codex", "dev-util/crush"]
+            }
+        )
+    )
+    comma
+  padded <-
+    commandOf "padded" ["outdated", "--exclude", "  dev-util/codex  ,  dev-util/crush  "]
+  assertEq
+    "padded tokens trimmed"
+    ( Just
+        ( CLI.Outdated
+            { CLI.outdatedRefresh = False,
+              CLI.outdatedTargets = [],
+              CLI.outdatedExcludeTokens = ["dev-util/codex", "dev-util/crush"]
+            }
+        )
+    )
+    padded
+  repeated <-
+    commandOf
+      "repeated"
+      ["update", "--exclude", "dev-util/codex", "--exclude", "dev-util/crush"]
+  assertEq
+    "repeated flags"
+    ( Just
+        ( CLI.Update
+            { CLI.updateRefresh = False,
+              CLI.updateTargets = [],
+              CLI.updateExcludeTokens = ["dev-util/codex", "dev-util/crush"]
+            }
+        )
+    )
+    repeated
+  positionalComma <-
+    commandOf "positional comma" ["outdated", "dev-util/codex,dev-util/crush"]
+  assertEq
+    "positional comma stays one target"
+    ( Just
+        ( CLI.Outdated
+            { CLI.outdatedRefresh = False,
+              CLI.outdatedTargets = ["dev-util/codex,dev-util/crush"],
+              CLI.outdatedExcludeTokens = []
+            }
+        )
+    )
+    positionalComma
+  excludeThenPos <-
+    commandOf
+      "exclude then positional"
+      ["outdated", "--exclude", "dev-util/codex", "dev-util/crush"]
+  assertEq
+    "exclude does not swallow the next positional"
+    ( Just
+        ( CLI.Outdated
+            { CLI.outdatedRefresh = False,
+              CLI.outdatedTargets = ["dev-util/crush"],
+              CLI.outdatedExcludeTokens = ["dev-util/codex"]
+            }
+        )
+    )
+    excludeThenPos
+  assertFail "empty segment" ["update", "--exclude", "dev-util/codex,"]
+  assertFail "whitespace-only" ["update", "--exclude", "   "]
+  assertFail "list rejects exclude" ["list", "--exclude", "dev-util/codex"]
+  assertFail "eclean rejects exclude" ["eclean", "--exclude", "dev-util/codex"]
+  assertFail "github-token rejects exclude" ["github-token", "--exclude", "dev-util/codex"]
+  assertFail "global exclude rejected" ["--exclude", "dev-util/codex", "outdated"]
+
+testExcludeHelp :: IO ()
+testExcludeHelp = do
+  let helpOf label args =
+        case execParserPure defaultPrefs parserInfo args of
+          Failure failure -> pure (renderFailure failure "mndz-overlay-manager")
+          Success opts -> do
+            hPutStrLn stderr $ label <> ": expected help, got " <> show opts
+            exitFailure
+          CompletionInvoked _ -> do
+            hPutStrLn stderr $ label <> ": expected help, got completion"
+            exitFailure
+      assertDocuments label msg = do
+        assertTrue (label <> " names --exclude") ("--exclude" `isInfixOf` msg)
+        assertTrue (label <> " comma-separated") ("comma-separated" `isInfixOf` msg)
+        assertTrue (label <> " repeatable") ("repeatable" `isInfixOf` msg)
+        assertTrue (label <> " positional selection") ("positional selection" `isInfixOf` msg)
+        assertTrue (label <> " whole inventory") ("whole inventory" `isInfixOf` msg)
+        assertTrue (label <> " empty selection") ("empty selection is an error" `isInfixOf` msg)
+  (outdatedMsg, outdatedCode) <- helpOf "outdated" ["outdated", "--help"]
+  assertEq "outdated help exits 0 without config" ExitSuccess outdatedCode
+  assertDocuments "outdated" outdatedMsg
+  (updateMsg, updateCode) <- helpOf "update" ["update", "--help"]
+  assertEq "update help exits 0 without config" ExitSuccess updateCode
+  assertDocuments "update" updateMsg
+  (gencacheMsg, gencacheCode) <- helpOf "gencache" ["gencache", "--help"]
+  assertEq "gencache help exits 0 without config" ExitSuccess gencacheCode
+  assertDocuments "gencache" gencacheMsg
+  assertTrue "gencache help still documents --force" ("--force" `isInfixOf` gencacheMsg)
+  (topMsg, topCode) <- helpOf "top" ["--help"]
+  assertEq "top help exits 0 without config" ExitSuccess topCode
+  assertTrue "top help does not document --exclude" (not ("--exclude" `isInfixOf` topMsg))
+  (listMsg, listCode) <- helpOf "list" ["list", "--help"]
+  assertEq "list help exits 0 without config" ExitSuccess listCode
+  assertTrue "list help does not document --exclude" (not ("--exclude" `isInfixOf` listMsg))
 
 -- | Top-level and @eclean --help@ catalog manager distfiles surfaces.
 testHelpCatalogDistfiles :: IO ()
