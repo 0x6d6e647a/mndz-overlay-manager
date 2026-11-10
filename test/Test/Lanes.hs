@@ -1252,6 +1252,44 @@ testCargoTargetCfg = do
     TagFloorComplete (Just v) _ ->
       assertEq "non-win7 table is active" "1.94.0" v
     other -> assertFailure ("win7 open: " <> show other)
+  apple <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.86\"",
+              "[target.'cfg(target_vendor = \"apple\")'.dependencies]",
+              "applecrate = { path = \"applecrate\" }"
+            ]
+        ),
+        (Just "applecrate", pkgToml "applecrate" "1.99")
+      ]
+  case apple of
+    TagFloorComplete (Just v) _ ->
+      assertEq "apple vendor table ignored" "1.86.0" v
+    other -> assertFailure ("apple: " <> show other)
+  appleUnix <-
+    runFloor
+      Nothing
+      Nothing
+      [ ( Nothing,
+          T.unlines
+            [ "[package]",
+              "name = \"root\"",
+              "rust-version = \"1.86\"",
+              "[target.'cfg(all(unix, not(target_vendor = \"apple\")))'.dependencies]",
+              "unixcrate = { path = \"unixcrate\" }"
+            ]
+        ),
+        (Just "unixcrate", pkgToml "unixcrate" "1.94")
+      ]
+  case appleUnix of
+    TagFloorComplete (Just v) _ ->
+      assertEq "unix non-apple table is active" "1.94.0" v
+    other -> assertFailure ("apple unix: " <> show other)
   vendorUnknown <-
     runFloor
       Nothing

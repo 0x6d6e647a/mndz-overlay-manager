@@ -155,6 +155,10 @@ hardcodedPolicies =
         "dev-util/cargo-llvm-cov"
         (GitHub "taiki-e" "cargo-llvm-cov" "v")
         (DepsAndAssets (Cargo Nothing Nothing CargoGitTagGenerateLock)),
+      policy
+        "dev-util/cargo-update"
+        (GitHub "nabijaczleweli" "cargo-update" "v")
+        (DepsAndAssets (Cargo Nothing Nothing CargoCratesIo)),
       policyArches
         "dev-util/codex"
         (GitHub "openai" "codex" "rust-v")

@@ -657,6 +657,21 @@ testPolicyClassification = do
     "cargo-llvm-cov arches"
     []
     (lookupLaneArches (PackageKey "dev-util/cargo-llvm-cov"))
+  case lookupPolicy (PackageKey "dev-util/cargo-update") of
+    Just
+      ( PackagePolicy
+          (GitHub "nabijaczleweli" "cargo-update" "v")
+          (DepsAndAssets (Cargo Nothing Nothing CargoCratesIo))
+          []
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "cargo-update technique: " <> show other
+      exitFailure
+  assertEq
+    "cargo-update arches"
+    []
+    (lookupLaneArches (PackageKey "dev-util/cargo-update"))
   case lookupPolicy (PackageKey "dev-util/codex") of
     Just
       ( PackagePolicy

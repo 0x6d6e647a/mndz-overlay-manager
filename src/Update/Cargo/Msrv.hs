@@ -1287,10 +1287,12 @@ atomHolds name mVal fam =
     ("target_env", Just "gnu") -> Just (fam == FamLinux)
     ("target_env", Just "msvc") -> Just (fam == FamWindows)
     ("target_env", Just _) -> Just False
-    -- Rust's windows7 target uses vendor "win7" (x86_64-win7-windows-msvc).
-    -- That vendor is not a modeled family. Other vendor values stay unparsed:
-    -- "unknown" is the ordinary Linux vendor and must not be dropped.
+    -- "win7" is Rust's windows7 vendor. "apple" is the Apple vendor.
+    -- Neither is a modeled family, so those tables are ignored.
+    -- Other vendor values stay unparsed: "unknown" is the ordinary Linux
+    -- vendor and must not be dropped.
     ("target_vendor", Just "win7") -> Just False
+    ("target_vendor", Just "apple") -> Just False
     ("target_arch", Just "wasm32") -> Just (fam == FamWasm)
     ("target_arch", Just "wasm64") -> Just (fam == FamWasm)
     ("target_arch", Just arch)

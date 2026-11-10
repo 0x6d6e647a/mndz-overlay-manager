@@ -321,6 +321,7 @@ tests =
       testCase "Cargo Provenance Coherence" testCargoProvenanceCoherence,
       testCase "cargo-llvm-cov GitHub source and GIT_CRATES" testCargoLlvmCovSrcUri,
       testCase "cargo-llvm-cov donor body survives rewrite" testCargoLlvmCovDonorPreservation,
+      testCase "cargo-update donor body survives rewrite" testCargoUpdateDonorPreservation,
       testCase "Go Keywords Assembly" testGoKeywordsAssembly,
       testCase "Set Keywords" testSetKeywords,
       testCase "Origin-derived assets SRC_URI" testOriginAssetsSrcUri,
@@ -1660,6 +1661,186 @@ testCargoLlvmCovDonorPreservation = do
     "primary source stays the GitHub tag archive"
     ( "github.com/taiki-e/cargo-llvm-cov/archive/refs/tags/v${PV}.tar.gz"
         `T.isInfixOf` rewritten
+    )
+
+-- | A 22.1.0-shaped cargo-update donor rewritten the way Cargo apply does
+-- for PV 22.1.1. pycargoebuild replaces the crate-license block; the manager
+-- empties CRATES, parameterizes the assets SRC_URI, and rewrites KEYWORDS
+-- and RUST_MIN_VER. The USE contract, both programs, and the crates.io
+-- primary source stay.
+testCargoUpdateDonorPreservation :: IO ()
+testCargoUpdateDonorPreservation = do
+  let oldGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tMIT",
+            "\tZLIB",
+            "\""
+          ]
+      newGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tApache-2.0",
+            "\tUnicode-3.0",
+            "\""
+          ]
+      donor =
+        T.unlines
+          [ "EAPI=8",
+            "",
+            "RUST_MIN_VER=\"1.86.0\"",
+            "",
+            "CRATES=\"",
+            "\toldcrate@1.0.0",
+            "\"",
+            "",
+            "inherit cargo",
+            "",
+            "DESCRIPTION=\"A cargo subcommand for checking and applying updates to installed executables\"",
+            "HOMEPAGE=\"https://github.com/nabijaczleweli/cargo-update\"",
+            "SRC_URI=\"https://crates.io/api/v1/crates/cargo-update/${PV}/download -> cargo-update-${PV}.crate\"",
+            "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/cargo-update-22.1.0/cargo-update-22.1.0-crates.tar.xz\"",
+            "",
+            "LICENSE=\"MIT\"",
+            oldGen,
+            "SLOT=\"0\"",
+            "KEYWORDS=\"~amd64\"",
+            "IUSE=\"+system-openssl +system-libgit2 +system-libcurl +libsecret +man test\"",
+            "REQUIRED_USE=\"system-libcurl? ( system-openssl )\"",
+            "RESTRICT=\"!test? ( test )\"",
+            "",
+            "DEPEND=\"",
+            "\tsystem-openssl? ( dev-libs/openssl:= )",
+            "\tsystem-libgit2? ( >=dev-libs/libgit2-1.9.0 <dev-libs/libgit2-1.10:= )",
+            "\tsystem-libcurl? ( net-misc/curl[http2] )",
+            "\tnet-libs/libssh2:=",
+            "\tsys-libs/zlib:=",
+            "\"",
+            "RDEPEND=\"",
+            "\t${DEPEND}",
+            "\tlibsecret? ( app-crypt/libsecret )",
+            "\"",
+            "BDEPEND=\"",
+            "\tvirtual/pkgconfig",
+            "\tdev-build/cmake",
+            "\tman? ( app-text/ronn-ng )",
+            "\t!system-openssl? ( dev-lang/perl )",
+            "\"",
+            "",
+            "QA_FLAGS_IGNORED=\"usr/bin/cargo-install-update usr/bin/cargo-install-update-config\"",
+            "",
+            "src_configure() {",
+            "\tlocal myfeatures=(",
+            "\t\t$(usev !system-openssl vendored-openssl)",
+            "\t\t$(usev !system-libgit2 vendored-libgit2)",
+            "\t\t$(usev !system-libcurl vendored-libcurl)",
+            "\t)",
+            "\texport LIBSSH2_SYS_USE_PKG_CONFIG=1",
+            "\tif use system-openssl; then",
+            "\t\texport OPENSSL_NO_VENDOR=1",
+            "\tfi",
+            "\tif use system-libgit2; then",
+            "\t\texport LIBGIT2_NO_VENDOR=1",
+            "\tfi",
+            "\tcargo_src_configure",
+            "}",
+            "",
+            "src_test() {",
+            "\tcargo_src_test",
+            "}",
+            "",
+            "src_install() {",
+            "\tcargo_src_install",
+            "\t# /usr/bin/cargo-install-update",
+            "\t# /usr/bin/cargo-install-update-config",
+            "\tif use man; then",
+            "\t\texport HOME=\"${T}\"",
+            "\t\texport RUBYOPT=\"-Eutf-8:utf-8\"",
+            "\t\tronn -r man/*.md || die",
+            "\t\tdoman man/*.1 || die",
+            "\tfi",
+            "}"
+          ]
+      simulated = T.replace oldGen newGen donor
+      keywords =
+        [ "~amd64",
+          "~arm",
+          "~arm64",
+          "~loong",
+          "~mips",
+          "~ppc",
+          "~ppc64",
+          "~riscv",
+          "~s390",
+          "~sparc",
+          "~x86"
+        ]
+      rewritten0 =
+        setKeywords
+          keywords
+          ( ensureCargoAssetsSrcUriFor
+              CargoCratesIo
+              "cargo-update"
+              (ensureEmptyCrates simulated)
+          )
+  rewritten <- assertRight "rust min" (ensureRustMinVer "1.88" rewritten0)
+  assertTrue
+    "IUSE survives"
+    ( "IUSE=\"+system-openssl +system-libgit2 +system-libcurl +libsecret +man test\""
+        `T.isInfixOf` rewritten
+    )
+  assertTrue
+    "REQUIRED_USE survives"
+    ( "REQUIRED_USE=\"system-libcurl? ( system-openssl )\""
+        `T.isInfixOf` rewritten
+    )
+  assertTrue
+    "cargo-install-update path survives"
+    ("# /usr/bin/cargo-install-update\n" `T.isInfixOf` rewritten)
+  assertTrue
+    "cargo-install-update-config path survives"
+    ("# /usr/bin/cargo-install-update-config\n" `T.isInfixOf` rewritten)
+  assertTrue
+    "QA_FLAGS_IGNORED survives"
+    ( "QA_FLAGS_IGNORED=\"usr/bin/cargo-install-update usr/bin/cargo-install-update-config\""
+        `T.isInfixOf` rewritten
+    )
+  assertTrue
+    "primary source stays the crates.io download"
+    ( "https://crates.io/api/v1/crates/cargo-update/${PV}/download -> cargo-update-${PV}.crate"
+        `T.isInfixOf` rewritten
+    )
+  assertTrue "RESTRICT survives" ("RESTRICT=\"!test? ( test )\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "system-library configure survives"
+    ( "OPENSSL_NO_VENDOR=1" `T.isInfixOf` rewritten
+        && "LIBGIT2_NO_VENDOR=1" `T.isInfixOf` rewritten
+        && "LIBSSH2_SYS_USE_PKG_CONFIG=1" `T.isInfixOf` rewritten
+        && "vendored-openssl" `T.isInfixOf` rewritten
+        && "vendored-libgit2" `T.isInfixOf` rewritten
+        && "vendored-libcurl" `T.isInfixOf` rewritten
+    )
+  assertTrue "src_test survives" ("cargo_src_test" `T.isInfixOf` rewritten)
+  assertTrue "man install survives" ("ronn -r man/*.md" `T.isInfixOf` rewritten)
+  assertTrue "CRATES emptied" ("CRATES=\"\"" `T.isInfixOf` rewritten)
+  assertTrue "old crate list dropped" (not ("oldcrate@1.0.0" `T.isInfixOf` rewritten))
+  let (generated, _after) = T.breakOn "SLOT=\"0\"" rewritten
+  assertTrue "generated license block changed" ("Unicode-3.0" `T.isInfixOf` generated)
+  assertTrue "old generated license dropped" (not ("ZLIB" `T.isInfixOf` generated))
+  assertTrue "primary license stays" ("LICENSE=\"MIT\"" `T.isInfixOf` rewritten)
+  assertTrue "RUST_MIN_VER updated" ("RUST_MIN_VER=\"1.88.0\"" `T.isInfixOf` rewritten)
+  assertTrue "old floor dropped" (not ("RUST_MIN_VER=\"1.86.0\"" `T.isInfixOf` rewritten))
+  assertTrue
+    "KEYWORDS updated"
+    ( "KEYWORDS=\"~amd64 ~arm ~arm64 ~loong ~mips ~ppc ~ppc64 ~riscv ~s390 ~sparc ~x86\""
+        `T.isInfixOf` rewritten
+    )
+  assertTrue
+    "assets SRC_URI parameterized to the new PV"
+    ( "cargo-update-${PV}/cargo-update-${PV}-crates.tar.xz" `T.isInfixOf` rewritten
+        && not ("cargo-update-22.1.0" `T.isInfixOf` rewritten)
     )
 
 testOriginAssetsSrcUri :: IO ()
