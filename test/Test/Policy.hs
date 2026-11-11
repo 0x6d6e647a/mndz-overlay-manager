@@ -657,6 +657,21 @@ testPolicyClassification = do
     "cargo-llvm-cov arches"
     []
     (lookupLaneArches (PackageKey "dev-util/cargo-llvm-cov"))
+  case lookupPolicy (PackageKey "dev-util/cargo-outdated") of
+    Just
+      ( PackagePolicy
+          (GitHub "kbknapp" "cargo-outdated" "v")
+          (DepsAndAssets (Cargo Nothing Nothing CargoCratesIo))
+          []
+        ) ->
+        pure ()
+    other -> do
+      hPutStrLn stderr $ "cargo-outdated technique: " <> show other
+      exitFailure
+  assertEq
+    "cargo-outdated arches"
+    []
+    (lookupLaneArches (PackageKey "dev-util/cargo-outdated"))
   case lookupPolicy (PackageKey "dev-util/cargo-update") of
     Just
       ( PackagePolicy

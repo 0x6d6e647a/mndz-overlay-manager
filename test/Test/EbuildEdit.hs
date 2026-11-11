@@ -322,6 +322,7 @@ tests =
       testCase "cargo-llvm-cov GitHub source and GIT_CRATES" testCargoLlvmCovSrcUri,
       testCase "cargo-llvm-cov donor body survives rewrite" testCargoLlvmCovDonorPreservation,
       testCase "cargo-update donor body survives rewrite" testCargoUpdateDonorPreservation,
+      testCase "cargo-outdated donor body survives rewrite" testCargoOutdatedDonorPreservation,
       testCase "Go Keywords Assembly" testGoKeywordsAssembly,
       testCase "Set Keywords" testSetKeywords,
       testCase "Origin-derived assets SRC_URI" testOriginAssetsSrcUri,
@@ -1841,6 +1842,148 @@ testCargoUpdateDonorPreservation = do
     "assets SRC_URI parameterized to the new PV"
     ( "cargo-update-${PV}/cargo-update-${PV}-crates.tar.xz" `T.isInfixOf` rewritten
         && not ("cargo-update-22.1.0" `T.isInfixOf` rewritten)
+    )
+
+-- | A 0.18.0-shaped cargo-outdated donor rewritten the way Cargo apply does
+-- for PV 0.19.0. The six system-* flags, the four-rule REQUIRED_USE, the
+-- system-versus-bundled configure, and the crates.io primary source stay.
+testCargoOutdatedDonorPreservation :: IO ()
+testCargoOutdatedDonorPreservation = do
+  let oldGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tMIT",
+            "\tZLIB",
+            "\""
+          ]
+      newGen =
+        T.unlines
+          [ "# Dependent crate licenses",
+            "LICENSE+=\"",
+            "\tApache-2.0",
+            "\tUnicode-3.0",
+            "\""
+          ]
+      requiredUse =
+        [ "REQUIRED_USE=\"",
+          "\t!system-openssl? ( !system-libcurl !system-libgit2 !system-libssh2 )",
+          "\t!system-libcurl? ( !system-openssl )",
+          "\tsystem-libgit2? ( system-libssh2 )",
+          "\t!system-zlib? ( !system-libcurl )",
+          "\""
+        ]
+      iuse =
+        "IUSE=\"+system-openssl +system-libcurl +system-libgit2 +system-libssh2 +system-zlib +system-sqlite +libsecret test\""
+      donor =
+        T.unlines
+          ( [ "EAPI=8",
+              "",
+              "RUST_MIN_VER=\"1.84.0\"",
+              "",
+              "CRATES=\"",
+              "\toldcrate@1.0.0",
+              "\"",
+              "",
+              "inherit cargo",
+              "",
+              "DESCRIPTION=\"A cargo subcommand for displaying when Rust dependencies are out of date\"",
+              "HOMEPAGE=\"https://github.com/kbknapp/cargo-outdated\"",
+              "SRC_URI=\"https://crates.io/api/v1/crates/cargo-outdated/${PV}/download -> cargo-outdated-${PV}.crate\"",
+              "SRC_URI+=\" https://github.com/0x6d6e647a/mndz-overlay-assets/releases/download/cargo-outdated-0.18.0/cargo-outdated-0.18.0-crates.tar.xz\"",
+              "",
+              "LICENSE=\"MIT\"",
+              oldGen,
+              "SLOT=\"0\"",
+              "KEYWORDS=\"~amd64\"",
+              iuse
+            ]
+              <> requiredUse
+              <> [ "RESTRICT=\"!test? ( test )\"",
+                   "",
+                   "BDEPEND=\"",
+                   "\tvirtual/pkgconfig",
+                   "\t!system-openssl? ( dev-lang/perl )",
+                   "\"",
+                   "",
+                   "QA_FLAGS_IGNORED=\"usr/bin/cargo-outdated\"",
+                   "",
+                   "src_configure() {",
+                   "\tlocal myfeatures=(",
+                   "\t\t$(usev !system-openssl vendored-openssl)",
+                   "\t\t$(usev !system-libcurl cargo/all-static)",
+                   "\t\t$(usev !system-libgit2 cargo/vendored-libgit2)",
+                   "\t)",
+                   "\tuse system-zlib || export LIBZ_SYS_STATIC=1",
+                   "\tuse system-openssl && export OPENSSL_NO_VENDOR=1",
+                   "\tuse system-libgit2 && export LIBGIT2_NO_VENDOR=1",
+                   "\tcargo_src_configure",
+                   "}",
+                   "",
+                   "src_test() {",
+                   "\tcargo_src_test",
+                   "}"
+                 ]
+          )
+      simulated = T.replace oldGen newGen donor
+      keywords =
+        [ "~amd64",
+          "~arm",
+          "~arm64",
+          "~loong",
+          "~mips",
+          "~ppc",
+          "~ppc64",
+          "~riscv",
+          "~s390",
+          "~sparc",
+          "~x86"
+        ]
+      rewritten0 =
+        setKeywords
+          keywords
+          ( ensureCargoAssetsSrcUriFor
+              CargoCratesIo
+              "cargo-outdated"
+              (ensureEmptyCrates simulated)
+          )
+  rewritten <- assertRight "rust min" (ensureRustMinVer "1.88" rewritten0)
+  assertTrue "IUSE survives" (iuse `T.isInfixOf` rewritten)
+  assertTrue
+    "REQUIRED_USE survives across its lines"
+    (T.unlines requiredUse `T.isInfixOf` rewritten)
+  assertTrue
+    "QA_FLAGS_IGNORED survives"
+    ("QA_FLAGS_IGNORED=\"usr/bin/cargo-outdated\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "primary source stays the crates.io download"
+    ( "https://crates.io/api/v1/crates/cargo-outdated/${PV}/download -> cargo-outdated-${PV}.crate"
+        `T.isInfixOf` rewritten
+    )
+  assertTrue "RESTRICT survives" ("RESTRICT=\"!test? ( test )\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "system-versus-bundled configure survives"
+    ( "cargo/all-static" `T.isInfixOf` rewritten
+        && "vendored-openssl" `T.isInfixOf` rewritten
+        && "cargo/vendored-libgit2" `T.isInfixOf` rewritten
+        && "LIBZ_SYS_STATIC=1" `T.isInfixOf` rewritten
+    )
+  assertTrue "src_test survives" ("cargo_src_test" `T.isInfixOf` rewritten)
+  assertTrue "CRATES emptied" ("CRATES=\"\"" `T.isInfixOf` rewritten)
+  assertTrue "old crate list dropped" (not ("oldcrate@1.0.0" `T.isInfixOf` rewritten))
+  let (generated, _after) = T.breakOn "SLOT=\"0\"" rewritten
+  assertTrue "generated license block changed" ("Unicode-3.0" `T.isInfixOf` generated)
+  assertTrue "old generated license dropped" (not ("ZLIB" `T.isInfixOf` generated))
+  assertTrue "RUST_MIN_VER updated" ("RUST_MIN_VER=\"1.88.0\"" `T.isInfixOf` rewritten)
+  assertTrue
+    "KEYWORDS updated"
+    ( "KEYWORDS=\"~amd64 ~arm ~arm64 ~loong ~mips ~ppc ~ppc64 ~riscv ~s390 ~sparc ~x86\""
+        `T.isInfixOf` rewritten
+    )
+  assertTrue
+    "assets SRC_URI parameterized to the new PV"
+    ( "cargo-outdated-${PV}/cargo-outdated-${PV}-crates.tar.xz" `T.isInfixOf` rewritten
+        && not ("cargo-outdated-0.18.0" `T.isInfixOf` rewritten)
     )
 
 testOriginAssetsSrcUri :: IO ()
