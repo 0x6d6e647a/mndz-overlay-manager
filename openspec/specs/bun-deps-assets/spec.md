@@ -21,7 +21,7 @@ For `DepsAndAssets Bun` full-path materialization of PV for packages that use **
 #### Scenario: Bun deps pack uses extreme multi-thread xz
 
 - **WHEN** the manager packs a BunCache deps tarball
-- **THEN** the pack process uses `XZ_OPT` containing `-T1` and `-9e` (single-thread extreme; hermetic-asset-materialize)
+- **THEN** the pack process uses `XZ_OPT` containing `-T` equal to the resolved `--jobs` value and `-9e` (hermetic-asset-materialize)
 
 #### Scenario: Bun deps pack rejects non-xz body
 
@@ -209,7 +209,7 @@ Bun runtime-lane ceilings SHALL be read from `{overlay-path}/dev-lang/bun-bin` n
 
 ### Requirement: InstallTree packaging for opencode deps distfile
 
-For `dev-util/opencode` full-path materialization of PV, after a successful image Bun gate and clone of the GitHub tag, the program SHALL run `bun install --frozen-lockfile` (network allowed during materialize) in the clone **inside the materialize container**, then create `{pn}-{pv}-deps.tar.xz` whose members are the **install tree** rooted at the repository root: all `node_modules` directories (and any additional workspace install artifacts required to build with `build.ts --skip-install`) with paths relative to that root. The tarball SHALL NOT be defined solely as a top-level `bun-cache/` directory. Packaging SHALL use the hermetic tar/xz rules specified by `hermetic-asset-materialize` (`XZ_OPT=-T1 -9e`) and SHALL verify the final deps path is an xz-compressed stream (hard-fail if not). Failure of install or packaging SHALL hard-fail the PV before assets publish.
+For `dev-util/opencode` full-path materialization of PV, after a successful image Bun gate and clone of the GitHub tag, the program SHALL run `bun install --frozen-lockfile` (network allowed during materialize) in the clone **inside the materialize container**, then create `{pn}-{pv}-deps.tar.xz` whose members are the **install tree** rooted at the repository root: all `node_modules` directories (and any additional workspace install artifacts required to build with `build.ts --skip-install`) with paths relative to that root. The tarball SHALL NOT be defined solely as a top-level `bun-cache/` directory. Packaging SHALL use the hermetic tar/xz rules specified by `hermetic-asset-materialize` (`XZ_OPT=-T{N} -9e`, where `N` is the resolved `--jobs` value) and SHALL verify the final deps path is an xz-compressed stream (hard-fail if not). Failure of install or packaging SHALL hard-fail the PV before assets publish.
 
 #### Scenario: Deps basename unchanged
 
@@ -229,7 +229,7 @@ For `dev-util/opencode` full-path materialization of PV, after a successful imag
 #### Scenario: InstallTree deps pack uses extreme multi-thread xz
 
 - **WHEN** the manager packs an InstallTree deps tarball for opencode
-- **THEN** the pack process uses `XZ_OPT` containing `-T1` and `-9e` (single-thread extreme; hermetic-asset-materialize)
+- **THEN** the pack process uses `XZ_OPT` containing `-T` equal to the resolved `--jobs` value and `-9e` (hermetic-asset-materialize)
 
 ### Requirement: Opencode Portage compile is offline for dependency install
 

@@ -21,7 +21,7 @@ For `DepsAndAssets Npm` full-path materialization of PV, the program SHALL, in t
 #### Scenario: Npm deps pack uses extreme multi-thread xz
 
 - **WHEN** the manager packs an npm deps tarball
-- **THEN** the pack process uses `XZ_OPT` containing `-T1` and `-9e` (single-thread extreme; hermetic-asset-materialize)
+- **THEN** the pack process uses `XZ_OPT` containing `-T` equal to the resolved `--jobs` value and `-9e` (hermetic-asset-materialize)
 
 #### Scenario: Npm deps pack rejects non-xz body
 

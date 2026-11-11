@@ -15,6 +15,7 @@ import CLI.Progress
     noopMultiHandle,
     withStepProgress,
   )
+import Control.Concurrent (newQSem)
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
 import Control.Monad (unless, void)
@@ -570,6 +571,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   cfg <- resolveMaterializeDockerCfg (rrRunId tempRun)
                                   pure (Just (cfg, inner))
                         httpMgr <- newManager tlsManagerSettings
+                        compressSlot <- newQSem 1
                         let closedRun _ =
                               pure
                                 ProcessResult
@@ -584,13 +586,13 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   aeGitOps = usdGitOps deps,
                                   aeEbuildRunner = usdEbuildRunner deps,
                                   aeEgencacheRunner = usdEgencacheRunner deps,
-                                  aeVendorOps = mkVendorOps closedRun,
-                                  aeNpmCacheOps = mkNpmCacheOps closedRun,
-                                  aeBunCacheOps = mkBunCacheOps closedRun,
-                                  aeCargoOps = mkCargoOps closedRun,
-                                  aeSbclDepsOps = mkSbclDepsOps closedRun,
-                                  aeUvDepsOps = mkUvDepsOps closedRun,
-                                  aePdmDepsOps = mkPdmDepsOps closedRun,
+                                  aeVendorOps = mkVendorOps jobs compressSlot closedRun,
+                                  aeNpmCacheOps = mkNpmCacheOps jobs compressSlot closedRun,
+                                  aeBunCacheOps = mkBunCacheOps jobs compressSlot closedRun,
+                                  aeCargoOps = mkCargoOps jobs compressSlot closedRun,
+                                  aeSbclDepsOps = mkSbclDepsOps jobs compressSlot closedRun,
+                                  aeUvDepsOps = mkUvDepsOps jobs compressSlot closedRun,
+                                  aePdmDepsOps = mkPdmDepsOps jobs compressSlot closedRun,
                                   aeReleaseOps = releaseOps,
                                   aeAssetsRoot = mAssetsRoot,
                                   aeGitHubToken = resolvedToken,
@@ -600,6 +602,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   aeOverlayLock = overlayLock,
                                   aeTreeLock = treeLock,
                                   aeJobs = jobs,
+                                  aePackSlot = compressSlot,
                                   aeMulti = noopMultiHandle,
                                   aePlanOps = toGoPlanOps (usdDepsPlanOps deps),
                                   aeDepsPlanOps = usdDepsPlanOps deps,

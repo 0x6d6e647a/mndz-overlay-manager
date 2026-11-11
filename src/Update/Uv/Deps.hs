@@ -17,6 +17,7 @@ module Update.Uv.Deps
   )
 where
 
+import Control.Concurrent (QSem)
 import Control.Exception (IOException, try)
 import Data.List (find, sort)
 import Data.Set (Set)
@@ -108,8 +109,10 @@ data UvDepsProgress = UvDepsProgress
     udpOnPackDone :: IO ()
   }
 
-mkUvDepsOps :: CommandRunner -> UvDepsOps
-mkUvDepsOps run =
+-- | @threads@ is the xz thread count for the deps pack (@XZ_OPT=-T{N} -9e@).
+-- @slot@ is the update's shared compress lock.
+mkUvDepsOps :: Int -> QSem -> CommandRunner -> UvDepsOps
+mkUvDepsOps threads slot run =
   UvDepsOps
     { udoClone = gitCloneTag run,
       udoSync = uvSync run,
@@ -119,7 +122,7 @@ mkUvDepsOps run =
       udoUnpack = unpackArchive run,
       udoCargoVendor = cargoVendor run,
       udoRepackSdist = repackSdist run,
-      udoPack = packStage run,
+      udoPack = packStage threads slot run,
       udoHasVendor = \dir -> doesDirectoryExist (dir </> "vendor"),
       udoHasCargoToml = \dir -> doesFileExist (dir </> "Cargo.toml"),
       udoPlanBackendSdists = planBackendSdists run,
@@ -127,8 +130,9 @@ mkUvDepsOps run =
       udoReadSdistPyproject = readSdistPyproject run
     }
 
-productionUvDepsOps :: UvDepsOps
-productionUvDepsOps = mkUvDepsOps productionCommandRunner
+-- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
+productionUvDepsOps :: QSem -> UvDepsOps
+productionUvDepsOps slot = mkUvDepsOps 1 slot productionCommandRunner
 
 -- | Clone the raw tag, sync the frozen lock, and pack @sdists/@.
 buildUvDepsTarball ::
@@ -761,11 +765,11 @@ repackSdist run srcDir dest =
         prStdin = ""
       }
 
-packStage :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
-packStage run stageDir outPath = do
+packStage :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+packStage threads slot run stageDir outPath = do
   hasGit <- doesDirectoryExist (stageDir </> "git")
   let entries = "sdists" : ["git" | hasGit]
-  packTarXz run "tar pack failed" Nothing (Just stageDir) entries outPath
+  packTarXz run slot threads "tar pack failed" Nothing (Just stageDir) entries outPath
 
 -- | Clone one tag and sync slots in probe order. Stops at the first success.
 -- A missing interpreter is 'Left'. A non-zero sync rejects that slot.

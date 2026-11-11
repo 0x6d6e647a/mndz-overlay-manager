@@ -16,6 +16,7 @@ module Update.Pdm.Deps
 where
 
 import Control.Applicative ((<|>))
+import Control.Concurrent (QSem)
 import Control.Exception (IOException, try)
 import Data.Aeson (Value, eitherDecodeStrict, withObject, (.:), (.:?))
 import Data.Aeson.Key qualified as Key
@@ -101,19 +102,22 @@ data PdmDepsProgress = PdmDepsProgress
     pdpOnPackDone :: IO ()
   }
 
-mkPdmDepsOps :: CommandRunner -> PdmDepsOps
-mkPdmDepsOps run =
+-- | @threads@ is the xz thread count for the deps pack (@XZ_OPT=-T{N} -9e@).
+-- @slot@ is the update's shared compress lock.
+mkPdmDepsOps :: Int -> QSem -> CommandRunner -> PdmDepsOps
+mkPdmDepsOps threads slot run =
   PdmDepsOps
     { pdoClone = gitCloneTag run,
       pdoPdm = pdmChecked run,
       pdoReadFile = readTextFile,
       pdoDownload = downloadFile run,
       pdoUnpack = unpackArchive run,
-      pdoPack = packStage run
+      pdoPack = packStage threads slot run
     }
 
-productionPdmDepsOps :: PdmDepsOps
-productionPdmDepsOps = mkPdmDepsOps productionCommandRunner
+-- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
+productionPdmDepsOps :: QSem -> PdmDepsOps
+productionPdmDepsOps slot = mkPdmDepsOps 1 slot productionCommandRunner
 
 -- | Clone the raw tag, dry-run the dev set, and pack @dists/@.
 buildPdmDepsTarball ::
@@ -677,9 +681,9 @@ unpackArchive run archive dest =
         prStdin = ""
       }
 
-packStage :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
-packStage run stageDir =
-  packTarXz run "tar pack failed" Nothing (Just stageDir) ["dists"]
+packStage :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+packStage threads slot run stageDir =
+  packTarXz run slot threads "tar pack failed" Nothing (Just stageDir) ["dists"]
 
 runChecked :: CommandRunner -> Text -> ProcessRequest -> IO (Either Text ())
 runChecked run prefix req = do

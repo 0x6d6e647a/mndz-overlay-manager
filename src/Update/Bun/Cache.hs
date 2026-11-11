@@ -23,6 +23,7 @@ module Update.Bun.Cache
 where
 
 import Control.Applicative ((<|>))
+import Control.Concurrent (QSem)
 import Control.Exception (IOException, try)
 import Control.Monad (foldM, forM)
 import Data.Aeson (Value, eitherDecode, withObject, (.:?))
@@ -128,17 +129,21 @@ data BunCacheProgress = BunCacheProgress
   }
 
 -- | Build bun cache ops over an injectable command runner (Unit heat surface).
-mkBunCacheOps :: CommandRunner -> BunCacheOps
-mkBunCacheOps run =
+--
+-- @threads@ is the xz thread count for the deps pack (@XZ_OPT=-T{N} -9e@).
+-- @slot@ is the update's shared compress lock.
+mkBunCacheOps :: Int -> QSem -> CommandRunner -> BunCacheOps
+mkBunCacheOps threads slot run =
   BunCacheOps
     { bcoClone = gitCloneTag run,
       bcoHostBunVersion = hostBunVersion run,
       bcoBunInstall = bunInstallCache run,
-      bcoTarXz = tarXzEntries run
+      bcoTarXz = tarXzEntries threads slot run
     }
 
-productionBunCacheOps :: BunCacheOps
-productionBunCacheOps = mkBunCacheOps productionCommandRunner
+-- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
+productionBunCacheOps :: QSem -> BunCacheOps
+productionBunCacheOps slot = mkBunCacheOps 1 slot productionCommandRunner
 
 hostBunVersion :: CommandRunner -> IO (Either Text Text)
 hostBunVersion run = do
@@ -637,6 +642,6 @@ bunInstallCache run cloneDir cacheDir = do
       then Right ()
       else Left ("bun install failed: " <> T.pack (prStderr res))
 
-tarXzEntries :: CommandRunner -> FilePath -> [FilePath] -> FilePath -> IO (Either Text ())
-tarXzEntries run workDir =
-  packTarXz run "tar xz bun deps failed" (Just workDir) Nothing
+tarXzEntries :: Int -> QSem -> CommandRunner -> FilePath -> [FilePath] -> FilePath -> IO (Either Text ())
+tarXzEntries threads slot run workDir =
+  packTarXz run slot threads "tar xz bun deps failed" (Just workDir) Nothing

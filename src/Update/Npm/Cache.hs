@@ -19,6 +19,7 @@ module Update.Npm.Cache
   )
 where
 
+import Control.Concurrent (QSem)
 import Control.Monad (when)
 import Data.Aeson (Value (..), eitherDecode, withObject, (.:), (.:?))
 import Data.Aeson.Key qualified as Key
@@ -79,17 +80,21 @@ data NpmCacheProgress = NpmCacheProgress
   }
 
 -- | Build npm cache ops over an injectable command runner (Unit heat surface).
-mkNpmCacheOps :: CommandRunner -> NpmCacheOps
-mkNpmCacheOps run =
+--
+-- @threads@ is the xz thread count for the deps pack (@XZ_OPT=-T{N} -9e@).
+-- @slot@ is the update's shared compress lock.
+mkNpmCacheOps :: Int -> QSem -> CommandRunner -> NpmCacheOps
+mkNpmCacheOps threads slot run =
   NpmCacheOps
     { ncoHostNodeVersion = hostNodeVersion run,
       ncoNpmPack = npmPack run,
       ncoNpmInstallCache = npmInstallCache run,
-      ncoTarXz = tarXzNpmCache run
+      ncoTarXz = tarXzNpmCache threads slot run
     }
 
-productionNpmCacheOps :: NpmCacheOps
-productionNpmCacheOps = mkNpmCacheOps productionCommandRunner
+-- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
+productionNpmCacheOps :: QSem -> NpmCacheOps
+productionNpmCacheOps slot = mkNpmCacheOps 1 slot productionCommandRunner
 
 hostNodeVersion :: CommandRunner -> IO (Either Text Text)
 hostNodeVersion run = do
@@ -268,10 +273,10 @@ npmInstallCache run tgz cacheDir = do
       then Right ()
       else Left ("npm --cache install failed: " <> T.pack (prStderr res))
 
-tarXzNpmCache :: CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
-tarXzNpmCache run workDir entry outPath = do
+tarXzNpmCache :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+tarXzNpmCache threads slot run workDir entry outPath = do
   prepareNpmCacheForPack (workDir </> entry)
-  packTarXz run "tar xz npm-cache failed" (Just workDir) Nothing [entry] outPath
+  packTarXz run slot threads "tar xz npm-cache failed" (Just workDir) Nothing [entry] outPath
 
 parseEnginesNode :: Value -> Parser Text
 parseEnginesNode =

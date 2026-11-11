@@ -2,10 +2,11 @@
 
 -- | Shared DepsAndAssets @tar@ + xz pack helpers.
 --
--- Sets @XZ_OPT=-T1 -9e@ (single-thread extreme, bit-stable across core
--- counts), forces xz compression with @-J@ (so a temporary basename cannot
--- disable @tar -a@ auto-compress), records numeric root owners and a clamped
--- epoch mtime, and verifies the final file begins with the xz stream magic.
+-- Sets @XZ_OPT=-T{N} -9e@ (extreme, @N@ at least 1), forces xz compression
+-- with @-J@ (so a temporary basename cannot disable @tar -a@ auto-compress),
+-- records numeric root owners and a clamped epoch mtime, and verifies the
+-- final file begins with the xz stream magic. Callers that share a @QSem@
+-- run at most one of these @tar@ invocations at a time.
 module Update.Pack.XzTar
   ( xzOptValue,
     withXzOpt,
@@ -18,6 +19,8 @@ module Update.Pack.XzTar
   )
 where
 
+import Control.Concurrent (QSem, signalQSem, waitQSem)
+import Control.Exception (bracket_)
 import Control.Monad (when)
 import Data.ByteString qualified as BS
 import Data.Text (Text)
@@ -39,9 +42,11 @@ import Update.Process
     ProcessResult (..),
   )
 
--- | Uniform extreme single-thread xz settings for DepsAndAssets packs.
-xzOptValue :: String
-xzOptValue = "-T1 -9e"
+-- | Extreme xz settings for one DepsAndAssets pack.
+--
+-- @n@ below 1 becomes 1, so the value is never @-T0@.
+xzOptValue :: Int -> String
+xzOptValue n = "-T" <> show (max 1 n) <> " -9e"
 
 -- | GNU tar flags that strip builder identity from ustar\/PAX headers.
 --
@@ -59,9 +64,9 @@ hermeticTarArgs =
   ]
 
 -- | Install @XZ_OPT@ into an environment list (replacing any prior value).
-withXzOpt :: [(String, String)] -> [(String, String)]
-withXzOpt env0 =
-  ("XZ_OPT", xzOptValue) : filter ((/= "XZ_OPT") . fst) env0
+withXzOpt :: Int -> [(String, String)] -> [(String, String)]
+withXzOpt n env0 =
+  ("XZ_OPT", xzOptValue n) : filter ((/= "XZ_OPT") . fst) env0
 
 -- | XZ stream header: @FD 37 7A 58 5A 00@ (\"\\xFD7zXZ\\0\").
 xzMagicPrefix :: BS.ByteString
@@ -95,22 +100,26 @@ verifyXzFile path = do
               )
 
 -- | Pack @entries@ to @finalPath@ with forced xz (@-cJf@), hermetic tar
--- flags, and @XZ_OPT=-T1 -9e@, then verify xz magic. Non-atomic: writes
--- @finalPath@ directly.
+-- flags, and @XZ_OPT=-T{threads} -9e@, then verify xz magic. Non-atomic:
+-- writes @finalPath@ directly. @threads@ below 1 is treated as 1.
 --
 -- @cwd@ is the process working directory; @changeDir@ is an optional @tar -C@
 -- directory (applied before create). @errPrefix@ prefixes failure messages.
+-- @slot@ is the update's capacity-1 compress lock. @bracket_@ inside
+-- 'runTarXz' releases it on success and on every failure.
 packTarXz ::
   CommandRunner ->
+  QSem ->
+  Int ->
   Text ->
   Maybe FilePath ->
   Maybe FilePath ->
   [FilePath] ->
   FilePath ->
   IO (Either Text ())
-packTarXz run errPrefix cwd changeDir entries finalPath = do
+packTarXz run slot threads errPrefix cwd changeDir entries finalPath = do
   createDirectoryIfMissing True (takeDirectory finalPath)
-  r <- runTarXz run errPrefix cwd changeDir entries finalPath
+  r <- runTarXz run slot threads errPrefix cwd changeDir entries finalPath
   case r of
     Left err -> pure (Left err)
     Right () -> mapLeft errPrefix <$> verifyXzFile finalPath
@@ -120,18 +129,20 @@ packTarXz run errPrefix cwd changeDir entries finalPath = do
 -- compression on even when the temp basename does not end in @.xz@.
 packTarXzAtomic ::
   CommandRunner ->
+  QSem ->
+  Int ->
   Text ->
   Maybe FilePath ->
   Maybe FilePath ->
   [FilePath] ->
   FilePath ->
   IO (Either Text ())
-packTarXzAtomic run errPrefix cwd changeDir entries finalPath = do
+packTarXzAtomic run slot threads errPrefix cwd changeDir entries finalPath = do
   createDirectoryIfMissing True (takeDirectory finalPath)
   let tmpPath = finalPath <> ".partial"
   tmpExists <- doesFileExist tmpPath
   when tmpExists (removeFile tmpPath)
-  r <- runTarXz run errPrefix cwd changeDir entries tmpPath
+  r <- runTarXz run slot threads errPrefix cwd changeDir entries tmpPath
   case r of
     Left err -> do
       tryRemove tmpPath
@@ -148,28 +159,34 @@ packTarXzAtomic run errPrefix cwd changeDir entries finalPath = do
 
 runTarXz ::
   CommandRunner ->
+  QSem ->
+  Int ->
   Text ->
   Maybe FilePath ->
   Maybe FilePath ->
   [FilePath] ->
   FilePath ->
   IO (Either Text ())
-runTarXz run errPrefix cwd changeDir entries archivePath = do
+runTarXz run slot threads errPrefix cwd changeDir entries archivePath = do
   env0 <- getEnvironment
-  let env' = withXzOpt env0
+  let env' = withXzOpt threads env0
       cArgs = case changeDir of
         Nothing -> []
         Just d -> ["-C", d]
       -- Force xz with -J so auto-compress suffix cannot skip compression.
       tarArgs = hermeticTarArgs ++ cArgs ++ ["-cJf", archivePath] ++ entries
   res <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "tar" tarArgs,
-          prCwd = cwd,
-          prEnv = Just env',
-          prStdin = ""
-        }
+    bracket_
+      (waitQSem slot)
+      (signalQSem slot)
+      ( run
+          ProcessRequest
+            { prMode = ExecCmd "tar" tarArgs,
+              prCwd = cwd,
+              prEnv = Just env',
+              prStdin = ""
+            }
+      )
   pure $
     if prExitCode res == ExitSuccess
       then Right ()

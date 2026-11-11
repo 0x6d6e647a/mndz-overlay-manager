@@ -16,6 +16,7 @@ module Update.Sbcl.Deps
   )
 where
 
+import Control.Concurrent (QSem)
 import Control.Monad (foldM, when)
 import Data.Char (isDigit)
 import Data.Foldable (for_)
@@ -66,18 +67,21 @@ data SbclDepsProgress = SbclDepsProgress
     sdpOnCompressDone :: IO ()
   }
 
-mkSbclDepsOps :: CommandRunner -> SbclDepsOps
-mkSbclDepsOps run =
+-- | @threads@ is the xz thread count for the deps pack (@XZ_OPT=-T{N} -9e@).
+-- @slot@ is the update's shared compress lock.
+mkSbclDepsOps :: Int -> QSem -> CommandRunner -> SbclDepsOps
+mkSbclDepsOps threads slot run =
   SbclDepsOps
     { sdoClone = gitCloneTag run,
       sdoQlotInstall = qlotInstall run,
       sdoCopyQlot = copyQlotTree run,
       sdoMaterializeFff = materializeFff run,
-      sdoPackTarball = packDepsTarball run
+      sdoPackTarball = packDepsTarball threads slot run
     }
 
-productionSbclDepsOps :: SbclDepsOps
-productionSbclDepsOps = mkSbclDepsOps productionCommandRunner
+-- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
+productionSbclDepsOps :: QSem -> SbclDepsOps
+productionSbclDepsOps slot = mkSbclDepsOps 1 slot productionCommandRunner
 
 -- | Generic home used for qlot (container @HOME@, not the operator).
 materializeHome :: FilePath
@@ -575,10 +579,12 @@ cargoVendorConfig =
   \[source.vendored-sources]\n\
   \directory = \"vendor\"\n"
 
-packDepsTarball :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
-packDepsTarball run stageDir =
+packDepsTarball :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+packDepsTarball threads slot run stageDir =
   packTarXz
     run
+    slot
+    threads
     "tar pack failed"
     Nothing
     (Just stageDir)

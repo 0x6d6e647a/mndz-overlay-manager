@@ -12,6 +12,7 @@ module Update.Go.Vendor
   )
 where
 
+import Control.Concurrent (QSem)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -80,13 +81,16 @@ noopVendorProgress =
     }
 
 -- | Build vendor ops over an injectable command runner (Unit heat surface).
-mkVendorOps :: CommandRunner -> VendorOps
-mkVendorOps run =
+--
+-- @threads@ is the xz thread count for the vendor pack (@XZ_OPT=-T{N} -9e@).
+-- @slot@ is the update's shared compress lock.
+mkVendorOps :: Int -> QSem -> CommandRunner -> VendorOps
+mkVendorOps threads slot run =
   VendorOps
     { voClone = gitCloneTag run,
       voHostGoVersion = probeHostGoVersion run,
       voGoModDownload = goModDownload run,
-      voTarXz = tarXzGoMod run
+      voTarXz = tarXzGoMod threads slot run
     }
 
 githubCloneUrl :: Text -> Text -> Text
@@ -245,6 +249,6 @@ goModDownload run goDir = do
       then Right ()
       else Left (enrichGoModDownloadError (T.pack (prStderr res)))
 
-tarXzGoMod :: CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
-tarXzGoMod run goDir entryName =
-  packTarXz run "tar failed" (Just goDir) Nothing [entryName]
+tarXzGoMod :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+tarXzGoMod threads slot run goDir entryName =
+  packTarXz run slot threads "tar failed" (Just goDir) Nothing [entryName]

@@ -10,6 +10,7 @@ module Update.Apply.Env
 where
 
 import CLI.Progress (MultiHandle)
+import Control.Concurrent (QSem)
 import Control.Concurrent.MVar (MVar)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -97,6 +98,8 @@ data ApplyEnv = ApplyEnv
     -- | Overlay ebuild observation and the publish that follows from it.
     aeTreeLock :: TreeLock,
     aeJobs :: Int,
+    -- | Capacity-1 lock shared by this update's DepsAndAssets tar/xz packs.
+    aePackSlot :: QSem,
     aeMulti :: MultiHandle,
     aePlanOps :: PlanOps,
     aeDepsPlanOps :: DepsPlanOps,

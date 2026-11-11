@@ -43,7 +43,7 @@ import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
 import Config.Loader (ConfigError (..), loadConfig)
 import Config.Types (CheckCacheTtl (..), OverlayConfig (..))
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (newQSem, threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
 import Control.Exception (SomeException, throwIO, try)
@@ -315,6 +315,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
             dpoGoCeilingsCache = poCeilingsCache planOps
           }
   (cache, _) <- openCheckCache CacheDisabled False "/tmp"
+  compressSlot <- newQSem 1
   pure
     ApplyEnv
       { aeFetcher = \_ -> pure (Left "unused"),
@@ -323,12 +324,12 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeEbuildRunner = ebuildRun,
         aeEgencacheRunner = mockEgencacheWriteMatching,
         aeVendorOps = vendorOps,
-        aeNpmCacheOps = productionNpmCacheOps,
-        aeBunCacheOps = productionBunCacheOps,
-        aeCargoOps = productionCargoOps,
-        aeSbclDepsOps = productionSbclDepsOps,
-        aeUvDepsOps = productionUvDepsOps,
-        aePdmDepsOps = productionPdmDepsOps,
+        aeNpmCacheOps = productionNpmCacheOps compressSlot,
+        aeBunCacheOps = productionBunCacheOps compressSlot,
+        aeCargoOps = productionCargoOps compressSlot,
+        aeSbclDepsOps = productionSbclDepsOps compressSlot,
+        aeUvDepsOps = productionUvDepsOps compressSlot,
+        aePdmDepsOps = productionPdmDepsOps compressSlot,
         aeReleaseOps = releaseOps,
         aeAssetsRoot = assetsRoot,
         aeGitHubToken = Just "tok",
@@ -338,6 +339,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeOverlayLock = overlayLock,
         aeTreeLock = treeLock,
         aeJobs = 1,
+        aePackSlot = compressSlot,
         aeMulti = noopMultiHandle,
         aePlanOps = planOps,
         aeDepsPlanOps = depsOps,

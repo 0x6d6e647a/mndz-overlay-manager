@@ -1791,13 +1791,13 @@ withFullPathMaterializeSession env unit category pn pv action =
         ( \runner ->
             action
               ( env
-                  { aeVendorOps = mkVendorOps runner,
-                    aeNpmCacheOps = mkNpmCacheOps runner,
-                    aeBunCacheOps = mkBunCacheOps runner,
-                    aeCargoOps = mkCargoOps runner,
-                    aeSbclDepsOps = mkSbclDepsOps runner,
-                    aeUvDepsOps = mkUvDepsOps runner,
-                    aePdmDepsOps = mkPdmDepsOps runner
+                  { aeVendorOps = mkVendorOps (aeJobs env) (aePackSlot env) runner,
+                    aeNpmCacheOps = mkNpmCacheOps (aeJobs env) (aePackSlot env) runner,
+                    aeBunCacheOps = mkBunCacheOps (aeJobs env) (aePackSlot env) runner,
+                    aeCargoOps = mkCargoOps (aeJobs env) (aePackSlot env) runner,
+                    aeSbclDepsOps = mkSbclDepsOps (aeJobs env) (aePackSlot env) runner,
+                    aeUvDepsOps = mkUvDepsOps (aeJobs env) (aePackSlot env) runner,
+                    aePdmDepsOps = mkPdmDepsOps (aeJobs env) (aePackSlot env) runner
                   }
               )
         )

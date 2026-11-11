@@ -4,8 +4,16 @@
 -- builders via injectable Ops — no live registry or GitHub network.
 module Test.Ecosystems (unitTests, integrationTests) where
 
-import Control.Concurrent.MVar (newMVar)
-import Control.Exception (SomeException, bracket_, throwIO, try)
+import Control.Concurrent (QSem, newQSem)
+import Control.Concurrent.Async (async, cancel, wait)
+import Control.Concurrent.MVar
+  ( newEmptyMVar,
+    newMVar,
+    putMVar,
+    takeMVar,
+    tryPutMVar,
+  )
+import Control.Exception (SomeException, bracket_, finally, throwIO, try)
 import Control.Monad (forM_, void, when)
 import Data.ByteString qualified as BS
 import Data.Foldable (for_)
@@ -31,6 +39,7 @@ import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, takeDirectory, (</>))
 import System.IO.Error (userError)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Support
   ( mkTestApplyEnv,
@@ -234,7 +243,10 @@ unitTests =
         "xz pack helpers"
         [ testCase "verifyXzFile rejects plain tar, accepts xz magic" testVerifyXzFile,
           testCase "packTarXzAtomic temp path is not bare .tmp" testPackTarXzAtomicTempSuffix,
-          testCase "packTarXz hermetic owners and XZ_OPT -T1 -9e" testPackTarXzHermetic
+          testCase "packTarXz hermetic owners and XZ_OPT -T1 -9e" testPackTarXzHermetic,
+          testCase "packTarXz XZ_OPT -T4 -9e keeps hermetic flags" testPackTarXzFourThreads,
+          testCase "packTarXz runs one tar at a time" testPackTarXzOneAtATime,
+          testCase "packTarXz releases the slot when tar fails" testPackTarXzFailureReleasesSlot
         ],
       testGroup
         "production CommandRunner adapters"
@@ -1691,6 +1703,7 @@ testGenerateLockFailureSkipsPack =
 testGenerateLockfileCommand :: IO ()
 testGenerateLockfileCommand =
   withSystemTempDirectory "mndz-genlock-cmd-" $ \tmp -> do
+    slot <- newQSem 1
     let lockRoot = tmp </> "src"
         run req = case execCmd req of
           Just ("git", "clone" : args) -> do
@@ -1718,7 +1731,7 @@ testGenerateLockfileCommand =
     res <-
       assertRight "command generate"
         =<< buildCargoCratesTarball
-          (mkCargoOps run)
+          (mkCargoOps 1 slot run)
           noopCargoProgress
           "taiki-e"
           "cargo-llvm-cov"
@@ -1809,6 +1822,7 @@ testCargoBuilderPackFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
 testPackCratesTarballFixture :: IO ()
 testPackCratesTarballFixture =
   withSystemTempDirectory "mndz-cargo-pack-" $ \tmp -> do
+    slot <- newQSem 1
     let lockRoot = tmp </> "src"
         distDir = tmp </> "distdir"
         stageDir = tmp </> "stage"
@@ -1843,7 +1857,7 @@ testPackCratesTarballFixture =
           ]
       )
     assertRight "pack fixture"
-      =<< packCratesTarball productionCommandRunner lockRoot distDir stageDir outPath
+      =<< packCratesTarball 1 slot productionCommandRunner lockRoot distDir stageDir outPath
     exists <- doesFileExist outPath
     assertTrue "tarball exists" exists
     -- Final body must be real xz (would fail under the old .tmp bare-suffix bug).
@@ -1902,6 +1916,7 @@ testPackCratesTarballFixture =
 testPackCratesTarballMissingCrate :: IO ()
 testPackCratesTarballMissingCrate =
   withSystemTempDirectory "mndz-cargo-pack-miss-" $ \tmp -> do
+    slot <- newQSem 1
     let lockRoot = tmp </> "src"
         distDir = tmp </> "distdir"
         stageDir = tmp </> "stage"
@@ -1920,7 +1935,7 @@ testPackCratesTarballMissingCrate =
       )
     err <-
       assertLeft "missing crate"
-        =<< packCratesTarball productionCommandRunner lockRoot distDir stageDir outPath
+        =<< packCratesTarball 1 slot productionCommandRunner lockRoot distDir stageDir outPath
     assertTrue "pack prefix" ("cargo crates pack failed" `T.isInfixOf` err)
     assertTrue "names crate" ("serde-1.0.200.crate" `T.isInfixOf` err)
     exists <- doesFileExist outPath
@@ -1929,6 +1944,7 @@ testPackCratesTarballMissingCrate =
 testPackCratesTarballXzArgv :: IO ()
 testPackCratesTarballXzArgv =
   withSystemTempDirectory "mndz-cargo-pack-argv-" $ \tmp -> do
+    slot <- newQSem 1
     let lockRoot = tmp </> "src"
         distDir = tmp </> "distdir"
         stageDir = tmp </> "stage"
@@ -1947,7 +1963,7 @@ testPackCratesTarballXzArgv =
               pure (okResult "")
             _ -> pure (failResult ("unexpected: " <> show (prMode req)))
     assertRight "empty registry pack"
-      =<< packCratesTarball run lockRoot distDir stageDir outPath
+      =<< packCratesTarball 4 slot run lockRoot distDir stageDir outPath
     reqs <- reverse <$> readIORef reqsRef
     let tarReqs =
           [ r
@@ -1981,13 +1997,14 @@ testPackCratesTarballXzArgv =
         case lookup "XZ_OPT" env of
           Nothing -> fail "XZ_OPT missing"
           Just v -> do
-            assertTrue "XZ_OPT has -T1" ("-T1" `isInfixOf` v)
+            assertTrue "XZ_OPT has -T4" ("-T4" `isInfixOf` v)
             assertTrue "XZ_OPT has -9e" ("-9e" `isInfixOf` v)
-            assertEq "XZ_OPT exact preset" xzOptValue v
+            assertEq "XZ_OPT exact preset" (xzOptValue 4) v
 
 testCargoStagingProgress :: IO ()
 testCargoStagingProgress =
   withSystemTempDirectory "mndz-cargo-stage-" $ \tmp -> do
+    slot <- newQSem 1
     let lockRoot = tmp </> "src"
         distDir = tmp </> "distdir"
         stageDir = tmp </> "stage"
@@ -2024,6 +2041,8 @@ testCargoStagingProgress =
       )
     assertRight "staged pack"
       =<< packCratesTarballWith
+        1
+        slot
         productionCommandRunner
         (\k n -> logEv ("staging crates " <> T.pack (show k) <> "/" <> T.pack (show n)))
         (logEv "crates pack")
@@ -2057,6 +2076,7 @@ testVerifyXzFile =
 testPackTarXzAtomicTempSuffix :: IO ()
 testPackTarXzAtomicTempSuffix =
   withSystemTempDirectory "mndz-xz-atomic-" $ \tmp -> do
+    slot <- newQSem 1
     let stage = tmp </> "stage"
         outPath = tmp </> "out.tar.xz"
         entryDir = stage </> "cargo_home"
@@ -2071,7 +2091,7 @@ testPackTarXzAtomicTempSuffix =
               pure (okResult "")
             _ -> pure (failResult "unexpected")
     assertRight "atomic pack"
-      =<< packTarXzAtomic run "test pack" Nothing (Just stage) ["cargo_home"] outPath
+      =<< packTarXzAtomic run slot 1 "test pack" Nothing (Just stage) ["cargo_home"] outPath
     reqs <- readIORef reqsRef
     let args =
           concat
@@ -2091,6 +2111,7 @@ testPackTarXzAtomicTempSuffix =
 testPackTarXzHermetic :: IO ()
 testPackTarXzHermetic =
   withSystemTempDirectory "mndz-xz-hermetic-" $ \tmp -> do
+    slot <- newQSem 1
     let src = tmp </> "src"
         outPath = tmp </> "out.tar.xz"
     createDirectoryIfMissing True src
@@ -2100,7 +2121,7 @@ testPackTarXzHermetic =
           atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
           productionCommandRunner req
     assertRight "hermetic pack"
-      =<< packTarXz run "hermetic pack" (Just src) Nothing ["hello.txt"] outPath
+      =<< packTarXz run slot 1 "hermetic pack" (Just src) Nothing ["hello.txt"] outPath
     assertRight "xz magic" =<< verifyXzFile outPath
     reqs <- readIORef reqsRef
     let tarArgs =
@@ -2119,7 +2140,7 @@ testPackTarXzHermetic =
           Just v -> do
             assertTrue "XZ_OPT has -T1" ("-T1" `isInfixOf` v)
             assertTrue "XZ_OPT has -9e" ("-9e" `isInfixOf` v)
-            assertEq "XZ_OPT exact" xzOptValue v
+            assertEq "XZ_OPT exact" (xzOptValue 1) v
     listed <-
       productionCommandRunner
         ProcessRequest
@@ -2131,9 +2152,182 @@ testPackTarXzHermetic =
     assertEq "tar -t exit" ExitSuccess (prExitCode listed)
     assertTrue "members are 0/0" ("0/0" `isInfixOf` prStdout listed)
 
+-- | How long a pack may sit on the compress slot before the test calls it stuck.
+packSlotWaitMicros :: Int
+packSlotWaitMicros = 15_000_000
+
+finishWithin :: String -> IO a -> IO a
+finishWithin label act = do
+  r <- timeout packSlotWaitMicros act
+  case r of
+    Nothing -> fail (label ++ " blocked on the compress slot")
+    Just v -> pure v
+
+testPackTarXzFourThreads :: IO ()
+testPackTarXzFourThreads =
+  withSystemTempDirectory "mndz-xz-t4-" $ \tmp -> do
+    let src = tmp </> "src"
+        outPath = tmp </> "out.tar.xz"
+    createDirectoryIfMissing True src
+    TIO.writeFile (src </> "hello.txt") "hi\n"
+    assertXzOptFor src outPath 4 "-T4 -9e"
+    assertXzOptFor src (tmp </> "clamped.tar.xz") 0 "-T1 -9e"
+  where
+    assertXzOptFor src outPath threads expected = do
+      slot <- newQSem 1
+      reqsRef <- newIORef ([] :: [ProcessRequest])
+      let run req = do
+            atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
+            case prMode req of
+              ExecCmd "tar" args -> do
+                for_ (tarArchivePath args) writeFakeXz
+                pure (okResult "")
+              _ -> pure (failResult "unexpected")
+      assertRight "pack"
+        =<< packTarXz run slot threads "threads" (Just src) Nothing ["hello.txt"] outPath
+      reqs <- readIORef reqsRef
+      let tarArgs =
+            concat
+              [ a
+              | r <- reqs,
+                ExecCmd "tar" a <- [prMode r]
+              ]
+          tarEnvs = [env | r <- reqs, Just env <- [prEnv r]]
+      assertTrue "hermetic flags unchanged" (all (`elem` tarArgs) hermeticTarArgs)
+      assertTrue "-cJf present" ("-cJf" `elem` tarArgs)
+      case tarEnvs of
+        [] -> fail "expected XZ_OPT env"
+        (env : _) ->
+          case lookup "XZ_OPT" env of
+            Nothing -> fail "XZ_OPT missing"
+            Just v -> assertEq "XZ_OPT exact" expected v
+
+testPackTarXzOneAtATime :: IO ()
+testPackTarXzOneAtATime =
+  withSystemTempDirectory "mndz-xz-serial-" $ \tmp -> do
+    slot <- newQSem 1
+    let src = tmp </> "src"
+        out1 = tmp </> "a.tar.xz"
+        out2 = tmp </> "b.tar.xz"
+    createDirectoryIfMissing True src
+    TIO.writeFile (src </> "hello.txt") "hi\n"
+    inFlight <- newIORef (0 :: Int)
+    peak <- newIORef (0 :: Int)
+    order <- newIORef ([] :: [String])
+    seqN <- newIORef (0 :: Int)
+    firstEntered <- newEmptyMVar
+    releaseFirst <- newEmptyMVar
+    let note ev = atomicModifyIORef' order (\xs -> (ev : xs, ()))
+        run req = case prMode req of
+          ExecCmd "tar" args -> do
+            n <- atomicModifyIORef' seqN (\i -> (i + 1, i + 1))
+            cur <- atomicModifyIORef' inFlight (\i -> (i + 1, i + 1))
+            atomicModifyIORef' peak (\p -> (max p cur, ()))
+            if n == 1
+              then do
+                note "first-enter"
+                putMVar firstEntered ()
+                takeMVar releaseFirst
+                note "first-return"
+                atomicModifyIORef' inFlight (\i -> (i - 1, ()))
+                for_ (tarArchivePath args) writeFakeXz
+                pure (okResult "")
+              else do
+                note "second-enter"
+                atomicModifyIORef' inFlight (\i -> (i - 1, ()))
+                for_ (tarArchivePath args) writeFakeXz
+                pure (okResult "")
+          _ -> pure (failResult "unexpected")
+        pack =
+          packTarXz run slot 4 "serial" (Just src) Nothing ["hello.txt"]
+    a1 <- async (pack out1)
+    a2 <- async (pack out2)
+    let release = void (tryPutMVar releaseFirst ())
+        cleanup = release >> cancel a1 >> cancel a2
+    result <-
+      timeout packSlotWaitMicros $
+        finally
+          ( do
+              takeMVar firstEntered
+              inflightNow <- readIORef inFlight
+              assertEq "one tar in flight" (1 :: Int) inflightNow
+              early <- reverse <$> readIORef order
+              assertEq "second has not entered" ["first-enter"] early
+              release
+              r1 <- wait a1
+              r2 <- wait a2
+              pure (r1, r2)
+          )
+          cleanup
+    case result of
+      Nothing -> fail "second pack did not start after the first tar returned"
+      Just (r1, r2) -> do
+        assertRight "pack 1" r1
+        assertRight "pack 2" r2
+        p <- readIORef peak
+        assertEq "peak in-flight tar" (1 :: Int) p
+        evs <- reverse <$> readIORef order
+        assertEq
+          "second starts after first returns"
+          ["first-enter", "first-return", "second-enter"]
+          evs
+
+testPackTarXzFailureReleasesSlot :: IO ()
+testPackTarXzFailureReleasesSlot =
+  withSystemTempDirectory "mndz-xz-fail-slot-" $ \tmp -> do
+    let src = tmp </> "src"
+    createDirectoryIfMissing True src
+    TIO.writeFile (src </> "hello.txt") "hi\n"
+    nonZeroThenNext src (tmp </> "fail.tar.xz") (tmp </> "ok.tar.xz")
+    thrownThenNext src (tmp </> "boom.tar.xz") (tmp </> "after-boom.tar.xz")
+  where
+    nonZeroThenNext src bad good = do
+      slot <- newQSem 1
+      nRef <- newIORef (0 :: Int)
+      let run req = case prMode req of
+            ExecCmd "tar" args -> do
+              n <- atomicModifyIORef' nRef (\i -> (i + 1, i + 1))
+              if n == 1
+                then pure (failResult "xz failed")
+                else do
+                  for_ (tarArchivePath args) writeFakeXz
+                  pure (okResult "")
+            _ -> pure (failResult "unexpected")
+          pack =
+            packTarXz run slot 1 "fail" (Just src) Nothing ["hello.txt"]
+      err <-
+        assertLeft "tar failure"
+          =<< finishWithin "failed tar" (pack bad)
+      assertTrue "names tar" ("tar archive" `T.isInfixOf` err)
+      assertRight "next pack"
+        =<< finishWithin "pack after tar failure" (pack good)
+    thrownThenNext src bad good = do
+      slot <- newQSem 1
+      nRef <- newIORef (0 :: Int)
+      let run req = case prMode req of
+            ExecCmd "tar" args -> do
+              n <- atomicModifyIORef' nRef (\i -> (i + 1, i + 1))
+              if n == 1
+                then throwIO (userError "tar exploded")
+                else do
+                  for_ (tarArchivePath args) writeFakeXz
+                  pure (okResult "")
+            _ -> pure (failResult "unexpected")
+          pack =
+            packTarXz run slot 1 "boom" (Just src) Nothing ["hello.txt"]
+      thrown <-
+        finishWithin "thrown tar" $
+          try @SomeException (pack bad)
+      case thrown of
+        Left _ -> pure ()
+        Right _ -> fail "expected tar to throw"
+      assertRight "pack after throw"
+        =<< finishWithin "pack after throw" (pack good)
+
 testNpmPackOmitsLogs :: IO ()
 testNpmPackOmitsLogs =
   withSystemTempDirectory "mndz-npm-omit-" $ \tmp -> do
+    slot <- newQSem 1
     let cache = tmp </> "npm-cache"
         logs = cache </> "_logs"
         outPath = tmp </> "deps.tar.xz"
@@ -2143,7 +2337,7 @@ testNpmPackOmitsLogs =
     TIO.writeFile (cache </> "index-v5") "ok\n"
     prepareNpmCacheForPack cache
     assertRight "pack after scrub"
-      =<< packTarXz productionCommandRunner "npm omit" (Just tmp) Nothing ["npm-cache"] outPath
+      =<< packTarXz productionCommandRunner slot 1 "npm omit" (Just tmp) Nothing ["npm-cache"] outPath
     listed <-
       productionCommandRunner
         ProcessRequest
@@ -2821,6 +3015,7 @@ writeFakeXz path = BS.writeFile path xzMagicPrefix
 testNpmMkCommandRunner :: IO ()
 testNpmMkCommandRunner =
   withSystemTempDirectory "mndz-npm-mk-" $ \outDir -> do
+    slot <- newQSem 1
     reqsRef <- newIORef ([] :: [ProcessRequest])
     let successRun req = do
           atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
@@ -2844,7 +3039,7 @@ testNpmMkCommandRunner =
     path <-
       assertRight "npm mk success"
         =<< buildNpmDepsTarball
-          (mkNpmCacheOps successRun)
+          (mkNpmCacheOps 4 slot successRun)
           noopNpmProgress
           "left-pad"
           "1.0.0"
@@ -2855,7 +3050,7 @@ testNpmMkCommandRunner =
     assertEq "out path" (outDir </> "left-pad-1.0.0-npm-cache.tar.xz") path
     exists <- doesFileExist path
     assertTrue "tarball written" exists
-    -- Non-Cargo pack asserts uniform XZ_OPT=-T1 -9e.
+    -- Non-Cargo pack sees the closed-over thread count on XZ_OPT.
     reqs <- reverse <$> readIORef reqsRef
     let tarReqs =
           [ r
@@ -2870,14 +3065,15 @@ testNpmMkCommandRunner =
         Just env ->
           case lookup "XZ_OPT" env of
             Just v -> do
-              assertTrue "npm XZ_OPT -T1" ("-T1" `isInfixOf` v)
+              assertTrue "npm XZ_OPT -T4" ("-T4" `isInfixOf` v)
               assertTrue "npm XZ_OPT -9e" ("-9e" `isInfixOf` v)
+              assertEq "npm XZ_OPT exact" (xzOptValue 4) v
             Nothing -> fail "npm tar missing XZ_OPT"
         Nothing -> fail "npm tar missing env"
     err <-
       assertLeft "npm mk host fail"
         =<< buildNpmDepsTarball
-          (mkNpmCacheOps failRun)
+          (mkNpmCacheOps 1 slot failRun)
           noopNpmProgress
           "pkg"
           "1.0.0"
@@ -2890,6 +3086,7 @@ testNpmMkCommandRunner =
 testBunMkCommandRunner :: IO ()
 testBunMkCommandRunner =
   withSystemTempDirectory "mndz-bun-mk-" $ \outDir -> do
+    slot <- newQSem 1
     let successRun req = case execCmd req of
           Just ("bun", ["--version"]) -> pure (okResult "1.2.3\n")
           Just ("git", "clone" : args) -> do
@@ -2909,7 +3106,7 @@ testBunMkCommandRunner =
     path <-
       assertRight "bun mk success"
         =<< buildBunDepsTarball
-          (mkBunCacheOps successRun)
+          (mkBunCacheOps 1 slot successRun)
           noopBunProgress
           BunCache
           "owner"
@@ -2925,7 +3122,7 @@ testBunMkCommandRunner =
     err <-
       assertLeft "bun mk clone fail"
         =<< buildBunDepsTarball
-          (mkBunCacheOps failRun)
+          (mkBunCacheOps 1 slot failRun)
           noopBunProgress
           BunCache
           "o"
@@ -2941,6 +3138,7 @@ testBunMkCommandRunner =
 testVendorMkCommandRunner :: IO ()
 testVendorMkCommandRunner =
   withSystemTempDirectory "mndz-vendor-mk-" $ \outDir -> do
+    slot <- newQSem 1
     let goMod =
           T.unlines
             [ "module example.com/pkg",
@@ -2965,7 +3163,7 @@ testVendorMkCommandRunner =
     res <-
       assertRight "vendor mk success"
         =<< buildVendorTarball
-          (mkVendorOps successRun)
+          (mkVendorOps 1 slot successRun)
           noopVendorProgress
           "owner"
           "repo"
@@ -2980,7 +3178,7 @@ testVendorMkCommandRunner =
     assertTrue "vendor tarball" exists
     vendorFail <-
       buildVendorTarball
-        (mkVendorOps failRun)
+        (mkVendorOps 1 slot failRun)
         noopVendorProgress
         "o"
         "r"
@@ -3012,13 +3210,14 @@ pycargoFailureSummary =
             prStderr = err
           }
     invoke unit code out err = do
+      slot <- newQSem 1
       let work = unit </> "work"
           distDir = work </> "distdir"
           logPath = unit </> "pycargoebuild.log"
       createDirectoryIfMissing True distDir
       result <-
         coPycargoebuild
-          (mkCargoOps (scripted code out err))
+          (mkCargoOps 1 slot (scripted code out err))
           (work </> "pkg.ebuild")
           (work </> "src")
           (unit </> "out" </> "pkg-crates.tar.xz")
@@ -3128,6 +3327,7 @@ pycargoFailureSummary =
       exists <- doesFileExist logPath
       assertTrue "success writes no log" (not exists)
     unwritableLog tmp = do
+      slot <- newQSem 1
       let unit = tmp </> "unwritable"
           logPath = unit </> "pycargoebuild.log"
           work = unit </> "work"
@@ -3140,6 +3340,8 @@ pycargoFailureSummary =
           result <-
             coPycargoebuild
               ( mkCargoOps
+                  1
+                  slot
                   ( scripted
                       (ExitFailure 1)
                       ""
@@ -3167,6 +3369,7 @@ pycargoFailureSummary =
 testCargoMkCommandRunner :: IO ()
 testCargoMkCommandRunner =
   withSystemTempDirectory "mndz-cargo-mk-" $ \tmp -> do
+    slot <- newQSem 1
     let outDir = tmp </> "out"
         -- Shared scratch so scripted git clone can drop a crate into a known
         -- distdir is awkward; instead pack path is exercised by real tar via
@@ -3218,7 +3421,7 @@ testCargoMkCommandRunner =
     res <-
       assertRight "cargo mk success"
         =<< buildCargoCratesTarball
-          (mkCargoOps successRun)
+          (mkCargoOps 1 slot successRun)
           noopCargoProgress
           "owner"
           "repo"
@@ -3239,7 +3442,7 @@ testCargoMkCommandRunner =
     assertTrue "crates tarball" exists
     cargoFail <-
       buildCargoCratesTarball
-        (mkCargoOps failRun)
+        (mkCargoOps 1 slot failRun)
         noopCargoProgress
         "o"
         "r"
@@ -3696,6 +3899,7 @@ testFetchUnpackCrateEdges =
 testCargoCratesIoFixtureLockPack :: IO ()
 testCargoCratesIoFixtureLockPack =
   withSystemTempDirectory "mndz-cargo-pack-io-" $ \tmp -> do
+    slot <- newQSem 1
     let lockRoot = tmp </> "crate"
         distDir = tmp </> "distdir"
         stageDir = tmp </> "stage"
@@ -3741,7 +3945,7 @@ testCargoCratesIoFixtureLockPack =
           ]
       )
     assertRight "pack fixture cratesio"
-      =<< packCratesTarball productionCommandRunner lockRoot distDir stageDir outPath
+      =<< packCratesTarball 1 slot productionCommandRunner lockRoot distDir stageDir outPath
     res <-
       productionCommandRunner
         ProcessRequest

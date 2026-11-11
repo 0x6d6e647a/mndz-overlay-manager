@@ -29,6 +29,7 @@ module Update.Cargo.Crates
   )
 where
 
+import Control.Concurrent (QSem)
 import Control.Exception (IOException, try)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -156,20 +157,25 @@ data CargoProgress = CargoProgress
   }
 
 -- | Build cargo ops over an injectable command runner (Unit heat surface).
-mkCargoOps :: CommandRunner -> CargoOps
-mkCargoOps run =
+--
+-- @threads@ is the xz thread count for crates and rusty_v8 packs
+-- (@XZ_OPT=-T{N} -9e@). @slot@ is the update's shared compress lock.
+-- Crate @tar -xzf@ extract does not take it.
+mkCargoOps :: Int -> QSem -> CommandRunner -> CargoOps
+mkCargoOps threads slot run =
   CargoOps
     { coClone = gitCloneTag run,
       coFetchUnpackCrate = fetchAndUnpackCrate run,
       coGenerateLockfile = runGenerateLockfile run,
       coPycargoebuild = runPycargoebuild run,
-      coPackCrates = packCratesTarballWith run,
+      coPackCrates = packCratesTarballWith threads slot run,
       coCloneRecursiveSubmodules = gitCloneRecursiveSubmodules run,
-      coPackTree = packRustyV8Tree run
+      coPackTree = packRustyV8Tree threads slot run
     }
 
-productionCargoOps :: CargoOps
-productionCargoOps = mkCargoOps productionCommandRunner
+-- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
+productionCargoOps :: QSem -> CargoOps
+productionCargoOps slot = mkCargoOps 1 slot productionCommandRunner
 
 -- | Clone-or-fetch @tag@/@published crate@, run pycargoebuild with
 -- @--use-crate-tarball@, pack crates, return tarball + MSRV + ebuild body.
@@ -584,20 +590,25 @@ cargoChecksumJson packageChecksum =
   "{\"package\":\"" <> packageChecksum <> "\",\"files\":{}}"
 
 -- | Stage distdir registry crates under @cargo_home/gentoo/@, write checksum JSON,
--- and create @{pn}-{pv}-crates.tar.xz@ via system @tar@ with @XZ_OPT=-T1 -9e@.
+-- and create @{pn}-{pv}-crates.tar.xz@ via system @tar@ with @XZ_OPT=-T{N} -9e@.
 -- Writes atomically (temp path then rename). Errors use a pack-specific prefix.
+-- @threads@ is that @N@ (values below 1 become 1).
 packCratesTarball ::
+  Int ->
+  QSem ->
   CommandRunner ->
   FilePath ->
   FilePath ->
   FilePath ->
   FilePath ->
   IO (Either Text ())
-packCratesTarball run =
-  packCratesTarballWith run (\_ _ -> pure ()) (pure ())
+packCratesTarball threads slot run =
+  packCratesTarballWith threads slot run (\_ _ -> pure ()) (pure ())
 
 -- | Like 'packCratesTarball' with staging (@k@ of @N@) and archive-start hooks.
 packCratesTarballWith ::
+  Int ->
+  QSem ->
   CommandRunner ->
   (Int -> Int -> IO ()) ->
   IO () ->
@@ -606,7 +617,7 @@ packCratesTarballWith ::
   FilePath ->
   FilePath ->
   IO (Either Text ())
-packCratesTarballWith run onStage onArchiveStart lockRoot distDir stageDir outPath = do
+packCratesTarballWith threads slot run onStage onArchiveStart lockRoot distDir stageDir outPath = do
   let lockPath = lockRoot </> "Cargo.lock"
   hasLock <- doesFileExist lockPath
   if not hasLock
@@ -616,9 +627,11 @@ packCratesTarballWith run onStage onArchiveStart lockRoot distDir stageDir outPa
       case parseRegistryPackages body of
         Left err -> pure $ Left ("cargo crates pack failed: " <> err)
         Right pkgs ->
-          stageAndArchive run onStage onArchiveStart pkgs distDir stageDir outPath
+          stageAndArchive threads slot run onStage onArchiveStart pkgs distDir stageDir outPath
 
 stageAndArchive ::
+  Int ->
+  QSem ->
   CommandRunner ->
   (Int -> Int -> IO ()) ->
   IO () ->
@@ -627,7 +640,7 @@ stageAndArchive ::
   FilePath ->
   FilePath ->
   IO (Either Text ())
-stageAndArchive run onStage onArchiveStart pkgs distDir stageDir outPath = do
+stageAndArchive threads slot run onStage onArchiveStart pkgs distDir stageDir outPath = do
   let gentooDir = stageDir </> "cargo_home" </> "gentoo"
   createDirectoryIfMissing True gentooDir
   staged <- stageAll 1 pkgs
@@ -635,7 +648,7 @@ stageAndArchive run onStage onArchiveStart pkgs distDir stageDir outPath = do
     Left err -> pure (Left err)
     Right () -> do
       onArchiveStart
-      createArchiveAtomic run stageDir outPath
+      createArchiveAtomic threads slot run stageDir outPath
   where
     n = length pkgs
     stageAll _ [] = pure (Right ())
@@ -701,10 +714,12 @@ extractCrate run cratePath destDir = do
               <> T.strip (T.pack (prStderr res))
           )
 
-createArchiveAtomic :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
-createArchiveAtomic run stageDir =
+createArchiveAtomic :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+createArchiveAtomic threads slot run stageDir =
   packTarXzAtomic
     run
+    slot
+    threads
     "cargo crates pack failed"
     Nothing
     (Just stageDir)
@@ -756,10 +771,12 @@ gitCloneWithArgs run args = do
       then Right ()
       else Left ("git clone failed: " <> T.pack (prStderr res))
 
-packRustyV8Tree :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
-packRustyV8Tree run src =
+packRustyV8Tree :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+packRustyV8Tree threads slot run src =
   packTarXzAtomic
     run
+    slot
+    threads
     "rusty_v8 snapshot pack failed"
     Nothing
     (Just src)
