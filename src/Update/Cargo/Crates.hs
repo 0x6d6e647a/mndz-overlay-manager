@@ -158,8 +158,9 @@ data CargoProgress = CargoProgress
 
 -- | Build cargo ops over an injectable command runner (Unit heat surface).
 --
--- @threads@ is the xz thread count for crates and rusty_v8 packs
--- (@XZ_OPT=-T{N} -9e@). @slot@ is the update's shared compress lock.
+-- @threads@ is the xz thread count @N@ for crates and rusty_v8 packs
+-- (@xzOptValue@: block size when @N > 1@). @slot@ is the update's shared
+-- compress lock.
 -- Crate @tar -xzf@ extract does not take it.
 mkCargoOps :: Int -> QSem -> CommandRunner -> CargoOps
 mkCargoOps threads slot run =
@@ -590,7 +591,8 @@ cargoChecksumJson packageChecksum =
   "{\"package\":\"" <> packageChecksum <> "\",\"files\":{}}"
 
 -- | Stage distdir registry crates under @cargo_home/gentoo/@, write checksum JSON,
--- and create @{pn}-{pv}-crates.tar.xz@ via system @tar@ with @XZ_OPT=-T{N} -9e@.
+-- and create @{pn}-{pv}-crates.tar.xz@ via system @tar@ with @xzOptValue@
+-- (@N@ threads, block size when @N > 1@).
 -- Writes atomically (temp path then rename). Errors use a pack-specific prefix.
 -- @threads@ is that @N@ (values below 1 become 1).
 packCratesTarball ::

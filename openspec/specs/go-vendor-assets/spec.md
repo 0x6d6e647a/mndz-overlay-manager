@@ -79,7 +79,7 @@ For ebuilds written or updated under Go runtime-lane apply, KEYWORDS SHALL match
 
 ### Requirement: Vendor tarball matches go-module.eclass
 
-From the go.mod directory the program SHALL: (1) populate a `go-mod` directory via `GOMODCACHE` pointing at that directory and `go mod download -modcacherw`; (2) create a tarball named `{pn}-{pv}-vendor.tar.xz` whose top-level entry is `go-mod/`; (3) pack with the hermetic tar/xz rules specified by `hermetic-asset-materialize` (`XZ_OPT=-T{N} -9e`, where `N` is the resolved `--jobs` value, numeric owner `0/0`, sorted names, clamped mtimes); (4) after writing the final vendor tarball path, verify that the file is an xz-compressed stream and hard-fail the pack if it is plain tar or otherwise not xz. The tarball filename SHALL use package name PN and PV without a leading `v`. Full-path clone, `go mod download`, and pack SHALL run in the materialize container.
+From the go.mod directory the program SHALL: (1) populate a `go-mod` directory via `GOMODCACHE` pointing at that directory and `go mod download -modcacherw`; (2) create a tarball named `{pn}-{pv}-vendor.tar.xz` whose top-level entry is `go-mod/`; (3) pack with the hermetic tar/xz rules specified by `hermetic-asset-materialize` (`XZ_OPT` from its pack xz threads requirement, numeric owner `0/0`, sorted names, clamped mtimes); (4) after writing the final vendor tarball path, verify that the file is an xz-compressed stream and hard-fail the pack if it is plain tar or otherwise not xz. The tarball filename SHALL use package name PN and PV without a leading `v`. Full-path clone, `go mod download`, and pack SHALL run in the materialize container.
 
 #### Scenario: Tarball name and layout
 

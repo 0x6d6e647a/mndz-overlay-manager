@@ -243,8 +243,10 @@ unitTests =
         "xz pack helpers"
         [ testCase "verifyXzFile rejects plain tar, accepts xz magic" testVerifyXzFile,
           testCase "packTarXzAtomic temp path is not bare .tmp" testPackTarXzAtomicTempSuffix,
+          testCase "xzOptValue block size when threads exceed 1" testXzOptValue,
           testCase "packTarXz hermetic owners and XZ_OPT -T1 -9e" testPackTarXzHermetic,
-          testCase "packTarXz XZ_OPT -T4 -9e keeps hermetic flags" testPackTarXzFourThreads,
+          testCase "packTarXz hermetic XZ_OPT --block-size=64MiB at 2 threads" testPackTarXzTwoThreads,
+          testCase "packTarXz XZ_OPT -T4 -9e --block-size=64MiB keeps hermetic flags" testPackTarXzFourThreads,
           testCase "packTarXz runs one tar at a time" testPackTarXzOneAtATime,
           testCase "packTarXz releases the slot when tar fails" testPackTarXzFailureReleasesSlot
         ],
@@ -2108,6 +2110,13 @@ testPackTarXzAtomicTempSuffix =
     exists <- doesFileExist outPath
     assertTrue "final path exists" exists
 
+testXzOptValue :: IO ()
+testXzOptValue = do
+  assertEq "4 threads" "-T4 -9e --block-size=64MiB" (xzOptValue 4)
+  assertEq "8 threads" "-T8 -9e --block-size=64MiB" (xzOptValue 8)
+  assertEq "1 thread" "-T1 -9e" (xzOptValue 1)
+  assertEq "0 clamped" "-T1 -9e" (xzOptValue 0)
+
 testPackTarXzHermetic :: IO ()
 testPackTarXzHermetic =
   withSystemTempDirectory "mndz-xz-hermetic-" $ \tmp -> do
@@ -2152,6 +2161,30 @@ testPackTarXzHermetic =
     assertEq "tar -t exit" ExitSuccess (prExitCode listed)
     assertTrue "members are 0/0" ("0/0" `isInfixOf` prStdout listed)
 
+testPackTarXzTwoThreads :: IO ()
+testPackTarXzTwoThreads =
+  withSystemTempDirectory "mndz-xz-block-" $ \tmp -> do
+    slot <- newQSem 1
+    let src = tmp </> "src"
+        outPath = tmp </> "out.tar.xz"
+    createDirectoryIfMissing True src
+    TIO.writeFile (src </> "hello.txt") "hi\n"
+    reqsRef <- newIORef ([] :: [ProcessRequest])
+    let run req = do
+          atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
+          productionCommandRunner req
+    assertRight "two-thread pack"
+      =<< packTarXz run slot 2 "block-size pack" (Just src) Nothing ["hello.txt"] outPath
+    assertRight "xz magic" =<< verifyXzFile outPath
+    reqs <- readIORef reqsRef
+    let tarEnvs = [env | r <- reqs, Just env <- [prEnv r]]
+    case tarEnvs of
+      [] -> fail "expected XZ_OPT env"
+      (env : _) ->
+        case lookup "XZ_OPT" env of
+          Nothing -> fail "XZ_OPT missing"
+          Just v -> assertEq "XZ_OPT exact" (xzOptValue 2) v
+
 -- | How long a pack may sit on the compress slot before the test calls it stuck.
 packSlotWaitMicros :: Int
 packSlotWaitMicros = 15_000_000
@@ -2170,7 +2203,7 @@ testPackTarXzFourThreads =
         outPath = tmp </> "out.tar.xz"
     createDirectoryIfMissing True src
     TIO.writeFile (src </> "hello.txt") "hi\n"
-    assertXzOptFor src outPath 4 "-T4 -9e"
+    assertXzOptFor src outPath 4 "-T4 -9e --block-size=64MiB"
     assertXzOptFor src (tmp </> "clamped.tar.xz") 0 "-T1 -9e"
   where
     assertXzOptFor src outPath threads expected = do

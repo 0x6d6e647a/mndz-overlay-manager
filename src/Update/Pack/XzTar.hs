@@ -2,7 +2,8 @@
 
 -- | Shared DepsAndAssets @tar@ + xz pack helpers.
 --
--- Sets @XZ_OPT=-T{N} -9e@ (extreme, @N@ at least 1), forces xz compression
+-- Sets @XZ_OPT@ from 'xzOptValue' (extreme, thread count @N@ at least 1,
+-- and @--block-size=64MiB@ when @N@ is greater than 1), forces xz compression
 -- with @-J@ (so a temporary basename cannot disable @tar -a@ auto-compress),
 -- records numeric root owners and a clamped epoch mtime, and verifies the
 -- final file begins with the xz stream magic. Callers that share a @QSem@
@@ -44,9 +45,16 @@ import Update.Process
 
 -- | Extreme xz settings for one DepsAndAssets pack.
 --
--- @n@ below 1 becomes 1, so the value is never @-T0@.
+-- @n@ below 1 becomes 1, so the value is never @-T0@. When that thread
+-- count is greater than 1, the value also sets @--block-size=64MiB@.
+-- A single thread omits the block size so @-T1@ output stays unchanged.
 xzOptValue :: Int -> String
-xzOptValue n = "-T" <> show (max 1 n) <> " -9e"
+xzOptValue n =
+  let threads = max 1 n
+      base = "-T" <> show threads <> " -9e"
+   in if threads > 1
+        then base <> " --block-size=64MiB"
+        else base
 
 -- | GNU tar flags that strip builder identity from ustar\/PAX headers.
 --
@@ -100,7 +108,7 @@ verifyXzFile path = do
               )
 
 -- | Pack @entries@ to @finalPath@ with forced xz (@-cJf@), hermetic tar
--- flags, and @XZ_OPT=-T{threads} -9e@, then verify xz magic. Non-atomic:
+-- flags, and @XZ_OPT@ from 'xzOptValue', then verify xz magic. Non-atomic:
 -- writes @finalPath@ directly. @threads@ below 1 is treated as 1.
 --
 -- @cwd@ is the process working directory; @changeDir@ is an optional @tar -C@

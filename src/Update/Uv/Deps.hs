@@ -109,7 +109,8 @@ data UvDepsProgress = UvDepsProgress
     udpOnPackDone :: IO ()
   }
 
--- | @threads@ is the xz thread count for the deps pack (@XZ_OPT=-T{N} -9e@).
+-- | @threads@ is the xz thread count @N@ for the deps pack (@xzOptValue@:
+-- block size when @N > 1@).
 -- @slot@ is the update's shared compress lock.
 mkUvDepsOps :: Int -> QSem -> CommandRunner -> UvDepsOps
 mkUvDepsOps threads slot run =

@@ -82,7 +82,8 @@ noopVendorProgress =
 
 -- | Build vendor ops over an injectable command runner (Unit heat surface).
 --
--- @threads@ is the xz thread count for the vendor pack (@XZ_OPT=-T{N} -9e@).
+-- @threads@ is the xz thread count @N@ for the vendor pack (@xzOptValue@:
+-- block size when @N > 1@).
 -- @slot@ is the update's shared compress lock.
 mkVendorOps :: Int -> QSem -> CommandRunner -> VendorOps
 mkVendorOps threads slot run =
