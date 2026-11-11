@@ -276,7 +276,7 @@ fakeCargoSuccessOps =
         TIO.writeFile ebuildPath (body <> "\n# pycargoebuild\n")
         pure (Right ()),
       coPackCrates = \onStage onArchive _lock _dist _stage outPath -> do
-        onStage 1 1
+        onStage 1
         onArchive
         BS.writeFile outPath cargoAssetBytes
         pure (Right ()),
@@ -1502,7 +1502,7 @@ testCargoFullPathStagingStatus =
         matSteps = filter (`elem` expectedMat) steps
     assertTrue
       "staging crates label"
-      ("status:staging crates 1/1" `elem` statuses)
+      ("status:staging 1 crate" `elem` statuses)
     assertTrue
       "crates pack status after staging"
       ("status:crates pack" `elem` statuses)

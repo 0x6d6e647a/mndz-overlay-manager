@@ -14,11 +14,11 @@ import Control.Concurrent.MVar
     tryPutMVar,
   )
 import Control.Exception (SomeException, bracket_, finally, throwIO, try)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.ByteString qualified as BS
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (isInfixOf, isPrefixOf)
+import Data.List (intercalate, isInfixOf, isPrefixOf)
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -31,12 +31,13 @@ import System.Directory
     doesFileExist,
     emptyPermissions,
     getSymbolicLinkTarget,
+    makeAbsolute,
     pathIsSymbolicLink,
     removePathForcibly,
     setPermissions,
   )
 import System.Exit (ExitCode (..))
-import System.FilePath (isAbsolute, takeDirectory, (</>))
+import System.FilePath (isAbsolute, takeDirectory, takeFileName, (</>))
 import System.IO.Error (userError)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
@@ -234,6 +235,15 @@ unitTests =
           testCase "packCratesTarball missing crate" testPackCratesTarballMissingCrate,
           testCase "packCratesTarball records XZ_OPT and -J / .xz temp" testPackCratesTarballXzArgv,
           testCase "crate staging progress then crates pack" testCargoStagingProgress,
+          testCase "crate staging lists missing crates before extract" testCrateStagingMissingListed,
+          testCase "crate staging one invocation uses jobs" testCrateStagingOneInvocation,
+          testCase "crate staging reports every extract failure" testCrateStagingReportsEveryFailure,
+          testCase "crate staging no directory" testCrateStagingNoDirectory,
+          testCase "crate staging invocation failure" testCrateStagingInvocationFailure,
+          testCase "crate staging archive independent of extract order" testCrateStagingArchiveOrder,
+          testCase "crate staging failure log" testCrateStagingFailureLog,
+          testCase "crate staging unwritable log" testCrateStagingUnwritableLog,
+          testCase "crate staging progress none" testCrateStagingProgressNone,
           testCase "CratesIo lane op sequence" testCargoCratesIoLaneOps,
           testCase "GitTag lane op sequence unchanged" testCargoGitTagLaneOps,
           testCase "fetchAndUnpackCrate edges" testFetchUnpackCrateEdges,
@@ -876,7 +886,7 @@ noopCargoProgress =
       cgpOnCloneDone = pure (),
       cgpOnPycargoStart = pure (),
       cgpOnPycargoDone = pure (),
-      cgpOnStageCrate = \_ _ -> pure (),
+      cgpOnStageCrate = \_ -> pure (),
       cgpOnPackStart = pure (),
       cgpOnPackDone = pure ()
     }
@@ -1313,8 +1323,8 @@ testCargoBuilderSuccess =
               cgpOnCloneDone = logEv "clone-done",
               cgpOnPycargoStart = logEv "pycargo-start",
               cgpOnPycargoDone = logEv "pycargo-done",
-              cgpOnStageCrate = \k n ->
-                logEv ("stage-" <> T.pack (show k) <> "/" <> T.pack (show n)),
+              cgpOnStageCrate = \n ->
+                logEv ("stage-" <> T.pack (show n)),
               cgpOnPackStart = logEv "pack-start",
               cgpOnPackDone = logEv "pack-done"
             }
@@ -1728,6 +1738,7 @@ testGenerateLockfileCommand =
                 TIO.writeFile ebuildPath (donorEbuild <> "\n# pycargo\n")
               _ -> pure ()
             pure (okResult "")
+          Just ("xargs", _) -> productionCommandRunner req
           Just ("tar", _) -> productionCommandRunner req
           _ -> pure (failResult ("unexpected: " <> show (prMode req)))
     res <-
@@ -1825,9 +1836,11 @@ testPackCratesTarballFixture :: IO ()
 testPackCratesTarballFixture =
   withSystemTempDirectory "mndz-cargo-pack-" $ \tmp -> do
     slot <- newQSem 1
-    let lockRoot = tmp </> "src"
-        distDir = tmp </> "distdir"
-        stageDir = tmp </> "stage"
+    let unit = tmp </> "unit"
+        work = unit </> "work"
+        lockRoot = work </> "src"
+        distDir = work </> "distdir"
+        stageDir = work </> "stage"
         outPath = tmp </> "pkg-0.1.0-crates.tar.xz"
         crateDir = tmp </> "serde-1.0.200"
         cratePath = distDir </> "serde-1.0.200.crate"
@@ -1914,15 +1927,20 @@ testPackCratesTarballFixture =
               prStdin = ""
             }
     assertTrue "package field from lock" ("abc123" `T.isInfixOf` T.pack checksumBody)
+    logExists <- doesFileExist (unit </> "crate-staging.log")
+    assertTrue "success leaves no staging log" (not logExists)
 
 testPackCratesTarballMissingCrate :: IO ()
 testPackCratesTarballMissingCrate =
   withSystemTempDirectory "mndz-cargo-pack-miss-" $ \tmp -> do
     slot <- newQSem 1
-    let lockRoot = tmp </> "src"
-        distDir = tmp </> "distdir"
-        stageDir = tmp </> "stage"
+    let unit = tmp </> "unit"
+        work = unit </> "work"
+        lockRoot = work </> "src"
+        distDir = work </> "distdir"
+        stageDir = work </> "stage"
         outPath = tmp </> "out-crates.tar.xz"
+        logPath = unit </> "crate-staging.log"
     createDirectoryIfMissing True lockRoot
     createDirectoryIfMissing True distDir
     TIO.writeFile
@@ -1940,8 +1958,13 @@ testPackCratesTarballMissingCrate =
         =<< packCratesTarball 1 slot productionCommandRunner lockRoot distDir stageDir outPath
     assertTrue "pack prefix" ("cargo crates pack failed" `T.isInfixOf` err)
     assertTrue "names crate" ("serde-1.0.200.crate" `T.isInfixOf` err)
+    assertTrue "singular missing" ("1 registry crate missing" `T.isInfixOf` err)
+    assertTrue "names the log" ("crate-staging.log" `T.isInfixOf` err)
+    assertTrue "names the unit" (T.pack unit `T.isInfixOf` err)
     exists <- doesFileExist outPath
     assertTrue "no partial final path" (not exists)
+    logged <- TIO.readFile logPath
+    assertTrue "log kind" ("serde-1.0.200.crate: missing" `T.isInfixOf` logged)
 
 testPackCratesTarballXzArgv :: IO ()
 testPackCratesTarballXzArgv =
@@ -1960,6 +1983,8 @@ testPackCratesTarballXzArgv =
     let run req = do
           atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
           case prMode req of
+            ExecCmd "xargs" _ ->
+              productionCommandRunner req
             ExecCmd "tar" args -> do
               for_ (tarArchivePath args) writeFakeXz
               pure (okResult "")
@@ -2046,7 +2071,7 @@ testCargoStagingProgress =
         1
         slot
         productionCommandRunner
-        (\k n -> logEv ("staging crates " <> T.pack (show k) <> "/" <> T.pack (show n)))
+        (logEv . crateStageEvent)
         (logEv "crates pack")
         lockRoot
         distDir
@@ -2055,10 +2080,484 @@ testCargoStagingProgress =
     evs <- reverse <$> readIORef events
     assertEq
       "staging then pack"
-      ["staging crates 1/1", "crates pack"]
+      ["staging 1 crate", "crates pack"]
       evs
     exists <- doesFileExist outPath
     assertTrue "tarball exists" exists
+
+-- | Status text the staging hook stands for. Matches 'crateStageStatus'.
+crateStageEvent :: Int -> T.Text
+crateStageEvent n =
+  "staging " <> T.pack (show n) <> if n == 1 then " crate" else " crates"
+
+data CargoPackDirs = CargoPackDirs
+  { cpdUnit :: FilePath,
+    cpdLock :: FilePath,
+    cpdDist :: FilePath,
+    cpdStage :: FilePath
+  }
+
+newPackDirs :: FilePath -> FilePath -> IO CargoPackDirs
+newPackDirs tmp stageName = do
+  let unit = tmp </> "unit"
+      work = unit </> "work"
+      dirs =
+        CargoPackDirs
+          { cpdUnit = unit,
+            cpdLock = work </> "src",
+            cpdDist = work </> "distdir",
+            cpdStage = work </> stageName
+          }
+  createDirectoryIfMissing True (cpdLock dirs)
+  createDirectoryIfMissing True (cpdDist dirs)
+  pure dirs
+
+writeRegistryLock :: FilePath -> [(T.Text, T.Text, T.Text)] -> IO ()
+writeRegistryLock lockRoot entries =
+  TIO.writeFile (lockRoot </> "Cargo.lock") $
+    T.unlines ("version = 4" : concatMap entry entries)
+  where
+    entry (name, ver, sum_) =
+      [ "[[package]]",
+        "name = \"" <> name <> "\"",
+        "version = \"" <> ver <> "\"",
+        "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+        "checksum = \"" <> sum_ <> "\""
+      ]
+
+writeRealCrate :: FilePath -> FilePath -> T.Text -> T.Text -> IO ()
+writeRealCrate scratch distDir name ver = do
+  let dirName = T.unpack (name <> "-" <> ver)
+      crateDir = scratch </> dirName
+  createDirectoryIfMissing True crateDir
+  TIO.writeFile (crateDir </> "Cargo.toml") ("[package]\nname = \"" <> name <> "\"\n")
+  void $
+    productionCommandRunner
+      ProcessRequest
+        { prMode =
+            ExecCmd
+              "tar"
+              ["-czf", distDir </> (dirName ++ ".crate"), "-C", scratch, dirName],
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = ""
+        }
+
+touchCrate :: FilePath -> T.Text -> T.Text -> IO ()
+touchCrate distDir name ver =
+  writeFile (distDir </> T.unpack (name <> "-" <> ver <> ".crate")) ""
+
+assertTextBefore :: String -> T.Text -> T.Text -> T.Text -> IO ()
+assertTextBefore label earlier later hay = do
+  assertTrue (label <> " has earlier") (earlier `T.isInfixOf` hay)
+  assertTrue (label <> " has later") (later `T.isInfixOf` hay)
+  let earlierAt = T.length (fst (T.breakOn earlier hay))
+      laterAt = T.length (fst (T.breakOn later hay))
+  assertTrue label (earlierAt < laterAt)
+
+argAfter :: String -> [String] -> Maybe String
+argAfter key args = case dropWhile (/= key) args of
+  (_ : value : _) -> Just value
+  _ -> Nothing
+
+splitNul :: String -> [String]
+splitNul = filter (not . null) . go
+  where
+    go "" = []
+    go s =
+      case break (== '\0') s of
+        (a, "") -> [a]
+        (a, _ : rest) -> a : go rest
+
+-- | Three lock entries, two absent. Nothing is extracted; the log lists both
+-- missing crates with the earlier lock entry first.
+testCrateStagingMissingListed :: IO ()
+testCrateStagingMissingListed =
+  withSystemTempDirectory "mndz-crate-miss-list-" $ \tmp -> do
+    slot <- newQSem 1
+    dirs <- newPackDirs tmp "stage"
+    reqs <- newIORef ([] :: [ProcessRequest])
+    writeRegistryLock
+      (cpdLock dirs)
+      [("a", "1.0.0", "aa"), ("b", "2.0.0", "bb"), ("c", "3.0.0", "cc")]
+    touchCrate (cpdDist dirs) "b" "2.0.0"
+    let run req = do
+          atomicModifyIORef' reqs (\rs -> (req : rs, ()))
+          pure (failResult "extract should not run")
+    err <-
+      assertLeft "two missing"
+        =<< packCratesTarballWith
+          4
+          slot
+          run
+          (\_ -> fail "staging hook should not run")
+          (fail "archive should not start")
+          (cpdLock dirs)
+          (cpdDist dirs)
+          (cpdStage dirs)
+          (tmp </> "out.tar.xz")
+    seen <- readIORef reqs
+    assertEq "no extraction request" ([] :: [ProcessRequest]) seen
+    assertTrue "starts with the pack prefix" ("cargo crates pack failed:" `T.isPrefixOf` err)
+    assertTrue "two missing" ("2 registry crates missing" `T.isInfixOf` err)
+    assertTrue "names the first" ("first: a-1.0.0.crate" `T.isInfixOf` err)
+    assertTrue "names the log" ("crate-staging.log" `T.isInfixOf` err)
+    assertTrue "names the unit" (T.pack (cpdUnit dirs) `T.isInfixOf` err)
+    logged <- TIO.readFile (cpdUnit dirs </> "crate-staging.log")
+    assertTextBefore "missing crates in lock order" "a-1.0.0.crate" "c-3.0.0.crate" logged
+    assertTrue "a is missing" ("a-1.0.0.crate: missing" `T.isInfixOf` logged)
+    assertTrue "c is missing" ("c-3.0.0.crate: missing" `T.isInfixOf` logged)
+    assertTrue "present crate is not listed" (not ("b-2.0.0.crate" `T.isInfixOf` logged))
+
+-- | Several real crates produce one @xargs@ request whose @-P@ is the thread count.
+testCrateStagingOneInvocation :: IO ()
+testCrateStagingOneInvocation =
+  withSystemTempDirectory "mndz-crate-one-exec-" $ \tmp -> do
+    slot <- newQSem 1
+    dirs <- newPackDirs tmp "stage"
+    events <- newIORef ([] :: [T.Text])
+    reqs <- newIORef ([] :: [ProcessRequest])
+    let names = [("a", "1.0.0", "aa"), ("b", "2.0.0", "bb"), ("c", "3.0.0", "cc")]
+        logEv event = atomicModifyIORef' events (\es -> (event : es, ()))
+        run req = do
+          atomicModifyIORef' reqs (\rs -> (req : rs, ()))
+          productionCommandRunner req
+    writeRegistryLock (cpdLock dirs) names
+    forM_ names $ \(name, ver, _) ->
+      writeRealCrate (tmp </> "scratch") (cpdDist dirs) name ver
+    assertRight "batched pack"
+      =<< packCratesTarballWith
+        4
+        slot
+        run
+        (logEv . crateStageEvent)
+        (logEv "crates pack")
+        (cpdLock dirs)
+        (cpdDist dirs)
+        (cpdStage dirs)
+        (tmp </> "out.tar.xz")
+    seen <- reverse <$> readIORef reqs
+    let extracts =
+          [ req
+          | req <- seen,
+            case prMode req of
+              ExecCmd "xargs" _ -> True
+              _ -> False
+          ]
+    assertEq "one extraction request" (1 :: Int) (length extracts)
+    case extracts of
+      [req] -> case prMode req of
+        ExecCmd "xargs" args -> do
+          assertEq "jobs width" (Just "4") (argAfter "-P" args)
+          paths <-
+            mapM
+              (makeAbsolute . (cpdDist dirs </>))
+              ["a-1.0.0.crate", "b-2.0.0.crate", "c-3.0.0.crate"]
+          assertEq "stdin lock order" (intercalate "\0" paths) (prStdin req)
+        _ -> fail "expected xargs"
+      _ -> fail "expected one xargs request"
+    evs <- reverse <$> readIORef events
+    assertEq "staging three then pack" ["staging 3 crates", "crates pack"] evs
+    logExists <- doesFileExist (cpdUnit dirs </> "crate-staging.log")
+    assertTrue "success leaves no log" (not logExists)
+
+-- | Corrupt neighbours do not stop the good crate. Failures stay in lock order.
+testCrateStagingReportsEveryFailure :: IO ()
+testCrateStagingReportsEveryFailure =
+  withSystemTempDirectory "mndz-crate-fail-all-" $ \tmp -> do
+    slot <- newQSem 1
+    dirs <- newPackDirs tmp "stage"
+    writeRegistryLock
+      (cpdLock dirs)
+      [("a", "1.0.0", "aa"), ("b", "2.0.0", "bb"), ("c", "3.0.0", "cc")]
+    writeFile (cpdDist dirs </> "a-1.0.0.crate") "not a gzip\n"
+    writeRealCrate (tmp </> "scratch") (cpdDist dirs) "b" "2.0.0"
+    writeFile (cpdDist dirs </> "c-3.0.0.crate") "also not a gzip\n"
+    err <-
+      assertLeft "two corrupt"
+        =<< packCratesTarball
+          2
+          slot
+          productionCommandRunner
+          (cpdLock dirs)
+          (cpdDist dirs)
+          (cpdStage dirs)
+          (tmp </> "out.tar.xz")
+    good <-
+      doesDirectoryExist
+        (cpdStage dirs </> "cargo_home" </> "gentoo" </> "b-2.0.0")
+    assertTrue "good crate was extracted" good
+    assertTrue "pack prefix" ("cargo crates pack failed:" `T.isPrefixOf` err)
+    assertTrue "two failures" ("2 crates failed to stage" `T.isInfixOf` err)
+    assertTrue "names the first crate" ("first: a-1.0.0.crate" `T.isInfixOf` err)
+    assertTrue "names the unit" (T.pack (cpdUnit dirs) `T.isInfixOf` err)
+    errBody <-
+      TIO.readFile
+        (takeDirectory (cpdStage dirs) </> "crate-errors" </> "a-1.0.0.crate.err")
+    case T.lines errBody of
+      (line : rest) -> do
+        assertTrue "summary has the first stderr line" (line `T.isInfixOf` err)
+        logged <- TIO.readFile (cpdUnit dirs </> "crate-staging.log")
+        assertTextBefore "failures in lock order" "a-1.0.0.crate" "c-3.0.0.crate" logged
+        assertTrue "a extract" ("a-1.0.0.crate: extract" `T.isInfixOf` logged)
+        assertTrue "c extract" ("c-3.0.0.crate: extract" `T.isInfixOf` logged)
+        assertTrue "good crate is not a failure" (not ("b-2.0.0.crate:" `T.isInfixOf` logged))
+        forM_ (line : rest) $ \stderrLine ->
+          unless (T.null stderrLine) $
+            assertTrue "log keeps the stderr line" (stderrLine `T.isInfixOf` logged)
+      [] -> fail "expected tar stderr for the corrupt crate"
+
+-- | Exit zero with no crate directory is a no-directory failure.
+testCrateStagingNoDirectory :: IO ()
+testCrateStagingNoDirectory =
+  withSystemTempDirectory "mndz-crate-nodir-" $ \tmp -> do
+    slot <- newQSem 1
+    dirs <- newPackDirs tmp "stage"
+    writeRegistryLock (cpdLock dirs) [("b", "2.0.0", "bb")]
+    touchCrate (cpdDist dirs) "b" "2.0.0"
+    let run req = case prMode req of
+          ExecCmd "xargs" _ -> pure (okResult "")
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+    err <-
+      assertLeft "no directory"
+        =<< packCratesTarballWith
+          1
+          slot
+          run
+          (\_ -> pure ())
+          (fail "archive should not start")
+          (cpdLock dirs)
+          (cpdDist dirs)
+          (cpdStage dirs)
+          (tmp </> "out.tar.xz")
+    assertTrue "singular" ("1 crate failed to stage" `T.isInfixOf` err)
+    assertTrue "names the crate" ("b-2.0.0.crate" `T.isInfixOf` err)
+    logged <- TIO.readFile (cpdUnit dirs </> "crate-staging.log")
+    assertTrue "no-directory kind" ("b-2.0.0.crate: no directory" `T.isInfixOf` logged)
+    created <-
+      doesDirectoryExist
+        (cpdStage dirs </> "cargo_home" </> "gentoo" </> "b-2.0.0")
+    assertTrue "crate directory was not created" (not created)
+
+-- | A non-zero extract invocation with no per-crate @.err@ file.
+testCrateStagingInvocationFailure :: IO ()
+testCrateStagingInvocationFailure =
+  withSystemTempDirectory "mndz-crate-invoke-" $ \tmp -> do
+    slot <- newQSem 1
+    dirs <- newPackDirs tmp "stage"
+    writeRegistryLock (cpdLock dirs) [("a", "1.0.0", "aa")]
+    touchCrate (cpdDist dirs) "a" "1.0.0"
+    let run req = case prMode req of
+          ExecCmd "xargs" _ ->
+            pure
+              ProcessResult
+                { prExitCode = ExitFailure 127,
+                  prStdout = "",
+                  prStderr = "xargs: not found\n"
+                }
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+    err <-
+      assertLeft "invocation"
+        =<< packCratesTarball
+          1
+          slot
+          run
+          (cpdLock dirs)
+          (cpdDist dirs)
+          (cpdStage dirs)
+          (tmp </> "out.tar.xz")
+    assertEq
+      "invocation message"
+      "cargo crates pack failed: crate extraction invocation exited 127: xargs: not found"
+      err
+    logExists <- doesFileExist (cpdUnit dirs </> "crate-staging.log")
+    assertTrue "invocation failure writes no log" (not logExists)
+
+-- | Same tree packed after extracts finish in two orders: identical archive bytes.
+testCrateStagingArchiveOrder :: IO ()
+testCrateStagingArchiveOrder =
+  withSystemTempDirectory "mndz-crate-order-" $ \tmp -> do
+    slot <- newQSem 1
+    let names = [("a", "1.0.0", "aa"), ("b", "2.0.0", "bb"), ("c", "3.0.0", "cc")]
+    base <- newPackDirs tmp "unused"
+    writeRegistryLock (cpdLock base) names
+    forM_ names $ \(name, ver, _) ->
+      writeRealCrate (tmp </> "scratch") (cpdDist base) name ver
+    let packOrder order stageName outName = do
+          let stage = takeDirectory (cpdDist base) </> stageName
+              outPath = tmp </> outName
+              run req = case prMode req of
+                ExecCmd "xargs" args -> extractInOrder order args (prStdin req)
+                ExecCmd "tar" _ -> productionCommandRunner req
+                _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+          assertRight "ordered pack"
+            =<< packCratesTarball
+              1
+              slot
+              run
+              (cpdLock base)
+              (cpdDist base)
+              stage
+              outPath
+          pure outPath
+    out1 <- packOrder ["a-1.0.0.crate", "b-2.0.0.crate", "c-3.0.0.crate"] "stage-a" "a.tar.xz"
+    out2 <- packOrder ["c-3.0.0.crate", "a-1.0.0.crate", "b-2.0.0.crate"] "stage-b" "b.tar.xz"
+    bytes1 <- BS.readFile out1
+    bytes2 <- BS.readFile out2
+    assertEq "byte-identical archives" bytes1 bytes2
+  where
+    extractInOrder order args stdin = case reverse args of
+      (_errDir : gentoo : _) -> do
+        let byName = [(takeFileName path, path) | path <- splitNul stdin]
+        forM_ order $ \name ->
+          case lookup name byName of
+            Nothing -> fail ("stdin missing " <> name)
+            Just path ->
+              void $
+                productionCommandRunner
+                  ProcessRequest
+                    { prMode = ExecCmd "tar" ["-xzf", path, "-C", gentoo],
+                      prCwd = Nothing,
+                      prEnv = Nothing,
+                      prStdin = ""
+                    }
+        pure (okResult "")
+      _ -> pure (failResult "xargs argv missing directories")
+
+-- | Log blocks are lock-ordered and keep each extract's full stderr.
+testCrateStagingFailureLog :: IO ()
+testCrateStagingFailureLog =
+  withSystemTempDirectory "mndz-crate-log-" $ \tmp -> do
+    slot <- newQSem 1
+    dirs <- newPackDirs tmp "stage"
+    writeRegistryLock
+      (cpdLock dirs)
+      [("a", "1.0.0", "aa"), ("b", "2.0.0", "bb"), ("c", "3.0.0", "cc")]
+    touchCrate (cpdDist dirs) "a" "1.0.0"
+    touchCrate (cpdDist dirs) "b" "2.0.0"
+    touchCrate (cpdDist dirs) "c" "3.0.0"
+    let stderrFor name =
+          name
+            <> ": line one\n"
+            <> name
+            <> ": line two\n"
+        run req = case prMode req of
+          ExecCmd "xargs" args -> case reverse args of
+            (errDir : _) -> do
+              TIO.writeFile
+                (errDir </> "a-1.0.0.crate.err")
+                (T.pack (stderrFor "a"))
+              TIO.writeFile
+                (errDir </> "c-3.0.0.crate.err")
+                (T.pack (stderrFor "c"))
+              pure
+                ProcessResult
+                  { prExitCode = ExitFailure 123,
+                    prStdout = "",
+                    prStderr = ""
+                  }
+            _ -> pure (failResult "xargs argv missing the error directory")
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+    err <-
+      assertLeft "mixed failures"
+        =<< packCratesTarball
+          1
+          slot
+          run
+          (cpdLock dirs)
+          (cpdDist dirs)
+          (cpdStage dirs)
+          (tmp </> "out.tar.xz")
+    assertTrue "pack prefix" ("cargo crates pack failed:" `T.isPrefixOf` err)
+    assertTrue "three failures" ("3 crates failed to stage" `T.isInfixOf` err)
+    assertTrue "first crate" ("a-1.0.0.crate" `T.isInfixOf` err)
+    assertTrue "first stderr line" ("a: line one" `T.isInfixOf` err)
+    assertTrue "unit path" (T.pack (cpdUnit dirs) `T.isInfixOf` err)
+    logged <- TIO.readFile (cpdUnit dirs </> "crate-staging.log")
+    assertTextBefore "a before b" "a-1.0.0.crate" "b-2.0.0.crate" logged
+    assertTextBefore "b before c" "b-2.0.0.crate" "c-3.0.0.crate" logged
+    assertTrue "a extract" ("a-1.0.0.crate: extract" `T.isInfixOf` logged)
+    assertTrue "b no directory" ("b-2.0.0.crate: no directory" `T.isInfixOf` logged)
+    assertTrue "c extract" ("c-3.0.0.crate: extract" `T.isInfixOf` logged)
+    assertTrue "a stderr" ("    a: line one" `T.isInfixOf` logged)
+    assertTrue "a stderr second line" ("    a: line two" `T.isInfixOf` logged)
+    assertTrue "c stderr" ("    c: line one" `T.isInfixOf` logged)
+    assertTrue "c stderr second line" ("    c: line two" `T.isInfixOf` logged)
+
+-- | An unwritable unit directory still names the first crate.
+testCrateStagingUnwritableLog :: IO ()
+testCrateStagingUnwritableLog =
+  withSystemTempDirectory "mndz-crate-nolog-" $ \tmp -> do
+    slot <- newQSem 1
+    dirs <- newPackDirs tmp "stage"
+    writeRegistryLock (cpdLock dirs) [("a", "1.0.0", "aa")]
+    touchCrate (cpdDist dirs) "a" "1.0.0"
+    let logPath = cpdUnit dirs </> "crate-staging.log"
+        run req = case prMode req of
+          ExecCmd "xargs" args -> case reverse args of
+            (errDir : _) -> do
+              TIO.writeFile
+                (errDir </> "a-1.0.0.crate.err")
+                "gzip: stdin: not in gzip format\n"
+              pure
+                ProcessResult
+                  { prExitCode = ExitFailure 123,
+                    prStdout = "",
+                    prStderr = ""
+                  }
+            _ -> pure (failResult "xargs argv missing the error directory")
+          _ -> pure (failResult ("unexpected: " <> show (prMode req)))
+    err <-
+      bracket_
+        (setPermissions (cpdUnit dirs) (stagingDirPerms False))
+        (setPermissions (cpdUnit dirs) (stagingDirPerms True))
+        $ assertLeft "unwritable log"
+          =<< packCratesTarball
+            1
+            slot
+            run
+            (cpdLock dirs)
+            (cpdDist dirs)
+            (cpdStage dirs)
+            (tmp </> "out.tar.xz")
+    assertTrue "log was not written" ("was not written" `T.isInfixOf` err)
+    assertTrue "still names the crate" ("a-1.0.0.crate" `T.isInfixOf` err)
+    assertTrue "still quotes stderr" ("gzip: stdin: not in gzip format" `T.isInfixOf` err)
+    exists <- doesFileExist logPath
+    assertTrue "log file absent" (not exists)
+  where
+    stagingDirPerms canWrite =
+      emptyPermissions
+        { readable = True,
+          writable = canWrite,
+          executable = True,
+          searchable = True
+        }
+
+-- | No registry crates: no staging status, and the archive step still runs.
+testCrateStagingProgressNone :: IO ()
+testCrateStagingProgressNone =
+  withSystemTempDirectory "mndz-crate-nostage-" $ \tmp -> do
+    slot <- newQSem 1
+    dirs <- newPackDirs tmp "stage"
+    events <- newIORef ([] :: [T.Text])
+    TIO.writeFile (cpdLock dirs </> "Cargo.lock") "version = 4\n"
+    let logEv event = atomicModifyIORef' events (\es -> (event : es, ()))
+    assertRight "empty registry"
+      =<< packCratesTarballWith
+        1
+        slot
+        productionCommandRunner
+        (logEv . crateStageEvent)
+        (logEv "crates pack")
+        (cpdLock dirs)
+        (cpdDist dirs)
+        (cpdStage dirs)
+        (tmp </> "out.tar.xz")
+    evs <- reverse <$> readIORef events
+    assertEq "no staging event" ["crates pack"] evs
+    logExists <- doesFileExist (cpdUnit dirs </> "crate-staging.log")
+    assertTrue "success leaves no log" (not logExists)
 
 testVerifyXzFile :: IO ()
 testVerifyXzFile =
@@ -3668,7 +4167,7 @@ testCargoCratesIoLaneOps =
               cgpOnCloneDone = logEv "source-done",
               cgpOnPycargoStart = logEv "pycargo-start",
               cgpOnPycargoDone = logEv "pycargo-done",
-              cgpOnStageCrate = \_ _ -> pure (),
+              cgpOnStageCrate = \_ -> pure (),
               cgpOnPackStart = logEv "pack-start",
               cgpOnPackDone = logEv "pack-done"
             }
@@ -3770,7 +4269,7 @@ testCargoGitTagLaneOps =
               cgpOnCloneDone = logEv "clone-done",
               cgpOnPycargoStart = logEv "pycargo-start",
               cgpOnPycargoDone = logEv "pycargo-done",
-              cgpOnStageCrate = \_ _ -> pure (),
+              cgpOnStageCrate = \_ -> pure (),
               cgpOnPackStart = logEv "pack-start",
               cgpOnPackDone = logEv "pack-done"
             }

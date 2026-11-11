@@ -31,6 +31,8 @@ where
 
 import Control.Concurrent (QSem)
 import Control.Exception (IOException, try)
+import Data.List (intercalate)
+import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -129,10 +131,10 @@ data CargoOps = CargoOps
     coGenerateLockfile :: FilePath -> IO (Either Text ()),
     -- | Run pycargoebuild: ebuild path, lock root / pkg dir, tarball out path, temp distdir.
     coPycargoebuild :: FilePath -> FilePath -> FilePath -> FilePath -> IO (Either Text ()),
-    -- | Pack registry crates: staging callback @k N@, archive-start, lock
-    -- root, distdir, stage dir, final tarball path.
+    -- | Pack registry crates: staging callback (registry crate count),
+    -- archive-start, lock root, distdir, stage dir, final tarball path.
     coPackCrates ::
-      (Int -> Int -> IO ()) ->
+      (Int -> IO ()) ->
       IO () ->
       FilePath ->
       FilePath ->
@@ -150,8 +152,9 @@ data CargoProgress = CargoProgress
     cgpOnCloneDone :: IO (),
     cgpOnPycargoStart :: IO (),
     cgpOnPycargoDone :: IO (),
-    -- | Called as @k N@ while extracting each registry crate (1-based @k@).
-    cgpOnStageCrate :: Int -> Int -> IO (),
+    -- | Called once with the registry crate count before extraction.
+    -- Skipped when that count is zero.
+    cgpOnStageCrate :: Int -> IO (),
     cgpOnPackStart :: IO (),
     cgpOnPackDone :: IO ()
   }
@@ -161,7 +164,8 @@ data CargoProgress = CargoProgress
 -- @threads@ is the xz thread count @N@ for crates and rusty_v8 packs
 -- (@xzOptValue@: block size when @N > 1@). @slot@ is the update's shared
 -- compress lock.
--- Crate @tar -xzf@ extract does not take it.
+-- Crate staging is one @xargs -P N@ invocation and does not take it.
+-- @N@ is @threads@ (values below 1 become 1, matching @xzOptValue@).
 mkCargoOps :: Int -> QSem -> CommandRunner -> CargoOps
 mkCargoOps threads slot run =
   CargoOps
@@ -605,14 +609,16 @@ packCratesTarball ::
   FilePath ->
   IO (Either Text ())
 packCratesTarball threads slot run =
-  packCratesTarballWith threads slot run (\_ _ -> pure ()) (pure ())
+  packCratesTarballWith threads slot run (\_ -> pure ()) (pure ())
 
--- | Like 'packCratesTarball' with staging (@k@ of @N@) and archive-start hooks.
+-- | Like 'packCratesTarball' with a staging-count hook and an archive-start hook.
+-- The staging hook runs once, with the registry crate count, and only when
+-- that count is at least 1.
 packCratesTarballWith ::
   Int ->
   QSem ->
   CommandRunner ->
-  (Int -> Int -> IO ()) ->
+  (Int -> IO ()) ->
   IO () ->
   FilePath ->
   FilePath ->
@@ -635,7 +641,7 @@ stageAndArchive ::
   Int ->
   QSem ->
   CommandRunner ->
-  (Int -> Int -> IO ()) ->
+  (Int -> IO ()) ->
   IO () ->
   [RegistryPackage] ->
   FilePath ->
@@ -644,77 +650,232 @@ stageAndArchive ::
   IO (Either Text ())
 stageAndArchive threads slot run onStage onArchiveStart pkgs distDir stageDir outPath = do
   let gentooDir = stageDir </> "cargo_home" </> "gentoo"
+      errDir = takeDirectory stageDir </> "crate-errors"
+      unitDir = takeDirectory (takeDirectory stageDir)
   createDirectoryIfMissing True gentooDir
-  staged <- stageAll 1 pkgs
-  case staged of
-    Left err -> pure (Left err)
-    Right () -> do
+  missing <- traverse (missingCrate distDir) pkgs
+  case catMaybes missing of
+    records@(first : _) ->
+      stagingHardFail unitDir records (missingSummary distDir (length records) first)
+    []
+      | null pkgs -> archiveStaged
+      | otherwise -> do
+          onStage (length pkgs)
+          createDirectoryIfMissing True errDir
+          cratePaths <-
+            traverse (\pkg -> makeAbsolute (distDir </> crateFilename pkg)) pkgs
+          res <- runCrateExtract run threads gentooDir errDir cratePaths
+          scanned <- traverse (scanStaged gentooDir errDir) pkgs
+          -- No @.err@ file means the invocation never reported a crate
+          -- (xargs or the container failed). A zero exit with a missing
+          -- directory is still a per-crate failure.
+          let anyExtract = any scanExtract scanned
+          case prExitCode res of
+            ExitFailure code
+              | not anyExtract ->
+                  pure (Left (invocationFailure code (prStderr res)))
+            _ -> do
+              settled <- traverse (settleStaged gentooDir) (zip pkgs scanned)
+              case catMaybes settled of
+                records@(first : _) ->
+                  stagingHardFail unitDir records (stageSummary (length records) first)
+                [] -> archiveStaged
+  where
+    archiveStaged = do
       onArchiveStart
       createArchiveAtomic threads slot run stageDir outPath
-  where
-    n = length pkgs
-    stageAll _ [] = pure (Right ())
-    stageAll k (p : rest) = do
-      onStage k n
-      r <- stageOne p
-      case r of
-        Left err -> pure (Left err)
-        Right () -> stageAll (k + 1) rest
 
-    stageOne p = do
-      let cratePath = distDir </> crateFilename p
-          destDir = stageDir </> "cargo_home" </> "gentoo"
-      exists <- doesFileExist cratePath
-      if not exists
-        then
-          pure $
-            Left
-              ( "cargo crates pack failed: missing registry crate "
-                  <> T.pack (crateFilename p)
-                  <> " in distdir "
-                  <> T.pack distDir
-              )
-        else do
-          extracted <- extractCrate run cratePath destDir
-          case extracted of
-            Left err -> pure (Left err)
-            Right () -> do
-              let pkgDir = destDir </> crateDirName p
-                  checksumPath = pkgDir </> ".cargo-checksum.json"
-              pkgExists <- doesDirectoryExist pkgDir
-              if not pkgExists
-                then
-                  pure $
-                    Left
-                      ( "cargo crates pack failed: extract of "
-                          <> T.pack (crateFilename p)
-                          <> " did not produce "
-                          <> T.pack (crateDirName p)
-                      )
-                else do
-                  TIO.writeFile checksumPath (cargoChecksumJson (rpChecksum p))
-                  pure (Right ())
-
-extractCrate :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
-extractCrate run cratePath destDir = do
-  res <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "tar" ["-xzf", cratePath, "-C", destDir],
-          prCwd = Nothing,
-          prEnv = Nothing,
-          prStdin = ""
-        }
+-- | One lock-listed crate that is not in the distdir. Lock order is the
+-- traversal order of 'stageAndArchive'.
+missingCrate :: FilePath -> RegistryPackage -> IO (Maybe CrateStageFailure)
+missingCrate distDir pkg = do
+  let file = crateFilename pkg
+  exists <- doesFileExist (distDir </> file)
   pure $
-    if prExitCode res == ExitSuccess
-      then Right ()
-      else
-        Left
-          ( "cargo crates pack failed: tar extract "
-              <> T.pack cratePath
-              <> ": "
-              <> T.strip (T.pack (prStderr res))
-          )
+    if exists
+      then Nothing
+      else Just (CrateStageFailure file CrateMissing "")
+
+-- | What the batched extract left for one lock entry, before checksums.
+data CrateScan = ScanExtract Text | ScanNoDirectory | ScanOk
+
+scanExtract :: CrateScan -> Bool
+scanExtract (ScanExtract _) = True
+scanExtract _ = False
+
+-- | An @.err@ file is an extract failure. Otherwise a missing crate directory
+-- is noted; the caller decides whether that is a no-directory failure or part
+-- of an invocation failure.
+scanStaged :: FilePath -> FilePath -> RegistryPackage -> IO CrateScan
+scanStaged gentooDir errDir pkg = do
+  let file = crateFilename pkg
+      errPath = errDir </> (file <> ".err")
+      pkgDir = gentooDir </> crateDirName pkg
+  hasErr <- doesFileExist errPath
+  if hasErr
+    then ScanExtract <$> TIO.readFile errPath
+    else do
+      hasDir <- doesDirectoryExist pkgDir
+      pure $ if hasDir then ScanOk else ScanNoDirectory
+
+-- | Turn a scan into a failure, or write @.cargo-checksum.json@ for a crate
+-- that staged cleanly.
+settleStaged ::
+  FilePath ->
+  (RegistryPackage, CrateScan) ->
+  IO (Maybe CrateStageFailure)
+settleStaged gentooDir (pkg, scan) = do
+  let file = crateFilename pkg
+      pkgDir = gentooDir </> crateDirName pkg
+  case scan of
+    ScanExtract body ->
+      pure (Just (CrateStageFailure file CrateExtract body))
+    ScanNoDirectory ->
+      pure (Just (CrateStageFailure file CrateNoDirectory ""))
+    ScanOk -> do
+      TIO.writeFile
+        (pkgDir </> ".cargo-checksum.json")
+        (cargoChecksumJson (rpChecksum pkg))
+      pure Nothing
+
+-- | One @xargs -0 -P W@ invocation. Paths stay on stdin, in lock order.
+-- @W@ is @threads@ clamped to at least 1 (@xargs -P 0@ would mean unlimited).
+runCrateExtract ::
+  CommandRunner ->
+  Int ->
+  FilePath ->
+  FilePath ->
+  [FilePath] ->
+  IO ProcessResult
+runCrateExtract run threads gentooDir errDir cratePaths =
+  run
+    ProcessRequest
+      { prMode =
+          ExecCmd
+            "xargs"
+            [ "-0",
+              "-P",
+              show (max 1 threads),
+              "-n",
+              "1",
+              "sh",
+              "-c",
+              crateExtractScript,
+              "sh",
+              gentooDir,
+              errDir
+            ],
+        prCwd = Nothing,
+        prEnv = Nothing,
+        prStdin = intercalate "\0" cratePaths
+      }
+
+-- | @$1@ is the gentoo directory, @$2@ is the error directory, @$3@ is the
+-- crate path @xargs@ appends. A failing @tar@ leaves @<filename>.err@ and
+-- exits 1 (never 255, so @xargs@ keeps going). Success removes that file.
+crateExtractScript :: String
+crateExtractScript =
+  unlines
+    [ "f=$3; e=$2/${f##*/}.err",
+      "tar -xzf \"$f\" -C \"$1\" 2>\"$e\" || exit 1",
+      "rm -f \"$e\""
+    ]
+
+data CrateStageKind = CrateMissing | CrateExtract | CrateNoDirectory
+  deriving (Eq)
+
+data CrateStageFailure = CrateStageFailure
+  { csfFile :: FilePath,
+    csfKind :: CrateStageKind,
+    csfStderr :: Text
+  }
+
+stagingHardFail ::
+  FilePath ->
+  [CrateStageFailure] ->
+  (Text -> Text) ->
+  IO (Either Text ())
+stagingHardFail unitDir records summary = do
+  let logPath = unitDir </> "crate-staging.log"
+  absLog <- makeAbsolute logPath
+  written <-
+    try @IOException $
+      TIO.writeFile absLog (renderCrateStagingLog records)
+  pure (Left (summary (stagingLogNote absLog written)))
+
+stagingLogNote :: FilePath -> Either IOException () -> Text
+stagingLogNote absLog written =
+  case written of
+    Right () -> "see " <> T.pack absLog
+    Left ex -> T.pack absLog <> " was not written: " <> T.pack (show ex)
+
+missingSummary :: FilePath -> Int -> CrateStageFailure -> Text -> Text
+missingSummary distDir n first note =
+  "cargo crates pack failed: "
+    <> T.pack (show n)
+    <> " registry "
+    <> crateWord n
+    <> " missing from distdir "
+    <> T.pack distDir
+    <> "; first: "
+    <> T.pack (csfFile first)
+    <> "; "
+    <> note
+
+stageSummary :: Int -> CrateStageFailure -> Text -> Text
+stageSummary n first note =
+  let detail = case csfKind first of
+        CrateExtract ->
+          case firstStderrLine (csfStderr first) of
+            Just line -> ": " <> line
+            Nothing -> ""
+        _ -> ""
+   in "cargo crates pack failed: "
+        <> T.pack (show n)
+        <> " "
+        <> crateWord n
+        <> " failed to stage; first: "
+        <> T.pack (csfFile first)
+        <> detail
+        <> "; "
+        <> note
+
+crateWord :: Int -> Text
+crateWord 1 = "crate"
+crateWord _ = "crates"
+
+firstStderrLine :: Text -> Maybe Text
+firstStderrLine body =
+  case T.lines body of
+    (line : _) | not (T.null line) -> Just line
+    _ -> Nothing
+
+invocationFailure :: Int -> String -> Text
+invocationFailure code err =
+  "cargo crates pack failed: crate extraction invocation exited "
+    <> T.pack (show code)
+    <> ": "
+    <> T.strip (T.pack err)
+
+renderCrateStagingLog :: [CrateStageFailure] -> Text
+renderCrateStagingLog records =
+  T.intercalate "\n" (map renderBlock records) <> "\n"
+  where
+    renderBlock record =
+      T.pack (csfFile record)
+        <> ": "
+        <> kindLabel (csfKind record)
+        <> stderrBlock record
+    kindLabel CrateMissing = "missing"
+    kindLabel CrateExtract = "extract"
+    kindLabel CrateNoDirectory = "no directory"
+    stderrBlock record
+      | csfKind record == CrateExtract =
+          case T.lines (csfStderr record) of
+            [] -> ""
+            lines_ ->
+              "\n" <> T.intercalate "\n" ["    " <> line | line <- lines_]
+      | otherwise = ""
 
 createArchiveAtomic :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
 createArchiveAtomic threads slot run stageDir =

@@ -1753,18 +1753,15 @@ cargoCratesProgress stepsDoneRef mh key cargoSrc =
           cgpOnCloneDone = markMaterializeStep stepsDoneRef mh key cloneLabel,
           cgpOnPycargoStart = mhStatus mh key "pycargoebuild",
           cgpOnPycargoDone = markMaterializeStep stepsDoneRef mh key "pycargoebuild",
-          cgpOnStageCrate = \k n ->
-            mhStatus
-              mh
-              key
-              ( "staging crates "
-                  <> T.pack (show k)
-                  <> "/"
-                  <> T.pack (show n)
-              ),
+          cgpOnStageCrate = mhStatus mh key . crateStageStatus,
           cgpOnPackStart = mhStatus mh key "crates pack",
           cgpOnPackDone = markMaterializeStep stepsDoneRef mh key "crates pack"
         }
+
+-- | Status text for one staging pass. Singular when the lock lists one crate.
+crateStageStatus :: Int -> Text
+crateStageStatus n =
+  "staging " <> T.pack (show n) <> if n == 1 then " crate" else " crates"
 
 -- | Open a per-unit Docker session when configured; otherwise keep injected ops.
 withFullPathMaterializeSession ::
