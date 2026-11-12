@@ -1591,7 +1591,6 @@ sessionOps warmed events =
           gaoKeyinfoCached = \_ _ -> do
             warm <- readIORef warmed
             pure (Right warm),
-          gaoReadyPrompt = logEv "prompt" >> pure (Right ()),
           gaoWarmKey = \_ _ _ -> do
             logEv "warm"
             writeIORef warmed True
@@ -1701,14 +1700,14 @@ testOverlapCommitSkipsPrompt =
                 Nothing ->
                   assertFailure $
                     "missing " <> T.unpack label <> " in " <> show evs
-        promptAt <- at "prompt"
+        warmAt <- at "warm"
         supAt <- at "supervisor"
         ensureAt <- at "ensure-start"
         grokAt <- at "commit-grok"
         endAt <- at "ensure-end"
         bunAt <- at "commit-bun"
-        assertTrue "one prompt" (length (filter (== "prompt") evs) == 1)
-        assertTrue "prompt before the image build" (promptAt < ensureAt)
+        assertTrue "one unlock" (length (filter (== "warm") evs) == 1)
+        assertTrue "unlock before the image build" (warmAt < ensureAt)
         assertTrue "supervisor before the image build" (supAt < ensureAt)
         assertTrue "grok commit during ensure" (ensureAt < grokAt && grokAt < endAt)
         assertTrue "bun-bin commit after ensure" (endAt < bunAt)

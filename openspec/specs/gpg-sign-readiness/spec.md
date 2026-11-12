@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Per-worktree GPG signing key resolution, a process-owned session agent unlocked before signed work, session-agent cache checks, ready-prompt and TTY pinentry, and teardown that kills that session agent.
+Per-worktree GPG signing key resolution, a process-owned session agent unlocked before signed work, session-agent cache checks, TTY pinentry unlock, and teardown that kills that session agent.
 
 ## Requirements
 
@@ -31,29 +31,29 @@ The program SHALL track the resolved keygrip per worktree (overlay and assets in
 
 Immediately before every GPG-signed git commit (overlay or assets), the program SHALL query the session agent for whether the worktree’s signing keygrip has a cached passphrase (KEYINFO cached field warm vs cold). The program SHALL NOT treat warmth detection as an unlock operation. A cached passphrase in the desktop agent SHALL NOT count as warm.
 
-#### Scenario: Warm cache skips ready prompt
+#### Scenario: Warm cache skips unlock
 
 - **WHEN** KEYINFO on the session agent reports the signing keygrip is cached
-- **THEN** the program proceeds to `git commit -S` without a ready-prompt or additional unlock for that commit
+- **THEN** the program proceeds to `git commit -S` without a passphrase prompt or additional unlock for that commit
 
-#### Scenario: Cold cache requires readiness
+#### Scenario: Cold cache requires unlock
 
 - **WHEN** KEYINFO on the session agent reports the signing keygrip is not cached
-- **THEN** the program performs the ready-prompt and unlock sequence before `git commit -S`
+- **THEN** the program unlocks the key through the terminal pinentry before `git commit -S`
 
 #### Scenario: Desktop warmth is ignored
 
 - **WHEN** the desktop agent has the signing key cached and the session agent does not
 - **THEN** the program treats the key as cold
 
-### Requirement: Ready prompt and unlock when cache is cold
+### Requirement: Unlock when cache is cold
 
-When the session agent's cache for the signing keygrip is cold, the program SHALL require a controlling terminal. It SHALL prompt the operator on that terminal to confirm they are ready (for example, press Enter), then unlock the key via pinentry so the passphrase is cached in the session agent. The program SHALL NOT read or store the GPG passphrase in the process. If no controlling terminal is available when unlock is required, the program SHALL hard-fail with an error explaining that interactive GPG unlock is required. Fully unattended unlock without a TTY is out of scope.
+When the session agent's cache for the signing keygrip is cold, the program SHALL require a controlling terminal and SHALL unlock the key via the terminal pinentry so the passphrase is cached in the session agent. The pinentry prompt SHALL appear immediately, with no separate operator confirmation step before it. The program SHALL NOT read or store the GPG passphrase in the process. If no controlling terminal is available when unlock is required, the program SHALL hard-fail with an error explaining that interactive GPG unlock is required. Fully unattended unlock without a TTY is out of scope.
 
-#### Scenario: Ready then unlock on TTY
+#### Scenario: Unlock on TTY
 
 - **WHEN** the session-agent cache is cold and a controlling TTY is available
-- **THEN** the program waits for operator confirmation on that TTY and then triggers pinentry unlock for the signing key
+- **THEN** the program triggers pinentry unlock for the signing key without first waiting for the operator to confirm on that TTY
 
 #### Scenario: No TTY when unlock required
 
@@ -91,7 +91,7 @@ For GPG unlock and for `git commit -S` child processes, the program SHALL set `G
 
 ### Requirement: No optional flag for GPG readiness
 
-GPG readiness behavior SHALL always apply when `update` or `gencache` performs signed commits. The program SHALL NOT require a CLI flag to enable the session agent, ready-prompt, warmth checks, TTY pinentry environment, or session-agent teardown.
+GPG readiness behavior SHALL always apply when `update` or `gencache` performs signed commits. The program SHALL NOT require a CLI flag to enable the session agent, warmth checks, TTY pinentry environment, or session-agent teardown.
 
 #### Scenario: Always on for signed update commits
 
@@ -125,7 +125,7 @@ When `update` or `gencache` will create a GPG-signed commit, the program SHALL s
 
 ### Requirement: Unlock each signing key before signed work
 
-Before `update` starts concurrent package work that may sign, the program SHALL unlock each distinct signing key that work may use (overlay, and assets when this run may publish assets) into the session agent, using the ready-prompt and terminal pinentry sequence. One keygrip shared by both worktrees SHALL be unlocked once. A `gencache` run SHALL unlock the overlay signing key into the session agent before its signed commit. After that unlock, a later signed commit in the same process whose session-agent cache is still warm SHALL NOT prompt again, including a commit that runs while the materialize image is building.
+Before `update` starts concurrent package work that may sign, the program SHALL unlock each distinct signing key that work may use (overlay, and assets when this run may publish assets) into the session agent, using the terminal pinentry. One keygrip shared by both worktrees SHALL be unlocked once. A `gencache` run SHALL unlock the overlay signing key into the session agent before its signed commit. After that unlock, a later signed commit in the same process whose session-agent cache is still warm SHALL NOT prompt again, including a commit that runs while the materialize image is building.
 
 #### Scenario: One prompt before the image build
 
@@ -193,3 +193,17 @@ Using the session agent SHALL NOT change when a unit's signed commit is created.
 
 - **WHEN** `update` ensures the materialize image and `dev-lang/bun-bin` needs GitMv work
 - **THEN** bun-bin's signed overlay commit is still created after that ensure attempt finishes
+
+### Requirement: Passphrase prompt does not time out
+
+The session agent SHALL be configured so the terminal pinentry waits for the operator without expiring. The configuration SHALL set the pinentry timeout to 2147483647 seconds, the largest value the terminal pinentry accepts. It SHALL NOT use `0`, because the agent then sends no timeout and the pinentry falls back to a 60 second default. The session agent configuration SHALL NOT change the desktop agent.
+
+#### Scenario: Prompt outlasts the pinentry default
+
+- **WHEN** the session-agent cache is cold, the pinentry prompt is showing, and the operator does not answer for longer than 60 seconds
+- **THEN** the prompt is still open and unlock has not failed
+
+#### Scenario: Operator answers late
+
+- **WHEN** the operator enters the passphrase after being away for several minutes
+- **THEN** the unlock succeeds and the key is cached in the session agent

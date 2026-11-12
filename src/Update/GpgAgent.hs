@@ -78,7 +78,6 @@ import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO
   ( BufferMode (LineBuffering),
-    IOMode (ReadWriteMode),
     hClose,
     hFlush,
     hGetLine,
@@ -86,7 +85,6 @@ import System.IO
     hSetBuffering,
     stderr,
     stdout,
-    withFile,
   )
 import System.Posix.Files (getFileStatus, setFileMode, specialDeviceID)
 import System.Posix.IO
@@ -188,8 +186,6 @@ data GpgAgentOps = GpgAgentOps
     gaoResolveKeygrip :: Text -> IO (Either Text Keygrip),
     -- | KEYINFO against the session home. @Nothing@ must not query the desktop agent.
     gaoKeyinfoCached :: Maybe FilePath -> Keygrip -> IO (Either Text Bool),
-    -- | Ready-prompt on controlling TTY (Enter to continue).
-    gaoReadyPrompt :: IO (Either Text ()),
     -- | Dummy warm (clearsign). Home and controlling tty are passed in.
     gaoWarmKey :: Maybe FilePath -> Maybe FilePath -> Text -> IO (Either Text ()),
     -- | Controlling tty device node if available (e.g. @\/dev\/pts\/N@).
@@ -213,15 +209,14 @@ data GpgAgentOps = GpgAgentOps
 -- | Build GPG agent ops over an injectable command runner (Unit heat surface).
 --
 -- Process-oriented helpers (git config, gpg list/clearsign, gpg-connect-agent)
--- go through the runner. TTY ready-prompt and controlling-tty discovery stay
--- host-local (not CommandRunner).
+-- go through the runner. Controlling-tty discovery stays host-local (not
+-- CommandRunner).
 mkGpgAgentOps :: CommandRunner -> IO () -> IO () -> GpgAgentOps
 mkGpgAgentOps run pauseUi resumeUi =
   GpgAgentOps
     { gaoGetSigningKey = gitGetSigningKey run,
       gaoResolveKeygrip = resolveKeygripViaGpg run,
       gaoKeyinfoCached = keyinfoCached run,
-      gaoReadyPrompt = readyPromptOnTty,
       gaoWarmKey = warmKeyDummy run,
       gaoControllingTty = controllingTtyPath,
       gaoPauseUi = pauseUi,
@@ -272,9 +267,9 @@ lookupGpgSessionHome handle = fmap gsHome <$> readMVar (ghSession handle)
 
 -- | Ensure the worktree’s signing key is ready for @git commit -S@.
 --
--- Cold session cache: ready-prompt then dummy warm. Warm session cache: no
--- prompt. A warm desktop agent is not a session-cache hit. Missing
--- @user.signingkey@ \/ no TTY when unlock is required: hard failure.
+-- Cold session cache: unlock through the TTY pinentry (dummy warm). Warm
+-- session cache: no prompt. A warm desktop agent is not a session-cache hit.
+-- Missing @user.signingkey@ \/ no TTY when unlock is required: hard failure.
 ensureGpgReady :: GpgHandle -> FilePath -> IO (Either Text ())
 ensureGpgReady handle repoRoot =
   withMVar (ghLock handle) $ \() -> do
@@ -370,6 +365,9 @@ gpgAgentConfText =
   T.unlines
     [ "default-cache-ttl 28800",
       "max-cache-ttl 28800",
+      -- INT_MAX: pinentry reads this with atoi, and 0 sends no timeout, which
+      -- falls back to pinentry's 60 second default.
+      "pinentry-timeout 2147483647",
       "pinentry-program /usr/bin/pinentry-tty"
     ]
 
@@ -688,11 +686,8 @@ unlockCold handle st = do
                   <> "). Run from a terminal."
               )
         Just _ ->
-          bracket_ (gaoPauseUi ops) (gaoResumeUi ops) $ do
-            prompted <- gaoReadyPrompt ops
-            case prompted of
-              Left err -> pure (Left err)
-              Right () -> gaoWarmKey ops mHome mTty (wsSigningKey st)
+          bracket_ (gaoPauseUi ops) (gaoResumeUi ops) $
+            gaoWarmKey ops mHome mTty (wsSigningKey st)
 
 ------------------------------------------------------------------------
 -- Resolve worktree state
@@ -878,32 +873,6 @@ parseKeyinfoCached out grip =
                 "-" -> Just False
                 _ -> Nothing
         _ -> Nothing
-
-readyPromptOnTty :: IO (Either Text ())
-readyPromptOnTty = do
-  mTty <- controllingTtyPath
-  case mTty of
-    Nothing ->
-      pure $
-        Left
-          "no controlling TTY for GPG ready-prompt; run from a terminal"
-    Just tty -> do
-      result <-
-        try $
-          withFile tty ReadWriteMode $ \h -> do
-            hPutStr
-              h
-              "Press Enter when ready to unlock GPG for signed commits…\n"
-            hFlush h
-            _ <- hGetLine h
-            pure ()
-      pure $ case result of
-        Left (e :: IOException) ->
-          Left
-            ( "failed to prompt on controlling TTY: "
-                <> T.pack (show e)
-            )
-        Right () -> Right ()
 
 warmKeyDummy ::
   CommandRunner ->

@@ -336,8 +336,7 @@ tests =
       testCase "Resolve Keygrip Fails" testResolveKeygripFails,
       testCase "Keyinfo Fail Propagates" testKeyinfoFailPropagates,
       testCase "Warm Cache Skips Prompt" testWarmCacheSkipsPrompt,
-      testCase "Cold Cache Ready Then Warm" testColdCacheReadyThenWarm,
-      testCase "Cold Ready Prompt Fails" testColdReadyPromptFails,
+      testCase "Cold Cache Unlocks Once" testColdCacheUnlocksOnce,
       testCase "Cold Warm Key Fails" testColdWarmKeyFails,
       testCase "No Tty When Cold Fails" testNoTtyWhenColdFails,
       testCase "Clear Only If Warmed" testClearOnlyIfWarmed,
@@ -519,7 +518,6 @@ baseFakeOps =
     { gaoGetSigningKey = \_ -> pure (Right "KEY1"),
       gaoResolveKeygrip = \_ -> pure (Right (Keygrip "GRIP1")),
       gaoKeyinfoCached = \_ _ -> pure (Right True),
-      gaoReadyPrompt = pure (Left "should not prompt"),
       gaoWarmKey = \_ _ _ -> pure (Left "should not warm"),
       gaoControllingTty = pure (Just "/dev/pts/7"),
       gaoPauseUi = pure (),
@@ -547,33 +545,29 @@ testMissingSigningKeyFails = do
 
 testWarmCacheSkipsPrompt :: IO ()
 testWarmCacheSkipsPrompt = do
-  promptRef <- newIORef (0 :: Int)
+  warmRef <- newIORef (0 :: Int)
   let ops =
         baseFakeOps
           { gaoKeyinfoCached = \_ _ -> pure (Right True),
-            gaoReadyPrompt = do
-              atomicModifyIORef' promptRef (\n -> (n + 1, ()))
+            gaoWarmKey = \_ _ _ -> do
+              atomicModifyIORef' warmRef (\n -> (n + 1, ()))
               pure (Right ())
           }
   h <- newGpgHandle ops
   result <- ensureGpgReady h "/tmp/overlay-repo"
   void $ assertRight "warm cache ready" result
-  prompts <- readIORef promptRef
-  assertEq "no ready prompt when warm" 0 prompts
+  warms <- readIORef warmRef
+  assertEq "no warm key when warm" 0 warms
   teardownGpgHandle h
 
-testColdCacheReadyThenWarm :: IO ()
-testColdCacheReadyThenWarm = do
-  promptRef <- newIORef (0 :: Int)
+testColdCacheUnlocksOnce :: IO ()
+testColdCacheUnlocksOnce = do
   warmRef <- newIORef (0 :: Int)
   pauseRef <- newIORef (0 :: Int)
   resumeRef <- newIORef (0 :: Int)
   let ops =
         baseFakeOps
           { gaoKeyinfoCached = \_ _ -> pure (Right False),
-            gaoReadyPrompt = do
-              atomicModifyIORef' promptRef (\n -> (n + 1, ()))
-              pure (Right ()),
             gaoWarmKey = \_ _ _ -> do
               atomicModifyIORef' warmRef (\n -> (n + 1, ()))
               pure (Right ()),
@@ -582,12 +576,10 @@ testColdCacheReadyThenWarm = do
           }
   h <- newGpgHandle ops
   result <- ensureGpgReady h "/tmp/overlay-repo"
-  void $ assertRight "cold ready" result
-  prompts <- readIORef promptRef
+  void $ assertRight "cold unlock" result
   warms <- readIORef warmRef
   pauses <- readIORef pauseRef
   resumes <- readIORef resumeRef
-  assertEq "ready once" 1 prompts
   assertEq "warm once" 1 warms
   assertEq "ui paused" 1 pauses
   assertEq "ui resumed" 1 resumes
@@ -681,30 +673,11 @@ testKeyinfoFailPropagates = do
   assertEq "keyinfo error" "KEYINFO failed" err
   teardownGpgHandle h
 
-testColdReadyPromptFails :: IO ()
-testColdReadyPromptFails = do
-  warmRef <- newIORef (0 :: Int)
-  let ops =
-        baseFakeOps
-          { gaoKeyinfoCached = \_ _ -> pure (Right False),
-            gaoReadyPrompt = pure (Left "prompt aborted"),
-            gaoWarmKey = \_ _ _ -> do
-              atomicModifyIORef' warmRef (\n -> (n + 1, ()))
-              pure (Right ())
-          }
-  h <- newGpgHandle ops
-  err <- assertLeft "prompt fail" =<< ensureGpgReady h "/tmp/overlay-repo"
-  assertEq "prompt error" "prompt aborted" err
-  warms <- readIORef warmRef
-  assertEq "no warm after prompt fail" 0 warms
-  teardownGpgHandle h
-
 testColdWarmKeyFails :: IO ()
 testColdWarmKeyFails = do
   let ops =
         baseFakeOps
           { gaoKeyinfoCached = \_ _ -> pure (Right False),
-            gaoReadyPrompt = pure (Right ()),
             gaoWarmKey = \_ _ _ -> pure (Left "clearsign failed")
           }
   h <- newGpgHandle ops
@@ -821,13 +794,14 @@ testGpgMkCommandRunnerSuccess =
     assertTrue "session kill recorded" (any ("--kill" `isInfixOf`) kills)
     assertTrue "kill names the session home" (any (home `isInfixOf`) kills)
 
-    promptRef <- newIORef (0 :: Int)
+    warmRef <- newIORef (0 :: Int)
     killRef2 <- newIORef ([] :: [String])
     let warmRun req = case execCmd req of
           Just ("git", "-C" : _ : "config" : _) -> pure (okResult "KEY1\n")
           Just ("gpg", args)
             | "--list-secret-keys" `elem` args -> pure (okResult signKeyColonOut)
-            | "--local-user" `elem` args ->
+            | "--local-user" `elem` args -> do
+                atomicModifyIORef' warmRef (\n -> (n + 1, ()))
                 pure (okResult "-----BEGIN PGP SIGNED MESSAGE-----\n")
             | otherwise -> pure (failResult ("unexpected gpg: " <> show args))
           Just ("gpg-connect-agent", args) ->
@@ -844,18 +818,15 @@ testGpgMkCommandRunnerSuccess =
           _ -> pure (failResult ("unexpected warm: " <> show (prMode req)))
         opsWarm =
           (mkGpgAgentOps warmRun (pure ()) (pure ()))
-            { gaoControllingTty = pure (Just "/dev/pts/7"),
-              gaoReadyPrompt = do
-                atomicModifyIORef' promptRef (\n -> (n + 1, ()))
-                pure (Right ())
+            { gaoControllingTty = pure (Just "/dev/pts/7")
             }
     h2 <- newGpgHandle opsWarm
     armGpgSession h2 home noopSupervisor
     void $ assertRight "mk cold warm" =<< ensureGpgReady h2 tmp
     teardownGpgHandle h2
-    prompts <- readIORef promptRef
+    warms <- readIORef warmRef
     kills2 <- readIORef killRef2
-    assertEq "cold session prompts" 1 prompts
+    assertEq "cold session warms" 1 warms
     assertTrue "cold path kills the session" (not (null kills2))
 
 testGpgMkCommandRunnerFailures :: IO ()
@@ -993,6 +964,7 @@ testSessionHomeSigns =
     assertTrue "default-cache-ttl" ("default-cache-ttl 28800" `isInfixOf` conf)
     assertTrue "max-cache-ttl" ("max-cache-ttl 28800" `isInfixOf` conf)
     assertTrue "pinentry-tty" ("pinentry-program /usr/bin/pinentry-tty" `isInfixOf` conf)
+    assertTrue "pinentry-timeout" ("pinentry-timeout 2147483647" `isInfixOf` conf)
     commonThere <- doesFileExist (sess </> "common.conf")
     when commonThere $ do
       common <- readFile (sess </> "common.conf")
@@ -1048,13 +1020,9 @@ testDistinctKeygrips =
   withSystemTempDirectory "mndz-gpg-grips-" $ \tmp -> do
     let once = do
           warms <- newIORef (0 :: Int)
-          prompts <- newIORef (0 :: Int)
           let ops =
                 baseFakeOps
                   { gaoKeyinfoCached = \_ _ -> pure (Right False),
-                    gaoReadyPrompt = do
-                      atomicModifyIORef' prompts (\n -> (n + 1, ()))
-                      pure (Right ()),
                     gaoWarmKey = \_ _ _ -> do
                       atomicModifyIORef' warms (\n -> (n + 1, ()))
                       pure (Right ()),
@@ -1069,20 +1037,14 @@ testDistinctKeygrips =
                 (tmp </> "run-same")
                 [tmp </> "overlay", tmp </> "assets"]
           w <- readIORef warms
-          p <- readIORef prompts
           teardownGpgHandle h
-          pure (w, p)
-    (w1, p1) <- once
+          pure w
+    w1 <- once
     assertEq "one warm when grips match" 1 w1
-    assertEq "one prompt when grips match" 1 p1
     warms2 <- newIORef (0 :: Int)
-    prompts2 <- newIORef (0 :: Int)
     let ops2 =
           baseFakeOps
             { gaoKeyinfoCached = \_ _ -> pure (Right False),
-              gaoReadyPrompt = do
-                atomicModifyIORef' prompts2 (\n -> (n + 1, ()))
-                pure (Right ()),
               gaoWarmKey = \_ _ _ -> do
                 atomicModifyIORef' warms2 (\n -> (n + 1, ()))
                 pure (Right ()),
@@ -1102,10 +1064,8 @@ testDistinctKeygrips =
       assertRight "two grips"
         =<< prepareSigningSession h2 (tmp </> "run2") [tmp </> "overlay", tmp </> "assets"]
     w2 <- readIORef warms2
-    p2 <- readIORef prompts2
     teardownGpgHandle h2
     assertEq "two warms when grips differ" 2 w2
-    assertEq "two prompts when grips differ" 2 p2
 
 testSupervisorSignalKills :: IO ()
 testSupervisorSignalKills =
@@ -1145,7 +1105,6 @@ testSupervisorStartFailure =
     let ops =
           baseFakeOps
             { gaoStartSupervisor = \_ -> pure (Left "supervisor unavailable"),
-              gaoReadyPrompt = pure (Right ()),
               gaoWarmKey = \_ _ _ -> do
                 atomicModifyIORef' warms (\n -> (n + 1, ()))
                 pure (Right ()),

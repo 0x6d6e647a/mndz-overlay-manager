@@ -259,7 +259,6 @@ fakeGpgOps =
     { gaoGetSigningKey = \_ -> pure (Right "TESTKEY"),
       gaoResolveKeygrip = \_ -> pure (Right (Keygrip "GRIP")),
       gaoKeyinfoCached = \_ _ -> pure (Right True),
-      gaoReadyPrompt = pure (Right ()),
       gaoWarmKey = \_ _ _ -> pure (Right ()),
       gaoControllingTty = pure Nothing,
       gaoPauseUi = pure (),
