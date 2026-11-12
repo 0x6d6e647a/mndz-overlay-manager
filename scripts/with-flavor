@@ -12,6 +12,8 @@
 #
 # Stack provenance, one --ghc-options value for every component of dev and
 # coverage-dev: -finfo-table-map -fdistinct-constructor-tables.
+# Every flavor also passes -DMNDZ_FLAVOR_<NAME> (DEV, RELEASE, COVERAGE_DEV,
+# COVERAGE_RELEASE); Build.Info records it as the build flavor.
 # Does not pass --ignore-project, so cabal.project and cabal.project.local apply.
 #
 # After a successful dev or release command, *.hie files are copied to
@@ -64,6 +66,8 @@ case "${flavor}" in
 esac
 
 build_root="${ROOT}/dist/${flavor}"
+# Build identity for run metrics: Build.Info maps this define to the flavor name.
+flavor_define="-DMNDZ_FLAVOR_$(printf '%s' "${flavor}" | tr 'a-z-' 'A-Z_')"
 cmd=(cabal "--builddir=dist/${flavor}")
 case "${flavor}" in
   dev | coverage-dev)
@@ -74,6 +78,7 @@ case "${flavor}" in
     )
     ;;
 esac
+cmd+=(--ghc-options="${flavor_define}")
 case "${flavor}" in
   coverage-dev | coverage-release)
     cmd+=(--enable-coverage)

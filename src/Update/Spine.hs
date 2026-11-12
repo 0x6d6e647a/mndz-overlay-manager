@@ -8,25 +8,25 @@ module Update.Spine
   )
 where
 
+import CLI.Jobs (newPackSlot, packSlotWithMetrics)
 import CLI.Progress
   ( MultiHandle (..),
-    ProgressConfig,
+    ProgressConfig (..),
     StepHandle (..),
     noopMultiHandle,
     withStepProgress,
   )
-import Control.Concurrent (newQSem)
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
 import Control.Monad (unless, void)
+import Data.Aeson (Value (..))
 import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Text (Text)
-import Network.HTTP.Client (newManager)
-import Network.HTTP.Client.TLS (tlsManagerSettings)
+import Metrics.Core (Metrics (..), setCount)
 import Overlay.Types (Ebuild)
 import Overlay.Version (renderPV)
 import System.Exit (ExitCode (..))
@@ -57,6 +57,7 @@ import Update.CheckCache
   ( CheckCacheHandle,
     cacheSummaryLine,
     flushCheckCache,
+    recordCacheCounters,
   )
 import Update.Deps.Plan (DepsPlanOps, toGoPlanOps)
 import Update.DiskSpace
@@ -70,7 +71,7 @@ import Update.Git (GitOps (..))
 import Update.GitHub (GitHubLatch, gitHubAbortLog, parseGitHubOrigin, peekGitHubLatch)
 import Update.Go.Vendor (mkVendorOps)
 import Update.Hardcoded (lookupPolicy)
-import Update.Http (httpLbsEither)
+import Update.Http (httpLbsEither, newMetricsManager)
 import Update.Materialize
   ( EnsureOutcome (..),
     NeededFloors (..),
@@ -121,7 +122,7 @@ import Update.SshAgent
     prepareSshIdentity,
     teardownSshSession,
   )
-import Update.TempWorkspace (RunRoot (..), openRunRoot)
+import Update.TempWorkspace (RunRoot (..), openRunRootWith)
 import Update.Types
   ( ApplyOutcome (..),
     Fetcher,
@@ -134,6 +135,8 @@ import Update.Uv.Deps (mkUvDepsOps)
 -- | Injectable dependencies for the update spine (tests override probes/ops).
 data UpdateSpineDeps = UpdateSpineDeps
   { usdJobs :: Int,
+    -- | Invocation run id (temp run root, metrics directory, container labels).
+    usdRunId :: String,
     usdProgress :: ProgressConfig,
     usdFetcher :: Fetcher,
     usdDepsPlanOps :: DepsPlanOps,
@@ -170,7 +173,7 @@ data UpdateSpineDeps = UpdateSpineDeps
     -- | Best-effort leftover materialize-session sweep (no-op in tests).
     usdSweepMaterialize :: IO (),
     -- | Inner @docker@ CLI for per-unit sessions. @Nothing@ keeps placeholder
-    -- ops (tests). Production is @Just productionCommandRunner@.
+    -- ops (tests). Production is the GNU time decorated production runner.
     usdMaterializeDockerRunner :: Maybe CommandRunner,
     usdGitHubLatch :: GitHubLatch,
     -- | Git Operations Statuspage check before assets @git push@ (no-op when unused).
@@ -262,6 +265,7 @@ runUpdatePhases deps entries allEbuilds selected = do
       distDir = usdDistDir deps
       byPkg = groupByPackage allEbuilds
   -- PLAN
+  mEnterPhase (pcMetrics pcfg) "plan"
   planResults <-
     planPackages
       pcfg
@@ -272,6 +276,10 @@ runUpdatePhases deps entries allEbuilds selected = do
       withNewTreeLock
       selected
       byPkg
+  setCount
+    (pcMetrics pcfg)
+    "packages.needs_work"
+    (length [() | PlanNeedsWork {} <- planResults])
   mPlanAbort <- peekGitHubLatch (usdGitHubLatch deps)
   case mPlanAbort of
     Just err -> pure (Left (gitHubAbortLog err))
@@ -307,6 +315,11 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
           )
           withheldKeys
       needDeps = needDepsAdmitted || withheldNeedsAssets
+      enterPhase = mEnterPhase (pcMetrics pcfg)
+      recordImageCounter = \case
+        EnsureBuilt -> mSetCounter (pcMetrics pcfg) "image" (String "built")
+        EnsureSkipped -> mSetCounter (pcMetrics pcfg) "image" (String "reused")
+  enterPhase "preflight"
   eDirty <-
     runDirtyPreflight
       pcfg
@@ -338,6 +351,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                   planResultKey r `elem` withheldKeys
                 ]
           -- CLASSIFY admitted and withheld hypo-planned consumers (t0 floors)
+          enterPhase "classify"
           classifyResults <-
             classifyNeedsWorkPackages
               releaseOps
@@ -351,11 +365,12 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
           gitMvUnits <- buildGitMvUnitPlans overlayRoot distDir admittedAfter
           let units = unitPlansFromClassifyResults classifyResults gitMvUnits
               t0FullKeys = fullPathKeysFromClassify classifyResults
+          enterPhase "disk-gate"
           diskGate <-
             withStepProgress pcfg 1 $ \step -> do
               shStep step "Checking free disk space"
               tempRoot <- resolveTempRoot
-              mPortage <- lookupPortageDistDir
+              mPortage <- lookupPortageDistDir (pcMetrics pcfg)
               runDiskSpaceGate
                 (usdDiskProbe deps)
                 jobs
@@ -366,6 +381,8 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
           case diskGate of
             Left err -> pure (Left err)
             Right (DiskGateOk warns) -> do
+              enterPhase "mutate"
+              mSetCounter (pcMetrics pcfg) "image" (String "not-needed")
               t0EnsureOutcome <- newIORef (Nothing :: Maybe (Either Text ()))
               ePrefloors <-
                 withNewTreeLock $ \tree -> do
@@ -454,7 +471,9 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   mhStatus mh k ensuringMaterializeImageStatus
                                 usdEnsureImage deps treeLock floors >>= \case
                                   Left err -> recordEnsure (Left err)
-                                  Right _ -> recordEnsure (Right ())
+                                  Right out -> do
+                                    recordImageCounter out
+                                    recordEnsure (Right ())
                       diskAfterClassify classifyR planned' = do
                         gitMvU <-
                           buildGitMvUnitPlans overlayRoot distDir planned'
@@ -464,7 +483,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                           then pure (Right planned')
                           else do
                             tempRoot <- resolveTempRoot
-                            mPortage <- lookupPortageDistDir
+                            mPortage <- lookupPortageDistDir (pcMetrics pcfg)
                             disk <-
                               runDiskSpaceGate
                                 (usdDiskProbe deps)
@@ -537,7 +556,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                       runMutate = do
                         assetsLock <- newMVar ()
                         overlayLock <- newMVar ()
-                        tempRun <- openRunRoot
+                        tempRun <- openRunRootWith (usdRunId deps)
                         eSign <-
                           if maySign
                             then
@@ -568,10 +587,10 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                             Just inner
                               | null t0FullKeys -> pure Nothing
                               | otherwise -> do
-                                  cfg <- resolveMaterializeDockerCfg (rrRunId tempRun)
+                                  cfg <- resolveMaterializeDockerCfg (rrRunId tempRun) (mTimeDir (pcMetrics pcfg))
                                   pure (Just (cfg, inner))
-                        httpMgr <- newManager tlsManagerSettings
-                        compressSlot <- newQSem 1
+                        httpMgr <- newMetricsManager (pcMetrics pcfg)
+                        compressSlot <- packSlotWithMetrics (pcMetrics pcfg) <$> newPackSlot
                         let closedRun _ =
                               pure
                                 ProcessResult
@@ -666,6 +685,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                           void (recordEnsure (Left err))
                                           pure (Left err)
                                         Right out -> do
+                                          recordImageCounter out
                                           void (recordEnsure (Right ()))
                                           pure (Right out)
                                 case eEns of
@@ -740,6 +760,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                               else runMutate
                           usdPruneMaterialize deps
                           flushCheckCache cache
+                          recordCacheCounters (pcMetrics pcfg) cache
                           mSummary <- cacheSummaryLine cache
                           pure $
                             Right

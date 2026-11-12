@@ -28,6 +28,9 @@ module CLI.Progress
     -- Pure frame draw plan (for tests)
     DrawPlan (..),
     planDraw,
+    -- Metrics spans derived from progress handles
+    instrumentMultiHandle,
+    instrumentStepHandle,
   )
 where
 
@@ -36,8 +39,9 @@ import Colog (LogAction, Message)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, cancel, race, waitCatch, withAsync)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, tryPutMVar, tryTakeMVar, withMVar)
-import Control.Exception (finally)
+import Control.Exception (finally, onException)
 import Control.Monad (unless, void, when)
+import Data.Aeson ((.=))
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sortOn)
@@ -58,6 +62,13 @@ import Layoutz
     withColor,
   )
 import Logging.Bootstrap (LogHold, beginLogHold, flushLogHold)
+import Metrics.Core
+  ( Metrics (..),
+    Outcome (..),
+    SpanId,
+    noopMetrics,
+    withSpan,
+  )
 import System.IO (Handle, hFlush, hIsTerminalDevice, hPutStr, stderr)
 import Update.Types (PackageKey, packageKeyText)
 
@@ -69,7 +80,11 @@ data ProgressConfig = ProgressConfig
     pcLogger :: LogAction IO Message,
     pcHandle :: Handle,
     -- | Active panel pause controller (set while a multi/step panel is running).
-    pcPanelCtrl :: IORef (Maybe PanelController)
+    pcPanelCtrl :: IORef (Maybe PanelController),
+    -- | Run metrics recorder ('noopMetrics' unless this run records).
+    pcMetrics :: Metrics,
+    -- | Open @prompt@ span while the panel is paused for a prompt.
+    pcPromptSpan :: IORef (Maybe SpanId)
   }
 
 -- | Pause/resume an active activity panel so interactive prompts can own the TTY.
@@ -92,7 +107,9 @@ data MultiHandle = MultiHandle
     mhSuccess :: PackageKey -> IO (),
     -- | Soft-skip terminal: retain row with skip/warning chrome (not hard-fail).
     mhSkip :: PackageKey -> Text -> IO (),
-    mhFail :: PackageKey -> Text -> IO ()
+    mhFail :: PackageKey -> Text -> IO (),
+    -- | Recorder for spans opened by work under this handle.
+    mhMetrics :: Metrics
   }
 
 -- | Handle for sequential step bars.
@@ -110,7 +127,8 @@ noopMultiHandle =
       mhStep = \_ _ -> pure (),
       mhSuccess = \_ -> pure (),
       mhSkip = \_ _ -> pure (),
-      mhFail = \_ _ -> pure ()
+      mhFail = \_ _ -> pure (),
+      mhMetrics = noopMetrics
     }
 
 noopStepHandle :: StepHandle
@@ -130,6 +148,7 @@ mkProgressConfig ::
   IO ProgressConfig
 mkProgressConfig enabled color hold logger = do
   panelCtrl <- newIORef Nothing
+  promptSpan <- newIORef Nothing
   pure
     ProgressConfig
       { pcEnabled = enabled,
@@ -137,12 +156,24 @@ mkProgressConfig enabled color hold logger = do
         pcLogHold = hold,
         pcLogger = logger,
         pcHandle = stderr,
-        pcPanelCtrl = panelCtrl
+        pcPanelCtrl = panelCtrl,
+        pcMetrics = noopMetrics,
+        pcPromptSpan = promptSpan
       }
 
 -- | Clear and pause the active activity panel (if any).
+--
+-- Opens an interactive @prompt@ span that 'resumeActivePanel' closes.
 pauseActivePanel :: ProgressConfig -> IO ()
 pauseActivePanel cfg = do
+  let m = pcMetrics cfg
+  when (mEnabled m) $ do
+    open <- readIORef (pcPromptSpan cfg)
+    case open of
+      Just _ -> pure ()
+      Nothing -> do
+        sid <- mSpanStart m "prompt" ["interactive" .= True]
+        writeIORef (pcPromptSpan cfg) (Just sid)
   mCtrl <- readIORef (pcPanelCtrl cfg)
   for_ mCtrl panelPause
 
@@ -151,6 +182,8 @@ resumeActivePanel :: ProgressConfig -> IO ()
 resumeActivePanel cfg = do
   mCtrl <- readIORef (pcPanelCtrl cfg)
   for_ mCtrl panelResume
+  open <- atomicModifyIORef' (pcPromptSpan cfg) (Nothing,)
+  for_ open $ \sid -> mSpanEnd (pcMetrics cfg) sid OutcomeOk []
 
 ------------------------------------------------------------------------
 -- Injectable panel IO (test seam)
@@ -240,7 +273,18 @@ withMultiProgressIO ::
   Int ->
   (MultiHandle -> IO a) ->
   IO a
-withMultiProgressIO pio cfg label total action
+withMultiProgressIO pio cfg label total action0 =
+  withMultiProgressRaw pio cfg label total $ \mh ->
+    instrumentMultiHandle (pcMetrics cfg) label mh action0
+
+withMultiProgressRaw ::
+  PanelIO ->
+  ProgressConfig ->
+  Text ->
+  Int ->
+  (MultiHandle -> IO a) ->
+  IO a
+withMultiProgressRaw pio cfg label total action
   | not (pcEnabled cfg) || total <= 0 = action noopMultiHandle
   | otherwise = do
       beginLogHold (pcLogHold cfg)
@@ -371,7 +415,8 @@ multiHandle stateRef =
         atomicModifyIORef' stateRef $ \s ->
           ( s {msJobs = Map.insert key (JobFailed reason) (msJobs s)},
             ()
-          )
+          ),
+      mhMetrics = noopMetrics
     }
 
 multiPanelLoop ::
@@ -523,7 +568,17 @@ withStepProgressIO ::
   Int ->
   (StepHandle -> IO a) ->
   IO a
-withStepProgressIO pio cfg total action
+withStepProgressIO pio cfg total action0 =
+  withStepProgressRaw pio cfg total $ \sh ->
+    instrumentStepHandle (pcMetrics cfg) sh action0
+
+withStepProgressRaw ::
+  PanelIO ->
+  ProgressConfig ->
+  Int ->
+  (StepHandle -> IO a) ->
+  IO a
+withStepProgressRaw pio cfg total action
   | not (pcEnabled cfg) || total <= 0 = action noopStepHandle
   | otherwise = do
       beginLogHold (pcLogHold cfg)
@@ -689,3 +744,105 @@ clearLines h n = when (n > 0) $ do
   hPutStr h (moveUp <> clear)
   hPutStr h ("\ESC[" <> show n <> "A\r")
   hFlush h
+
+------------------------------------------------------------------------
+-- Metrics spans derived from progress (design D3)
+------------------------------------------------------------------------
+
+-- | Open package span and its current step span.
+data PackageSpans = PackageSpans
+  { psPackage :: SpanId,
+    psStep :: Maybe SpanId
+  }
+
+-- | Wrap a multi handle so every visible package transition is a span.
+--
+-- @start@ opens a @package@ span; @step@, @status@, and @wait@ close the
+-- previous @step@ span and open the next; @success@, @skip@, and @fail@
+-- close the open step and the package span with that outcome. Spans still
+-- open when @action@ ends are closed (@fail@ when it threw).
+instrumentMultiHandle ::
+  Metrics ->
+  Text ->
+  MultiHandle ->
+  (MultiHandle -> IO a) ->
+  IO a
+instrumentMultiHandle m label inner action
+  | not (mEnabled m) = action inner {mhMetrics = m}
+  | otherwise = do
+      spansRef <- newIORef (Map.empty :: Map PackageKey PackageSpans)
+      let pkgAttrs key = ["package" .= packageKeyText key]
+          closeStep outcome ps =
+            for_ (psStep ps) $ \sid -> mSpanEnd m sid outcome []
+          finish key outcome attrs = do
+            mPs <- atomicModifyIORef' spansRef $ \mp ->
+              (Map.delete key mp, Map.lookup key mp)
+            for_ mPs $ \ps -> do
+              closeStep outcome ps
+              mSpanEnd m (psPackage ps) outcome attrs
+          nextStep key name extra = do
+            mPs <- Map.lookup key <$> readIORef spansRef
+            for_ mPs $ \ps -> do
+              closeStep OutcomeOk ps
+              sid <- mSpanStart m "step" (pkgAttrs key <> ["step" .= name] <> extra)
+              atomicModifyIORef' spansRef $ \mp ->
+                (Map.adjust (\p -> p {psStep = Just sid}) key mp, ())
+          closeAll outcome = do
+            open <- atomicModifyIORef' spansRef (Map.empty,)
+            for_ open $ \ps -> do
+              closeStep outcome ps
+              mSpanEnd m (psPackage ps) outcome []
+          handle =
+            inner
+              { mhStart = \key -> do
+                  mhStart inner key
+                  finish key OutcomeOk []
+                  sid <- mSpanStart m "package" (pkgAttrs key <> ["panel" .= label])
+                  atomicModifyIORef' spansRef $ \mp ->
+                    (Map.insert key (PackageSpans sid Nothing) mp, ()),
+                mhWait = \key reason -> do
+                  mhWait inner key reason
+                  nextStep key reason ["wait" .= True],
+                mhStatus = \key name -> do
+                  mhStatus inner key name
+                  nextStep key name [],
+                mhStep = \key name -> do
+                  mhStep inner key name
+                  nextStep key name [],
+                mhSuccess = \key -> do
+                  mhSuccess inner key
+                  finish key OutcomeOk [],
+                mhSkip = \key reason -> do
+                  mhSkip inner key reason
+                  finish key OutcomeSkip ["reason" .= reason],
+                mhFail = \key reason -> do
+                  mhFail inner key reason
+                  finish key OutcomeFail ["reason" .= reason],
+                mhMetrics = m
+              }
+      r <- action handle `onException` closeAll OutcomeFail
+      closeAll OutcomeOk
+      pure r
+
+-- | Wrap a step bar: one @steps@ span for the bar and one @step@ child span
+-- per 'shStep'.
+instrumentStepHandle :: Metrics -> StepHandle -> (StepHandle -> IO a) -> IO a
+instrumentStepHandle m inner action
+  | not (mEnabled m) = action inner
+  | otherwise = do
+      current <- newIORef Nothing
+      let closeCurrent outcome = do
+            open <- atomicModifyIORef' current (Nothing,)
+            for_ open $ \sid -> mSpanEnd m sid outcome []
+          handle =
+            StepHandle
+              { shStep = \desc -> do
+                  shStep inner desc
+                  closeCurrent OutcomeOk
+                  sid <- mSpanStart m "step" ["step" .= desc]
+                  writeIORef current (Just sid)
+              }
+      withSpan m "steps" [] $ do
+        r <- action handle `onException` closeCurrent OutcomeFail
+        closeCurrent OutcomeOk
+        pure r

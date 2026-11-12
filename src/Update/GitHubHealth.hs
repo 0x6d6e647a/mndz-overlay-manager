@@ -19,8 +19,8 @@ import Data.Foldable (toList)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Network.HTTP.Client (method, newManager, parseRequest, responseBody, responseStatus)
-import Network.HTTP.Client.TLS (tlsManagerSettings)
+import Metrics.Core (Metrics)
+import Network.HTTP.Client (method, parseRequest, responseBody, responseStatus)
 import Network.HTTP.Types.Status (statusCode)
 import Update.GitHub
   ( GitHubLatch,
@@ -30,10 +30,10 @@ import Update.GitHub
     githubGetJson,
     peekGitHubLatch,
   )
-import Update.Http (HttpLbs, httpLbsEither)
+import Update.Http (HttpLbs, httpLbsEither, newMetricsManager)
 
-productionGitHubHealthHttp :: IO HttpLbs
-productionGitHubHealthHttp = httpLbsEither <$> newManager tlsManagerSettings
+productionGitHubHealthHttp :: Metrics -> IO HttpLbs
+productionGitHubHealthHttp m = httpLbsEither <$> newMetricsManager m
 
 interpretHealthOutcome :: GitHubHealthOutcome -> Either Text [Text]
 interpretHealthOutcome = \case

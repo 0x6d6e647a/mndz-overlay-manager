@@ -15,8 +15,8 @@ module Update.Pdm.Deps
   )
 where
 
+import CLI.Jobs (PackSlot)
 import Control.Applicative ((<|>))
-import Control.Concurrent (QSem)
 import Control.Exception (IOException, try)
 import Data.Aeson (Value, eitherDecodeStrict, withObject, (.:), (.:?))
 import Data.Aeson.Key qualified as Key
@@ -71,6 +71,7 @@ import Update.Pdm.Pack
   )
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -105,7 +106,7 @@ data PdmDepsProgress = PdmDepsProgress
 -- | @threads@ is the xz thread count @N@ for the deps pack (@xzOptValue@:
 -- block size when @N > 1@).
 -- @slot@ is the update's shared compress lock.
-mkPdmDepsOps :: Int -> QSem -> CommandRunner -> PdmDepsOps
+mkPdmDepsOps :: Int -> PackSlot -> CommandRunner -> PdmDepsOps
 mkPdmDepsOps threads slot run =
   PdmDepsOps
     { pdoClone = gitCloneTag run,
@@ -117,7 +118,7 @@ mkPdmDepsOps threads slot run =
     }
 
 -- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
-productionPdmDepsOps :: QSem -> PdmDepsOps
+productionPdmDepsOps :: PackSlot -> PdmDepsOps
 productionPdmDepsOps slot = mkPdmDepsOps 1 slot productionCommandRunner
 
 -- | Clone the raw tag, dry-run the dev set, and pack @dists/@.
@@ -616,7 +617,8 @@ pdmChecked run cwd args
             { prMode = ExecCmd "pdm" (map T.unpack args),
               prCwd = Just cwd,
               prEnv = Nothing,
-              prStdin = ""
+              prStdin = "",
+              prMeasure = Timed
             }
       let out = T.pack (prStdout res)
           err = T.pack (prStderr res)
@@ -655,7 +657,8 @@ gitCloneTag run url tag dest = do
             ],
         prCwd = Nothing,
         prEnv = Nothing,
-        prStdin = ""
+        prStdin = "",
+        prMeasure = Timed
       }
 
 downloadFile :: CommandRunner -> Text -> FilePath -> IO (Either Text ())
@@ -667,7 +670,8 @@ downloadFile run url dest =
       { prMode = ExecCmd "wget" ["-O", dest, T.unpack url],
         prCwd = Nothing,
         prEnv = Nothing,
-        prStdin = ""
+        prStdin = "",
+        prMeasure = Timed
       }
 
 unpackArchive :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
@@ -679,10 +683,11 @@ unpackArchive run archive dest =
       { prMode = ExecCmd "tar" ["-xzf", archive, "-C", dest],
         prCwd = Nothing,
         prEnv = Nothing,
-        prStdin = ""
+        prStdin = "",
+        prMeasure = Timed
       }
 
-packStage :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+packStage :: Int -> PackSlot -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
 packStage threads slot run stageDir =
   packTarXz run slot threads "tar pack failed" Nothing (Just stageDir) ["dists"]
 

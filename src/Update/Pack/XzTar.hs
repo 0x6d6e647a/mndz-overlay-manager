@@ -6,7 +6,7 @@
 -- and @--block-size=64MiB@ when @N@ is greater than 1), forces xz compression
 -- with @-J@ (so a temporary basename cannot disable @tar -a@ auto-compress),
 -- records numeric root owners and a clamped epoch mtime, and verifies the
--- final file begins with the xz stream magic. Callers that share a @QSem@
+-- final file begins with the xz stream magic. Callers that share a @PackSlot@
 -- run at most one of these @tar@ invocations at a time.
 module Update.Pack.XzTar
   ( xzOptValue,
@@ -20,15 +20,16 @@ module Update.Pack.XzTar
   )
 where
 
-import Control.Concurrent (QSem, signalQSem, waitQSem)
-import Control.Exception (bracket_)
+import CLI.Jobs (PackSlot, packSlotMetrics, withPackSlot)
 import Control.Monad (when)
 import Data.ByteString qualified as BS
 import Data.Text (Text)
 import Data.Text qualified as T
+import Metrics.Core (Metrics (..))
 import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
+    getFileSize,
     removeFile,
     renameFile,
   )
@@ -38,6 +39,7 @@ import System.FilePath (takeDirectory)
 import System.IO (IOMode (ReadMode), withBinaryFile)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -113,11 +115,11 @@ verifyXzFile path = do
 --
 -- @cwd@ is the process working directory; @changeDir@ is an optional @tar -C@
 -- directory (applied before create). @errPrefix@ prefixes failure messages.
--- @slot@ is the update's capacity-1 compress lock. @bracket_@ inside
+-- @slot@ is the update's capacity-1 compress lock. 'withPackSlot' inside
 -- 'runTarXz' releases it on success and on every failure.
 packTarXz ::
   CommandRunner ->
-  QSem ->
+  PackSlot ->
   Int ->
   Text ->
   Maybe FilePath ->
@@ -130,14 +132,17 @@ packTarXz run slot threads errPrefix cwd changeDir entries finalPath = do
   r <- runTarXz run slot threads errPrefix cwd changeDir entries finalPath
   case r of
     Left err -> pure (Left err)
-    Right () -> mapLeft errPrefix <$> verifyXzFile finalPath
+    Right () -> do
+      verified <- mapLeft errPrefix <$> verifyXzFile finalPath
+      recordPacked slot verified finalPath
+      pure verified
 
 -- | Like 'packTarXz', but writes to @finalPath <> \".partial\"@ then renames.
 -- Temp stays in the same directory as the final path. Explicit @-J@ keeps
 -- compression on even when the temp basename does not end in @.xz@.
 packTarXzAtomic ::
   CommandRunner ->
-  QSem ->
+  PackSlot ->
   Int ->
   Text ->
   Maybe FilePath ->
@@ -159,7 +164,9 @@ packTarXzAtomic run slot threads errPrefix cwd changeDir entries finalPath = do
       finalExists <- doesFileExist finalPath
       when finalExists (removeFile finalPath)
       renameFile tmpPath finalPath
-      mapLeft errPrefix <$> verifyXzFile finalPath
+      verified <- mapLeft errPrefix <$> verifyXzFile finalPath
+      recordPacked slot verified finalPath
+      pure verified
   where
     tryRemove p = do
       e <- doesFileExist p
@@ -167,7 +174,7 @@ packTarXzAtomic run slot threads errPrefix cwd changeDir entries finalPath = do
 
 runTarXz ::
   CommandRunner ->
-  QSem ->
+  PackSlot ->
   Int ->
   Text ->
   Maybe FilePath ->
@@ -184,15 +191,15 @@ runTarXz run slot threads errPrefix cwd changeDir entries archivePath = do
       -- Force xz with -J so auto-compress suffix cannot skip compression.
       tarArgs = hermeticTarArgs ++ cArgs ++ ["-cJf", archivePath] ++ entries
   res <-
-    bracket_
-      (waitQSem slot)
-      (signalQSem slot)
+    withPackSlot
+      slot
       ( run
           ProcessRequest
             { prMode = ExecCmd "tar" tarArgs,
               prCwd = cwd,
               prEnv = Just env',
-              prStdin = ""
+              prStdin = "",
+              prMeasure = Timed
             }
       )
   pure $
@@ -204,6 +211,14 @@ runTarXz run slot threads errPrefix cwd changeDir entries archivePath = do
               <> ": tar archive: "
               <> T.strip (T.pack (prStderr res))
           )
+
+-- | Add a verified archive's size to the @assets.packed_bytes@ counter.
+recordPacked :: PackSlot -> Either Text () -> FilePath -> IO ()
+recordPacked slot verified path = case verified of
+  Left _ -> pure ()
+  Right () -> do
+    size <- getFileSize path
+    mBump (packSlotMetrics slot) "assets.packed_bytes" size
 
 mapLeft :: Text -> Either Text a -> Either Text a
 mapLeft prefix e = case e of

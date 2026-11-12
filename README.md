@@ -18,8 +18,9 @@ The documented build and run commands use [just](https://just.systems/) **1.55 o
 | `gencache` | `git`, `egencache`, `gpg` |
 | `update` of packages that **need work** and use **full-path** DepsAndAssets materialize (new vendor/deps/crates tarballs) | `docker` on `PATH` and a usable product Gentoo materialize image (host CPU architecture). The image provides `go`, `node`/`npm`, overlay `node-gyp` (`dev-build/node-gyp::mndz`), `bun`, `sbcl`, overlay `qlot` (`dev-lisp/qlot::mndz`), `cargo`, `pycargoebuild`, Python, uv, pdm, and Rust, plus `tar`, `xz`, `git`, and fetchers. Full-path Pdm packing runs in that image, which provides Python and pdm. Host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` / `xz` are **not** required for that path. |
 | `update` that only **reuses** existing GitHub release assets | no Docker and no host language toolchains (download + verify stay on the host) |
+| `outdated`, `update`, `gencache`, `eclean` (unless `--no-metrics`) | GNU time at `/usr/bin/time` (`sys-process/time`) for [run metrics](#run-metrics) |
 
-`list` and `outdated` only need a readable overlay and a valid config; they do not require Portage, GPG, or Docker. Help (`--help`) does not load configuration and needs no overlay.
+`list` and `outdated` only need a readable overlay and a valid config (plus GNU `/usr/bin/time` for `outdated` unless `--no-metrics`); they do not require Portage, GPG, or Docker. Help (`--help`) does not load configuration and needs no overlay.
 
 GPG-signed overlay/assets commits, SSH `git push`, the GitHub token, `ebuild` / `egencache`, and overlay/assets worktrees stay on the **host**. The materialize container does not receive `GITHUB_TOKEN`, `GNUPGHOME`, or `SSH_AUTH_SOCK`.
 
@@ -36,7 +37,9 @@ Bun inside the image comes from overlay `dev-lang/bun-bin::mndz` (overlay bind-m
 
 Image Portage DISTDIR (`/var/cache/distfiles`), PKGDIR (`/var/cache/binpkgs`), and binhost fetch caches (`/var/cache/binhost`) live in Docker BuildKit, not as XDG binpkg trees under that overlay-manager cache path (except `image.json` and the last generated Dockerfile). A successful default-tag `docker build` runs Gentoo `eclean-pkg --deep` and `eclean-dist --deep` after toolchain install so those caches keep the exact installed versions. `docker builder prune` wipes them; ensure does not run it. Cache sizes appear in the ensure build log. Moving a warm cache to another machine means copying `image.json` together with the docker image, not copying a host directory of binpkgs.
 
-Override with `MNDZ_MATERIALIZE_IMAGE` to an **existing** tag: the CLI inspects/satisfies that tag only and does not `docker build` or `docker rmi` it. The image must match the **host CPU architecture** (no qemu/foreign-arch materialize).
+Override with `MNDZ_MATERIALIZE_IMAGE` to an **existing** tag: the CLI inspects/satisfies that tag only and does not `docker build` or `docker rmi` it. The image must match the **host CPU architecture** (no qemu/foreign-arch materialize). While run metrics record, the image must also provide GNU time at `/usr/bin/time`; a full-path unit whose image lacks it hard-fails with an error naming the image and `--no-metrics`.
+
+The generated image installs `sys-process/time` so run metrics can measure commands inside the container. Images built before that change are rebuilt once on the next full-path `update`.
 
 While a **full-path** unit is running, `update` keeps one named Docker container for that unit (`mndz-mat-<run-id>-<category>-<package>-<pv>`, slashes replaced so the name is Docker-legal). `docker ps`, `docker stats`, and `docker exec` can target it **while the unit runs**. The container is removed when that unit ends (`--rm` / `docker rm`). Do not drop `--rm` or keep failed containers for debugging; a hard-fail retains the host unit `work/` directory (see temp workspace below) as the investigation artifact.
 
@@ -132,6 +135,7 @@ Global options apply **before** the subcommand (for example `mndz-overlay-manage
 | `--log-level LEVEL` | Set log level (`error` \| `warn` \| `info` \| `debug`); overrides `-v` when set |
 | `--no-progress` | Disable interactive activity indicators (useful for CI or plain logs) |
 | `--no-color` | Disable ANSI colors in logs and indicators (also honors non-empty `NO_COLOR`) |
+| `--no-metrics` | Do not record [run metrics](#run-metrics) for this invocation (logs a warning; also skips the GNU time requirement) |
 
 ### `list`
 
@@ -303,6 +307,29 @@ just run eclean
 # Clean an explicit manager cache path
 just run --distfiles-path /path/to/private-distfiles eclean
 ```
+
+## Run metrics
+
+`outdated`, `update`, `gencache`, and `eclean` record each run by default, so you can see where a run spent its time and compare runs across builds. `list` and `github-token` never record.
+
+Each run writes one directory:
+
+- `$XDG_STATE_HOME/mndz/overlay-manager/metrics/<run-id>-<command>/` when `XDG_STATE_HOME` is set and non-empty
+- otherwise `~/.local/state/mndz/overlay-manager/metrics/<run-id>-<command>/`
+
+The run id is the same one used for the temp workspace run root and the materialize container names. The directory holds `run.jsonl`: one JSON object per line, starting with a `run_start` header (build identity, host, invocation) and ending with a `run_end` footer (outcome, resource use, counters such as check-cache hits). Between them are timed spans for phases, package steps, subprocesses, HTTP requests, and slot waits, plus machine `sample` lines every 5 seconds. Subprocesses are measured with GNU time. Command arguments are recorded with the GitHub token and other known secrets replaced by `<redacted>`; environment variables are never recorded. A `time/` subdirectory holds per-process GNU time files only while they are being read (a file that cannot be parsed is kept there).
+
+Runs are kept; the manager never prunes the metrics directory. Delete old run directories by hand when you no longer need them.
+
+**GNU time is required.** Before loading configuration, a recording command checks that `/usr/bin/time` is GNU time and that the metrics directory can be created. If either fails, it exits with status 1 and the error names `/usr/bin/time` (or the directory) and `--no-metrics`. Install `sys-process/time`, or opt out:
+
+```bash
+just run --no-metrics outdated
+```
+
+`--no-metrics` logs a warning that metrics are disabled and changes nothing else about the run. On `list` and `github-token` it is accepted with a warning that it has no effect. There is no config key for metrics.
+
+If writing metrics fails partway through a run (for example, a full disk), the manager logs one warning, stops recording, and the command continues with the same result.
 
 ## Development
 

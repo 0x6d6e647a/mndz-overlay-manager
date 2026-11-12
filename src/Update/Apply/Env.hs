@@ -9,11 +9,13 @@ module Update.Apply.Env
   )
 where
 
+import CLI.Jobs (PackSlot)
 import CLI.Progress (MultiHandle)
-import Control.Concurrent (QSem)
 import Control.Concurrent.MVar (MVar)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Metrics.Core (Metrics)
+import Metrics.Process (timedRunner)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import Update.Assets.Release (ReleaseOps)
@@ -36,6 +38,7 @@ import Update.OverlayTree (TreeLock)
 import Update.Pdm.Deps (PdmDepsOps)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -62,7 +65,8 @@ mkEbuildRunner distDir run pkgDir ebuildFileName = do
         { prMode = ShellCmd cmd,
           prCwd = Just pkgDir,
           prEnv = Just (ebuildManifestEnv distDir env0),
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
@@ -70,8 +74,8 @@ mkEbuildRunner distDir run pkgDir ebuildFileName = do
       else Left (enrichEbuildManifestError distDir (T.pack (prStderr res)))
 
 -- | Production ebuild runner for the given effective manager distfiles path.
-productionEbuildRunner :: FilePath -> EbuildRunner
-productionEbuildRunner distDir = mkEbuildRunner distDir productionCommandRunner
+productionEbuildRunner :: Metrics -> FilePath -> EbuildRunner
+productionEbuildRunner m distDir = mkEbuildRunner distDir (timedRunner m productionCommandRunner)
 
 data ApplyEnv = ApplyEnv
   { aeFetcher :: Fetcher,
@@ -99,7 +103,7 @@ data ApplyEnv = ApplyEnv
     aeTreeLock :: TreeLock,
     aeJobs :: Int,
     -- | Capacity-1 lock shared by this update's DepsAndAssets tar/xz packs.
-    aePackSlot :: QSem,
+    aePackSlot :: PackSlot,
     aeMulti :: MultiHandle,
     aePlanOps :: PlanOps,
     aeDepsPlanOps :: DepsPlanOps,

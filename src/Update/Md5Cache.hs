@@ -57,6 +57,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8)
 import Data.Text.IO qualified as TIO
+import Metrics.Core (Metrics)
+import Metrics.Process (timedRunner)
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Version (parseEbuildVersion)
 import System.Directory
@@ -78,6 +80,7 @@ import Update.OverlayTree
   )
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -363,7 +366,8 @@ discoverGentooLocationWith run = do
         { prMode = ExecCmd "portageq" ["get_repo_path", "/", "gentoo"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   let fromPq =
         if prExitCode res == ExitSuccess
@@ -436,15 +440,16 @@ mkEgencacheRunner run req = do
             { prMode = ExecCmd "egencache" args,
               prCwd = Nothing,
               prEnv = Nothing,
-              prStdin = ""
+              prStdin = "",
+              prMeasure = Timed
             }
       pure $
         if prExitCode res == ExitSuccess
           then Right ()
           else Left ("egencache failed: " <> T.pack (prStderr res))
 
-productionEgencacheRunner :: EgencacheRunner
-productionEgencacheRunner = mkEgencacheRunner productionCommandRunner
+productionEgencacheRunner :: Metrics -> EgencacheRunner
+productionEgencacheRunner m = mkEgencacheRunner (timedRunner m productionCommandRunner)
 
 -- | Run package-scoped egencache and return pathspecs for git (before∪after).
 runPackageEgencache ::

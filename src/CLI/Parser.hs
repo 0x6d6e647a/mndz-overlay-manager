@@ -65,6 +65,8 @@ data Options = Options
     optJobs :: Maybe Int,
     optNoProgress :: Bool,
     optNoColor :: Bool,
+    -- | Turn off run metrics recording for this invocation.
+    optNoMetrics :: Bool,
     -- | 'Nothing' when no subcommand was given (bare / globals-only).
     optCommand :: Maybe Command
   }
@@ -141,6 +143,16 @@ noColorParser =
   switch
     ( long "no-color"
         <> help "Disable ANSI colors in logs and indicators"
+    )
+
+noMetricsParser :: Parser Bool
+noMetricsParser =
+  switch
+    ( long "no-metrics"
+        <> help
+          "Turn off run metrics recording for this invocation (outdated, \
+          \update, gencache, and eclean otherwise record a run and require \
+          \GNU /usr/bin/time)"
     )
 
 configParser :: Parser (Maybe FilePath)
@@ -409,6 +421,7 @@ optionsParser = do
   optJobs <- jobsParser
   optNoProgress <- noProgressParser
   optNoColor <- noColorParser
+  optNoMetrics <- noMetricsParser
   optCommand <- commandParser
   pure Options {..}
 

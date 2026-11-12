@@ -26,23 +26,21 @@ import Data.Maybe (catMaybes, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
+import Metrics.Core (Metrics)
 import Network.HTTP.Client
-  ( Manager,
-    RequestBody (RequestBodyLBS),
+  ( RequestBody (RequestBodyLBS),
     method,
-    newManager,
     parseRequest,
     requestBody,
     requestHeaders,
     responseBody,
     responseStatus,
   )
-import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders, statusCode)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, takeFileName)
 import Update.GitHub (GitHubLatch, latchedHttp)
-import Update.Http (HttpLbs, httpLbsEither)
+import Update.Http (HttpLbs, httpLbsEither, newMetricsManager)
 
 data ReleaseMeta = ReleaseMeta
   { rmOwner :: Text,
@@ -82,9 +80,9 @@ data ReleaseOps = ReleaseOps
   }
 
 -- | Production ops using the same Bearer token headers as create-release.
-productionReleaseOpsWithLatch :: GitHubLatch -> Text -> IO ReleaseOps
-productionReleaseOpsWithLatch latch token = do
-  mgr <- newManager tlsManagerSettings
+productionReleaseOpsWithLatch :: Metrics -> GitHubLatch -> Text -> IO ReleaseOps
+productionReleaseOpsWithLatch m latch token = do
+  mgr <- newMetricsManager m
   pure (releaseOpsHttp (latchedHttp latch (httpLbsEither mgr)) token)
 
 releaseOpsHttp :: HttpLbs -> Text -> ReleaseOps

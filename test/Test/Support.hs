@@ -12,12 +12,7 @@ module Test.Support
   )
 where
 
-import CLI.Jobs
-  ( mapConcurrentlyN,
-    newWorkBudget,
-    withWorkSlot,
-    workBudgetCapacity,
-  )
+import CLI.Jobs (mapConcurrentlyN, newPackSlot, newWorkBudget, withWorkSlot, workBudgetCapacity)
 import CLI.Parser (ColorMode (..), resolveVerbosity)
 import CLI.Parser qualified as V
 import CLI.Progress
@@ -43,7 +38,7 @@ import Colog (LogAction (..), Message, Msg (..))
 import Colog qualified as C
 import Config.Loader (ConfigError (..), loadConfig)
 import Config.Types (CheckCacheTtl (..), OverlayConfig (..))
-import Control.Concurrent (newQSem, threadDelay)
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
 import Control.Exception (SomeException, throwIO, try)
@@ -261,7 +256,7 @@ import Update.SshAgent
     ensureSshAgent,
   )
 import Update.Targets (TargetError (..), resolveTargetToken, resolveTargets)
-import Update.TempWorkspace (openRunRoot)
+import Update.TempWorkspace (newRunId, openRunRootWith)
 import Update.Types
   ( ApplyOutcome (..),
     EcosystemSpec (..),
@@ -305,7 +300,7 @@ mkTestApplyEnv ::
 mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLock overlayLock = do
   treeLock <- newTreeLock
   depsBase <- productionDepsPlanOps (Just "tok") 1 Nothing
-  tempRun <- openRunRoot
+  tempRun <- newRunId >>= openRunRootWith
   let depsOps =
         depsBase
           { dpoPortageq = poPortageq planOps,
@@ -315,7 +310,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
             dpoGoCeilingsCache = poCeilingsCache planOps
           }
   (cache, _) <- openCheckCache CacheDisabled False "/tmp"
-  compressSlot <- newQSem 1
+  compressSlot <- newPackSlot
   pure
     ApplyEnv
       { aeFetcher = \_ -> pure (Left "unused"),

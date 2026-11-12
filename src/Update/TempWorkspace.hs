@@ -11,8 +11,10 @@ module Update.TempWorkspace
     formatRunId,
     runRootPath,
     unitDirPath,
-    openRunRoot,
+    newRunId,
+    openRunRootWith,
     openRunRootAt,
+    openRunRootAtWith,
     ensureUnit,
     deleteUnit,
     cleanupRunSuccess,
@@ -100,20 +102,29 @@ unitDirPath runPath category package pv kind =
     </> T.unpack package
     </> (T.unpack pv <> "-" <> unitKindSuffix kind)
 
--- | Open a new run root under the effective temp root.
-openRunRoot :: IO RunRoot
-openRunRoot = do
-  tempRoot <- resolveTempRoot
-  openRunRootAt tempRoot
-
--- | Open a new run root under an explicit temp root (tests / injection).
-openRunRootAt :: FilePath -> IO RunRoot
-openRunRootAt tempRoot = do
+-- | Fresh run id for one command invocation ('formatRunId' of now, our pid,
+-- and random hex). Work commands create it once and share it with run
+-- metrics and materialize container labels.
+newRunId :: IO String
+newRunId = do
   zt <- getZonedTime
   pid <- getProcessID
-  rand <- randomHex 4
-  let runId = formatRunId zt pid rand
-      path = runRootPath tempRoot runId
+  formatRunId zt pid <$> randomHex 4
+
+-- | Open the run root for @runId@ under the effective temp root.
+openRunRootWith :: String -> IO RunRoot
+openRunRootWith runId = do
+  tempRoot <- resolveTempRoot
+  openRunRootAtWith tempRoot runId
+
+-- | Open a run root with a fresh run id under an explicit temp root (tests).
+openRunRootAt :: FilePath -> IO RunRoot
+openRunRootAt tempRoot = newRunId >>= openRunRootAtWith tempRoot
+
+-- | Open the run root for @runId@ under an explicit temp root.
+openRunRootAtWith :: FilePath -> String -> IO RunRoot
+openRunRootAtWith tempRoot runId = do
+  let path = runRootPath tempRoot runId
   createDirectoryIfMissing True path
   pure
     RunRoot

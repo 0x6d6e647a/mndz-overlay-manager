@@ -224,7 +224,7 @@ planPackages pcfg fetch depsOps cache jobs observe selected byPkg =
               peSelectedKeys = map peKey selected,
               peObserveTree = observe
             }
-     in mapConcurrentlyN jobs (planPackageTracked env byPkg) selected
+     in mapConcurrentlyN (mhMetrics mh) jobs (planPackageTracked env byPkg) selected
 
 planPackageTracked ::
   PlanEnv ->

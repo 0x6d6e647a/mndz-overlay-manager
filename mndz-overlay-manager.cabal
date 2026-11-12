@@ -65,13 +65,23 @@ library
     -- Public surface for the executable and test-suite (inventory-driven).
     -- Not a third-party API: expand only when app/ or test/ need a new import.
     exposed-modules:
-        CLI.Jobs
+        Build.Info
+      , CLI.Jobs
       , CLI.Parser
       , CLI.Progress
       , Config.Loader
       , Config.TokenEnvelope
       , Config.Types
       , Logging.Bootstrap
+      , Metrics.Container
+      , Metrics.Core
+      , Metrics.Http
+      , Metrics.Process
+      , Metrics.Recorder
+      , Metrics.Run
+      , Metrics.Sampler
+      , Metrics.Startup
+      , Metrics.Writer
       , Overlay.Discovery
       , Overlay.Types
       , Overlay.Validation
@@ -135,7 +145,9 @@ library
 
     -- Implementation details not imported by app/ or test/.
     other-modules:
-        Update.Adequacy
+        Build.GitRev
+      , Paths_mndz_overlay_manager
+      , Update.Adequacy
       , Update.AtomClosure
       , Update.Apply.Commit
       , Update.Apply.Env
@@ -154,6 +166,10 @@ library
       , Update.Materialize.Recipe
       , Update.Materialize.Resolve
       , Update.Materialize.Sidecar
+
+    -- Cabal-generated version module (Build.Info reads the package version).
+    autogen-modules:
+        Paths_mndz_overlay_manager
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -178,6 +194,7 @@ library
         memory ^>=0.18,
         optparse-applicative ^>=0.19,
         process ^>=1.6,
+        template-haskell ^>=2.22,
         temporary ^>=1.3,
         text ^>=2.1,
         time ^>=1.12,
@@ -186,6 +203,9 @@ library
 
     -- Directories containing source files.
     hs-source-dirs:   src
+
+    -- getrusage(2) and page-size shim for run metrics (Metrics.Recorder, Metrics.Sampler).
+    c-sources:        cbits/rusage.c
 
     -- Base language which the package is written in.
     default-language: GHC2024
@@ -205,10 +225,11 @@ executable mndz-overlay-manager
 
     -- Concurrent package jobs + nested Go probes need the threaded RTS;
     -- without -threaded, blocking HTTP freezes all green threads (one package at a time).
+    -- -T enables GHC.Stats for run metrics footers.
     ghc-options:
         -threaded
         -rtsopts
-        -with-rtsopts=-N
+        "-with-rtsopts=-N -T"
 
     -- Other library packages from which modules are imported.
     build-depends:
@@ -256,6 +277,7 @@ test-suite mndz-overlay-manager-test
         Test.Lanes
         Test.Materialize
         Test.Md5Cache
+        Test.Metrics
         Test.Overlay
         Test.OverlayTree
         Test.OverlayWaves

@@ -58,6 +58,7 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
+import Metrics.Core (noopMetrics)
 import Network.HTTP.Client (path)
 import Overlay.Discovery
   ( DiscoveryError (..),
@@ -785,7 +786,8 @@ testGitMvCommitsOnSuccess =
             { mdcImage = defaultMaterializeImage,
               mdcUser = "1000:1000",
               mdcRunId = "test-run",
-              mdcCliPid = "1"
+              mdcCliPid = "1",
+              mdcTimeDir = Nothing
             }
         env =
           env0
@@ -1792,7 +1794,8 @@ testFullPathApplyProgressSequence =
               mhStep = \_ name -> logEv ("step:" <> name),
               mhSuccess = \_ -> pure (),
               mhSkip = \_ _ -> pure (),
-              mhFail = \_ _ -> pure ()
+              mhFail = \_ _ -> pure (),
+              mhMetrics = noopMetrics
             }
         gitOps =
           GitOps
@@ -1963,7 +1966,8 @@ testReusePathApplyProgressSequence =
               mhStep = \_ name -> logEv ("step:" <> name),
               mhSuccess = \_ -> pure (),
               mhSkip = \_ _ -> pure (),
-              mhFail = \_ _ -> pure ()
+              mhFail = \_ _ -> pure (),
+              mhMetrics = noopMetrics
             }
         gitOps =
           GitOps
@@ -2042,7 +2046,8 @@ testReusePathApplyProgressSequence =
             { mdcImage = defaultMaterializeImage,
               mdcUser = "1000:1000",
               mdcRunId = "test-run",
-              mdcCliPid = "1"
+              mdcCliPid = "1",
+              mdcTimeDir = Nothing
             }
         env =
           env0

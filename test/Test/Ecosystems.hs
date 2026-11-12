@@ -4,7 +4,7 @@
 -- builders via injectable Ops — no live registry or GitHub network.
 module Test.Ecosystems (unitTests, integrationTests) where
 
-import Control.Concurrent (QSem, newQSem)
+import CLI.Jobs (PackSlot, newPackSlot)
 import Control.Concurrent.Async (async, cancel, wait)
 import Control.Concurrent.MVar
   ( newEmptyMVar,
@@ -22,6 +22,8 @@ import Data.List (intercalate, isInfixOf, isPrefixOf)
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Metrics.Container (productionCgroupRoots)
+import Metrics.Core (noopMetrics)
 import System.Directory
   ( Permissions (executable, readable, searchable, writable),
     copyFile,
@@ -120,7 +122,8 @@ import Update.Pack.XzTar
     xzOptValue,
   )
 import Update.Process
-  ( ProcessMode (..),
+  ( Measure (..),
+    ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
     productionCommandRunner,
@@ -1715,7 +1718,7 @@ testGenerateLockFailureSkipsPack =
 testGenerateLockfileCommand :: IO ()
 testGenerateLockfileCommand =
   withSystemTempDirectory "mndz-genlock-cmd-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let lockRoot = tmp </> "src"
         run req = case execCmd req of
           Just ("git", "clone" : args) -> do
@@ -1835,7 +1838,7 @@ testCargoBuilderPackFail = withSystemTempDirectory "mndz-eco-tmp-" $ \tmp -> do
 testPackCratesTarballFixture :: IO ()
 testPackCratesTarballFixture =
   withSystemTempDirectory "mndz-cargo-pack-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let unit = tmp </> "unit"
         work = unit </> "work"
         lockRoot = work </> "src"
@@ -1858,7 +1861,8 @@ testPackCratesTarballFixture =
                 ["-czf", cratePath, "-C", tmp, "serde-1.0.200"],
             prCwd = Nothing,
             prEnv = Nothing,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
     TIO.writeFile
       (lockRoot </> "Cargo.lock")
@@ -1886,7 +1890,8 @@ testPackCratesTarballFixture =
           { prMode = ExecCmd "tar" ["-tf", outPath],
             prCwd = Nothing,
             prEnv = Nothing,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
     assertEq "tar list exit" ExitSuccess (prExitCode res)
     let listing = T.pack (prStdout res)
@@ -1909,7 +1914,8 @@ testPackCratesTarballFixture =
                 ],
             prCwd = Nothing,
             prEnv = Nothing,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
     checksumBody <-
       prStdout
@@ -1924,7 +1930,8 @@ testPackCratesTarballFixture =
                   ],
               prCwd = Nothing,
               prEnv = Nothing,
-              prStdin = ""
+              prStdin = "",
+              prMeasure = Timed
             }
     assertTrue "package field from lock" ("abc123" `T.isInfixOf` T.pack checksumBody)
     logExists <- doesFileExist (unit </> "crate-staging.log")
@@ -1933,7 +1940,7 @@ testPackCratesTarballFixture =
 testPackCratesTarballMissingCrate :: IO ()
 testPackCratesTarballMissingCrate =
   withSystemTempDirectory "mndz-cargo-pack-miss-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let unit = tmp </> "unit"
         work = unit </> "work"
         lockRoot = work </> "src"
@@ -1969,7 +1976,7 @@ testPackCratesTarballMissingCrate =
 testPackCratesTarballXzArgv :: IO ()
 testPackCratesTarballXzArgv =
   withSystemTempDirectory "mndz-cargo-pack-argv-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let lockRoot = tmp </> "src"
         distDir = tmp </> "distdir"
         stageDir = tmp </> "stage"
@@ -2031,7 +2038,7 @@ testPackCratesTarballXzArgv =
 testCargoStagingProgress :: IO ()
 testCargoStagingProgress =
   withSystemTempDirectory "mndz-cargo-stage-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let lockRoot = tmp </> "src"
         distDir = tmp </> "distdir"
         stageDir = tmp </> "stage"
@@ -2053,7 +2060,8 @@ testCargoStagingProgress =
                 ["-czf", cratePath, "-C", tmp, "serde-1.0.200"],
             prCwd = Nothing,
             prEnv = Nothing,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
     TIO.writeFile
       (lockRoot </> "Cargo.lock")
@@ -2140,7 +2148,8 @@ writeRealCrate scratch distDir name ver = do
               ["-czf", distDir </> (dirName ++ ".crate"), "-C", scratch, dirName],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
 
 touchCrate :: FilePath -> T.Text -> T.Text -> IO ()
@@ -2174,7 +2183,7 @@ splitNul = filter (not . null) . go
 testCrateStagingMissingListed :: IO ()
 testCrateStagingMissingListed =
   withSystemTempDirectory "mndz-crate-miss-list-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     dirs <- newPackDirs tmp "stage"
     reqs <- newIORef ([] :: [ProcessRequest])
     writeRegistryLock
@@ -2213,7 +2222,7 @@ testCrateStagingMissingListed =
 testCrateStagingOneInvocation :: IO ()
 testCrateStagingOneInvocation =
   withSystemTempDirectory "mndz-crate-one-exec-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     dirs <- newPackDirs tmp "stage"
     events <- newIORef ([] :: [T.Text])
     reqs <- newIORef ([] :: [ProcessRequest])
@@ -2265,7 +2274,7 @@ testCrateStagingOneInvocation =
 testCrateStagingReportsEveryFailure :: IO ()
 testCrateStagingReportsEveryFailure =
   withSystemTempDirectory "mndz-crate-fail-all-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     dirs <- newPackDirs tmp "stage"
     writeRegistryLock
       (cpdLock dirs)
@@ -2311,7 +2320,7 @@ testCrateStagingReportsEveryFailure =
 testCrateStagingNoDirectory :: IO ()
 testCrateStagingNoDirectory =
   withSystemTempDirectory "mndz-crate-nodir-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     dirs <- newPackDirs tmp "stage"
     writeRegistryLock (cpdLock dirs) [("b", "2.0.0", "bb")]
     touchCrate (cpdDist dirs) "b" "2.0.0"
@@ -2343,7 +2352,7 @@ testCrateStagingNoDirectory =
 testCrateStagingInvocationFailure :: IO ()
 testCrateStagingInvocationFailure =
   withSystemTempDirectory "mndz-crate-invoke-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     dirs <- newPackDirs tmp "stage"
     writeRegistryLock (cpdLock dirs) [("a", "1.0.0", "aa")]
     touchCrate (cpdDist dirs) "a" "1.0.0"
@@ -2377,7 +2386,7 @@ testCrateStagingInvocationFailure =
 testCrateStagingArchiveOrder :: IO ()
 testCrateStagingArchiveOrder =
   withSystemTempDirectory "mndz-crate-order-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let names = [("a", "1.0.0", "aa"), ("b", "2.0.0", "bb"), ("c", "3.0.0", "cc")]
     base <- newPackDirs tmp "unused"
     writeRegistryLock (cpdLock base) names
@@ -2419,7 +2428,8 @@ testCrateStagingArchiveOrder =
                     { prMode = ExecCmd "tar" ["-xzf", path, "-C", gentoo],
                       prCwd = Nothing,
                       prEnv = Nothing,
-                      prStdin = ""
+                      prStdin = "",
+                      prMeasure = Timed
                     }
         pure (okResult "")
       _ -> pure (failResult "xargs argv missing directories")
@@ -2428,7 +2438,7 @@ testCrateStagingArchiveOrder =
 testCrateStagingFailureLog :: IO ()
 testCrateStagingFailureLog =
   withSystemTempDirectory "mndz-crate-log-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     dirs <- newPackDirs tmp "stage"
     writeRegistryLock
       (cpdLock dirs)
@@ -2488,7 +2498,7 @@ testCrateStagingFailureLog =
 testCrateStagingUnwritableLog :: IO ()
 testCrateStagingUnwritableLog =
   withSystemTempDirectory "mndz-crate-nolog-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     dirs <- newPackDirs tmp "stage"
     writeRegistryLock (cpdLock dirs) [("a", "1.0.0", "aa")]
     touchCrate (cpdDist dirs) "a" "1.0.0"
@@ -2538,7 +2548,7 @@ testCrateStagingUnwritableLog =
 testCrateStagingProgressNone :: IO ()
 testCrateStagingProgressNone =
   withSystemTempDirectory "mndz-crate-nostage-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     dirs <- newPackDirs tmp "stage"
     events <- newIORef ([] :: [T.Text])
     TIO.writeFile (cpdLock dirs </> "Cargo.lock") "version = 4\n"
@@ -2577,7 +2587,7 @@ testVerifyXzFile =
 testPackTarXzAtomicTempSuffix :: IO ()
 testPackTarXzAtomicTempSuffix =
   withSystemTempDirectory "mndz-xz-atomic-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let stage = tmp </> "stage"
         outPath = tmp </> "out.tar.xz"
         entryDir = stage </> "cargo_home"
@@ -2619,7 +2629,7 @@ testXzOptValue = do
 testPackTarXzHermetic :: IO ()
 testPackTarXzHermetic =
   withSystemTempDirectory "mndz-xz-hermetic-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let src = tmp </> "src"
         outPath = tmp </> "out.tar.xz"
     createDirectoryIfMissing True src
@@ -2655,7 +2665,8 @@ testPackTarXzHermetic =
           { prMode = ExecCmd "tar" ["--numeric-owner", "-tvf", outPath],
             prCwd = Nothing,
             prEnv = Nothing,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
     assertEq "tar -t exit" ExitSuccess (prExitCode listed)
     assertTrue "members are 0/0" ("0/0" `isInfixOf` prStdout listed)
@@ -2663,7 +2674,7 @@ testPackTarXzHermetic =
 testPackTarXzTwoThreads :: IO ()
 testPackTarXzTwoThreads =
   withSystemTempDirectory "mndz-xz-block-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let src = tmp </> "src"
         outPath = tmp </> "out.tar.xz"
     createDirectoryIfMissing True src
@@ -2706,7 +2717,7 @@ testPackTarXzFourThreads =
     assertXzOptFor src (tmp </> "clamped.tar.xz") 0 "-T1 -9e"
   where
     assertXzOptFor src outPath threads expected = do
-      slot <- newQSem 1
+      slot <- newPackSlot
       reqsRef <- newIORef ([] :: [ProcessRequest])
       let run req = do
             atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
@@ -2737,7 +2748,7 @@ testPackTarXzFourThreads =
 testPackTarXzOneAtATime :: IO ()
 testPackTarXzOneAtATime =
   withSystemTempDirectory "mndz-xz-serial-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let src = tmp </> "src"
         out1 = tmp </> "a.tar.xz"
         out2 = tmp </> "b.tar.xz"
@@ -2814,7 +2825,7 @@ testPackTarXzFailureReleasesSlot =
     thrownThenNext src (tmp </> "boom.tar.xz") (tmp </> "after-boom.tar.xz")
   where
     nonZeroThenNext src bad good = do
-      slot <- newQSem 1
+      slot <- newPackSlot
       nRef <- newIORef (0 :: Int)
       let run req = case prMode req of
             ExecCmd "tar" args -> do
@@ -2834,7 +2845,7 @@ testPackTarXzFailureReleasesSlot =
       assertRight "next pack"
         =<< finishWithin "pack after tar failure" (pack good)
     thrownThenNext src bad good = do
-      slot <- newQSem 1
+      slot <- newPackSlot
       nRef <- newIORef (0 :: Int)
       let run req = case prMode req of
             ExecCmd "tar" args -> do
@@ -2859,7 +2870,7 @@ testPackTarXzFailureReleasesSlot =
 testNpmPackOmitsLogs :: IO ()
 testNpmPackOmitsLogs =
   withSystemTempDirectory "mndz-npm-omit-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let cache = tmp </> "npm-cache"
         logs = cache </> "_logs"
         outPath = tmp </> "deps.tar.xz"
@@ -2876,7 +2887,8 @@ testNpmPackOmitsLogs =
           { prMode = ExecCmd "tar" ["-tf", outPath],
             prCwd = Nothing,
             prEnv = Nothing,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
     assertEq "tar -t exit" ExitSuccess (prExitCode listed)
     let members = prStdout listed
@@ -3109,7 +3121,8 @@ sampleDockerCfg =
     { mdcImage = defaultMaterializeImage,
       mdcUser = "1000:1000",
       mdcRunId = "20260810T154207-0700-4242.a8f3",
-      mdcCliPid = "4242"
+      mdcCliPid = "4242",
+      mdcTimeDir = Nothing
     }
 
 sampleUnitRef :: MaterializeUnitRef
@@ -3144,7 +3157,8 @@ goVersionReq =
             ("GOMODCACHE", "/tmp/mndz/overlay-manager/run1/work/go-mod"),
             ("XZ_OPT", "-T1 -9e")
           ],
-      prStdin = ""
+      prStdin = "",
+      prMeasure = Timed
     }
 
 dockerArgv :: ProcessRequest -> Maybe [String]
@@ -3224,8 +3238,8 @@ testDockerCreateArgs =
 testDockerExecGoVersion :: IO ()
 testDockerExecGoVersion = do
   let name = materializeSessionName sampleDockerCfg sampleUnitRef
-      args = materializeExecArgs sampleDockerCfg name goVersionReq
-      wrapped = wrapMaterializeExecRequest sampleDockerCfg name goVersionReq
+      args = materializeExecArgs sampleDockerCfg name Nothing goVersionReq
+      wrapped = wrapMaterializeExecRequest sampleDockerCfg name Nothing goVersionReq
   assertTrue "exec not run" ("exec" `elem` args)
   assertTrue "no docker run" ("run" `notElem` args)
   assertTrue "--user host uid" (["--user", "1000:1000"] `isInfixOf` args)
@@ -3241,7 +3255,7 @@ testDockerExecGoVersion = do
   assertTrue "keeps XZ_OPT" (any ("XZ_OPT=" `isInfixOf`) args)
   assertTrue "no -i when stdin empty" ("-i" `notElem` args)
   let withStdin = goVersionReq {prStdin = "payload"}
-      iArgs = materializeExecArgs sampleDockerCfg name withStdin
+      iArgs = materializeExecArgs sampleDockerCfg name Nothing withStdin
   assertTrue "-i when stdin non-empty" ("-i" `elem` iArgs)
   assertEq "cwd consumed" Nothing (prCwd wrapped)
   assertEq "env not on host docker" Nothing (prEnv wrapped)
@@ -3286,7 +3300,7 @@ testDockerSessionBracket =
     let run = scriptedDocker reqsRef sessionOkHandler
         dirs = sampleUnitDirs tmp
     result <-
-      withUnitMaterializeSession run sampleDockerCfg sampleUnitRef dirs $ \runner -> do
+      withUnitMaterializeSession noopMetrics productionCgroupRoots run sampleDockerCfg sampleUnitRef dirs $ \runner -> do
         res <- runner goVersionReq
         assertEq "exec ok" ExitSuccess (prExitCode res)
         pure (Right (prStdout res))
@@ -3306,7 +3320,7 @@ testDockerSessionBracket =
     let run2 = scriptedDocker reqs2 sessionOkHandler
     threw <-
       try @SomeException $
-        withUnitMaterializeSession run2 sampleDockerCfg sampleUnitRef dirs $ \_ ->
+        withUnitMaterializeSession noopMetrics productionCgroupRoots run2 sampleDockerCfg sampleUnitRef dirs $ \_ ->
           throwIO (userError "boom")
     case threw of
       Left _ -> pure ()
@@ -3329,6 +3343,8 @@ testDockerSessionCreateFail =
     err <-
       assertLeft "create fail"
         =<< withUnitMaterializeSession
+          noopMetrics
+          productionCgroupRoots
           run
           sampleDockerCfg
           sampleUnitRef
@@ -3371,6 +3387,8 @@ testDockerSessionDeadExec =
     err <-
       assertLeft "dead exec"
         =<< withUnitMaterializeSession
+          noopMetrics
+          productionCgroupRoots
           run
           sampleDockerCfg
           sampleUnitRef
@@ -3412,11 +3430,11 @@ testDockerSequentialSessions =
               udOut = tmp </> "u2" </> "out"
             }
     r1 <-
-      withUnitMaterializeSession run sampleDockerCfg unit1 dirs1 $ \runner -> do
+      withUnitMaterializeSession noopMetrics productionCgroupRoots run sampleDockerCfg unit1 dirs1 $ \runner -> do
         _ <- runner goVersionReq
         pure (Right ())
     r2 <-
-      withUnitMaterializeSession run sampleDockerCfg unit2 dirs2 $ \runner -> do
+      withUnitMaterializeSession noopMetrics productionCgroupRoots run sampleDockerCfg unit2 dirs2 $ \runner -> do
         _ <- runner goVersionReq
         pure (Right ())
     _ <- assertRight "pv1" r1
@@ -3547,7 +3565,7 @@ writeFakeXz path = BS.writeFile path xzMagicPrefix
 testNpmMkCommandRunner :: IO ()
 testNpmMkCommandRunner =
   withSystemTempDirectory "mndz-npm-mk-" $ \outDir -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     reqsRef <- newIORef ([] :: [ProcessRequest])
     let successRun req = do
           atomicModifyIORef' reqsRef (\rs -> (req : rs, ()))
@@ -3618,7 +3636,7 @@ testNpmMkCommandRunner =
 testBunMkCommandRunner :: IO ()
 testBunMkCommandRunner =
   withSystemTempDirectory "mndz-bun-mk-" $ \outDir -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let successRun req = case execCmd req of
           Just ("bun", ["--version"]) -> pure (okResult "1.2.3\n")
           Just ("git", "clone" : args) -> do
@@ -3670,7 +3688,7 @@ testBunMkCommandRunner =
 testVendorMkCommandRunner :: IO ()
 testVendorMkCommandRunner =
   withSystemTempDirectory "mndz-vendor-mk-" $ \outDir -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let goMod =
           T.unlines
             [ "module example.com/pkg",
@@ -3742,7 +3760,7 @@ pycargoFailureSummary =
             prStderr = err
           }
     invoke unit code out err = do
-      slot <- newQSem 1
+      slot <- newPackSlot
       let work = unit </> "work"
           distDir = work </> "distdir"
           logPath = unit </> "pycargoebuild.log"
@@ -3859,7 +3877,7 @@ pycargoFailureSummary =
       exists <- doesFileExist logPath
       assertTrue "success writes no log" (not exists)
     unwritableLog tmp = do
-      slot <- newQSem 1
+      slot <- newPackSlot
       let unit = tmp </> "unwritable"
           logPath = unit </> "pycargoebuild.log"
           work = unit </> "work"
@@ -3901,7 +3919,7 @@ pycargoFailureSummary =
 testCargoMkCommandRunner :: IO ()
 testCargoMkCommandRunner =
   withSystemTempDirectory "mndz-cargo-mk-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let outDir = tmp </> "out"
         -- Shared scratch so scripted git clone can drop a crate into a known
         -- distdir is awkward; instead pack path is exercised by real tar via
@@ -4366,7 +4384,8 @@ buildTestCrate tmp dirName mCrateName withLock = do
         { prMode = ExecCmd "tar" ["-czf", cratePath, "-C", workRoot, dirName],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure cratePath
 
@@ -4431,7 +4450,7 @@ testFetchUnpackCrateEdges =
 testCargoCratesIoFixtureLockPack :: IO ()
 testCargoCratesIoFixtureLockPack =
   withSystemTempDirectory "mndz-cargo-pack-io-" $ \tmp -> do
-    slot <- newQSem 1
+    slot <- newPackSlot
     let lockRoot = tmp </> "crate"
         distDir = tmp </> "distdir"
         stageDir = tmp </> "stage"
@@ -4458,7 +4477,8 @@ testCargoCratesIoFixtureLockPack =
                     ["-czf", distDir </> (dirName ++ ".crate"), "-C", tmp, dirName],
                 prCwd = Nothing,
                 prEnv = Nothing,
-                prStdin = ""
+                prStdin = "",
+                prMeasure = Timed
               }
     TIO.writeFile
       (lockRoot </> "Cargo.lock")
@@ -4484,7 +4504,8 @@ testCargoCratesIoFixtureLockPack =
           { prMode = ExecCmd "tar" ["-tf", outPath],
             prCwd = Nothing,
             prEnv = Nothing,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
     assertEq "tar list exit" ExitSuccess (prExitCode res)
     let listing = T.pack (prStdout res)

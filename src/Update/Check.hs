@@ -35,8 +35,7 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Network.HTTP.Client (newManager)
-import Network.HTTP.Client.TLS (tlsManagerSettings)
+import Metrics.Core (Metrics)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPVNoRev, samePV)
 import System.Directory (doesDirectoryExist, doesFileExist)
@@ -101,7 +100,7 @@ import Update.Go.Plan
     localNonLivePVs,
   )
 import Update.Hardcoded (lookupLaneArches, lookupPolicy)
-import Update.Http (fetchHttpJsonWith, fetchHttpWith)
+import Update.Http (fetchHttpJsonWith, fetchHttpWith, newMetricsManager)
 import Update.Npm (fetchNpmWith)
 import Update.OverlayTree (InTree, readEbuild, withNewTreeLock)
 import Update.OverlayWaves
@@ -201,7 +200,7 @@ checkOverlayWithDepsPlan jobs mh fetch depsOps cache ebuilds = do
   let entries = sortOn (packageKeyText . peKey) (groupNewest ebuilds)
       byPkg = groupByPackage ebuilds
       checkSet = Set.fromList (map peKey entries)
-  mapConcurrentlyN jobs (checkOne mh fetch depsOps cache byPkg checkSet) entries
+  mapConcurrentlyN (mhMetrics mh) jobs (checkOne mh fetch depsOps cache byPkg checkSet) entries
 
 checkOne ::
   MultiHandle ->
@@ -853,9 +852,9 @@ statusFromCompare local remote =
         )
 
 -- | Production fetcher dispatching to Http / GitHub / npm clients.
-productionFetcherWithLatch :: GitHubLatch -> Maybe T.Text -> IO Fetcher
-productionFetcherWithLatch latch mToken = do
-  mgr <- newManager tlsManagerSettings
+productionFetcherWithLatch :: Metrics -> GitHubLatch -> Maybe T.Text -> IO Fetcher
+productionFetcherWithLatch m latch mToken = do
+  mgr <- newMetricsManager m
   pure $ \src -> case src of
     Http {} -> fetchHttpWith mgr src
     HttpJson {} -> fetchHttpJsonWith mgr src

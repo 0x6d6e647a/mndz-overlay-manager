@@ -12,7 +12,7 @@ module Update.Go.Vendor
   )
 where
 
-import Control.Concurrent (QSem)
+import CLI.Jobs (PackSlot)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -34,6 +34,7 @@ import Update.Go.Version
 import Update.Pack.XzTar (packTarXz)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -85,7 +86,7 @@ noopVendorProgress =
 -- @threads@ is the xz thread count @N@ for the vendor pack (@xzOptValue@:
 -- block size when @N > 1@).
 -- @slot@ is the update's shared compress lock.
-mkVendorOps :: Int -> QSem -> CommandRunner -> VendorOps
+mkVendorOps :: Int -> PackSlot -> CommandRunner -> VendorOps
 mkVendorOps threads slot run =
   VendorOps
     { voClone = gitCloneTag run,
@@ -194,7 +195,8 @@ probeHostGoVersion run = do
         { prMode = ExecCmd "go" ["version"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res /= ExitSuccess
@@ -224,7 +226,8 @@ gitCloneTag run url tag dest = do
               ],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
@@ -243,13 +246,14 @@ goModDownload run goDir = do
         { prMode = ExecCmd "go" ["mod", "download", "-modcacherw"],
           prCwd = Just goDir,
           prEnv = Just (("GOMODCACHE", cacheDir) : filter ((/= "GOMODCACHE") . fst) env0),
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
       then Right ()
       else Left (enrichGoModDownloadError (T.pack (prStderr res)))
 
-tarXzGoMod :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+tarXzGoMod :: Int -> PackSlot -> CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
 tarXzGoMod threads slot run goDir entryName =
   packTarXz run slot threads "tar failed" (Just goDir) Nothing [entryName]

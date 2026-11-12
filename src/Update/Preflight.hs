@@ -27,6 +27,7 @@ where
 import Data.Maybe (catMaybes, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Metrics.Core (noopMetrics)
 import System.Directory (doesDirectoryExist, doesFileExist, findExecutable)
 import System.FilePath ((</>))
 import Update.Apply.Plan
@@ -198,7 +199,7 @@ preflightUpdateToolsWithImage findTool inspectImage image ap = do
 
 -- | Validate assets worktree path when assets publish is required.
 validateAssetsPath :: Maybe FilePath -> IO (Either Text FilePath)
-validateAssetsPath = validateAssetsPathWith doesDirectoryExist isGitWorkTree
+validateAssetsPath = validateAssetsPathWith doesDirectoryExist (isGitWorkTree noopMetrics)
 
 -- | Validate assets path with injectable directory / git-tree predicates.
 validateAssetsPathWith ::

@@ -58,6 +58,8 @@ import Foreign.C.Types (CInt (..), CLong (..), CUInt (..), CULong (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek, poke)
+import Metrics.Core (Metrics, Outcome (..), noopMetrics, openLifecycleSpan)
+import Metrics.Process (timedRunner, wallClockProc)
 import System.Directory
   ( copyFile,
     createDirectoryIfMissing,
@@ -110,6 +112,7 @@ import System.Process
   )
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -231,8 +234,17 @@ mkGpgAgentOps run pauseUi resumeUi =
     }
 
 -- | Production ops. Pass pause\/resume from 'CLI.Progress' panel controls.
-productionGpgAgentOps :: IO () -> IO () -> GpgAgentOps
-productionGpgAgentOps = mkGpgAgentOps productionCommandRunner
+productionGpgAgentOps :: Metrics -> IO () -> IO () -> GpgAgentOps
+productionGpgAgentOps m pauseUi resumeUi =
+  (mkGpgAgentOps (timedRunner m productionCommandRunner) pauseUi resumeUi)
+    { gaoBuildSessionHome = buildGpgSessionHomeWith m,
+      gaoStartSupervisor = \home -> do
+        close <- openLifecycleSpan m "gpg-session-supervisor"
+        started <- spawnGpgSessionSupervisor home
+        case started of
+          Left err -> close OutcomeFail >> pure (Left err)
+          Right sup -> pure (Right sup {supReap = supReap sup >> close OutcomeOk})
+    }
 
 -- | Create a process-lifetime handle.
 newGpgHandle :: GpgAgentOps -> IO GpgHandle
@@ -384,28 +396,33 @@ sourceGnuPGHome = do
 -- file is linked, or copied when this GnuPG will not list the linked key.
 -- @use-keyboxd@ is left off.
 buildGpgSessionHome :: FilePath -> FilePath -> [Text] -> IO (Either Text ())
-buildGpgSessionHome source dest keyIds = do
+buildGpgSessionHome = buildGpgSessionHomeWith noopMetrics
+
+-- | 'buildGpgSessionHome' with each direct @gpg@ call as a @proc@ span.
+buildGpgSessionHomeWith :: Metrics -> FilePath -> FilePath -> [Text] -> IO (Either Text ())
+buildGpgSessionHomeWith m source dest keyIds = do
   writeGpgSessionSkeleton dest
   go (nubOrd keyIds)
   where
     go [] = pure (Right ())
     go (keyId : rest) = do
-      installed <- installSigningKey source dest keyId
+      installed <- installSigningKey m source dest keyId
       case installed of
         Left err -> pure (Left err)
         Right () -> go rest
 
-installSigningKey :: FilePath -> FilePath -> Text -> IO (Either Text ())
-installSigningKey source dest keyId = do
+installSigningKey :: Metrics -> FilePath -> FilePath -> Text -> IO (Either Text ())
+installSigningKey m source dest keyId = do
   exported <-
     runGpg
+      m
       source
       ["--export", "--output", dest </> "session-pub.gpg", T.unpack keyId]
   case exported of
     Left err ->
       pure (Left ("could not export public key " <> keyId <> ": " <> err))
     Right _ -> do
-      imported <- runGpg dest ["--import", dest </> "session-pub.gpg"]
+      imported <- runGpg m dest ["--import", dest </> "session-pub.gpg"]
       _ <- try @IOException (removeFile (dest </> "session-pub.gpg"))
       case imported of
         Left err ->
@@ -413,6 +430,7 @@ installSigningKey source dest keyId = do
         Right _ -> do
           listed <-
             runGpg
+              m
               source
               [ "--list-secret-keys",
                 "--with-colons",
@@ -421,10 +439,10 @@ installSigningKey source dest keyId = do
               ]
           case listed >>= parseSignCapableKeygrip of
             Left err -> pure (Left err)
-            Right (Keygrip grip) -> linkOrCopySecret source dest grip
+            Right (Keygrip grip) -> linkOrCopySecret m source dest grip
 
-linkOrCopySecret :: FilePath -> FilePath -> Text -> IO (Either Text ())
-linkOrCopySecret source dest grip = do
+linkOrCopySecret :: Metrics -> FilePath -> FilePath -> Text -> IO (Either Text ())
+linkOrCopySecret m source dest grip = do
   let src = source </> "private-keys-v1.d" </> T.unpack grip <> ".key"
       dstDir = dest </> "private-keys-v1.d"
       dst = dstDir </> T.unpack grip <> ".key"
@@ -443,7 +461,7 @@ linkOrCopySecret source dest grip = do
         Left e ->
           pure (Left ("could not link secret key " <> grip <> ": " <> T.pack (show e)))
         Right () -> do
-          visible <- sessionListsGrip dest grip
+          visible <- sessionListsGrip m dest grip
           if visible
             then pure (Right ())
             else do
@@ -462,7 +480,7 @@ linkOrCopySecret source dest grip = do
                     )
                 Right () -> do
                   setFileMode dst 0o600
-                  visible' <- sessionListsGrip dest grip
+                  visible' <- sessionListsGrip m dest grip
                   pure $
                     if visible'
                       then Right ()
@@ -470,10 +488,11 @@ linkOrCopySecret source dest grip = do
                         Left
                           ("session home cannot see secret keygrip " <> grip)
 
-sessionListsGrip :: FilePath -> Text -> IO Bool
-sessionListsGrip dest grip = do
+sessionListsGrip :: Metrics -> FilePath -> Text -> IO Bool
+sessionListsGrip m dest grip = do
   listed <-
     runGpg
+      m
       dest
       ["--list-secret-keys", "--with-colons", "--with-keygrip"]
   pure $ case listed of
@@ -481,14 +500,13 @@ sessionListsGrip dest grip = do
     Left _ -> False
 
 -- | @gpg --homedir@ so a caller @GNUPGHOME@ cannot redirect the command.
-runGpg :: FilePath -> [String] -> IO (Either Text String)
-runGpg home args = do
+runGpg :: Metrics -> FilePath -> [String] -> IO (Either Text String)
+runGpg m home args = do
+  let argv = ["--homedir", home, "--batch", "--pinentry-mode", "cancel"] <> args
   result <-
     try @IOException $
-      readProcessWithExitCode
-        "gpg"
-        (["--homedir", home, "--batch", "--pinentry-mode", "cancel"] <> args)
-        ""
+      wallClockProc m "gpg" argv Nothing [] (\(c, _, _) -> Just c) $
+        readProcessWithExitCode "gpg" argv ""
   pure $ case result of
     Left e -> Left (T.pack (show e))
     Right (code, out, err) ->
@@ -722,7 +740,8 @@ gitGetSigningKey run repoRoot = do
               ["-C", rootAbs, "config", "--get", "user.signingkey"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res /= ExitSuccess
@@ -758,7 +777,8 @@ resolveKeygripViaGpg run signingKey = do
               ],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res /= ExitSuccess
@@ -822,7 +842,8 @@ keyinfoCached run (Just home) (Keygrip grip) = do
         { prMode = ExecCmd "gpg-connect-agent" ["--homedir", home],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = "KEYINFO " <> T.unpack grip <> "\n"
+          prStdin = "KEYINFO " <> T.unpack grip <> "\n",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res /= ExitSuccess
@@ -915,7 +936,8 @@ warmKeyDummy run mHome mTty signingKey = do
               ),
           prCwd = Nothing,
           prEnv = Just env1,
-          prStdin = "mndz-overlay-manager gpg readiness warm\n"
+          prStdin = "mndz-overlay-manager gpg readiness warm\n",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
@@ -938,7 +960,8 @@ killSessionAgent run home = do
               ["--homedir", home, "--kill", "gpg-agent"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure ()
 

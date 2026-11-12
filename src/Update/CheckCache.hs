@@ -42,6 +42,7 @@ module Update.CheckCache
     flushCheckCache,
     cacheSummaryLine,
     cacheStats,
+    recordCacheCounters,
     CacheStats (..),
   )
 where
@@ -76,6 +77,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
+import Metrics.Core (Metrics (..))
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version
@@ -933,6 +935,14 @@ cacheStats :: CheckCacheHandle -> IO CacheStats
 cacheStats h = do
   st <- readMVar (cchState h)
   pure CacheStats {csHits = hsHits st, csFetches = hsFetches st}
+
+-- | Run metrics footer counters @check_cache.hits@ and @check_cache.misses@
+-- (live fetches), the same numbers as 'cacheSummaryLine'.
+recordCacheCounters :: Metrics -> CheckCacheHandle -> IO ()
+recordCacheCounters m h = do
+  st <- cacheStats h
+  mSetCounter m "check_cache.hits" (Number (fromIntegral (csHits st)))
+  mSetCounter m "check_cache.misses" (Number (fromIntegral (csFetches st)))
 
 -- | Info summary line: @check cache: N hit, M fetch@.
 cacheSummaryLine :: CheckCacheHandle -> IO (Maybe Text)

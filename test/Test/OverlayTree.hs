@@ -166,7 +166,14 @@ isIdent c = c == '_' || isAsciiUpper c || isAsciiLower c || isDigit c
 
 nonEbuildAllowlist :: [FilePath]
 nonEbuildAllowlist =
-  [ "src/Config/Loader.hs",
+  [ "src/Build/GitRev.hs",
+    "src/Build/Info.hs",
+    "src/Config/Loader.hs",
+    "src/Metrics/Container.hs",
+    "src/Metrics/Process.hs",
+    "src/Metrics/Recorder.hs",
+    "src/Metrics/Sampler.hs",
+    "src/Metrics/Startup.hs",
     "src/Overlay/Validation.hs",
     "src/Update/Assets/Hash.hs",
     "src/Update/Assets/Release.hs",

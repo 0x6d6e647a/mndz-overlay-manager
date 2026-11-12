@@ -21,6 +21,7 @@ import Test.Gpg qualified as Gpg
 import Test.Lanes qualified as Lanes
 import Test.Materialize qualified as Materialize
 import Test.Md5Cache qualified as Md5Cache
+import Test.Metrics qualified as Metrics
 import Test.Overlay qualified as Overlay
 import Test.OverlayTree qualified as OverlayTree
 import Test.OverlayWaves qualified as OverlayWaves
@@ -92,6 +93,7 @@ main = do
               Materialize.unitTests,
               Ensure.unitTests,
               Md5Cache.unitTests,
+              Metrics.unitTests,
               Ecosystems.unitTests,
               CheckPlan.unitTests,
               CaddyAnalyzer.unitTests,

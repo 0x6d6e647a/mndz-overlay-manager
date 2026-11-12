@@ -23,6 +23,8 @@ where
 import Control.Exception (try)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Metrics.Core (Metrics)
+import Metrics.Process (wallClockProc)
 import System.Directory
   ( createDirectoryIfMissing,
     doesDirectoryExist,
@@ -88,11 +90,13 @@ ensureDistfilesDir path = do
         Right () -> Right ()
 
 -- | Query live Portage @DISTDIR@ via @portageq envvar DISTDIR@ (best-effort).
-lookupPortageDistDir :: IO (Maybe FilePath)
-lookupPortageDistDir = do
+lookupPortageDistDir :: Metrics -> IO (Maybe FilePath)
+lookupPortageDistDir m = do
+  let args = ["envvar", "DISTDIR"]
   result <-
     try @IOError $
-      readProcessWithExitCode "portageq" ["envvar", "DISTDIR"] ""
+      wallClockProc m "portageq" args Nothing [] (\(c, _, _) -> Just c) $
+        readProcessWithExitCode "portageq" args ""
   pure $ case result of
     Left _ -> Nothing
     Right (ExitSuccess, out, _) ->
@@ -104,9 +108,9 @@ lookupPortageDistDir = do
     dropWhileEnd p = reverse . dropWhile p . reverse
 
 -- | Whether @path@ is the system Portage DISTDIR (canonical fallback and/or live).
-isSystemDistfilesPath :: FilePath -> IO Bool
-isSystemDistfilesPath path = do
-  mLive <- lookupPortageDistDir
+isSystemDistfilesPath :: Metrics -> FilePath -> IO Bool
+isSystemDistfilesPath m path = do
+  mLive <- lookupPortageDistDir m
   let systems = case mLive of
         Just live | live /= systemDistfilesFallback -> [systemDistfilesFallback, live]
         _ -> [systemDistfilesFallback]
@@ -149,9 +153,9 @@ probeDistfilesDir dir = do
 
 -- | Delete manager distfiles cache contents. Refuses system Portage DISTDIR.
 -- Missing path is success (nothing to clean).
-cleanManagerDistfiles :: FilePath -> IO (Either Text ())
-cleanManagerDistfiles path = do
-  system <- isSystemDistfilesPath path
+cleanManagerDistfiles :: Metrics -> FilePath -> IO (Either Text ())
+cleanManagerDistfiles m path = do
+  system <- isSystemDistfilesPath m path
   if system
     then
       pure $

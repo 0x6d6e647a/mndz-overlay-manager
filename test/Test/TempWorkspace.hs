@@ -2,7 +2,7 @@
 
 module Test.TempWorkspace (tests) where
 
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Data.Text qualified as T
 import Data.Time.Format (defaultTimeLocale, parseTimeOrError)
 import Data.Time.LocalTime (ZonedTime)
@@ -10,7 +10,7 @@ import System.Directory
   ( doesDirectoryExist,
     doesFileExist,
   )
-import System.FilePath ((</>))
+import System.FilePath (takeFileName, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Process (getProcessID)
 import Test.Assert (assertEq, assertTrue)
@@ -25,6 +25,7 @@ import Update.TempWorkspace
     ensureUnit,
     formatRunId,
     openRunRootAt,
+    openRunRootAtWith,
     retainUnitError,
     runRootPath,
     unitDirPath,
@@ -40,6 +41,7 @@ tests =
       testCase "formatRunId is ISO 8601 basic without colon" testFormatRunId,
       testCase "run id has pid and random hex" testRunIdFormat,
       testCase "openRunRootAt creates brand path" testOpenRunRoot,
+      testCase "openRunRootAtWith names the run root by the given run id" testOpenRunRootWithId,
       testCase "ensureUnit creates out and work" testEnsureUnit,
       testCase "deleteUnit prunes empty package/category" testDeleteUnitPrune,
       testCase "cleanupRunSuccess upward-prunes brand dirs" testCleanupRunSuccess,
@@ -116,6 +118,17 @@ testOpenRunRoot =
       "path under brand"
       (tmp </> "mndz" </> "overlay-manager" </> rrRunId run)
       (rrPath run)
+
+testOpenRunRootWithId :: IO ()
+testOpenRunRootWithId =
+  withSystemTempDirectory "mndz-tw-with-" $ \tmp -> do
+    let rid = "20261111T101500-0700-4242.a8f3"
+    run <- openRunRootAtWith tmp rid
+    assertEq "run id" rid (rrRunId run)
+    assertTrue
+      "run root name starts with run id"
+      (rid `isPrefixOf` takeFileName (rrPath run))
+    assertTrue "run path exists" =<< doesDirectoryExist (rrPath run)
 
 testEnsureUnit :: IO ()
 testEnsureUnit =

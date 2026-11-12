@@ -67,6 +67,15 @@ Each flavor has its own build directory, so switching flavors does not rebuild t
 
 Stan and weeder read HIE collected from the release build into `dist/release/hie/{lib,exe,test}/`. Coverage builds do not write that tree. There is no `-O2` flavor and no per-command recipe for work commands (`outdated`, `update`, and the others are arguments to `just run`).
 
+### Build identity
+
+Binaries embed a build identity that run metrics write into each run header (`build` in `run_start`):
+
+- **Flavor.** `scripts/with-flavor` passes `-DMNDZ_FLAVOR_<NAME>` (`DEV`, `RELEASE`, `COVERAGE_DEV`, `COVERAGE_RELEASE`) to every component. `Build.Info` is the only module that uses CPP; it maps the define to `dev`, `release`, `coverage-dev`, or `coverage-release`. A plain `cabal build` outside `with-flavor` records `unknown`.
+- **Git revision and dirty flag.** `Build.GitRev` is a Template Haskell splice that runs `git rev-parse HEAD` and `git status --porcelain --untracked-files=no` when `Build.Info` compiles. It tracks `.git/HEAD`, the current ref, and `.git/index`, so a new commit or staging change recompiles it. Builds without git or `.git` record `unknown` and not dirty.
+- **Staleness.** The revision is captured at compile time. Editing tracked files without touching the index, or a build Cabal reports as up to date, can leave `git_rev` and `git_dirty` describing an older state than the binary's sources.
+- **Ground truth.** Each run header also records `exe_sha256`, the SHA-256 of the running executable. Two runs with the same `git_rev` but different `exe_sha256` came from different binaries; trust the hash.
+
 ## Developer onboarding
 
 ### Prerequisites
@@ -254,6 +263,7 @@ Product behavior is specified under OpenSpec:
 ```
 app/                 executable
 src/                 library
+cbits/               small C shims (getrusage, page size) for run metrics
 test/                tasty suite: Main.hs (Unit/Integration groups), Test/* modules, fixtures/
 justfile             contributor recipes (just 1.55+)
 scripts/with-flavor  Cabal flavor flags and build directories

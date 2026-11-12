@@ -741,9 +741,13 @@ assertGentoolkitInBase label df = do
   case runs of
     [] -> assertFailure (label <> ": no Portage RUN for gentoolkit")
     (base : _) ->
-      assertTrue
-        (label <> ": base RUN emerges gentoolkit")
-        ("app-portage/gentoolkit" `T.isInfixOf` base)
+      do
+        assertTrue
+          (label <> ": base RUN emerges gentoolkit")
+          ("app-portage/gentoolkit" `T.isInfixOf` base)
+        assertTrue
+          (label <> ": base RUN emerges GNU time")
+          ("sys-process/time" `T.isInfixOf` base)
 
 assertPruneRun :: String -> T.Text -> IO ()
 assertPruneRun label df = do
@@ -1209,7 +1213,8 @@ testGeneratorMismatchRebuilds =
         iid = "sha256:stale-gen"
     createDirectoryIfMissing True overlay
     seedGoAmd64 (tmp </> "gentoo")
-    writeSidecarGoGen sidecar iid "1.26.5" "mndz-overlay-manager-materialize-1"
+    -- The pre-GNU-time generator is a miss.
+    writeSidecarGoGen sidecar iid "1.26.5" "mndz-overlay-manager-materialize-8"
     builds <- mkLogRef
     fake <- mkFakeDocker True iid builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
@@ -1223,8 +1228,8 @@ testGeneratorMismatchRebuilds =
       Right side -> do
         assertEq "records current generator" materializeGeneratorId (isGenerator side)
         assertEq
-          "generator is materialize-8"
-          "mndz-overlay-manager-materialize-8"
+          "generator is materialize-9"
+          "mndz-overlay-manager-materialize-9"
           materializeGeneratorId
     df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
     assertPruneRun "generator rebuild" df

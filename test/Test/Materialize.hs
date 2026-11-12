@@ -13,6 +13,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
+import Metrics.Core (noopMetrics)
 import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Version (EbuildVersion, parseEbuildVersion, renderPV)
@@ -376,7 +377,8 @@ recordingMulti events =
           mhStep = \_ name -> logEv ("step:" <> name),
           mhSuccess = \_ -> pure (),
           mhSkip = \_ _ -> pure (),
-          mhFail = \_ _ -> pure ()
+          mhFail = \_ _ -> pure (),
+          mhMetrics = noopMetrics
         }
 
 -- | Build ApplyEnv with injectable deps + eco ops (overrides mkTestApplyEnv defaults).

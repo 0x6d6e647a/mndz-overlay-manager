@@ -17,7 +17,7 @@ module Update.Deps.Plan
   )
 where
 
-import CLI.Jobs (WorkBudget, newWorkBudget, withWorkSlot)
+import CLI.Jobs (WorkBudget, newWorkBudget, withWorkSlot, workBudgetWithMetrics)
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
 import Control.Exception (SomeException, catch)
 import Data.ByteString.Lazy qualified as BL
@@ -29,17 +29,8 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Network.HTTP.Client
-  ( Manager,
-    httpLbs,
-    method,
-    newManager,
-    parseRequest,
-    requestHeaders,
-    responseBody,
-    responseStatus,
-  )
-import Network.HTTP.Client.TLS (tlsManagerSettings)
+import Metrics.Core (Metrics, noopMetrics)
+import Network.HTTP.Client (Manager, httpLbs, method, parseRequest, requestHeaders, responseBody, responseStatus)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Types (Ebuild)
 import Overlay.Version (EbuildVersion (..), comparePV, renderPV, renderPVNoRev, samePV)
@@ -95,6 +86,7 @@ import Update.Go.Plan
     PlanProgress (..),
   )
 import Update.Go.Vendor (versionTag)
+import Update.Http (newMetricsManager)
 import Update.Npm.Cache
   ( fetchNpmEnginesNode,
     listNpmVersions,
@@ -215,17 +207,18 @@ withSuccessCache base = do
 productionDepsPlanOps :: Maybe Text -> Int -> Maybe FilePath -> IO DepsPlanOps
 productionDepsPlanOps mToken jobs mOverlay = do
   latch <- newGitHubLatch
-  productionDepsPlanOpsWithLatch latch mToken jobs mOverlay
+  productionDepsPlanOpsWithLatch noopMetrics latch mToken jobs mOverlay
 
 productionDepsPlanOpsWithLatch ::
+  Metrics ->
   GitHubLatch ->
   Maybe Text ->
   Int ->
   Maybe FilePath ->
   IO DepsPlanOps
-productionDepsPlanOpsWithLatch latch mToken jobs mOverlay = do
-  mgr <- newManager tlsManagerSettings
-  baseMod <- productionGoModFetcher mToken
+productionDepsPlanOpsWithLatch m latch mToken jobs mOverlay = do
+  mgr <- newMetricsManager m
+  baseMod <- productionGoModFetcher m mToken
   cachedMod <- withGoModCache baseMod
   cachedList <-
     withListVersionsSuccessCache $ \src -> case src of
@@ -233,7 +226,7 @@ productionDepsPlanOpsWithLatch latch mToken jobs mOverlay = do
       Npm pkg -> listNpmVersions mgr pkg
       _ -> pure (Left "unsupported update source for deps planning")
   cachedBun <- withBunEnginesSuccessCache (fetchBunEnginesAtTag mgr mToken)
-  budget <- newWorkBudget jobs
+  budget <- workBudgetWithMetrics m <$> newWorkBudget jobs
   goCache <- newMVar Nothing
   nodeCache <- newMVar Nothing
   bunCache <- newMVar Nothing
@@ -241,7 +234,7 @@ productionDepsPlanOpsWithLatch latch mToken jobs mOverlay = do
   sbclCache <- newMVar Nothing
   pure
     DepsPlanOps
-      { dpoPortageq = productionPortageqRunner,
+      { dpoPortageq = productionPortageqRunner m,
         dpoListVersions = cachedList,
         dpoFetchGoMod = cachedMod,
         dpoFetchNpmEngines = fetchNpmEnginesNode mgr,
@@ -258,7 +251,7 @@ productionDepsPlanOpsWithLatch latch mToken jobs mOverlay = do
         dpoOverlayRoot = mOverlay,
         dpoManager = mgr,
         dpoGitHubToken = mToken,
-        dpoProbeUvSync = productionProbeUvSync
+        dpoProbeUvSync = productionProbeUvSync m
       }
 
 planDepsPackageWithProgress ::

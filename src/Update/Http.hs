@@ -3,6 +3,7 @@
 module Update.Http
   ( HttpLbs,
     httpLbsEither,
+    newMetricsManager,
     fetchHttpWith,
     fetchHttpWithHttp,
     fetchHttpJsonWith,
@@ -20,16 +21,20 @@ import Data.ByteString.Lazy.Char8 qualified as L8
 import Data.Maybe (isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Metrics.Core (Metrics)
+import Metrics.Http (instrumentManagerSettings)
 import Network.HTTP.Client
   ( Manager,
     Request,
     Response,
     httpLbs,
     method,
+    newManager,
     parseRequest,
     responseBody,
     responseStatus,
   )
+import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version
   ( EbuildVersion (..),
@@ -40,6 +45,10 @@ import Update.Types (UpdateSource (..))
 
 -- | Injectable HTTP GET/POST runner for tests (no live network).
 type HttpLbs = Request -> IO (Either Text (Response L8.ByteString))
+
+-- | TLS manager whose requests are run metrics @http@ spans when recording.
+newMetricsManager :: Metrics -> IO Manager
+newMetricsManager m = newManager (instrumentManagerSettings m tlsManagerSettings)
 
 -- | Production runner: @tryHttp (httpLbs req mgr)@.
 httpLbsEither :: Manager -> HttpLbs

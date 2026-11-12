@@ -6,6 +6,7 @@ module Test.Distfiles (tests) where
 
 import Data.Bits ((.&.))
 import Data.Text qualified as T
+import Metrics.Core (noopMetrics)
 import System.Directory
   ( createDirectoryIfMissing,
     doesDirectoryExist,
@@ -164,14 +165,14 @@ testEclean =
     let manager = tmp </> "cache"
     createDirectoryIfMissing True manager
     writeFile (manager </> "blob") "data"
-    assertRight "clean" =<< cleanManagerDistfiles manager
+    assertRight "clean" =<< cleanManagerDistfiles noopMetrics manager
     assertTrue "dir remains" =<< doesDirectoryExist manager
     left <- listDirectory manager
     assertEq "emptied" [] left
     -- missing is success
-    assertRight "missing" =<< cleanManagerDistfiles (tmp </> "no-such-cache")
+    assertRight "missing" =<< cleanManagerDistfiles noopMetrics (tmp </> "no-such-cache")
     -- refuse system path
-    refuse <- assertLeft "refuse system" =<< cleanManagerDistfiles systemDistfilesFallback
+    refuse <- assertLeft "refuse system" =<< cleanManagerDistfiles noopMetrics systemDistfilesFallback
     assertTrue "refuse message" ("refuses" `T.isInfixOf` refuse || "system" `T.isInfixOf` T.toLower refuse)
     -- system path must not have been deleted by us (if it exists on host, still there)
     -- We only assert the refuse outcome.

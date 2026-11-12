@@ -57,6 +57,7 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
+import Metrics.Core (noopMetrics)
 import Overlay.Discovery
   ( DiscoveryError (..),
     collectEbuilds,
@@ -453,7 +454,7 @@ takeGpgTtyProbe = do
       unsetEnv gpgTtyProbeEnv
       bracket (openFd slave ReadWrite defaultFileFlags {noctty = False}) closeFd $
         \_ -> do
-          mPath <- gaoControllingTty (productionGpgAgentOps (pure ()) (pure ()))
+          mPath <- gaoControllingTty (productionGpgAgentOps noopMetrics (pure ()) (pure ()))
           hSetBuffering stdout LineBuffering
           putStrLn (fromMaybe "" mPath)
           hFlush stdout

@@ -56,6 +56,7 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
+import Metrics.Core (noopMetrics)
 import Overlay.Discovery
   ( DiscoveryError (..),
     collectEbuilds,
@@ -668,7 +669,8 @@ testApplyProgressSoftSkipHandle = do
               mhStep = \_ _ -> pure (),
               mhSuccess = \_ -> logTerm "success",
               mhSkip = \_ reason -> logTerm ("skip:" <> reason),
-              mhFail = \_ reason -> logTerm ("fail:" <> reason)
+              mhFail = \_ reason -> logTerm ("fail:" <> reason),
+              mhMetrics = noopMetrics
             }
         gitOps =
           GitOps

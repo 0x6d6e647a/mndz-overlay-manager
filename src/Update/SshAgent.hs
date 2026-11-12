@@ -21,12 +21,15 @@ import Control.Concurrent.Async (race)
 import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Exception (IOException, try)
 import Control.Monad (filterM, unless, void, when)
+import Data.Aeson ((.=))
 import Data.Char (isSpace)
 import Data.List (isPrefixOf, isSuffixOf)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Foreign.C.Types (CInt (..), CLong (..))
+import Metrics.Core (Metrics, Outcome (..), openLifecycleSpan)
+import Metrics.Process (timedRunner, wallClockProc)
 import System.Directory (doesFileExist, getHomeDirectory)
 import System.Environment
   ( getEnvironment,
@@ -65,6 +68,7 @@ import System.Process
 import Update.GitHub (AssetsPushTransport (..), classifyAssetsPushUrl)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -140,8 +144,25 @@ mkSshAgentOps run =
       saoFileExists = doesFileExist
     }
 
-productionSshAgentOps :: SshAgentOps
-productionSshAgentOps = mkSshAgentOps productionCommandRunner
+productionSshAgentOps :: Metrics -> SshAgentOps
+productionSshAgentOps m =
+  (mkSshAgentOps (timedRunner m productionCommandRunner))
+    { saoSshAdd = \keyPath ->
+        wallClockProc
+          m
+          "ssh-add"
+          [keyPath]
+          Nothing
+          ["interactive" .= True]
+          (const Nothing)
+          (runSshAddInteractive keyPath),
+      saoStartSupervisor = \pid -> do
+        close <- openLifecycleSpan m "ssh-session-supervisor"
+        started <- spawnSshSessionSupervisor pid
+        case started of
+          Left err -> close OutcomeFail >> pure (Left err)
+          Right reap -> pure (Right (reap >> close OutcomeOk))
+    }
 
 -- | Error for an omitted or empty @ssh-identity@. Names the key and no path.
 sshIdentityRequired :: Text
@@ -257,7 +278,8 @@ readCoreSshCommand run root = do
             ExecCmd "git" ["-C", root, "config", "--get", "core.sshCommand"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   let stdoutT = T.strip (T.pack (prStdout res))
   pure $ case prExitCode res of
@@ -291,7 +313,8 @@ runSshDashG run mUser = do
         { prMode = ExecCmd "ssh" args,
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
@@ -503,7 +526,8 @@ runSshAgent run = do
         { prMode = ExecCmd "ssh-agent" ["-s"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   if prExitCode res /= ExitSuccess
     then
@@ -535,7 +559,8 @@ fingerprintOf run path = do
         { prMode = ExecCmd "ssh-keygen" ["-lf", path, "-E", "sha256"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res /= ExitSuccess
@@ -557,7 +582,8 @@ listTokens run = do
         { prMode = ExecCmd "ssh-add" ["-E", "sha256", "-l"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $ case prExitCode res of
     ExitSuccess -> Right (sha256Tokens (prStdout res))
@@ -582,7 +608,8 @@ killSshAgent run pid = do
         { prMode = ExecCmd "kill" [pid],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure ()
 

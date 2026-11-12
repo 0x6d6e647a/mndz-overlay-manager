@@ -19,20 +19,12 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
 import Data.Text.Encoding.Error (lenientDecode)
-import Network.HTTP.Client
-  ( Manager,
-    method,
-    newManager,
-    parseRequest,
-    requestHeaders,
-    responseBody,
-    responseStatus,
-  )
-import Network.HTTP.Client.TLS (tlsManagerSettings)
+import Metrics.Core (Metrics)
+import Network.HTTP.Client (Manager, method, parseRequest, requestHeaders, responseBody, responseStatus)
 import Network.HTTP.Types.Status (statusCode)
 import System.FilePath (normalise)
 import Update.Go.Version (parseGoModGoDirective)
-import Update.Http (HttpLbs, httpLbsEither)
+import Update.Http (HttpLbs, httpLbsEither, newMetricsManager)
 
 -- | Cache key for go.mod at a repository ref.
 data GoModKey = GoModKey
@@ -77,9 +69,9 @@ cachedFetch cacheVar base key = do
           Nothing -> pure (Map.insert key result cache, result)
 
 -- | Production fetcher using raw.githubusercontent.com with optional token.
-productionGoModFetcher :: Maybe Text -> IO GoModFetcher
-productionGoModFetcher mToken = do
-  mgr <- newManager tlsManagerSettings
+productionGoModFetcher :: Metrics -> Maybe Text -> IO GoModFetcher
+productionGoModFetcher m mToken = do
+  mgr <- newMetricsManager m
   pure (fetchGoModAtTag mgr mToken)
 
 -- | Fetch go.mod at tag via raw.githubusercontent.com (token optional).

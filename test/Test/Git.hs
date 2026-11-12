@@ -6,6 +6,7 @@ module Test.Git (clearGitLocalEnv, tests) where
 
 import Control.Monad (forM_, unless, void, when)
 import Data.Text qualified as T
+import Metrics.Core (noopMetrics)
 import System.Directory (createDirectoryIfMissing)
 import System.Environment (getEnvironment, getExecutablePath, lookupEnv, unsetEnv)
 import System.Exit (ExitCode (..))
@@ -119,7 +120,7 @@ testClearedEnvTemporaryInit =
     let other = tmp </> "other"
     createDirectoryIfMissing True other
     callProcess "git" ["-C", other, "init", "-q"]
-    inside <- isGitWorkTree other
+    inside <- isGitWorkTree noopMetrics other
     assertEq "temporary directory is a work tree" True inside
     mRoot <- lookupEnv probeRootEnv
     forM_ mRoot assertCommonConfigOmitsWorktree
@@ -155,11 +156,11 @@ testIsGitWorkTree :: IO ()
 testIsGitWorkTree =
   withSystemTempDirectory "git-wt" $ \tmp -> do
     createDirectoryIfMissing True (tmp </> "plain")
-    plain <- isGitWorkTree (tmp </> "plain")
+    plain <- isGitWorkTree noopMetrics (tmp </> "plain")
     assertEq "non-git" False plain
     createDirectoryIfMissing True (tmp </> "repo")
     initRepo (tmp </> "repo")
-    inside <- isGitWorkTree (tmp </> "repo")
+    inside <- isGitWorkTree noopMetrics (tmp </> "repo")
     assertEq "git worktree" True inside
 
 testPathsDirty :: IO ()
@@ -168,13 +169,13 @@ testPathsDirty =
     let root = tmp </> "repo"
     createDirectoryIfMissing True root
     initRepo root
-    clean <- assertRight "clean" =<< pathsDirty root ["README"]
+    clean <- assertRight "clean" =<< pathsDirty noopMetrics root ["README"]
     assertEq "clean false" False clean
     writeFile (root </> "README") "dirty\n"
-    dirty <- assertRight "dirty" =<< pathsDirty root ["README"]
+    dirty <- assertRight "dirty" =<< pathsDirty noopMetrics root ["README"]
     assertEq "dirty true" True dirty
     -- missing pathspec is still a successful status (not dirty)
-    missing <- assertRight "missing path" =<< pathsDirty root ["no-such-file"]
+    missing <- assertRight "missing path" =<< pathsDirty noopMetrics root ["no-such-file"]
     assertEq "missing not dirty" False missing
 
 testPathsDirtyDeletedUntracked :: IO ()
@@ -193,7 +194,7 @@ testPathsDirtyDeletedUntracked =
     createDirectoryIfMissing True pkg
     writeFile (pkg </> "bun-bin-1.4.0.ebuild") "EAPI=8\n"
     dirty <-
-      assertRight "D and ??" =<< pathsDirty root ["dev-lang/bun-bin"]
+      assertRight "D and ??" =<< pathsDirty noopMetrics root ["dev-lang/bun-bin"]
     assertEq "untracked and deleted count as dirty" True dirty
 
 testPathsDirtyStatusFailure :: IO ()
@@ -201,7 +202,7 @@ testPathsDirtyStatusFailure =
   withSystemTempDirectory "git-status-fail" $ \tmp -> do
     -- Not a git repo → git status fails
     createDirectoryIfMissing True (tmp </> "plain")
-    err <- assertLeft "status fail" =<< pathsDirty (tmp </> "plain") ["x"]
+    err <- assertLeft "status fail" =<< pathsDirty noopMetrics (tmp </> "plain") ["x"]
     assertTrue "mentions status" ("git status failed" `T.isInfixOf` err)
 
 testRelativeOverlayPath :: IO ()
@@ -220,7 +221,7 @@ testGitPushNoRemote =
     let root = tmp </> "repo"
     createDirectoryIfMissing True root
     initRepo root
-    err <- assertLeft "push fail" =<< gitPush root
+    err <- assertLeft "push fail" =<< gitPush noopMetrics root
     assertTrue "push failed msg" ("git push failed" `T.isInfixOf` err)
 
 fakeGpgOps :: GpgAgentOps
@@ -254,7 +255,7 @@ testGitAddCommitGpgNotReady =
             }
     h <- newGpgHandle ops
     err <-
-      assertLeft "gpg gate" =<< gitAddAndSignedCommit h root ["extra"] "msg"
+      assertLeft "gpg gate" =<< gitAddAndSignedCommit noopMetrics h root ["extra"] "msg"
     assertTrue "signingkey" ("signingkey" `T.isInfixOf` err)
     teardownGpgHandle h
 
@@ -269,7 +270,7 @@ testGitAddCommitCommitFails =
     h <- newGpgHandle fakeGpgOps
     void $ assertRight "gpg ready" =<< ensureGpgReady h root
     err <-
-      assertLeft "commit -S" =<< gitAddAndSignedCommit h root ["extra"] "signed"
+      assertLeft "commit -S" =<< gitAddAndSignedCommit noopMetrics h root ["extra"] "signed"
     assertTrue "commit failed" ("git commit -S failed" `T.isInfixOf` err)
     teardownGpgHandle h
 
@@ -280,7 +281,7 @@ testProductionGitOpsWiring =
     createDirectoryIfMissing True root
     initRepo root
     h <- newGpgHandle fakeGpgOps
-    let ops = productionGitOps h
+    let ops = productionGitOps noopMetrics h
     assertTrue "worktree via ops" =<< Git.goIsWorkTree ops root
     dirty <- assertRight "paths" =<< Git.goPathsDirty ops root ["README"]
     assertEq "clean" False dirty
@@ -295,9 +296,9 @@ testGitRevParseHead =
     let root = tmp </> "repo"
     createDirectoryIfMissing True root
     initRepo root
-    sha <- assertRight "HEAD" =<< gitRevParseHead root
+    sha <- assertRight "HEAD" =<< gitRevParseHead noopMetrics root
     assertTrue "sha nonempty" (T.length sha >= 7)
     missing <-
       assertLeft "missing repo"
-        =<< gitRevParseHead (tmp </> "not-a-repo")
+        =<< gitRevParseHead noopMetrics (tmp </> "not-a-repo")
     assertTrue "rev-parse fail" ("git rev-parse HEAD failed" `T.isInfixOf` missing)

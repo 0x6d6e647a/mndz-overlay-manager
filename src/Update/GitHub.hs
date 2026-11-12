@@ -44,6 +44,8 @@ import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
+import Metrics.Core (Metrics)
+import Metrics.Process (wallClockProc)
 import Network.HTTP.Client
   ( Manager,
     Response,
@@ -578,33 +580,35 @@ validGitHubName name =
         || c == '.'
 
 -- | @git remote get-url origin@ in @dir@.
-gitRemoteOriginUrl :: FilePath -> IO (Either Text Text)
-gitRemoteOriginUrl =
+gitRemoteOriginUrl :: Metrics -> FilePath -> IO (Either Text Text)
+gitRemoteOriginUrl m =
   readGitRemoteUrl
+    m
     ["remote", "get-url", "origin"]
     "assets-path origin remote is missing or unreadable"
     "assets-path origin remote URL is empty"
 
 -- | @git remote get-url --push origin@ in @dir@.
-gitRemotePushUrl :: FilePath -> IO (Either Text Text)
-gitRemotePushUrl =
+gitRemotePushUrl :: Metrics -> FilePath -> IO (Either Text Text)
+gitRemotePushUrl m =
   readGitRemoteUrl
+    m
     ["remote", "get-url", "--push", "origin"]
     "assets-path origin push URL is missing or unreadable"
     "assets-path origin push URL is empty"
 
 readGitRemoteUrl ::
+  Metrics ->
   [String] ->
   Text ->
   Text ->
   FilePath ->
   IO (Either Text Text)
-readGitRemoteUrl args missing empty dir = do
+readGitRemoteUrl m args missing empty dir = do
+  let argv = ["-C", dir] <> args
   (code, out, err) <-
-    readProcessWithExitCode
-      "git"
-      (["-C", dir] <> args)
-      ""
+    wallClockProc m "git" argv Nothing [] (\(c, _, _) -> Just c) $
+      readProcessWithExitCode "git" argv ""
   let stdoutT = T.strip (T.pack out)
       errT = T.strip (T.pack err)
   pure $

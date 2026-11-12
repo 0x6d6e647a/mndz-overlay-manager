@@ -112,7 +112,7 @@ renderMaterializeDockerfile arch installs =
       [ "emerge-webrsync",
         "(command -v getuto >/dev/null && getuto || true)",
         "emerge --oneshot sys-apps/portage",
-        "emerge -n app-arch/tar app-arch/xz-utils app-misc/ca-certificates app-arch/unzip dev-vcs/git net-misc/aria2 net-misc/wget app-portage/gentoolkit"
+        "emerge -n app-arch/tar app-arch/xz-utils app-misc/ca-certificates app-arch/unzip dev-vcs/git net-misc/aria2 net-misc/wget app-portage/gentoolkit sys-process/time"
       ]
     pruneCmds =
       [ "du -sh /var/cache/binhost /var/cache/binpkgs /var/cache/distfiles",

@@ -19,7 +19,7 @@ module Update.Npm.Cache
   )
 where
 
-import Control.Concurrent (QSem)
+import CLI.Jobs (PackSlot)
 import Control.Monad (when)
 import Data.Aeson (Value (..), eitherDecode, withObject, (.:), (.:?))
 import Data.Aeson.Key qualified as Key
@@ -56,6 +56,7 @@ import Update.Http (HttpLbs, httpLbsEither)
 import Update.Pack.XzTar (packTarXz)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -84,7 +85,7 @@ data NpmCacheProgress = NpmCacheProgress
 -- @threads@ is the xz thread count @N@ for the deps pack (@xzOptValue@:
 -- block size when @N > 1@).
 -- @slot@ is the update's shared compress lock.
-mkNpmCacheOps :: Int -> QSem -> CommandRunner -> NpmCacheOps
+mkNpmCacheOps :: Int -> PackSlot -> CommandRunner -> NpmCacheOps
 mkNpmCacheOps threads slot run =
   NpmCacheOps
     { ncoHostNodeVersion = hostNodeVersion run,
@@ -94,7 +95,7 @@ mkNpmCacheOps threads slot run =
     }
 
 -- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
-productionNpmCacheOps :: QSem -> NpmCacheOps
+productionNpmCacheOps :: PackSlot -> NpmCacheOps
 productionNpmCacheOps slot = mkNpmCacheOps 1 slot productionCommandRunner
 
 hostNodeVersion :: CommandRunner -> IO (Either Text Text)
@@ -105,7 +106,8 @@ hostNodeVersion run = do
         { prMode = ExecCmd "node" ["--version"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res /= ExitSuccess
@@ -243,7 +245,8 @@ npmPack run npmPkg pv workDir = do
               ["pack", spec, "--pack-destination", workDir, "--userconfig", uc],
           prCwd = Just workDir,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   if prExitCode res /= ExitSuccess
     then pure (Left ("npm pack failed: " <> T.pack (prStderr res) <> T.pack (prStdout res)))
@@ -267,14 +270,15 @@ npmInstallCache run tgz cacheDir = do
               ["--userconfig", uc, "--cache", cacheDir, "install", tgz],
           prCwd = Just workDir,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
       then Right ()
       else Left ("npm --cache install failed: " <> T.pack (prStderr res))
 
-tarXzNpmCache :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+tarXzNpmCache :: Int -> PackSlot -> CommandRunner -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
 tarXzNpmCache threads slot run workDir entry outPath = do
   prepareNpmCacheForPack (workDir </> entry)
   packTarXz run slot threads "tar xz npm-cache failed" (Just workDir) Nothing [entry] outPath

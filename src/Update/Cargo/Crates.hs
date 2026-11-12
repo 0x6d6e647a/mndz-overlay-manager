@@ -29,7 +29,7 @@ module Update.Cargo.Crates
   )
 where
 
-import Control.Concurrent (QSem)
+import CLI.Jobs (PackSlot)
 import Control.Exception (IOException, try)
 import Data.List (intercalate)
 import Data.Maybe (catMaybes)
@@ -81,6 +81,7 @@ import Update.Go.Vendor (githubCloneUrl, versionTag)
 import Update.Pack.XzTar (packTarXzAtomic)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -166,7 +167,7 @@ data CargoProgress = CargoProgress
 -- compress lock.
 -- Crate staging is one @xargs -P N@ invocation and does not take it.
 -- @N@ is @threads@ (values below 1 become 1, matching @xzOptValue@).
-mkCargoOps :: Int -> QSem -> CommandRunner -> CargoOps
+mkCargoOps :: Int -> PackSlot -> CommandRunner -> CargoOps
 mkCargoOps threads slot run =
   CargoOps
     { coClone = gitCloneTag run,
@@ -179,7 +180,7 @@ mkCargoOps threads slot run =
     }
 
 -- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
-productionCargoOps :: QSem -> CargoOps
+productionCargoOps :: PackSlot -> CargoOps
 productionCargoOps slot = mkCargoOps 1 slot productionCommandRunner
 
 -- | Clone-or-fetch @tag@/@published crate@, run pycargoebuild with
@@ -403,7 +404,8 @@ runGenerateLockfile run lockRoot = do
         { prMode = ExecCmd "cargo" ["generate-lockfile"],
           prCwd = Just lockRoot,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $ case prExitCode res of
     ExitSuccess -> Right ()
@@ -524,7 +526,8 @@ runPycargoebuild run ebuildPath lockRoot tarballPath distDir = do
         { prMode = ExecCmd "pycargoebuild" args,
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   case prExitCode res of
     ExitSuccess -> pure (Right ())
@@ -601,7 +604,7 @@ cargoChecksumJson packageChecksum =
 -- @threads@ is that @N@ (values below 1 become 1).
 packCratesTarball ::
   Int ->
-  QSem ->
+  PackSlot ->
   CommandRunner ->
   FilePath ->
   FilePath ->
@@ -616,7 +619,7 @@ packCratesTarball threads slot run =
 -- that count is at least 1.
 packCratesTarballWith ::
   Int ->
-  QSem ->
+  PackSlot ->
   CommandRunner ->
   (Int -> IO ()) ->
   IO () ->
@@ -639,7 +642,7 @@ packCratesTarballWith threads slot run onStage onArchiveStart lockRoot distDir s
 
 stageAndArchive ::
   Int ->
-  QSem ->
+  PackSlot ->
   CommandRunner ->
   (Int -> IO ()) ->
   IO () ->
@@ -767,7 +770,8 @@ runCrateExtract run threads gentooDir errDir cratePaths =
             ],
         prCwd = Nothing,
         prEnv = Nothing,
-        prStdin = intercalate "\0" cratePaths
+        prStdin = intercalate "\0" cratePaths,
+        prMeasure = Timed
       }
 
 -- | @$1@ is the gentoo directory, @$2@ is the error directory, @$3@ is the
@@ -877,7 +881,7 @@ renderCrateStagingLog records =
               "\n" <> T.intercalate "\n" ["    " <> line | line <- lines_]
       | otherwise = ""
 
-createArchiveAtomic :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+createArchiveAtomic :: Int -> PackSlot -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
 createArchiveAtomic threads slot run stageDir =
   packTarXzAtomic
     run
@@ -927,14 +931,15 @@ gitCloneWithArgs run args = do
         { prMode = ExecCmd "git" ("clone" : args),
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
       then Right ()
       else Left ("git clone failed: " <> T.pack (prStderr res))
 
-packRustyV8Tree :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+packRustyV8Tree :: Int -> PackSlot -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
 packRustyV8Tree threads slot run src =
   packTarXzAtomic
     run
@@ -1016,7 +1021,8 @@ fetchAndUnpackCrate run pn pv distDir srcDir = do
               ],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   case prExitCode fetchRes of
     ExitFailure _ ->
@@ -1038,7 +1044,8 @@ fetchAndUnpackCrate run pn pv distDir srcDir = do
             { prMode = ExecCmd "tar" ["-xzf", cratePath, "-C", srcDir],
               prCwd = Nothing,
               prEnv = Nothing,
-              prStdin = ""
+              prStdin = "",
+              prMeasure = Timed
             }
       case prExitCode unpacked of
         ExitFailure _ ->

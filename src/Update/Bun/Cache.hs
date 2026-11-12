@@ -22,8 +22,8 @@ module Update.Bun.Cache
   )
 where
 
+import CLI.Jobs (PackSlot)
 import Control.Applicative ((<|>))
-import Control.Concurrent (QSem)
 import Control.Exception (IOException, try)
 import Control.Monad (foldM, forM)
 import Data.Aeson (Value, eitherDecode, withObject, (.:?))
@@ -71,6 +71,7 @@ import Update.Go.Version
 import Update.Pack.XzTar (packTarXz)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -133,7 +134,7 @@ data BunCacheProgress = BunCacheProgress
 -- @threads@ is the xz thread count @N@ for the deps pack (@xzOptValue@:
 -- block size when @N > 1@).
 -- @slot@ is the update's shared compress lock.
-mkBunCacheOps :: Int -> QSem -> CommandRunner -> BunCacheOps
+mkBunCacheOps :: Int -> PackSlot -> CommandRunner -> BunCacheOps
 mkBunCacheOps threads slot run =
   BunCacheOps
     { bcoClone = gitCloneTag run,
@@ -143,7 +144,7 @@ mkBunCacheOps threads slot run =
     }
 
 -- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
-productionBunCacheOps :: QSem -> BunCacheOps
+productionBunCacheOps :: PackSlot -> BunCacheOps
 productionBunCacheOps slot = mkBunCacheOps 1 slot productionCommandRunner
 
 hostBunVersion :: CommandRunner -> IO (Either Text Text)
@@ -154,7 +155,8 @@ hostBunVersion run = do
         { prMode = ExecCmd "bun" ["--version"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res /= ExitSuccess
@@ -614,7 +616,8 @@ gitCloneTag run url tag dest = do
               ],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
@@ -636,13 +639,14 @@ bunInstallCache run cloneDir cacheDir = do
               ],
           prCwd = Just cloneDir,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
       then Right ()
       else Left ("bun install failed: " <> T.pack (prStderr res))
 
-tarXzEntries :: Int -> QSem -> CommandRunner -> FilePath -> [FilePath] -> FilePath -> IO (Either Text ())
+tarXzEntries :: Int -> PackSlot -> CommandRunner -> FilePath -> [FilePath] -> FilePath -> IO (Either Text ())
 tarXzEntries threads slot run workDir =
   packTarXz run slot threads "tar xz bun deps failed" (Just workDir) Nothing

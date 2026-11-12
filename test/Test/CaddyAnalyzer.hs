@@ -661,7 +661,8 @@ publish overlayRoot assetsRoot ent probe releaseOps vendorOps dockerArmed manife
           { mdcImage = defaultMaterializeImage,
             mdcUser = "1000:1000",
             mdcRunId = "caddy-test",
-            mdcCliPid = "1"
+            mdcCliPid = "1",
+            mdcTimeDir = Nothing
           }
       env =
         env0

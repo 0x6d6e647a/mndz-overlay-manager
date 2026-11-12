@@ -65,6 +65,8 @@ import Data.Maybe (catMaybes, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Metrics.Core (Metrics)
+import Metrics.Process (timedRunner)
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import System.Directory (doesDirectoryExist, listDirectory)
@@ -79,6 +81,7 @@ import Update.OverlayTree
   )
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -171,7 +174,8 @@ mkPortageqRunner run args = do
         { prMode = ExecCmd "portageq" args,
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
@@ -184,8 +188,8 @@ mkPortageqRunner run args = do
               <> T.pack (prStderr res)
           )
 
-productionPortageqRunner :: PortageqRunner
-productionPortageqRunner = mkPortageqRunner productionCommandRunner
+productionPortageqRunner :: Metrics -> PortageqRunner
+productionPortageqRunner m = mkPortageqRunner (timedRunner m productionCommandRunner)
 
 -- | Resolve Gentoo repository path via @portageq get_repo_path / gentoo@.
 gentooRepoPath :: PortageqRunner -> IO (Either Text FilePath)

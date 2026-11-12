@@ -12,7 +12,7 @@ import CLI.Parser
   )
 import CLI.Parser qualified as Cmd
 import CLI.Progress
-  ( ProgressConfig,
+  ( ProgressConfig (..),
     StepHandle (..),
     mkProgressConfig,
     pauseActivePanel,
@@ -39,6 +39,16 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
 import Logging.Bootstrap (LogHold, mkLogHold, mkLogger)
+import Metrics.Core (Metrics (..), setCount)
+import Metrics.Process (timedRunner)
+import Metrics.Run (RunSetup (..), invocationFor, withRunMetrics)
+import Metrics.Sampler (productionSamplerConfig, startSampler)
+import Metrics.Startup
+  ( MetricsStart (..),
+    commandName,
+    metricsGate,
+    productionMetricsStartupOps,
+  )
 import Options.Applicative (execParser)
 import Overlay.Discovery (collectEbuilds, discoveryErrorMessage)
 import Overlay.Types (Ebuild, ebuildAtom, ebuildCategory, ebuildPackage)
@@ -67,6 +77,7 @@ import Update.CheckCache
   ( cacheSummaryLine,
     flushCheckCache,
     openCheckCache,
+    recordCacheCounters,
   )
 import Update.Deps.Plan (productionDepsPlanOpsWithLatch)
 import Update.DiskSpace (productionDiskSpaceProbe)
@@ -122,6 +133,7 @@ import Update.Process (productionCommandRunner)
 import Update.Process.Docker
   ( isLiveOverlayManagerPid,
     materializeImageEnvVar,
+    secretMaterializeEnvKeys,
     sweepStaleMaterializeSessions,
   )
 import Update.Runtime.Ceilings (gentooRepoPath, productionPortageqRunner)
@@ -138,7 +150,7 @@ import Update.Targets
     selectExcluding,
     targetErrorMessage,
   )
-import Update.TempWorkspace (openRunRoot, rrPath)
+import Update.TempWorkspace (newRunId, openRunRootWith, rrPath)
 import Update.Types
   ( ApplyOutcome (..),
     PackageKey (..),
@@ -156,7 +168,9 @@ data Runtime = Runtime
     rtColor :: ColorMode,
     rtLogger :: LogAction IO Message,
     rtHold :: LogHold,
-    rtProgress :: ProgressConfig
+    rtProgress :: ProgressConfig,
+    -- | One id per invocation: temp run root, metrics directory, container labels.
+    rtRunId :: String
   }
 
 main :: IO ()
@@ -174,29 +188,76 @@ runProgram = do
   let logger = mkLogger (optVerbosity opts) color hold
   enabled <- progressEnabled (optNoProgress opts)
   pcfg <- mkProgressConfig enabled color hold logger
-  let rt =
-        Runtime
-          { rtOptions = opts,
-            rtJobs = jobs,
-            rtColor = color,
-            rtLogger = logger,
-            rtHold = hold,
-            rtProgress = pcfg
-          }
   case optCommand opts of
     Nothing -> showTopLevelHelpExit1
-    Just cmd ->
-      usingLoggerT logger $
-        case cmd of
-          Cmd.List -> runList rt
-          Cmd.Outdated refresh pkgs excludeArgs ->
-            runOutdated rt refresh pkgs excludeArgs
-          Cmd.Update refresh pkgs excludeArgs ->
-            runUpdate rt refresh pkgs excludeArgs
-          Cmd.Gencache targets force excludeArgs ->
-            runGencache rt targets force excludeArgs
-          Cmd.Eclean -> runEclean rt
-          Cmd.GitHubToken force -> runGitHubToken rt force
+    Just cmd -> do
+      runId <- newRunId
+      gate <-
+        metricsGate
+          productionMetricsStartupOps
+          (usingLoggerT logger . logWarning)
+          (optNoMetrics opts)
+          cmd
+          runId
+      let rtFor m =
+            Runtime
+              { rtOptions = opts,
+                rtJobs = jobs,
+                rtColor = color,
+                rtLogger = logger,
+                rtHold = hold,
+                rtProgress = pcfg {pcMetrics = m},
+                rtRunId = runId
+              }
+          dispatch m = do
+            registerEnvSecrets m
+            usingLoggerT logger (runCommand (rtFor m) cmd)
+      case gate of
+        Left err -> do
+          usingLoggerT logger (logError err)
+          exitWith (ExitFailure 1)
+        Right MetricsOff -> dispatch (pcMetrics pcfg)
+        Right (MetricsOn dir timeVersion) ->
+          withRunMetrics
+            RunSetup
+              { rsRunDir = dir,
+                rsRunId = runId,
+                rsCommand = commandName cmd,
+                rsTimeVersion = timeVersion,
+                rsInvocation = invocationFor jobs cmd,
+                rsWarn = usingLoggerT logger . logWarning,
+                rsStartSampler = \rec -> do
+                  cfg <- productionSamplerConfig
+                  startSampler cfg rec
+              }
+            dispatch
+
+runCommand :: (WithLog env Message m, MonadIO m) => Runtime -> Cmd.Command -> m ()
+runCommand rt cmd =
+  case cmd of
+    Cmd.List -> runList rt
+    Cmd.Outdated refresh pkgs excludeArgs ->
+      runOutdated rt refresh pkgs excludeArgs
+    Cmd.Update refresh pkgs excludeArgs ->
+      runUpdate rt refresh pkgs excludeArgs
+    Cmd.Gencache targets force excludeArgs ->
+      runGencache rt targets force excludeArgs
+    Cmd.Eclean -> runEclean rt
+    Cmd.GitHubToken force -> runGitHubToken rt force
+
+rtMetrics :: Runtime -> Metrics
+rtMetrics = pcMetrics . rtProgress
+
+-- | Close the open command phase and open @phase.\<name\>@ (run metrics).
+enterPhase :: (MonadIO m) => Runtime -> Text -> m ()
+enterPhase rt = liftIO . mEnterPhase (rtMetrics rt)
+
+-- | Values of 'secretMaterializeEnvKeys' are redacted from recorded argv.
+registerEnvSecrets :: Metrics -> IO ()
+registerEnvSecrets m =
+  for_ secretMaterializeEnvKeys $ \key -> do
+    v <- lookupEnv key
+    for_ v (mAddSecret m . T.pack)
 
 runList :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runList rt = do
@@ -232,10 +293,12 @@ runOutdated ::
   [String] ->
   m ()
 runOutdated rt refresh pkgArgs excludeArgs = do
+  enterPhase rt "config"
   (cfg, overlayResolved, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
       excludes = map T.pack excludeArgs
+  enterPhase rt "select"
   resolveCommandSelection entries tokens excludes >>= \keys -> do
     let selectedEntries = [e | e <- entries, peKey e `elem` keys]
         filteredEbuilds =
@@ -246,6 +309,7 @@ runOutdated rt refresh pkgArgs excludeArgs = do
             ebuilds
         total = length selectedEntries
         byPkg = groupByPackage ebuilds
+    enterPhase rt "auth"
     (cache, cacheWarn) <-
       liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayResolved
     mapM_ logWarning cacheWarn
@@ -269,18 +333,21 @@ runOutdated rt refresh pkgArgs excludeArgs = do
       Left err -> dieError (T.unpack err)
       Right (tok, warns) -> do
         mapM_ logWarning warns
+        for_ tok (liftIO . mAddSecret (rtMetrics rt))
         l <- liftIO newGitHubLatch
-        when willLive $ runGitHubHealth l tok
+        when willLive $ runGitHubHealth (rtMetrics rt) l tok
         pure (tok, l)
-    fetch <- liftIO (productionFetcherWithLatch latch token)
+    fetch <- liftIO (productionFetcherWithLatch (rtMetrics rt) latch token)
     depsOps <-
       liftIO
         ( productionDepsPlanOpsWithLatch
+            (rtMetrics rt)
             latch
             token
             (rtJobs rt)
             (Just overlayResolved)
         )
+    enterPhase rt "check"
     reports <-
       liftIO $
         withMultiProgress (rtProgress rt) "Checking packages" total $ \mh ->
@@ -292,8 +359,14 @@ runOutdated rt refresh pkgArgs excludeArgs = do
             cache
             filteredEbuilds
     liftIO (flushCheckCache cache)
+    liftIO $ do
+      recordCacheCounters (rtMetrics rt) cache
+      setCount (rtMetrics rt) "packages.selected" total
+      setCount (rtMetrics rt) "packages.needs_work" (length [() | U.Outdated _ <- map reportStatus reports])
+      setCount (rtMetrics rt) "packages.failed" (length [() | U.FetchError _ <- map reportStatus reports])
     mSummary <- liftIO (cacheSummaryLine cache)
     mapM_ logInfo mSummary
+    enterPhase rt "report"
     (keep, mAbort) <- liftIO (finishOutdatedReports latch reports)
     mapM_ emitReport keep
     case mAbort of
@@ -308,10 +381,12 @@ runUpdate ::
   [String] ->
   m ()
 runUpdate rt refresh pkgArgs excludeArgs = do
+  enterPhase rt "config"
   (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
       excludes = map T.pack excludeArgs
+  enterPhase rt "select"
   resolveCommandSelection entries tokens excludes >>= \keys -> do
     let selected = [e | e <- entries, peKey e `elem` keys]
         -- Spine tools only; language/assets tools come after plan.
@@ -324,6 +399,7 @@ runUpdate rt refresh pkgArgs excludeArgs = do
               apNeedCargo = False,
               apNeedDocker = False
             }
+    enterPhase rt "tools"
     preflightOk <- liftIO $ runSpineToolSteps (rtProgress rt) spinePf
     case preflightOk of
       Left err -> dieError (T.unpack err)
@@ -342,6 +418,7 @@ runUpdate rt refresh pkgArgs excludeArgs = do
       Left err -> dieError (T.unpack err)
       Right () -> pure ()
     -- Open check cache before plan phase.
+    enterPhase rt "auth"
     (cache, cacheWarn) <-
       liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayPath
     mapM_ logWarning cacheWarn
@@ -366,13 +443,15 @@ runUpdate rt refresh pkgArgs excludeArgs = do
       Left err -> dieError (T.unpack err)
       Right (tok, warns) -> do
         mapM_ logWarning warns
+        for_ tok (liftIO . mAddSecret (rtMetrics rt))
         l <- liftIO newGitHubLatch
-        when willLive $ runGitHubHealth l tok
+        when willLive $ runGitHubHealth (rtMetrics rt) l tok
         pure (tok, l)
-    fetch <- liftIO (productionFetcherWithLatch latch token)
+    fetch <- liftIO (productionFetcherWithLatch (rtMetrics rt) latch token)
     depsOps <-
       liftIO
         ( productionDepsPlanOpsWithLatch
+            (rtMetrics rt)
             latch
             token
             (rtJobs rt)
@@ -381,7 +460,7 @@ runUpdate rt refresh pkgArgs excludeArgs = do
     dummyReleaseOps <-
       liftIO $
         case token of
-          Just t -> productionReleaseOpsWithLatch latch t
+          Just t -> productionReleaseOpsWithLatch (rtMetrics rt) latch t
           Nothing ->
             pure
               ReleaseOps
@@ -389,8 +468,10 @@ runUpdate rt refresh pkgArgs excludeArgs = do
                   roDownloadAsset = \_ _ -> pure (Left "GitHub token required"),
                   roCreateReleaseWithAssets = \_ _ -> pure (Left "GitHub token required")
                 }
-    let gpgOps =
+    let run = timedRunner (rtMetrics rt) productionCommandRunner
+        gpgOps =
           productionGpgAgentOps
+            (rtMetrics rt)
             (pauseActivePanel pcfg)
             (resumeActivePanel pcfg)
     spineResult <-
@@ -408,7 +489,7 @@ runUpdate rt refresh pkgArgs excludeArgs = do
                     _ -> Nothing
                   ensureCfg =
                     EnsureConfig
-                      { ecRun = productionCommandRunner,
+                      { ecRun = run,
                         ecProbe = productionDiskSpaceProbe,
                         ecOverlayRoot = overlayPath,
                         ecSidecarDir = sidecarDir,
@@ -416,7 +497,7 @@ runUpdate rt refresh pkgArgs excludeArgs = do
                         ecUname = uname,
                         ecOverrideTag = ovr,
                         ecPrevImageId = prev,
-                        ecGentooRoot = gentooRepoPath productionPortageqRunner
+                        ecGentooRoot = gentooRepoPath (productionPortageqRunner (rtMetrics rt))
                       }
                   unlockEnvelope =
                     case githubToken cfg of
@@ -424,45 +505,48 @@ runUpdate rt refresh pkgArgs excludeArgs = do
                         pure $
                           Left
                             "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
-                      Just envelope ->
-                        decryptConfigEnvelope secretPrompt decryptCache envelope
+                      Just envelope -> do
+                        r <- decryptConfigEnvelope secretPrompt decryptCache envelope
+                        for_ r (mAddSecret (rtMetrics rt))
+                        pure r
                   deps =
                     UpdateSpineDeps
                       { usdJobs = rtJobs rt,
+                        usdRunId = rtRunId rt,
                         usdProgress = pcfg,
                         usdFetcher = fetch,
                         usdDepsPlanOps = depsOps,
                         usdReleaseOps = dummyReleaseOps,
                         usdDiskProbe = productionDiskSpaceProbe,
-                        usdGitOps = productionGitOps gpg,
+                        usdGitOps = productionGitOps (rtMetrics rt) gpg,
                         usdCheckCache = cache,
                         usdAssetsOwner = "0x6d6e647a",
                         usdAssetsRepo = "mndz-overlay-assets",
                         usdGitHubToken = token,
                         usdUnlockConfigToken = unlockEnvelope,
-                        usdMkReleaseOps = productionReleaseOpsWithLatch latch,
-                        usdGitOriginUrl = gitRemoteOriginUrl,
-                        usdGitPushUrl = gitRemotePushUrl,
-                        usdCommandRunner = productionCommandRunner,
+                        usdMkReleaseOps = productionReleaseOpsWithLatch (rtMetrics rt) latch,
+                        usdGitOriginUrl = gitRemoteOriginUrl (rtMetrics rt),
+                        usdGitPushUrl = gitRemotePushUrl (rtMetrics rt),
+                        usdCommandRunner = run,
                         usdAssetsPathCfg = assetsPath cfg,
                         usdDistDir = distDir,
                         usdOverlayRoot = overlayPath,
-                        usdSshOps = productionSshAgentOps,
+                        usdSshOps = productionSshAgentOps (rtMetrics rt),
                         usdSshIdentity = sshIdentity cfg,
-                        usdEbuildRunner = productionEbuildRunner distDir,
-                        usdEgencacheRunner = productionEgencacheRunner,
+                        usdEbuildRunner = productionEbuildRunner (rtMetrics rt) distDir,
+                        usdEgencacheRunner = productionEgencacheRunner (rtMetrics rt),
                         usdPreflightTools = preflightUpdateTools,
                         usdEnsureImage = (`ensureMaterializeImage` ensureCfg),
                         usdPruneMaterialize =
                           prunePreviousMaterializeImage ensureCfg,
                         usdSweepMaterialize =
                           sweepStaleMaterializeSessions
-                            productionCommandRunner
+                            run
                             isLiveOverlayManagerPid,
                         usdMaterializeDockerRunner =
-                          Just productionCommandRunner,
+                          Just run,
                         usdGitHubLatch = latch,
-                        usdGitOperationsHealth = productionGitOperationsHealth,
+                        usdGitOperationsHealth = productionGitOperationsHealth (rtMetrics rt),
                         usdPrepareSigning =
                           \runRoot mayAssets overlay mAssets ->
                             prepareSigningSession
@@ -481,6 +565,13 @@ runUpdate rt refresh pkgArgs excludeArgs = do
     case spineResult of
       Left err -> dieError (T.unpack err)
       Right res -> do
+        liftIO $ do
+          let outs = usrOutcomes res
+              m = rtMetrics rt
+          setCount m "packages.selected" (length selected)
+          setCount m "packages.applied" (length [() | ApplySuccess {} <- outs])
+          setCount m "packages.skipped" (length [() | ApplySoftSkip {} <- outs])
+          setCount m "packages.failed" (length [() | ApplyHardFail {} <- outs])
         mapM_ logWarning (usrWarnings res)
         mapM_ logInfo (usrCacheSummary res)
         case usrOutcomes res of
@@ -557,11 +648,12 @@ runGitHubToken rt force = do
 
 runGitHubHealth ::
   (WithLog env Message m, MonadIO m) =>
+  Metrics ->
   GitHubLatch ->
   Maybe T.Text ->
   m ()
-runGitHubHealth latch token = do
-  http <- liftIO productionGitHubHealthHttp
+runGitHubHealth metrics latch token = do
+  http <- liftIO (productionGitHubHealthHttp metrics)
   outcome <-
     liftIO $
       runGitHubHealthPreflight
@@ -576,9 +668,9 @@ runGitHubHealth latch token = do
     Left err -> dieError (T.unpack err)
     Right warns -> mapM_ logWarning warns
 
-productionGitOperationsHealth :: IO (Either T.Text ())
-productionGitOperationsHealth = do
-  http <- productionGitHubHealthHttp
+productionGitOperationsHealth :: Metrics -> IO (Either T.Text ())
+productionGitOperationsHealth metrics = do
+  http <- productionGitHubHealthHttp metrics
   outcome <- runGitOperationsHealth http
   pure $ case interpretHealthOutcome outcome of
     Left err -> Left err
@@ -586,13 +678,15 @@ productionGitOperationsHealth = do
 
 runEclean :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runEclean rt = do
+  enterPhase rt "config"
   cfg <- loadConfigOrDie (optConfig (rtOptions rt))
   distDir <-
     liftIO $
       resolveDistfilesPath
         (optDistfilesPath (rtOptions rt))
         (distfilesPath cfg)
-  result <- liftIO (cleanManagerDistfiles distDir)
+  enterPhase rt "eclean"
+  result <- liftIO (cleanManagerDistfiles (rtMetrics rt) distDir)
   case result of
     Left err -> dieError (T.unpack err)
     Right () ->
@@ -606,8 +700,10 @@ runGencache ::
   [String] ->
   m ()
 runGencache rt pkgArgs force excludeArgs = do
+  enterPhase rt "config"
   (_cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
-  isGit <- liftIO (isGitWorkTree overlayPath)
+  enterPhase rt "preflight"
+  isGit <- liftIO (isGitWorkTree (rtMetrics rt) overlayPath)
   unless isGit $
     dieError ("overlay path is not a git work tree: " <> overlayPath)
   toolsOk <- liftIO preflightGencache
@@ -621,10 +717,14 @@ runGencache rt pkgArgs force excludeArgs = do
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
       excludes = map T.pack excludeArgs
+  enterPhase rt "select"
   resolveCommandSelection entries tokens excludes >>= \keys -> do
+    enterPhase rt "gencache"
+    liftIO (setCount (rtMetrics rt) "packages.selected" (length keys))
     let pcfg = rtProgress rt
         gpgOps =
           productionGpgAgentOps
+            (rtMetrics rt)
             (pauseActivePanel pcfg)
             (resumeActivePanel pcfg)
     result <-
@@ -634,14 +734,14 @@ runGencache rt pkgArgs force excludeArgs = do
           teardownGpgHandle
           ( \gpg ->
               gencachePackages
-                productionEgencacheRunner
-                (productionGitOps gpg)
+                (productionEgencacheRunner (rtMetrics rt))
+                (productionGitOps (rtMetrics rt) gpg)
                 overlayPath
                 keys
                 force
                 (Just (rtJobs rt))
                 ( do
-                    runRoot <- openRunRoot
+                    runRoot <- openRunRootWith (rtRunId rt)
                     prepareSigningSession gpg (rrPath runRoot) [overlayPath]
                 )
           )

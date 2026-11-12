@@ -423,6 +423,7 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
   pure
     UpdateSpineDeps
       { usdJobs = jobs,
+        usdRunId = "20260810T154207-0700-4242.a8f3",
         usdProgress = pcfg,
         usdFetcher = fetchBunLatest,
         usdDepsPlanOps = depsOps,

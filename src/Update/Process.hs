@@ -4,7 +4,8 @@
 -- supplies a uniform request/result runner so production process bodies can be
 -- Unit-heated with scripted fakes (no live PATH tools).
 module Update.Process
-  ( ProcessMode (..),
+  ( Measure (..),
+    ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
     CommandRunner,
@@ -33,12 +34,27 @@ data ProcessMode
       }
   deriving (Eq, Show)
 
+-- | How run metrics measure a request.
+data Measure
+  = -- | Wrap with GNU time and record a @proc@ span (the default).
+    Timed
+  | -- | Host side of a materialize container exec: like 'Timed', but the
+    -- time file is the @.outer@ half of an inner/outer pair.
+    TimedContainerExec
+  | -- | Long-lived session process: never wrapped; its owner records a
+    -- lifecycle span.
+    Lifecycle
+  | -- | Run as-is with no span.
+    Untimed
+  deriving (Eq, Show)
+
 -- | Process invocation request.
 data ProcessRequest = ProcessRequest
   { prMode :: ProcessMode,
     prCwd :: Maybe FilePath,
     prEnv :: Maybe [(String, String)],
-    prStdin :: String
+    prStdin :: String,
+    prMeasure :: Measure
   }
   deriving (Eq, Show)
 

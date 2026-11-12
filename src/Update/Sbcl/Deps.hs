@@ -16,7 +16,7 @@ module Update.Sbcl.Deps
   )
 where
 
-import Control.Concurrent (QSem)
+import CLI.Jobs (PackSlot)
 import Control.Monad (foldM, when)
 import Data.Char (isDigit)
 import Data.Foldable (for_)
@@ -40,6 +40,7 @@ import Update.Go.Vendor (githubCloneUrl, versionTag)
 import Update.Pack.XzTar (packTarXz)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -70,7 +71,7 @@ data SbclDepsProgress = SbclDepsProgress
 -- | @threads@ is the xz thread count @N@ for the deps pack (@xzOptValue@:
 -- block size when @N > 1@).
 -- @slot@ is the update's shared compress lock.
-mkSbclDepsOps :: Int -> QSem -> CommandRunner -> SbclDepsOps
+mkSbclDepsOps :: Int -> PackSlot -> CommandRunner -> SbclDepsOps
 mkSbclDepsOps threads slot run =
   SbclDepsOps
     { sdoClone = gitCloneTag run,
@@ -81,7 +82,7 @@ mkSbclDepsOps threads slot run =
     }
 
 -- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
-productionSbclDepsOps :: QSem -> SbclDepsOps
+productionSbclDepsOps :: PackSlot -> SbclDepsOps
 productionSbclDepsOps slot = mkSbclDepsOps 1 slot productionCommandRunner
 
 -- | Generic home used for qlot (container @HOME@, not the operator).
@@ -220,7 +221,8 @@ copyQlotTree run cloneDir stageDir = do
             { prMode = ExecCmd "cp" ["-aL", src, dest],
               prCwd = Nothing,
               prEnv = Just env0,
-              prStdin = ""
+              prStdin = "",
+              prMeasure = Timed
             }
       pure $
         if prExitCode res == ExitSuccess
@@ -414,7 +416,8 @@ gitCloneTag run url tag dest = do
               ],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
@@ -434,7 +437,8 @@ qlotInstall run root = do
         { prMode = ExecCmd "qlot" ["install"],
           prCwd = Just root,
           prEnv = Just env,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
@@ -461,7 +465,8 @@ materializeFff run root stageDir = do
               ],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   if prExitCode cloneRes /= ExitSuccess
     then pure (Left ("fff clone failed: " <> T.pack (prStderr cloneRes)))
@@ -475,7 +480,8 @@ materializeFff run root stageDir = do
                   ["-C", fffDir, "fetch", "--depth", "1", "origin", T.unpack commit],
               prCwd = Nothing,
               prEnv = Nothing,
-              prStdin = ""
+              prStdin = "",
+              prMeasure = Timed
             }
       if prExitCode fetchRes /= ExitSuccess
         then pure (Left ("fff fetch failed: " <> T.pack (prStderr fetchRes)))
@@ -495,7 +501,8 @@ materializeFff run root stageDir = do
                       ],
                   prCwd = Nothing,
                   prEnv = Nothing,
-                  prStdin = ""
+                  prStdin = "",
+                  prMeasure = Timed
                 }
           if prExitCode coRes /= ExitSuccess
             then pure (Left ("fff checkout failed: " <> T.pack (prStderr coRes)))
@@ -506,7 +513,8 @@ materializeFff run root stageDir = do
                     { prMode = ExecCmd "git" ["-C", fffDir, "rev-parse", "HEAD"],
                       prCwd = Nothing,
                       prEnv = Nothing,
-                      prStdin = ""
+                      prStdin = "",
+                      prMeasure = Timed
                     }
               let actual = T.strip (T.pack (prStdout headRes))
               if prExitCode headRes /= ExitSuccess || actual /= commit
@@ -529,7 +537,8 @@ materializeFff run root stageDir = do
                               ["vendor", "--locked", "--versioned-dirs", "vendor"],
                           prCwd = Just fffDir,
                           prEnv = Nothing,
-                          prStdin = ""
+                          prStdin = "",
+                          prMeasure = Timed
                         }
                   if prExitCode vendorRes /= ExitSuccess
                     then
@@ -557,7 +566,8 @@ finishFffStage run fffDir = do
               ["build", "--offline", "--locked", "-p", "fff-c"],
           prCwd = Just fffDir,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   if prExitCode smokeRes /= ExitSuccess
     then
@@ -580,7 +590,7 @@ cargoVendorConfig =
   \[source.vendored-sources]\n\
   \directory = \"vendor\"\n"
 
-packDepsTarball :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+packDepsTarball :: Int -> PackSlot -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
 packDepsTarball threads slot run stageDir =
   packTarXz
     run

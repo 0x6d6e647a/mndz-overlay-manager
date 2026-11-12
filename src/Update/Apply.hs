@@ -24,7 +24,7 @@ module Update.Apply
   )
 where
 
-import CLI.Jobs (mapConcurrentlyN)
+import CLI.Jobs (mapConcurrentlyN, withMeasuredSlot)
 import CLI.Progress
   ( MultiHandle (..),
     ProgressConfig,
@@ -34,7 +34,7 @@ import Control.Concurrent (newQSem, signalQSem, waitQSem)
 import Control.Concurrent.Async (mapConcurrently_, wait, withAsync)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
-import Control.Exception (IOException, bracket_, try)
+import Control.Exception (IOException, try)
 import Control.Monad (replicateM_, unless, void, when)
 import Data.Either (partitionEithers)
 import Data.Foldable (for_)
@@ -45,6 +45,7 @@ import Data.Maybe (mapMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Metrics.Core (captureSpanContext)
 import Update.Apply.Env
   ( ApplyEnv (..),
     EbuildRunner,
@@ -130,6 +131,7 @@ applyOverlay pcfg env overlayRoot entries mFilter = do
         withMultiProgress pcfg "Updating packages" (length selected) $ \mh ->
           let env' = env {aeMulti = mh}
            in mapConcurrentlyN
+                (mhMetrics mh)
                 (aeJobs env')
                 (applyPackagePhase1Tracked env' overlayRoot)
                 selected
@@ -472,9 +474,11 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
               Just (entry, work)
                 | delayedGitMv (peKey entry) work -> do
                     fileResult <-
-                      bracket_
-                        (waitQSem sem)
-                        (signalQSem sem)
+                      withMeasuredSlot
+                        (mhMetrics mh)
+                        "jobs"
+                        jobs
+                        sem
                         (runDelayedGitMvFiles env overlayRoot entry work)
                     case fileResult of
                       Left outcome -> do
@@ -488,9 +492,11 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                         worker
                 | gatedFileWork (peKey entry) work -> do
                     outs <-
-                      bracket_
-                        (waitQSem sem)
-                        (signalQSem sem)
+                      withMeasuredSlot
+                        (mhMetrics mh)
+                        "jobs"
+                        jobs
+                        sem
                         (applyNeedsWorkTracked env overlayRoot entry work)
                     signalGateDone $
                       case [m | ApplyHardFail _ m _ _ <- outs] of
@@ -500,9 +506,11 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                     worker
                 | otherwise -> do
                     outs <-
-                      bracket_
-                        (waitQSem sem)
-                        (signalQSem sem)
+                      withMeasuredSlot
+                        (mhMetrics mh)
+                        "jobs"
+                        jobs
+                        sem
                         (applyNeedsWorkTracked env overlayRoot entry work)
                     handleDone (peKey entry) outs
                     worker
@@ -537,8 +545,9 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                   Left err -> failEnsureWork err
                   Right () ->
                     for_ ensureWork $ \item -> writeChan chan (Just item)
-      withAsync runEnsure $ \ea -> do
-        mapConcurrently_ (const worker) [1 .. nWorkers]
+      inherit <- captureSpanContext (mhMetrics mh)
+      withAsync (inherit runEnsure) $ \ea -> do
+        mapConcurrently_ (const (inherit worker)) [1 .. nWorkers]
         wait ea
       readIORef outcomesRef
 

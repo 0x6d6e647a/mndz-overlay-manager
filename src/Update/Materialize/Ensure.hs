@@ -110,6 +110,7 @@ import Update.Materialize.Sidecar
 import Update.OverlayTree (InTree, TreeLock, withOverlayTreeChecked)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -508,7 +509,8 @@ discoverSystemSnapshotter run facts = do
         { prMode = ExecCmd "containerd" ["config", "dump"],
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   let out = T.strip (T.pack (prStdout res))
   if prExitCode res /= ExitSuccess || T.null out
@@ -662,7 +664,8 @@ docker run args =
       { prMode = ExecCmd "docker" args,
         prCwd = Nothing,
         prEnv = Nothing,
-        prStdin = ""
+        prStdin = "",
+        prMeasure = Timed
       }
 
 dockerIgnore :: CommandRunner -> [String] -> IO ()

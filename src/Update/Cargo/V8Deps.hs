@@ -13,6 +13,8 @@ import Data.Char (isSpace)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Metrics.Core (Metrics)
+import Metrics.Process (wallClockProc)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeFileName)
 import System.Process (readProcessWithExitCode)
@@ -44,10 +46,12 @@ linuxHostCondition = "host_os == \"linux\""
 
 -- | Unique Linux_x64 @host_os == \"linux\"@ GCS objects for clang and rust-toolchain.
 -- | Extract @v8/DEPS@ from a hermetic rusty_v8 snapshot tarball (@tar -xJOf@).
-extractV8DepsFromSnapshot :: FilePath -> IO (Either Text Text)
-extractV8DepsFromSnapshot tarball = do
+extractV8DepsFromSnapshot :: Metrics -> FilePath -> IO (Either Text Text)
+extractV8DepsFromSnapshot m tarball = do
+  let args = ["-xJOf", tarball, "v8/DEPS"]
   (code, out, err) <-
-    readProcessWithExitCode "tar" ["-xJOf", tarball, "v8/DEPS"] ""
+    wallClockProc m "tar" args Nothing [] (\(c, _, _) -> Just c) $
+      readProcessWithExitCode "tar" args ""
   pure $
     if code == ExitSuccess
       then Right (T.pack out)

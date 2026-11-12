@@ -17,6 +17,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as T
+import Metrics.Core (noopMetrics)
 import Network.HTTP.Client
   ( RequestBody (RequestBodyLBS),
     method,
@@ -53,7 +54,7 @@ productionGitHubTokenOps pause resume = do
       { gtoHttp = httpLbsEither mgr,
         gtoPrompt = productionSecretPrompt pause resume,
         gtoWrap = wrapToken,
-        gtoOriginUrl = gitRemoteOriginUrl
+        gtoOriginUrl = gitRemoteOriginUrl noopMetrics
       }
 
 -- | Refuse any token that does not start with @github_pat_@.

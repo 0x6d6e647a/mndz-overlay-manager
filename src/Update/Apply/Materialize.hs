@@ -29,6 +29,8 @@ import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Metrics.Container (productionCgroupRoots)
+import Metrics.Core (Metrics)
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version
@@ -1777,6 +1779,8 @@ withFullPathMaterializeSession env unit category pn pv action =
     Nothing -> action env
     Just (cfg, dockerRun) ->
       withUnitMaterializeSession
+        (mhMetrics (aeMulti env))
+        productionCgroupRoots
         dockerRun
         cfg
         MaterializeUnitRef
@@ -2263,7 +2267,7 @@ resolveCodexRustyV8 env assetsRoot workDir outDir ver donorContent = do
                       gcs <-
                         if samePin
                           then pure (Right Nothing)
-                          else fmap Just <$> gcsFromSnapshotOrTree dest workDir
+                          else fmap Just <$> gcsFromSnapshotOrTree (mhMetrics (aeMulti env)) dest workDir
                       pure $ case gcs of
                         Left err -> Left err
                         Right mGcs ->
@@ -2362,14 +2366,14 @@ gcsFromCloneTree workDir = do
     then pure (Left ("v8/DEPS missing after rusty_v8 clone at " <> T.pack depsPath))
     else parseV8DepsGcsLinux <$> TIO.readFile depsPath -- allow-non-ebuild: work-tree
 
-gcsFromSnapshotOrTree :: FilePath -> FilePath -> IO (Either Text V8GcsLinuxDists)
-gcsFromSnapshotOrTree tarball workDir = do
+gcsFromSnapshotOrTree :: Metrics -> FilePath -> FilePath -> IO (Either Text V8GcsLinuxDists)
+gcsFromSnapshotOrTree m tarball workDir = do
   let depsPath = workDir </> "rusty_v8" </> "v8" </> "DEPS"
   exists <- doesFileExist depsPath
   if exists
     then parseV8DepsGcsLinux <$> TIO.readFile depsPath -- allow-non-ebuild: work-tree
     else do
-      extracted <- extractV8DepsFromSnapshot tarball
+      extracted <- extractV8DepsFromSnapshot m tarball
       pure $ case extracted of
         Left err -> Left err
         Right body -> parseV8DepsGcsLinux body

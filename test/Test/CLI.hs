@@ -68,6 +68,7 @@ import Logging.Bootstrap
     showSeverityColored,
     verbosityToSeverity,
   )
+import Metrics.Core (noopMetrics)
 import Options.Applicative
   ( ParseError (ShowHelpText),
     ParserResult (..),
@@ -367,7 +368,7 @@ testNoColorStripsEscapes = do
 
 testJobsBound :: IO ()
 testJobsBound = do
-  results <- mapConcurrentlyN 4 pure [1 .. 10 :: Int]
+  results <- mapConcurrentlyN noopMetrics 4 pure [1 .. 10 :: Int]
   assertEq "preserves values" [1 .. 10] (sort results)
 
 -- | With --jobs 1, concurrent slots never exceed one in-flight job.
@@ -385,7 +386,7 @@ testJobsOneSerial = do
         threadDelay 20_000
         atomicModifyIORef' inFlight $ \n -> (n - 1, ())
         pure ()
-  void $ mapConcurrentlyN 1 job [1 .. 6 :: Int]
+  void $ mapConcurrentlyN noopMetrics 1 job [1 .. 6 :: Int]
   peak <- readIORef maxSeen
   assertEq "jobs 1 peak concurrency" 1 peak
   -- Also verify higher bound can exceed 1 when work overlaps.
@@ -399,7 +400,7 @@ testJobsOneSerial = do
         threadDelay 50_000
         atomicModifyIORef' inFlight2 $ \n -> (n - 1, ())
         pure ()
-  void $ mapConcurrentlyN 3 job2 [1 .. 6 :: Int]
+  void $ mapConcurrentlyN noopMetrics 3 job2 [1 .. 6 :: Int]
   peak2 <- readIORef maxSeen2
   assertTrue "jobs 3 can exceed 1" (peak2 > 1)
 
@@ -524,6 +525,7 @@ testParserPureCommands = do
       assertEq "global jobs" (Just 8) (optJobs opts)
       assertEq "global no-progress" True (optNoProgress opts)
       assertEq "global no-color" True (optNoColor opts)
+      assertEq "global no-metrics default" False (optNoMetrics opts)
       assertEq "global -v" V.Info (optVerbosity opts)
       assertEq "global + list" (Just CLI.List) (optCommand opts)
     Nothing -> do
@@ -790,6 +792,13 @@ testHelpCatalogDistfiles = do
   assertTrue "top help lists eclean" ("eclean" `isInfixOf` topMsg)
   assertTrue "top help lists github-token" ("github-token" `isInfixOf` topMsg)
   assertTrue "top help lists distfiles-path" ("distfiles-path" `isInfixOf` topMsg)
+  assertTrue "top help lists no-metrics" ("--no-metrics" `isInfixOf` topMsg)
+  assertTrue "top help names GNU time" ("/usr/bin/time" `isInfixOf` topMsg)
+  case getParseResult (execParserPure defaultPrefs parserInfo ["--no-metrics", "outdated"]) of
+    Just opts -> assertEq "global no-metrics" True (optNoMetrics opts)
+    Nothing -> do
+      hPutStrLn stderr "parse --no-metrics outdated failed"
+      exitFailure
   case execParserPure defaultPrefs parserInfo ["eclean", "--help"] of
     Failure failure -> do
       let (msg, _) = renderFailure failure "mndz-overlay-manager"

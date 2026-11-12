@@ -17,7 +17,7 @@ module Update.Uv.Deps
   )
 where
 
-import Control.Concurrent (QSem)
+import CLI.Jobs (PackSlot)
 import Control.Exception (IOException, try)
 import Data.List (find, sort)
 import Data.Set (Set)
@@ -25,6 +25,8 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Metrics.Core (Metrics)
+import Metrics.Process (timedRunner)
 import System.Directory
   ( createDirectoryIfMissing,
     doesDirectoryExist,
@@ -44,6 +46,7 @@ import Update.Go.Vendor (githubCloneUrl)
 import Update.Pack.XzTar (packTarXz)
 import Update.Process
   ( CommandRunner,
+    Measure (..),
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
@@ -112,7 +115,7 @@ data UvDepsProgress = UvDepsProgress
 -- | @threads@ is the xz thread count @N@ for the deps pack (@xzOptValue@:
 -- block size when @N > 1@).
 -- @slot@ is the update's shared compress lock.
-mkUvDepsOps :: Int -> QSem -> CommandRunner -> UvDepsOps
+mkUvDepsOps :: Int -> PackSlot -> CommandRunner -> UvDepsOps
 mkUvDepsOps threads slot run =
   UvDepsOps
     { udoClone = gitCloneTag run,
@@ -132,7 +135,7 @@ mkUvDepsOps threads slot run =
     }
 
 -- | Fallback ops. An update passes the resolved @--jobs@ count and its slot.
-productionUvDepsOps :: QSem -> UvDepsOps
+productionUvDepsOps :: PackSlot -> UvDepsOps
 productionUvDepsOps slot = mkUvDepsOps 1 slot productionCommandRunner
 
 -- | Clone the raw tag, sync the frozen lock, and pack @sdists/@.
@@ -440,7 +443,8 @@ planBackendSdists run slot reqs workDir =
           { prMode = ExecCmd "uv" ["venv", "--python", python, venv],
             prCwd = Nothing,
             prEnv = Just env,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
     case made of
       Left err -> pure (Left err)
@@ -465,7 +469,8 @@ planBackendSdists run slot reqs workDir =
                     ],
                 prCwd = Nothing,
                 prEnv = Just env,
-                prStdin = ""
+                prStdin = "",
+                prMeasure = Timed
               }
         let logged = T.pack (prStdout res) <> "\n" <> T.pack (prStderr res)
         pure $
@@ -494,7 +499,8 @@ backendSdistUrl run slot name version workDir =
           { prMode = ExecCmd python [script, T.unpack name, T.unpack version],
             prCwd = Nothing,
             prEnv = Just env,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
     pure $
       if prExitCode res /= ExitSuccess
@@ -568,7 +574,8 @@ runCapture run prefix cmd args = do
         { prMode = ExecCmd cmd args,
           prCwd = Nothing,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res == ExitSuccess
@@ -655,7 +662,8 @@ gitCloneTag run url tag dest = do
             ],
         prCwd = Nothing,
         prEnv = Nothing,
-        prStdin = ""
+        prStdin = "",
+        prMeasure = Timed
       }
 
 uvSync :: CommandRunner -> FilePath -> Text -> IO (Either Text ())
@@ -671,7 +679,8 @@ uvSync run projectDir slot = do
       { prMode = ExecCmd "uv" (map T.unpack (frozenUvSyncArgs slot)),
         prCwd = Just projectDir,
         prEnv = Just env,
-        prStdin = ""
+        prStdin = "",
+        prMeasure = Timed
       }
 
 uvFreeze :: CommandRunner -> FilePath -> IO (Either Text [Text])
@@ -682,7 +691,8 @@ uvFreeze run projectDir = do
         { prMode = ExecCmd "uv" ["pip", "freeze"],
           prCwd = Just projectDir,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res /= ExitSuccess
@@ -716,7 +726,8 @@ downloadFile run url dest =
       { prMode = ExecCmd "wget" ["-O", dest, T.unpack url],
         prCwd = Nothing,
         prEnv = Nothing,
-        prStdin = ""
+        prStdin = "",
+        prMeasure = Timed
       }
 
 unpackArchive :: CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
@@ -728,7 +739,8 @@ unpackArchive run archive dest =
       { prMode = ExecCmd "tar" ["-xzf", archive, "-C", dest],
         prCwd = Nothing,
         prEnv = Nothing,
-        prStdin = ""
+        prStdin = "",
+        prMeasure = Timed
       }
 
 cargoVendor :: CommandRunner -> FilePath -> IO (Either Text Text)
@@ -739,7 +751,8 @@ cargoVendor run dir = do
         { prMode = ExecCmd "cargo" ["vendor"],
           prCwd = Just dir,
           prEnv = Nothing,
-          prStdin = ""
+          prStdin = "",
+          prMeasure = Timed
         }
   pure $
     if prExitCode res /= ExitSuccess
@@ -763,10 +776,11 @@ repackSdist run srcDir dest =
             ],
         prCwd = Nothing,
         prEnv = Nothing,
-        prStdin = ""
+        prStdin = "",
+        prMeasure = Timed
       }
 
-packStage :: Int -> QSem -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
+packStage :: Int -> PackSlot -> CommandRunner -> FilePath -> FilePath -> IO (Either Text ())
 packStage threads slot run stageDir outPath = do
   hasGit <- doesDirectoryExist (stageDir </> "git")
   let entries = "sdists" : ["git" | hasGit]
@@ -775,19 +789,21 @@ packStage threads slot run stageDir outPath = do
 -- | Clone one tag and sync slots in probe order. Stops at the first success.
 -- A missing interpreter is 'Left'. A non-zero sync rejects that slot.
 productionProbeUvSync ::
+  Metrics ->
   Text ->
   Text ->
   Text ->
   Maybe FilePath ->
   [Text] ->
   IO (Either Text (Set Text))
-productionProbeUvSync owner repo tag mSub slots
+productionProbeUvSync m owner repo tag mSub slots
   | null slots = pure (Right Set.empty)
   | otherwise =
       withSystemTempDirectory "uv-probe-" $ \tmp -> do
+        let run = timedRunner m productionCommandRunner
         let dest = tmp </> "src"
             url = githubCloneUrl owner repo
-        cloned <- gitCloneTag productionCommandRunner url tag dest
+        cloned <- gitCloneTag run url tag dest
         case cloned of
           Left err -> pure (Left err)
           Right () -> do
@@ -798,7 +814,7 @@ productionProbeUvSync owner repo tag mSub slots
             if not exists
               then
                 pure (Left ("uv project directory is missing: " <> T.pack project))
-              else probeOrdered (probeSlot productionCommandRunner project) slots
+              else probeOrdered (probeSlot run project) slots
 
 probeSlot :: CommandRunner -> FilePath -> Text -> IO ProbeStep
 probeSlot run project slot = do
@@ -822,7 +838,8 @@ pythonFind run slot = do
           { prMode = ExecCmd "uv" ["python", "find", T.unpack slot],
             prCwd = Nothing,
             prEnv = Just env,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
   pure $ case eres of
     Left _ -> Left "uv is not installed"
@@ -843,7 +860,8 @@ uvSyncExit run project slot = do
           { prMode = ExecCmd "uv" (map T.unpack (frozenUvSyncArgs slot)),
             prCwd = Just project,
             prEnv = Just env,
-            prStdin = ""
+            prStdin = "",
+            prMeasure = Timed
           }
   pure $ case eres of
     Left _ -> Left "uv is not installed"
