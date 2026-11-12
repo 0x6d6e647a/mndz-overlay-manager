@@ -44,8 +44,6 @@ import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
-import Metrics.Core (Metrics)
-import Metrics.Process (wallClockProc)
 import Network.HTTP.Client
   ( Manager,
     Response,
@@ -61,9 +59,15 @@ import Network.HTTP.Types (HeaderName, RequestHeaders, ResponseHeaders)
 import Network.HTTP.Types.Status (statusCode)
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPV, samePV)
 import System.Exit (ExitCode (..))
-import System.Process (readProcessWithExitCode)
 import Text.Read (readMaybe)
 import Update.Http (HttpLbs, httpLbsEither)
+import Update.Process
+  ( CommandRunner,
+    Measure (..),
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+  )
 import Update.Types (UpdateSource (..))
 
 -- | Structured @api.github.com@ HTTP error (status, URL, JSON message, quota).
@@ -580,39 +584,44 @@ validGitHubName name =
         || c == '.'
 
 -- | @git remote get-url origin@ in @dir@.
-gitRemoteOriginUrl :: Metrics -> FilePath -> IO (Either Text Text)
-gitRemoteOriginUrl m =
+gitRemoteOriginUrl :: CommandRunner -> FilePath -> IO (Either Text Text)
+gitRemoteOriginUrl run =
   readGitRemoteUrl
-    m
+    run
     ["remote", "get-url", "origin"]
     "assets-path origin remote is missing or unreadable"
     "assets-path origin remote URL is empty"
 
 -- | @git remote get-url --push origin@ in @dir@.
-gitRemotePushUrl :: Metrics -> FilePath -> IO (Either Text Text)
-gitRemotePushUrl m =
+gitRemotePushUrl :: CommandRunner -> FilePath -> IO (Either Text Text)
+gitRemotePushUrl run =
   readGitRemoteUrl
-    m
+    run
     ["remote", "get-url", "--push", "origin"]
     "assets-path origin push URL is missing or unreadable"
     "assets-path origin push URL is empty"
 
 readGitRemoteUrl ::
-  Metrics ->
+  CommandRunner ->
   [String] ->
   Text ->
   Text ->
   FilePath ->
   IO (Either Text Text)
-readGitRemoteUrl m args missing empty dir = do
-  let argv = ["-C", dir] <> args
-  (code, out, err) <-
-    wallClockProc m "git" argv Nothing [] (\(c, _, _) -> Just c) $
-      readProcessWithExitCode "git" argv ""
-  let stdoutT = T.strip (T.pack out)
-      errT = T.strip (T.pack err)
+readGitRemoteUrl run args missing empty dir = do
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "git" (["-C", dir] <> args),
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = "",
+          prMeasure = Timed
+        }
+  let stdoutT = T.strip (T.pack (prStdout res))
+      errT = T.strip (T.pack (prStderr res))
   pure $
-    if code /= ExitSuccess
+    if prExitCode res /= ExitSuccess
       then
         Left
           ( missing

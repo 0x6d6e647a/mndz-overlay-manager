@@ -4,9 +4,13 @@
 -- and injectable GpgHandle (no live pinentry).
 module Test.Git (clearGitLocalEnv, tests) where
 
+import Control.Exception (IOException, try)
 import Control.Monad (forM_, unless, void, when)
+import Data.ByteString qualified as BS
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Text qualified as T
 import Metrics.Core (noopMetrics)
+import Metrics.Process (timedRunner)
 import System.Directory (createDirectoryIfMissing)
 import System.Environment (getEnvironment, getExecutablePath, lookupEnv, unsetEnv)
 import System.Exit (ExitCode (..))
@@ -21,6 +25,7 @@ import System.Process
     waitForProcess,
   )
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
+import Test.Metrics (spanStarts, withRecorded)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
 import Update.Git
@@ -33,13 +38,23 @@ import Update.Git
     relativeOverlayPath,
   )
 import Update.Git qualified as Git
+import Update.GitHub (gitRemoteOriginUrl, gitRemotePushUrl)
 import Update.GpgAgent
   ( GpgAgentOps (..),
+    GpgHandle,
     Keygrip (..),
     ensureGpgReady,
     newGpgHandle,
     noopSupervisor,
     teardownGpgHandle,
+  )
+import Update.Process
+  ( CommandRunner,
+    Measure (..),
+    ProcessMode (..),
+    ProcessRequest (..),
+    ProcessResult (..),
+    productionCommandRunner,
   )
 
 tests :: TestTree
@@ -57,7 +72,21 @@ tests =
       testCase "Git Add Commit Gpg Not Ready" testGitAddCommitGpgNotReady,
       testCase "Git Add Commit Commit Failure" testGitAddCommitCommitFails,
       testCase "Production GitOps Wiring" testProductionGitOpsWiring,
-      testCase "Rev-parse HEAD" testGitRevParseHead
+      testCase "Rev-parse HEAD" testGitRevParseHead,
+      testGroup
+        "Scripted runner"
+        [ testCase "isGitWorkTree argv, measure, stdout" testFakeWorkTree,
+          testCase "pathsDirty argv, measure, mapping" testFakePathsDirty,
+          testCase "gitRevParseHead argv, trim, mapping" testFakeRevParse,
+          testCase "gitPush is interactive and maps failure" testFakePush,
+          testCase "signed commit: add then interactive commit with env" testFakeSignedCommit,
+          testCase "signed commit: add failure stops before commit" testFakeAddFails,
+          testCase "signed commit: commit failure maps stderr" testFakeCommitFails,
+          testCase "signed commit: gpg not ready runs no git" testFakeGpgNotReady,
+          testCase "remote URL argv and mapping" testFakeRemoteUrl,
+          testCase "missing git raises the same IOException with metrics" testMissingGit,
+          testCase "signing environment is not recorded" testSigningEnvNotRecorded
+        ]
     ]
 
 -- | Drop Git's repository-location variables so later git commands target the
@@ -120,7 +149,7 @@ testClearedEnvTemporaryInit =
     let other = tmp </> "other"
     createDirectoryIfMissing True other
     callProcess "git" ["-C", other, "init", "-q"]
-    inside <- isGitWorkTree noopMetrics other
+    inside <- isGitWorkTree productionCommandRunner other
     assertEq "temporary directory is a work tree" True inside
     mRoot <- lookupEnv probeRootEnv
     forM_ mRoot assertCommonConfigOmitsWorktree
@@ -156,11 +185,11 @@ testIsGitWorkTree :: IO ()
 testIsGitWorkTree =
   withSystemTempDirectory "git-wt" $ \tmp -> do
     createDirectoryIfMissing True (tmp </> "plain")
-    plain <- isGitWorkTree noopMetrics (tmp </> "plain")
+    plain <- isGitWorkTree productionCommandRunner (tmp </> "plain")
     assertEq "non-git" False plain
     createDirectoryIfMissing True (tmp </> "repo")
     initRepo (tmp </> "repo")
-    inside <- isGitWorkTree noopMetrics (tmp </> "repo")
+    inside <- isGitWorkTree productionCommandRunner (tmp </> "repo")
     assertEq "git worktree" True inside
 
 testPathsDirty :: IO ()
@@ -169,13 +198,13 @@ testPathsDirty =
     let root = tmp </> "repo"
     createDirectoryIfMissing True root
     initRepo root
-    clean <- assertRight "clean" =<< pathsDirty noopMetrics root ["README"]
+    clean <- assertRight "clean" =<< pathsDirty productionCommandRunner root ["README"]
     assertEq "clean false" False clean
     writeFile (root </> "README") "dirty\n"
-    dirty <- assertRight "dirty" =<< pathsDirty noopMetrics root ["README"]
+    dirty <- assertRight "dirty" =<< pathsDirty productionCommandRunner root ["README"]
     assertEq "dirty true" True dirty
     -- missing pathspec is still a successful status (not dirty)
-    missing <- assertRight "missing path" =<< pathsDirty noopMetrics root ["no-such-file"]
+    missing <- assertRight "missing path" =<< pathsDirty productionCommandRunner root ["no-such-file"]
     assertEq "missing not dirty" False missing
 
 testPathsDirtyDeletedUntracked :: IO ()
@@ -194,7 +223,7 @@ testPathsDirtyDeletedUntracked =
     createDirectoryIfMissing True pkg
     writeFile (pkg </> "bun-bin-1.4.0.ebuild") "EAPI=8\n"
     dirty <-
-      assertRight "D and ??" =<< pathsDirty noopMetrics root ["dev-lang/bun-bin"]
+      assertRight "D and ??" =<< pathsDirty productionCommandRunner root ["dev-lang/bun-bin"]
     assertEq "untracked and deleted count as dirty" True dirty
 
 testPathsDirtyStatusFailure :: IO ()
@@ -202,7 +231,7 @@ testPathsDirtyStatusFailure =
   withSystemTempDirectory "git-status-fail" $ \tmp -> do
     -- Not a git repo → git status fails
     createDirectoryIfMissing True (tmp </> "plain")
-    err <- assertLeft "status fail" =<< pathsDirty noopMetrics (tmp </> "plain") ["x"]
+    err <- assertLeft "status fail" =<< pathsDirty productionCommandRunner (tmp </> "plain") ["x"]
     assertTrue "mentions status" ("git status failed" `T.isInfixOf` err)
 
 testRelativeOverlayPath :: IO ()
@@ -221,7 +250,7 @@ testGitPushNoRemote =
     let root = tmp </> "repo"
     createDirectoryIfMissing True root
     initRepo root
-    err <- assertLeft "push fail" =<< gitPush noopMetrics root
+    err <- assertLeft "push fail" =<< gitPush productionCommandRunner root
     assertTrue "push failed msg" ("git push failed" `T.isInfixOf` err)
 
 fakeGpgOps :: GpgAgentOps
@@ -255,7 +284,7 @@ testGitAddCommitGpgNotReady =
             }
     h <- newGpgHandle ops
     err <-
-      assertLeft "gpg gate" =<< gitAddAndSignedCommit noopMetrics h root ["extra"] "msg"
+      assertLeft "gpg gate" =<< gitAddAndSignedCommit productionCommandRunner h root ["extra"] "msg"
     assertTrue "signingkey" ("signingkey" `T.isInfixOf` err)
     teardownGpgHandle h
 
@@ -270,7 +299,7 @@ testGitAddCommitCommitFails =
     h <- newGpgHandle fakeGpgOps
     void $ assertRight "gpg ready" =<< ensureGpgReady h root
     err <-
-      assertLeft "commit -S" =<< gitAddAndSignedCommit noopMetrics h root ["extra"] "signed"
+      assertLeft "commit -S" =<< gitAddAndSignedCommit productionCommandRunner h root ["extra"] "signed"
     assertTrue "commit failed" ("git commit -S failed" `T.isInfixOf` err)
     teardownGpgHandle h
 
@@ -296,9 +325,234 @@ testGitRevParseHead =
     let root = tmp </> "repo"
     createDirectoryIfMissing True root
     initRepo root
-    sha <- assertRight "HEAD" =<< gitRevParseHead noopMetrics root
+    sha <- assertRight "HEAD" =<< gitRevParseHead productionCommandRunner root
     assertTrue "sha nonempty" (T.length sha >= 7)
     missing <-
       assertLeft "missing repo"
-        =<< gitRevParseHead noopMetrics (tmp </> "not-a-repo")
+        =<< gitRevParseHead productionCommandRunner (tmp </> "not-a-repo")
     assertTrue "rev-parse fail" ("git rev-parse HEAD failed" `T.isInfixOf` missing)
+
+------------------------------------------------------------------------
+-- Scripted runner
+------------------------------------------------------------------------
+
+okOut :: String -> ProcessResult
+okOut out = ProcessResult {prExitCode = ExitSuccess, prStdout = out, prStderr = ""}
+
+failErr :: String -> ProcessResult
+failErr err = ProcessResult {prExitCode = ExitFailure 1, prStdout = "", prStderr = err}
+
+-- | Runner that records requests and answers each from @answer@.
+recordingRunner ::
+  (ProcessRequest -> ProcessResult) ->
+  IO (CommandRunner, IO [ProcessRequest])
+recordingRunner answer = do
+  seen <- newIORef []
+  let run req = do
+        modifyIORef' seen (<> [req])
+        pure (answer req)
+  pure (run, readIORef seen)
+
+-- | Single-answer 'recordingRunner'.
+constRunner :: ProcessResult -> IO (CommandRunner, IO [ProcessRequest])
+constRunner = recordingRunner . const
+
+gitArgs :: ProcessRequest -> [String]
+gitArgs req = case prMode req of
+  ExecCmd "git" args -> args
+  other -> error ("not a git exec: " <> show other)
+
+testFakeWorkTree :: IO ()
+testFakeWorkTree = do
+  (run, seen) <- constRunner (okOut " true\n")
+  yes <- isGitWorkTree run "/some/dir"
+  assertTrue "trimmed true" yes
+  reqs <- seen
+  assertEq "argv" [["-C", "/some/dir", "rev-parse", "--is-inside-work-tree"]] (map gitArgs reqs)
+  assertEq "measure" [Timed] (map prMeasure reqs)
+  assertEq "no env" [Nothing] (map prEnv reqs)
+  (runF, _) <- constRunner (okOut "false\n")
+  no <- isGitWorkTree runF "/x"
+  assertTrue "false stdout" (not no)
+  (runE, _) <- constRunner (failErr "fatal: not a git repository")
+  err <- isGitWorkTree runE "/x"
+  assertTrue "non-zero exit" (not err)
+
+testFakePathsDirty :: IO ()
+testFakePathsDirty = do
+  (run, seen) <- constRunner (okOut " M cat/pkg/Manifest\n")
+  dirty <- assertRight "dirty" =<< pathsDirty run "/overlay" ["cat/pkg", "other"]
+  assertTrue "dirty from output" dirty
+  reqs <- seen
+  assertEq
+    "argv"
+    [["-C", "/overlay", "status", "--porcelain", "--", "cat/pkg", "other"]]
+    (map gitArgs reqs)
+  assertEq "measure" [Timed] (map prMeasure reqs)
+  (runC, _) <- constRunner (okOut "")
+  clean <- assertRight "clean" =<< pathsDirty runC "/overlay" ["x"]
+  assertTrue "empty output is clean" (not clean)
+  (runE, _) <- constRunner (failErr "boom")
+  err <- assertLeft "status failure" =<< pathsDirty runE "/overlay" ["x"]
+  assertEq "message" "git status failed: boom" err
+
+testFakeRevParse :: IO ()
+testFakeRevParse = do
+  (run, seen) <- constRunner (okOut "abc1234\n")
+  sha <- assertRight "HEAD" =<< gitRevParseHead run "/repo"
+  assertEq "trimmed" "abc1234" sha
+  reqs <- seen
+  assertEq "argv" [["-C", "/repo", "rev-parse", "HEAD"]] (map gitArgs reqs)
+  assertEq "measure" [Timed] (map prMeasure reqs)
+  (runE, _) <- constRunner (failErr "bad revision")
+  err <- assertLeft "failure" =<< gitRevParseHead runE "/repo"
+  assertEq "message" "git rev-parse HEAD failed: bad revision" err
+
+testFakePush :: IO ()
+testFakePush = do
+  (run, seen) <- constRunner (okOut "")
+  assertRight "push" =<< gitPush run "/repo"
+  reqs <- seen
+  assertEq "argv" [["-C", "/repo", "push"]] (map gitArgs reqs)
+  assertEq "measure" [TimedInteractive] (map prMeasure reqs)
+  (runE, _) <- constRunner (failErr "rejected")
+  err <- assertLeft "failure" =<< gitPush runE "/repo"
+  assertEq "message" "git push failed: rejected" err
+
+-- | Fake GPG ops whose child environment carries a recognizable GPG_TTY.
+ttyGpgOps :: GpgAgentOps
+ttyGpgOps = fakeGpgOps {gaoControllingTty = pure (Just "/dev/pts/mndz-test-tty")}
+
+withReadyHandle :: (FilePath -> GpgHandle -> IO a) -> IO a
+withReadyHandle act =
+  withSystemTempDirectory "git-fake-commit" $ \tmp -> do
+    let root = tmp </> "repo"
+    createDirectoryIfMissing True root
+    initRepo root
+    h <- newGpgHandle ttyGpgOps
+    r <- act root h
+    teardownGpgHandle h
+    pure r
+
+testFakeSignedCommit :: IO ()
+testFakeSignedCommit = withReadyHandle $ \root h -> do
+  (run, seen) <- constRunner (okOut "")
+  assertRight "commit" =<< gitAddAndSignedCommit run h root ["a", "b"] "the message"
+  reqs <- seen
+  assertEq
+    "argv"
+    [ ["-C", root, "add", "--", "a", "b"],
+      ["-C", root, "commit", "-S", "-m", "the message"]
+    ]
+    (map gitArgs reqs)
+  assertEq "measures" [Timed, TimedInteractive] (map prMeasure reqs)
+  case map prEnv reqs of
+    [Nothing, Just env1] ->
+      assertEq "signing tty" (Just "/dev/pts/mndz-test-tty") (lookup "GPG_TTY" env1)
+    other -> assertTrue ("unexpected envs: " <> show other) False
+
+testFakeAddFails :: IO ()
+testFakeAddFails = withReadyHandle $ \root h -> do
+  (run, seen) <- constRunner (failErr "pathspec 'a' did not match")
+  err <- assertLeft "add" =<< gitAddAndSignedCommit run h root ["a"] "m"
+  assertEq "message" "git add failed: pathspec 'a' did not match" err
+  reqs <- seen
+  assertEq "only add ran" 1 (length reqs)
+
+testFakeCommitFails :: IO ()
+testFakeCommitFails = withReadyHandle $ \root h -> do
+  (run, seen) <-
+    recordingRunner $ \req ->
+      if "commit" `elem` gitArgs req then failErr "no secret key" else okOut ""
+  err <- assertLeft "commit" =<< gitAddAndSignedCommit run h root ["a"] "m"
+  assertEq "message" "git commit -S failed: no secret key" err
+  reqs <- seen
+  assertEq "add then commit" 2 (length reqs)
+
+testFakeGpgNotReady :: IO ()
+testFakeGpgNotReady =
+  withSystemTempDirectory "git-fake-gpg" $ \tmp -> do
+    let root = tmp </> "repo"
+    createDirectoryIfMissing True root
+    initRepo root
+    h <- newGpgHandle fakeGpgOps {gaoGetSigningKey = \_ -> pure (Left "signingkey unset")}
+    (run, seen) <- constRunner (okOut "")
+    err <- assertLeft "gpg gate" =<< gitAddAndSignedCommit run h root ["a"] "m"
+    assertTrue "signingkey" ("signingkey" `T.isInfixOf` err)
+    reqs <- seen
+    assertEq "no git ran" [] (map gitArgs reqs)
+    teardownGpgHandle h
+
+testFakeRemoteUrl :: IO ()
+testFakeRemoteUrl = do
+  (run, seen) <- constRunner (okOut " git@github.com:o/r.git\n")
+  origin <- assertRight "origin" =<< gitRemoteOriginUrl run "/assets"
+  assertEq "trimmed" "git@github.com:o/r.git" origin
+  pushUrl <- assertRight "push url" =<< gitRemotePushUrl run "/assets"
+  assertEq "trimmed push" "git@github.com:o/r.git" pushUrl
+  reqs <- seen
+  assertEq
+    "argv"
+    [ ["-C", "/assets", "remote", "get-url", "origin"],
+      ["-C", "/assets", "remote", "get-url", "--push", "origin"]
+    ]
+    (map gitArgs reqs)
+  assertEq "measure" [Timed, Timed] (map prMeasure reqs)
+  (runE, _) <- constRunner (failErr "")
+  noErr <- assertLeft "no stderr" =<< gitRemoteOriginUrl runE "/assets"
+  assertEq "bare message" "assets-path origin remote is missing or unreadable" noErr
+  (runS, _) <- constRunner (failErr "fatal: No such remote 'origin'\n")
+  withErr <- assertLeft "stderr" =<< gitRemoteOriginUrl runS "/assets"
+  assertEq
+    "message with stderr"
+    "assets-path origin remote is missing or unreadable: fatal: No such remote 'origin'"
+    withErr
+  pushErr <- assertLeft "push stderr" =<< gitRemotePushUrl runS "/assets"
+  assertEq
+    "push message"
+    "assets-path origin push URL is missing or unreadable: fatal: No such remote 'origin'"
+    pushErr
+  (runB, _) <- constRunner (okOut "  \n")
+  empty <- assertLeft "empty" =<< gitRemoteOriginUrl runB "/assets"
+  assertEq "empty message" "assets-path origin remote URL is empty" empty
+  emptyPush <- assertLeft "empty push" =<< gitRemotePushUrl runB "/assets"
+  assertEq "empty push message" "assets-path origin push URL is empty" emptyPush
+
+-- | Point @git@ requests at an executable that does not exist, so GNU time
+-- cannot be asked to exec it.
+missingGit :: CommandRunner -> CommandRunner
+missingGit run req = run req {prMode = mode}
+  where
+    mode = case prMode req of
+      ExecCmd "git" args -> ExecCmd "mndz-no-such-git" args
+      other -> other
+
+testMissingGit :: IO ()
+testMissingGit = do
+  plain <- try @IOException (isGitWorkTree (missingGit productionCommandRunner) "/x")
+  (timed, _) <- withRecorded $ \m ->
+    try @IOException (isGitWorkTree (missingGit (timedRunner m productionCommandRunner)) "/x")
+  case (plain, timed) of
+    (Left a, Left b) -> assertEq "same failure" (show a) (show b)
+    _ -> assertTrue "expected IOException from both runners" False
+
+testSigningEnvNotRecorded :: IO ()
+testSigningEnvNotRecorded = withReadyHandle $ \root h -> do
+  seenEnv <- newIORef []
+  let inner req = do
+        modifyIORef' seenEnv (<> [prEnv req])
+        case prMode req of
+          ExecCmd "/usr/bin/time" ("-o" : file : _) -> BS.writeFile file "{}"
+          _ -> pure ()
+        pure (okOut "")
+  (res, evs) <- withRecorded $ \m ->
+    gitAddAndSignedCommit (timedRunner m inner) h root ["a"] "m"
+  assertRight "commit" res
+  envs <- readIORef seenEnv
+  assertTrue
+    "the commit really carried the tty"
+    (any (maybe False (elem ("GPG_TTY", "/dev/pts/mndz-test-tty"))) envs)
+  assertTrue
+    "git commit span recorded"
+    (length [() | (_, _, "proc", _) <- spanStarts evs] == 2)
+  assertTrue "tty value absent from every event" (not ("mndz-test-tty" `T.isInfixOf` T.pack (show evs)))

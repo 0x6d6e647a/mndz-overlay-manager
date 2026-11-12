@@ -33,9 +33,9 @@ import CLI.Progress
   )
 import Colog (LogAction (..), Message, Msg (..), logWarning, usingLoggerT)
 import Config.Types (CheckCacheTtl (..))
-import Control.Concurrent (threadDelay)
-import Control.Concurrent.MVar (newEmptyMVar, readMVar)
-import Control.Exception (AsyncException (..), SomeException, throwIO, try)
+import Control.Concurrent (forkIO, threadDelay, throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Exception (AsyncException (..), IOException, SomeException, fromException, throwIO, try)
 import Control.Monad (join, void, when)
 import Data.Aeson (Value (..), decodeStrict)
 import Data.Aeson.Key qualified as Key
@@ -43,7 +43,9 @@ import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.Char (isHexDigit)
+import Data.Foldable (toList)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.List (isSuffixOf)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, mapMaybe)
 import Data.Set qualified as Set
@@ -62,7 +64,7 @@ import Metrics.Core
     withSpan,
   )
 import Metrics.Http (githubRouteTemplate, instrumentManagerSettings)
-import Metrics.Process (timeFormat, timedRunner)
+import Metrics.Process (requestMarkerVar, timeFormat, timedRunner)
 import Metrics.Recorder
   ( HeaderInputs (..),
     HostFacts (..),
@@ -115,7 +117,7 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (IOMode (WriteMode), openBinaryFile)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (callProcess)
+import System.Process (readProcessWithExitCode)
 import Test.Assert (assertEq, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase)
@@ -197,9 +199,15 @@ unitTests =
           testCase "parsed time file is attached and deleted" testTimedIngest,
           testCase "malformed time file is kept with time_parse_error" testTimedMalformed,
           testCase "Lifecycle and Untimed pass through" testTimedPassThrough,
+          testCase "TimedInteractive is wrapped and marked interactive" testTimedInteractive,
+          testCase "interrupt during a TimedInteractive run ends the span fail and leaves no child" testTimedInterrupted,
+          testCase "wrapped request is marked, original env kept" testTimedMarker,
+          testCase "completed request leaves its background processes alone" testTimedNoReapOnSuccess,
+          testCase "missing tool under TimedInteractive raises as without metrics" testTimedInteractiveMissingTool,
           testCase "argv token is redacted in proc span" testTimedRedaction,
           testCase "real GNU time keeps stderr and exit 2" testTimedRealBinary,
-          testCase "git ops record wall-clock proc spans" testGitProcSpans
+          testCase "git ops record measured proc spans" testGitProcSpans,
+          testCase "git argv token is redacted in proc span" testGitArgvRedaction
         ],
       testGroup
         "Container"
@@ -988,6 +996,86 @@ testTimedPassThrough = do
   reqsN <- seen
   assertEq "recording off: unwrapped" [execReq "sh" []] reqsN
 
+testTimedInteractive :: IO ()
+testTimedInteractive = do
+  (_, reqs, evs, left) <-
+    runTimed validTime (execReq "sh" ["-c", "x"]) {prMeasure = TimedInteractive}
+  case reqs of
+    [ProcessRequest {prMode = ExecCmd "/usr/bin/time" ("-o" : file : _)}] ->
+      assertTrue "json time file" (".json" `isSuffixOf` file)
+    other -> assertFailure ("unexpected inner requests: " <> show other)
+  assertEq "time dir empty" [] left
+  (sid, attrs) <- procSpan evs
+  assertEq "interactive" (Just (Bool True)) (KM.lookup "interactive" attrs)
+  assertTrue "time object" (KM.member "time" (spanEndAttrs evs sid))
+  (_, _, evsPlain, _) <- runTimed validTime (execReq "sh" ["-c", "x"])
+  (_, plainAttrs) <- procSpan evsPlain
+  assertEq "Timed has no interactive key" Nothing (KM.lookup "interactive" plainAttrs)
+
+testTimedInteractiveMissingTool :: IO ()
+testTimedInteractiveMissingTool = do
+  let req =
+        (execReq "mndz-no-such-tool-xyz" [])
+          { prEnv = Just [("PATH", "")],
+            prMeasure = TimedInteractive
+          }
+  plain <- try @IOException (productionCommandRunner req)
+  timed <- try @IOException $ do
+    (res, _) <- withRecorded $ \m -> timedRunner m productionCommandRunner req
+    pure res
+  case (plain, timed) of
+    (Left a, Left b) -> assertEq "same failure" (show a) (show b)
+    _ -> assertFailure "expected IOException from both runners"
+
+-- | A real GNU time wrapper around a real long-running child, interrupted the
+-- way Ctrl-C reaches the program (@UserInterrupt@ in the running thread).
+testTimedInterrupted :: IO ()
+testTimedInterrupted = do
+  let marker = "7313"
+      req = (execReq "sleep" [marker]) {prMeasure = TimedInteractive}
+  (r, evs) <- withRecorded $ \m -> do
+    done <- newEmptyMVar
+    tid <- forkIO (try @SomeException (timedRunner m productionCommandRunner req) >>= putMVar done)
+    threadDelay 500000
+    throwTo tid UserInterrupt
+    takeMVar done
+  case r of
+    Left e -> assertEq "interrupt propagates" (Just UserInterrupt) (fromException e)
+    Right _ -> assertFailure "expected the interrupt to propagate"
+  (sid, attrs) <- procSpan evs
+  assertEq "interactive" (Just (Bool True)) (KM.lookup "interactive" attrs)
+  assertEq "span ends fail" (Just "fail") (spanEndOutcome evs sid)
+  assertTrue "error recorded" (KM.member "error" (spanEndAttrs evs sid))
+  (code, _, _) <- readProcessWithExitCode "pgrep" ["-f", "sleep " <> marker] ""
+  assertEq "no child left running" (ExitFailure 1) code
+
+testTimedMarker :: IO ()
+testTimedMarker = do
+  let req = (execReq "sh" []) {prEnv = Just [("KEEP", "1")]}
+  (_, reqs, _, _) <- runTimed validTime req
+  case reqs of
+    [ProcessRequest {prEnv = Just env1}] -> do
+      assertEq "original env kept" (Just "1") (lookup "KEEP" env1)
+      assertTrue "marker names the time file" (maybe False (".json" `isSuffixOf`) (lookup requestMarkerVar env1))
+    other -> assertFailure ("unexpected inner requests: " <> show other)
+  (_, reqsInherit, _, _) <- runTimed validTime (execReq "sh" [])
+  case reqsInherit of
+    [ProcessRequest {prEnv = Just env1}] -> do
+      assertTrue "inherited env carried over" (any ((== "PATH") . fst) env1)
+      assertTrue "marker present" (any ((== requestMarkerVar) . fst) env1)
+    other -> assertFailure ("unexpected inner requests: " <> show other)
+
+-- | Reaping is for interrupted requests only: a request that completes may
+-- legitimately leave a background process behind.
+testTimedNoReapOnSuccess :: IO ()
+testTimedNoReapOnSuccess = do
+  let req = execReq "sh" ["-c", "sleep 7314 >/dev/null 2>&1 & exit 0"]
+  (_, _) <- withRecorded $ \m -> timedRunner m productionCommandRunner req
+  threadDelay 200000
+  (code, _, _) <- readProcessWithExitCode "pgrep" ["-f", "sleep 7314"] ""
+  void (readProcessWithExitCode "pkill" ["-f", "sleep 7314"] "")
+  assertEq "background process still running" ExitSuccess code
+
 testTimedRedaction :: IO ()
 testTimedRedaction = do
   (inner, _) <- fakeInner validTime
@@ -1037,27 +1125,52 @@ testTimedRealBinary = do
       Just (String _) -> True
       _ -> False
 
+-- | Fake inner runner for git: writes @validTime@ for GNU time wrappers and
+-- succeeds with @true@ on stdout.
+fakeGitInner :: ProcessRequest -> IO ProcessResult
+fakeGitInner req = do
+  case prMode req of
+    ExecCmd "/usr/bin/time" ("-o" : file : _) -> BS.writeFile file validTime
+    _ -> pure ()
+  pure ProcessResult {prExitCode = ExitSuccess, prStdout = "true\n", prStderr = ""}
+
 testGitProcSpans :: IO ()
-testGitProcSpans =
-  withSystemTempDirectory "mndz-metrics-git-" $ \repo -> do
-    callProcess "git" ["-C", repo, "init", "-q"]
-    ((inside, dirty, pushed), evs) <- withRecorded $ \m -> do
-      i <- isGitWorkTree m repo
-      d <- pathsDirty m repo ["README"]
-      p <- gitPush m repo
-      pure (i, d, p)
-    assertTrue "work tree" inside
-    assertEq "clean" (Right False) dirty
-    assertTrue "push without remote fails" (either (const True) (const False) pushed)
-    let gitSpans = [(sid, a) | (sid, _, "proc", a) <- spanStarts evs, KM.lookup "cmd" a == Just (String "git")]
-    assertEq "three git spans" 3 (length gitSpans)
-    case gitSpans of
-      [(s1, _), _, (s3, pushAttrs)] -> do
-        assertEq "rev-parse exit 0" (Just (Number 0)) (KM.lookup "exit" (spanEndAttrs evs s1))
-        assertEq "no time object" Nothing (KM.lookup "time" (spanEndAttrs evs s1))
-        assertEq "push is interactive" (Just (Bool True)) (KM.lookup "interactive" pushAttrs)
-        assertEq "push fails" (Just "fail") (spanEndOutcome evs s3)
-      _ -> assertFailure "unexpected git spans"
+testGitProcSpans = do
+  ((inside, dirty, pushed), evs) <- withRecorded $ \m -> do
+    let run = timedRunner m fakeGitInner
+    i <- isGitWorkTree run "/repo"
+    d <- pathsDirty run "/repo" ["README"]
+    p <- gitPush run "/repo"
+    pure (i, d, p)
+  assertTrue "work tree" inside
+  assertEq "dirty from stdout" (Right True) dirty
+  assertEq "push ok" (Right ()) pushed
+  let gitSpans = [(sid, a) | (sid, _, "proc", a) <- spanStarts evs, KM.lookup "cmd" a == Just (String "git")]
+  assertEq "three git spans" 3 (length gitSpans)
+  case gitSpans of
+    [(s1, a1), _, (s3, pushAttrs)] -> do
+      assertEq "rev-parse exit 0" (Just (Number 0)) (KM.lookup "exit" (spanEndAttrs evs s1))
+      assertTrue "rev-parse time object" (KM.member "time" (spanEndAttrs evs s1))
+      assertEq "rev-parse is not interactive" Nothing (KM.lookup "interactive" a1)
+      assertEq "push is interactive" (Just (Bool True)) (KM.lookup "interactive" pushAttrs)
+      assertTrue "push time object" (KM.member "time" (spanEndAttrs evs s3))
+    _ -> assertFailure "unexpected git spans"
+
+testGitArgvRedaction :: IO ()
+testGitArgvRedaction = do
+  (_, evs) <- withRecorded $ \m -> do
+    mAddSecret m "github_pat_SECRET"
+    pathsDirty (timedRunner m fakeGitInner) "/repo" ["github_pat_SECRET/file"]
+  (_, attrs) <- procSpan evs
+  case KM.lookup "args" attrs of
+    Just (Array args) ->
+      assertTrue "token redacted in git argv" (not (any (isInfixOfS "github_pat_SECRET") (mapMaybe asString (toList args))))
+    other -> assertFailure ("args attr: " <> show other)
+  where
+    asString = \case
+      String t -> Just (T.unpack t)
+      _ -> Nothing
+    isInfixOfS needle = T.isInfixOf (T.pack needle) . T.pack
 
 ------------------------------------------------------------------------
 -- Materialize container

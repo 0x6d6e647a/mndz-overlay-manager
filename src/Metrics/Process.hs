@@ -5,8 +5,14 @@
 -- 'timedRunner' wraps a 'CommandRunner': each 'Timed' request runs as
 -- @/usr/bin/time -o \<file\> --quiet -f \<fmt\> -- cmd args…@ inside a @proc@
 -- span, and the time file is read into the span and deleted.
+--
+-- GNU time does not forward SIGTERM, so cancelling the wrapped request would
+-- leave the command running. Each wrapped request therefore carries a unique
+-- 'requestMarkerVar' in its environment, and an interrupted request terminates
+-- every process still carrying its marker.
 module Metrics.Process
   ( timedRunner,
+    requestMarkerVar,
     timeFormat,
     timeWrapArgs,
     timeFileName,
@@ -17,11 +23,15 @@ module Metrics.Process
   )
 where
 
+import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, mask, throwIO, try)
+import Control.Monad (filterM, forM_, unless, void, when)
 import Data.Aeson (Value (..), decodeStrict, (.=))
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BS8
 import Data.Char (isAlphaNum)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Either (fromRight)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -31,10 +41,16 @@ import System.Directory
   ( doesFileExist,
     findExecutable,
     findExecutablesInDirectories,
+    listDirectory,
     removeFile,
   )
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, splitSearchPath, takeFileName, (</>))
+import System.Posix.Process (getProcessID)
+import System.Posix.Signals (sigKILL, sigTERM, signalProcess)
+import System.Posix.Types (CPid (..))
+import Text.Read (readMaybe)
 import Update.Process
   ( CommandRunner,
     Measure (..),
@@ -129,27 +145,36 @@ outcomeOf = \case
 timedRunner :: Metrics -> CommandRunner -> CommandRunner
 timedRunner m inner req =
   case (mEnabled m, mTimeDir m, prMeasure req) of
-    (True, Just dir, Timed) -> measured dir ""
-    (True, Just dir, TimedContainerExec) -> measured dir ".outer"
+    (True, Just dir, Timed) -> measured dir "" []
+    (True, Just dir, TimedInteractive) -> measured dir "" ["interactive" .= True]
+    (True, Just dir, TimedContainerExec) -> measured dir ".outer" []
     _ -> inner req
   where
     (cmd, args) = case prMode req of
       ExecCmd c as -> (c, as)
       ShellCmd s -> ("/bin/sh", ["-c", s])
-    measured dir suffix = do
-      startAttrs <- procStartAttrs m cmd args (prCwd req)
+    measured dir suffix extra = do
+      startAttrs <- (<> extra) <$> procStartAttrs m cmd args (prCwd req)
       found <- resolvable req
       mask $ \restore -> do
         sid <- mSpanStart m "proc" startAttrs
         pkg <- mCurrentPackage m
         let file = dir </> timeFileName sid pkg cmd suffix
             (timeCmd, timeArgs) = timeWrapArgs file (cmd : args)
-            wrapped = req {prMode = ExecCmd timeCmd timeArgs}
+            marker = takeFileName file
+        baseEnv <- maybe getEnvironment pure (prEnv req)
+        let wrapped =
+              req
+                { prMode = ExecCmd timeCmd timeArgs,
+                  prEnv = Just ((requestMarkerVar, marker) : baseEnv)
+                }
         r <-
           try @SomeException . restore $
             if found then inner wrapped else inner req
         case r of
           Left e -> do
+            -- Cancelling the request kills GNU time but not its command.
+            when found (reapMarked marker)
             mSpanEnd m sid OutcomeFail ["error" .= T.pack (show e)]
             throwIO e
           Right res -> do
@@ -159,6 +184,48 @@ timedRunner m inner req =
                 else pure ["unwrapped" .= ("command not found" :: Text)]
             mSpanEnd m sid (outcomeOf (prExitCode res)) (procEndAttrs res <> timeAttrs)
             pure res
+
+-- | Environment variable naming the wrapped request a process belongs to.
+requestMarkerVar :: String
+requestMarkerVar = "MNDZ_TIMED_REQUEST"
+
+procRoot :: FilePath
+procRoot = "/proc"
+
+-- | Terminate every other process whose environment carries @marker@:
+-- @SIGTERM@, then @SIGKILL@ for those still alive after a short grace period.
+-- Best effort: a process that clears its environment is not found.
+reapMarked :: String -> IO ()
+reapMarked marker = do
+  self <- getProcessID
+  pids <- markedProcesses procRoot marker
+  let targets = filter (/= self) pids
+  forM_ targets (signalQuietly sigTERM)
+  unless (null targets) $ do
+    survivors <- waitGone (20 :: Int) targets
+    forM_ survivors (signalQuietly sigKILL)
+  where
+    waitGone 0 ps = alive ps
+    waitGone n ps = do
+      left <- alive ps
+      if null left
+        then pure []
+        else threadDelay 50000 *> waitGone (n - 1) left
+    alive = filterM (\p -> (p `elem`) <$> markedProcesses procRoot marker)
+    signalQuietly sig p = void (trySync (signalProcess sig p))
+
+-- | Processes (by pid) whose initial environment has the request marker.
+markedProcesses :: FilePath -> String -> IO [CPid]
+markedProcesses root marker = do
+  entries <- fromRight [] <$> trySync (listDirectory root)
+  let needle = TE.encodeUtf8 (T.pack (requestMarkerVar <> "=" <> marker))
+  fmap concat . mapM (check needle) $ mapMaybe readMaybe entries
+  where
+    check needle pid = do
+      r <- trySync (BS.readFile (root </> show (pid :: Int) </> "environ"))
+      pure $ case r of
+        Right bytes | needle `elem` BS8.split '\0' bytes -> [CPid (fromIntegral pid)]
+        _ -> []
 
 -- | Whether GNU time could exec the request's command.
 resolvable :: ProcessRequest -> IO Bool

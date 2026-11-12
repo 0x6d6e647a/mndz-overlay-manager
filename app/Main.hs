@@ -525,8 +525,8 @@ runUpdate rt refresh pkgArgs excludeArgs = do
                         usdGitHubToken = token,
                         usdUnlockConfigToken = unlockEnvelope,
                         usdMkReleaseOps = productionReleaseOpsWithLatch (rtMetrics rt) latch,
-                        usdGitOriginUrl = gitRemoteOriginUrl (rtMetrics rt),
-                        usdGitPushUrl = gitRemotePushUrl (rtMetrics rt),
+                        usdGitOriginUrl = gitRemoteOriginUrl run,
+                        usdGitPushUrl = gitRemotePushUrl run,
                         usdCommandRunner = run,
                         usdAssetsPathCfg = assetsPath cfg,
                         usdDistDir = distDir,
@@ -703,7 +703,7 @@ runGencache rt pkgArgs force excludeArgs = do
   enterPhase rt "config"
   (_cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   enterPhase rt "preflight"
-  isGit <- liftIO (isGitWorkTree (rtMetrics rt) overlayPath)
+  isGit <- liftIO (isGitWorkTree (timedRunner (rtMetrics rt) productionCommandRunner) overlayPath)
   unless isGit $
     dieError ("overlay path is not a git work tree: " <> overlayPath)
   toolsOk <- liftIO preflightGencache

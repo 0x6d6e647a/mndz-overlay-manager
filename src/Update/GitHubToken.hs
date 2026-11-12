@@ -17,7 +17,6 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as T
-import Metrics.Core (noopMetrics)
 import Network.HTTP.Client
   ( RequestBody (RequestBodyLBS),
     method,
@@ -37,6 +36,7 @@ import Update.Auth
   )
 import Update.GitHub (gitRemoteOriginUrl, parseGitHubOrigin)
 import Update.Http (HttpLbs, httpLbsEither)
+import Update.Process (productionCommandRunner)
 
 -- | Injectable seams for the setter (HTTP, prompts, wrap, origin).
 data GitHubTokenOps = GitHubTokenOps
@@ -54,7 +54,7 @@ productionGitHubTokenOps pause resume = do
       { gtoHttp = httpLbsEither mgr,
         gtoPrompt = productionSecretPrompt pause resume,
         gtoWrap = wrapToken,
-        gtoOriginUrl = gitRemoteOriginUrl noopMetrics
+        gtoOriginUrl = gitRemoteOriginUrl productionCommandRunner
       }
 
 -- | Refuse any token that does not start with @github_pat_@.

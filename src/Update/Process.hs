@@ -38,6 +38,9 @@ data ProcessMode
 data Measure
   = -- | Wrap with GNU time and record a @proc@ span (the default).
     Timed
+  | -- | Like 'Timed', plus @interactive: true@ on the span (the process may
+    -- wait on the operator).
+    TimedInteractive
   | -- | Host side of a materialize container exec: like 'Timed', but the
     -- time file is the @.outer@ half of an inner/outer pair.
     TimedContainerExec
