@@ -5,8 +5,11 @@
 module Test.CheckCache (tests) where
 
 import Config.Types (CheckCacheTtl (..))
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Data.ByteString qualified as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Maybe (isJust, isNothing)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime, addUTCTime, getCurrentTime)
@@ -18,6 +21,7 @@ import System.Directory
   )
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 import Test.Assert (assertEq, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
@@ -40,6 +44,14 @@ import Update.CheckCache
     storeDeps,
     storeLatest,
     updateSourceId,
+    withCheckCacheTreeCommit,
+  )
+import Update.FileLock
+  ( LockMode (..),
+    acquireFileLock,
+    releaseFileLock,
+    tryAcquireFileLock,
+    withFileLock,
   )
 import Update.Go.Lanes
   ( CargoFloorCoverage (..),
@@ -69,9 +81,12 @@ tests =
       testCase "Fingerprint miss" testFingerprintMiss,
       testCase "Disabled never writes" testDisabledNoWrite,
       testCase "Atomic replace" testAtomicReplace,
+      testCase "Shared lock holder blocks exclusive taker" testSharedBlocksExclusive,
       testCase "Corrupt is empty" testCorruptEmpty,
       testCase "Bun-bin tree change misses ralph deps" testOverlayProviderMiss,
       testCase "GitMv latest ignores overlay provider field" testLatestNoProviderField,
+      testCase "Tree commit change misses deps entry" testTreeCommitMissesDeps,
+      testCase "GitMv entry ignores tree commit" testLatestIgnoresTreeCommit,
       testCase "Missing overlay-provider field is a miss" testMissingOverlayProviderMiss,
       testCase "Old Cargo plan without snapshots is unusable" testOldCargoPlanUnusable,
       testCase "Non-Cargo plan remains usable without snapshots" testNonCargoPlanUsableWithoutSnapshots,
@@ -79,6 +94,27 @@ tests =
       testCase "Cargo v1 policy version misses" testCargoV1PolicyMisses,
       testCase "Cargo prefix/subdir/policy-version invalidation" testCargoPolicyKeyInvalidation
     ]
+
+-- | A shared holder keeps an exclusive taker waiting until release; other
+-- shared takers proceed. Same process, separate descriptors.
+testSharedBlocksExclusive :: IO ()
+testSharedBlocksExclusive =
+  withSystemTempDirectory "om-flock" $ \tmp -> do
+    let lockPath = tmp </> "sub" </> "x.lock"
+    held <- acquireFileLock SharedLock lockPath
+    other <- tryAcquireFileLock SharedLock lockPath
+    assertTrue "second shared taker proceeds" (isJust other)
+    mapM_ releaseFileLock other
+    noEx <- tryAcquireFileLock ExclusiveLock lockPath
+    assertTrue "exclusive try fails while shared held" (isNothing noEx)
+    done <- newEmptyMVar
+    _ <- forkIO $ withFileLock ExclusiveLock lockPath (putMVar done ())
+    threadDelay 100000
+    early <- tryReadMVar done
+    assertEq "exclusive still waiting" Nothing early
+    releaseFileLock held
+    got <- timeout 5000000 (takeMVar done)
+    assertEq "exclusive taken after release" (Just ()) got
 
 testXdgDir :: IO ()
 testXdgDir = do
@@ -311,6 +347,47 @@ testOverlayProviderMiss =
     (h2, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
     miss <- lookupDeps h2 key consumerFp (Just bunFp1)
     assertEq "bun-bin tree change is a miss" Nothing miss
+
+testTreeCommitMissesDeps :: IO ()
+testTreeCommitMissesDeps =
+  withSystemTempDirectory "om-cc-tree" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        cacheDir = tmp </> "check-cache"
+        src = GitHub "o" "r" "v"
+        key = PackageKey "dev-lang/foo"
+    pkgDir <- setupPkg overlay
+    now <- getCurrentTime
+    (h0, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
+    let hA = withCheckCacheTreeCommit "aaaa" h0
+    fp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "foo"
+    storeDeps hA key fp Nothing emptyDepsPlan
+    flushCheckCache hA
+    (reopened, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
+    hitA <- lookupDeps (withCheckCacheTreeCommit "aaaa" reopened) key fp Nothing
+    assertEq "same tree commit hits" (Just emptyDepsPlan) hitA
+    missB <- lookupDeps (withCheckCacheTreeCommit "bbbb" reopened) key fp Nothing
+    assertEq "tree commit change is a miss" Nothing missB
+    -- An entry written without a tree identity misses once a run has one.
+    (hNone, _) <- openAt (pure now) (tmp </> "cc-none") (CacheTtl (5 * 60)) False overlay
+    storeDeps hNone key fp Nothing emptyDepsPlan
+    missNone <- lookupDeps (withCheckCacheTreeCommit "aaaa" hNone) key fp Nothing
+    assertEq "missing tree identity is a miss" Nothing missNone
+
+testLatestIgnoresTreeCommit :: IO ()
+testLatestIgnoresTreeCommit =
+  withSystemTempDirectory "om-cc-gitmv-tree" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        cacheDir = tmp </> "check-cache"
+        src = GitHub "o" "r" "v"
+        key = PackageKey "dev-lang/foo"
+        remote = parseEbuildVersion "1.2.3"
+    pkgDir <- setupPkg overlay
+    now <- getCurrentTime
+    (h0, _) <- openAt (pure now) cacheDir (CacheTtl (5 * 60)) False overlay
+    fp <- withNewTreeLock $ \tree -> computeFingerprintFromDir tree src pkgDir "foo"
+    storeLatest (withCheckCacheTreeCommit "aaaa" h0) key fp remote
+    hit <- lookupLatest (withCheckCacheTreeCommit "bbbb" h0) key fp
+    assertEq "latest hits across tree commits" (Just remote) hit
 
 testLatestNoProviderField :: IO ()
 testLatestNoProviderField =

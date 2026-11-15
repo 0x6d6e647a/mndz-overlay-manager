@@ -321,7 +321,7 @@ Subprocesses the program starts outside the shared command execution (GPG comman
 
 #### Scenario: Portage DISTDIR lookup is timed
 
-- **WHEN** `update` queries Portage for its `DISTDIR`
+- **WHEN** `eclean` queries Portage for its `DISTDIR`
 - **THEN** a `proc` span for `portageq` with its duration and exit status exists in the run
 - **AND** the span has no `time` object
 

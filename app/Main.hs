@@ -33,6 +33,7 @@ import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.Bifunctor (first)
 import Data.Foldable (for_)
 import Data.IORef (newIORef)
 import Data.Text (Text)
@@ -78,6 +79,7 @@ import Update.CheckCache
     flushCheckCache,
     openCheckCache,
     recordCacheCounters,
+    withCheckCacheTreeCommit,
   )
 import Update.Deps.Plan (productionDepsPlanOpsWithLatch)
 import Update.DiskSpace (productionDiskSpaceProbe)
@@ -86,6 +88,7 @@ import Update.Distfiles
     probeDistfilesDir,
     resolveDistfilesPath,
   )
+import Update.GentooTree (GentooTree, gentooTreeCommit, gentooTreePath, productionTreeEnv, resolveGentooTree)
 import Update.Git (isGitWorkTree, productionGitOps)
 import Update.GitHub
   ( GitHubLatch,
@@ -111,13 +114,16 @@ import Update.GpgAgent
     takeGpgSessionSupervisor,
     teardownGpgHandle,
   )
+import Update.Http (httpLbsEither, newMetricsManager)
 import Update.Materialize
   ( EnsureConfig (..),
     defaultMaterializeSidecarDir,
     ensureMaterializeImage,
+    ensureToolsImage,
     hostMachineArch,
     productionEnsureNow,
     prunePreviousMaterializeImage,
+    stage3DigestWith,
   )
 import Update.Md5Cache
   ( checkLayoutCacheFormats,
@@ -125,18 +131,21 @@ import Update.Md5Cache
     preflightGencache,
     productionEgencacheRunner,
   )
+import Update.OverlayTree (newTreeLock)
 import Update.Preflight
   ( AssetsPreflight (..),
     preflightUpdateTools,
   )
-import Update.Process (productionCommandRunner)
+import Update.Process (CommandRunner, productionCommandRunner)
 import Update.Process.Docker
-  ( isLiveOverlayManagerPid,
+  ( ToolsSession,
+    isLiveOverlayManagerPid,
     materializeImageEnvVar,
+    resolveToolsContainerCfg,
     secretMaterializeEnvKeys,
     sweepStaleMaterializeSessions,
+    withToolsSession,
   )
-import Update.Runtime.Ceilings (gentooRepoPath, productionPortageqRunner)
 import Update.Spine
   ( UpdateSpineDeps (..),
     UpdateSpineResult (..),
@@ -170,7 +179,10 @@ data Runtime = Runtime
     rtHold :: LogHold,
     rtProgress :: ProgressConfig,
     -- | One id per invocation: temp run root, metrics directory, container labels.
-    rtRunId :: String
+    rtRunId :: String,
+    -- | 'commandTreeSync' of the command: whether it reads the managed Gentoo
+    -- tree, and whether it forces a sync.
+    rtTreeSync :: Maybe Bool
   }
 
 main :: IO ()
@@ -207,7 +219,8 @@ runProgram = do
                 rtLogger = logger,
                 rtHold = hold,
                 rtProgress = pcfg {pcMetrics = m},
-                rtRunId = runId
+                rtRunId = runId,
+                rtTreeSync = Cmd.commandTreeSync cmd
               }
           dispatch m = do
             registerEnvSecrets m
@@ -309,9 +322,12 @@ runOutdated rt refresh pkgArgs excludeArgs = do
             ebuilds
         total = length selectedEntries
         byPkg = groupByPackage ebuilds
+    tree <- resolveTreeOrDie rt cfg
     enterPhase rt "auth"
     (cache, cacheWarn) <-
-      liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayResolved
+      liftIO $
+        first (withCheckCacheTreeCommit (gentooTreeCommit tree))
+          <$> openCheckCache (checkCacheTtl cfg) refresh overlayResolved
     mapM_ logWarning cacheWarn
     willLive <-
       liftIO
@@ -343,6 +359,7 @@ runOutdated rt refresh pkgArgs excludeArgs = do
         ( productionDepsPlanOpsWithLatch
             (rtMetrics rt)
             latch
+            (gentooTreePath tree)
             token
             (rtJobs rt)
             (Just overlayResolved)
@@ -417,10 +434,13 @@ runUpdate rt refresh pkgArgs excludeArgs = do
     case probeOk of
       Left err -> dieError (T.unpack err)
       Right () -> pure ()
+    tree <- resolveTreeOrDie rt cfg
     -- Open check cache before plan phase.
     enterPhase rt "auth"
     (cache, cacheWarn) <-
-      liftIO $ openCheckCache (checkCacheTtl cfg) refresh overlayPath
+      liftIO $
+        first (withCheckCacheTreeCommit (gentooTreeCommit tree))
+          <$> openCheckCache (checkCacheTtl cfg) refresh overlayPath
     mapM_ logWarning cacheWarn
     willLive <-
       liftIO
@@ -453,6 +473,7 @@ runUpdate rt refresh pkgArgs excludeArgs = do
         ( productionDepsPlanOpsWithLatch
             (rtMetrics rt)
             latch
+            (gentooTreePath tree)
             token
             (rtJobs rt)
             (Just overlayPath)
@@ -474,94 +495,77 @@ runUpdate rt refresh pkgArgs excludeArgs = do
             (rtMetrics rt)
             (pauseActivePanel pcfg)
             (resumeActivePanel pcfg)
+    ensureCfg <- liftIO (productionEnsureConfig rt cfg run overlayPath tree)
     spineResult <-
       liftIO $
-        bracket
-          (newGpgHandle gpgOps)
-          teardownGpgHandle
-          ( \gpg -> do
-              sidecarDir <- defaultMaterializeSidecarDir
-              uname <- hostMachineArch
-              mOvr <- lookupEnv materializeImageEnvVar
-              prev <- newMVar Nothing
-              let ovr = case mOvr of
-                    Just s | not (null s) -> Just s
-                    _ -> Nothing
-                  ensureCfg =
-                    EnsureConfig
-                      { ecRun = run,
-                        ecProbe = productionDiskSpaceProbe,
-                        ecOverlayRoot = overlayPath,
-                        ecSidecarDir = sidecarDir,
-                        ecNow = productionEnsureNow,
-                        ecUname = uname,
-                        ecOverrideTag = ovr,
-                        ecPrevImageId = prev,
-                        ecGentooRoot = gentooRepoPath (productionPortageqRunner (rtMetrics rt))
-                      }
-                  unlockEnvelope =
-                    case githubToken cfg of
-                      Nothing ->
-                        pure $
-                          Left
-                            "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
-                      Just envelope -> do
-                        r <- decryptConfigEnvelope secretPrompt decryptCache envelope
-                        for_ r (mAddSecret (rtMetrics rt))
-                        pure r
-                  deps =
-                    UpdateSpineDeps
-                      { usdJobs = rtJobs rt,
-                        usdRunId = rtRunId rt,
-                        usdProgress = pcfg,
-                        usdFetcher = fetch,
-                        usdDepsPlanOps = depsOps,
-                        usdReleaseOps = dummyReleaseOps,
-                        usdDiskProbe = productionDiskSpaceProbe,
-                        usdGitOps = productionGitOps (rtMetrics rt) gpg,
-                        usdCheckCache = cache,
-                        usdAssetsOwner = "0x6d6e647a",
-                        usdAssetsRepo = "mndz-overlay-assets",
-                        usdGitHubToken = token,
-                        usdUnlockConfigToken = unlockEnvelope,
-                        usdMkReleaseOps = productionReleaseOpsWithLatch (rtMetrics rt) latch,
-                        usdGitOriginUrl = gitRemoteOriginUrl run,
-                        usdGitPushUrl = gitRemotePushUrl run,
-                        usdCommandRunner = run,
-                        usdAssetsPathCfg = assetsPath cfg,
-                        usdDistDir = distDir,
-                        usdOverlayRoot = overlayPath,
-                        usdSshOps = productionSshAgentOps (rtMetrics rt),
-                        usdSshIdentity = sshIdentity cfg,
-                        usdEbuildRunner = productionEbuildRunner (rtMetrics rt) distDir,
-                        usdEgencacheRunner = productionEgencacheRunner (rtMetrics rt),
-                        usdPreflightTools = preflightUpdateTools,
-                        usdEnsureImage = (`ensureMaterializeImage` ensureCfg),
-                        usdPruneMaterialize =
-                          prunePreviousMaterializeImage ensureCfg,
-                        usdSweepMaterialize =
-                          sweepStaleMaterializeSessions
-                            run
-                            isLiveOverlayManagerPid,
-                        usdMaterializeDockerRunner =
-                          Just run,
-                        usdGitHubLatch = latch,
-                        usdGitOperationsHealth = productionGitOperationsHealth (rtMetrics rt),
-                        usdPrepareSigning =
-                          \runRoot mayAssets overlay mAssets ->
-                            prepareSigningSession
-                              gpg
-                              runRoot
-                              ( overlay
-                                  : [ assets
-                                    | mayAssets,
-                                      Just assets <- [mAssets]
-                                    ]
-                              ),
-                        usdReleaseSigning = teardownGpgHandle gpg
-                      }
-              runUpdatePhases deps entries ebuilds selected
-          )
+        withRunToolsSession rt run ensureCfg tree (Just distDir) $ \tools ->
+          bracket
+            (newGpgHandle gpgOps)
+            teardownGpgHandle
+            ( \gpg -> do
+                let unlockEnvelope =
+                      case githubToken cfg of
+                        Nothing ->
+                          pure $
+                            Left
+                              "GitHub token required for assets publish (set github-token in config or GITHUB_TOKEN/GH_TOKEN)"
+                        Just envelope -> do
+                          r <- decryptConfigEnvelope secretPrompt decryptCache envelope
+                          for_ r (mAddSecret (rtMetrics rt))
+                          pure r
+                    deps =
+                      UpdateSpineDeps
+                        { usdJobs = rtJobs rt,
+                          usdRunId = rtRunId rt,
+                          usdProgress = pcfg,
+                          usdFetcher = fetch,
+                          usdDepsPlanOps = depsOps,
+                          usdReleaseOps = dummyReleaseOps,
+                          usdDiskProbe = productionDiskSpaceProbe,
+                          usdGitOps = productionGitOps (rtMetrics rt) gpg,
+                          usdCheckCache = cache,
+                          usdAssetsOwner = "0x6d6e647a",
+                          usdAssetsRepo = "mndz-overlay-assets",
+                          usdGitHubToken = token,
+                          usdUnlockConfigToken = unlockEnvelope,
+                          usdMkReleaseOps = productionReleaseOpsWithLatch (rtMetrics rt) latch,
+                          usdGitOriginUrl = gitRemoteOriginUrl run,
+                          usdGitPushUrl = gitRemotePushUrl run,
+                          usdCommandRunner = run,
+                          usdAssetsPathCfg = assetsPath cfg,
+                          usdDistDir = distDir,
+                          usdOverlayRoot = overlayPath,
+                          usdSshOps = productionSshAgentOps (rtMetrics rt),
+                          usdSshIdentity = sshIdentity cfg,
+                          usdEbuildRunner = productionEbuildRunner tools distDir,
+                          usdEgencacheRunner = productionEgencacheRunner tools,
+                          usdPreflightTools = preflightUpdateTools,
+                          usdEnsureImage = (`ensureMaterializeImage` ensureCfg),
+                          usdPruneMaterialize =
+                            prunePreviousMaterializeImage ensureCfg,
+                          usdSweepMaterialize =
+                            sweepStaleMaterializeSessions
+                              run
+                              isLiveOverlayManagerPid,
+                          usdMaterializeDockerRunner =
+                            Just run,
+                          usdGitHubLatch = latch,
+                          usdGitOperationsHealth = productionGitOperationsHealth (rtMetrics rt),
+                          usdPrepareSigning =
+                            \runRoot mayAssets overlay mAssets ->
+                              prepareSigningSession
+                                gpg
+                                runRoot
+                                ( overlay
+                                    : [ assets
+                                      | mayAssets,
+                                        Just assets <- [mAssets]
+                                      ]
+                                ),
+                          usdReleaseSigning = teardownGpgHandle gpg
+                        }
+                runUpdatePhases deps entries ebuilds selected
+            )
     case spineResult of
       Left err -> dieError (T.unpack err)
       Right res -> do
@@ -583,7 +587,76 @@ runUpdate rt refresh pkgArgs excludeArgs = do
               liftIO $
                 exitWith (ExitFailure 1)
 
--- | Spine-tool preflight step (git/ebuild/egencache/gpg only).
+-- | Default-tag ensure configuration for this run.
+productionEnsureConfig :: Runtime -> OverlayConfig -> CommandRunner -> FilePath -> GentooTree -> IO EnsureConfig
+productionEnsureConfig rt cfg run overlayPath tree = do
+  mgr <- newMetricsManager (rtMetrics rt)
+  sidecarDir <- defaultMaterializeSidecarDir
+  uname <- hostMachineArch
+  mOvr <- lookupEnv materializeImageEnvVar
+  prev <- newMVar Nothing
+  buildLock <- newMVar ()
+  pure
+    EnsureConfig
+      { ecRun = run,
+        ecProbe = productionDiskSpaceProbe,
+        ecOverlayRoot = overlayPath,
+        ecSidecarDir = sidecarDir,
+        ecNow = productionEnsureNow,
+        ecUname = uname,
+        ecOverrideTag = case mOvr of
+          Just s | not (null s) -> Just s
+          _ -> Nothing,
+        ecPrevImageId = prev,
+        ecGentooTree = gentooTreePath tree,
+        ecGentooCommit = gentooTreeCommit tree,
+        ecStage3Digest = stage3DigestWith (httpLbsEither mgr),
+        ecBaseCheckInterval = materializeBaseCheckInterval cfg,
+        ecWarn = usingLoggerT (rtLogger rt) . logWarning,
+        ecBuildLock = buildLock
+      }
+
+-- | The run's Portage tools container (created on first @ebuild@ /
+-- @egencache@, removed when the continuation returns).
+withRunToolsSession ::
+  Runtime ->
+  CommandRunner ->
+  EnsureConfig ->
+  GentooTree ->
+  Maybe FilePath ->
+  (ToolsSession -> IO a) ->
+  IO a
+withRunToolsSession rt run ensureCfg tree mDist k = do
+  cfg <- resolveToolsContainerCfg (rtRunId rt) (gentooTreePath tree) (ecOverlayRoot ensureCfg) mDist
+  baseLock <- newTreeLock
+  withToolsSession run cfg (ensureToolsImage baseLock ensureCfg) k
+
+-- | Resolve the managed Gentoo tree once per run, before any tree read.
+-- Syncs when due or when the command forces it ('commandTreeSync'); holds
+-- the tree shared until exit.
+resolveTreeOrDie ::
+  (WithLog env Message m, MonadIO m) =>
+  Runtime ->
+  OverlayConfig ->
+  m GentooTree
+resolveTreeOrDie rt cfg = do
+  refresh <- case rtTreeSync rt of
+    Just r -> pure r
+    Nothing -> dieError "internal error: this command does not use the Gentoo tree"
+  enterPhase rt "tree"
+  let say f = usingLoggerT (rtLogger rt) . f
+  env <-
+    liftIO $
+      productionTreeEnv
+        (rtMetrics rt)
+        (gentooTreeMaxAge cfg)
+        refresh
+        (say logInfo)
+        (say logWarning)
+  result <- liftIO (resolveGentooTree env)
+  either (dieError . T.unpack) pure result
+
+-- | Spine-tool preflight step (git/gpg/docker only).
 runSpineToolSteps :: ProgressConfig -> AssetsPreflight -> IO (Either T.Text ())
 runSpineToolSteps pcfg ap =
   withStepProgress pcfg 1 $ \step -> do
@@ -701,7 +774,7 @@ runGencache ::
   m ()
 runGencache rt pkgArgs force excludeArgs = do
   enterPhase rt "config"
-  (_cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
+  (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   enterPhase rt "preflight"
   isGit <- liftIO (isGitWorkTree (timedRunner (rtMetrics rt) productionCommandRunner) overlayPath)
   unless isGit $
@@ -719,6 +792,7 @@ runGencache rt pkgArgs force excludeArgs = do
       excludes = map T.pack excludeArgs
   enterPhase rt "select"
   resolveCommandSelection entries tokens excludes >>= \keys -> do
+    tree <- resolveTreeOrDie rt cfg
     enterPhase rt "gencache"
     liftIO (setCount (rtMetrics rt) "packages.selected" (length keys))
     let pcfg = rtProgress rt
@@ -727,24 +801,27 @@ runGencache rt pkgArgs force excludeArgs = do
             (rtMetrics rt)
             (pauseActivePanel pcfg)
             (resumeActivePanel pcfg)
+        run = timedRunner (rtMetrics rt) productionCommandRunner
+    ensureCfg <- liftIO (productionEnsureConfig rt cfg run overlayPath tree)
     result <-
       liftIO $
-        bracket
-          (newGpgHandle gpgOps)
-          teardownGpgHandle
-          ( \gpg ->
-              gencachePackages
-                (productionEgencacheRunner (rtMetrics rt))
-                (productionGitOps (rtMetrics rt) gpg)
-                overlayPath
-                keys
-                force
-                (Just (rtJobs rt))
-                ( do
-                    runRoot <- openRunRootWith (rtRunId rt)
-                    prepareSigningSession gpg (rrPath runRoot) [overlayPath]
-                )
-          )
+        withRunToolsSession rt run ensureCfg tree Nothing $ \tools ->
+          bracket
+            (newGpgHandle gpgOps)
+            teardownGpgHandle
+            ( \gpg ->
+                gencachePackages
+                  (productionEgencacheRunner tools)
+                  (productionGitOps (rtMetrics rt) gpg)
+                  overlayPath
+                  keys
+                  force
+                  (Just (rtJobs rt))
+                  ( do
+                      runRoot <- openRunRootWith (rtRunId rt)
+                      prepareSigningSession gpg (rrPath runRoot) [overlayPath]
+                  )
+            )
     case result of
       Left err -> dieError (T.unpack err)
       Right Nothing ->

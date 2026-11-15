@@ -836,7 +836,7 @@ testPolicyClassification = do
     "craft-fonts needs no assets publish"
     (not (techniqueNeedsAssets (Unsupported fontsReason)))
   cache <- fst <$> openCheckCache CacheDisabled False "/tmp"
-  depsOps <- productionDepsPlanOps Nothing 1 Nothing
+  depsOps <- productionDepsPlanOps "/nonexistent/gentoo-tree" Nothing 1 Nothing
   let fontsEntry =
         PackageEntry
           { peKey = fontsKey,

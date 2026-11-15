@@ -11,6 +11,7 @@ module CLI.Parser
     resolveVerbosity,
     resolveColorMode,
     resolveJobs,
+    commandTreeSync,
   )
 where
 
@@ -185,13 +186,25 @@ distfilesPathParser =
             \mndz/overlay-manager/distfiles)"
       )
 
+-- | Whether a command reads the managed Gentoo tree and, if so, whether it
+-- forces a sync (@--refresh@). 'Nothing' never resolves or syncs the tree.
+commandTreeSync :: Command -> Maybe Bool
+commandTreeSync = \case
+  Outdated {outdatedRefresh} -> Just outdatedRefresh
+  Update {updateRefresh} -> Just updateRefresh
+  Gencache {} -> Just False
+  List -> Nothing
+  Eclean -> Nothing
+  GitHubToken {} -> Nothing
+
 refreshParser :: Parser Bool
 refreshParser =
   switch
     ( long "refresh"
         <> help
           "Ignore check-cache entries and perform live upstream check/plan \
-          \(writes fresh cache entries when caching is enabled)"
+          \(writes fresh cache entries when caching is enabled), and sync the \
+          \managed Gentoo tree regardless of its age"
     )
 
 -- | Repeatable long-only @--exclude PACKAGE,...@.
@@ -313,7 +326,7 @@ outdatedInfo =
             \unambiguous package name. With no PACKAGE arguments, check all \
             \discovered packages. Empty inventory is an error. Successful checks \
             \are cached briefly (see check-cache-ttl); use --refresh to force \
-            \live network checks. "
+            \live network checks and a Gentoo tree sync. "
               <> excludeFooter
               <> globalsFooter
           )
@@ -331,7 +344,7 @@ updateInfo =
             \unambiguous package name. With no PACKAGE arguments, update all \
             \packages that need work (outdated non-Go packages and Go packages \
             \with tree-lane gaps). Uses the shared check cache when valid; \
-            \--refresh forces live fetch/plan. "
+            \--refresh forces live fetch/plan and a Gentoo tree sync. "
               <> excludeFooter
               <> globalsFooter
           )

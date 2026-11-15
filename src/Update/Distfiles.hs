@@ -10,6 +10,7 @@ module Update.Distfiles
     isSystemDistfilesPath,
     isSystemDistfilesPathWith,
     lookupPortageDistDir,
+    lookupPortageDistDirWith,
     probeDistfilesDir,
     cleanManagerDistfiles,
     ebuildManifestEnv,
@@ -90,13 +91,22 @@ ensureDistfilesDir path = do
         Right () -> Right ()
 
 -- | Query live Portage @DISTDIR@ via @portageq envvar DISTDIR@ (best-effort).
+-- Only the @eclean@ system-DISTDIR guard asks.
 lookupPortageDistDir :: Metrics -> IO (Maybe FilePath)
-lookupPortageDistDir m = do
+lookupPortageDistDir m = lookupPortageDistDirWith m readProcessWithExitCode
+
+-- | 'lookupPortageDistDir' over an injectable process reader. The call is a
+-- wall-clock @proc@ span (no GNU time).
+lookupPortageDistDirWith ::
+  Metrics ->
+  (FilePath -> [String] -> String -> IO (ExitCode, String, String)) ->
+  IO (Maybe FilePath)
+lookupPortageDistDirWith m readProc = do
   let args = ["envvar", "DISTDIR"]
   result <-
     try @IOError $
       wallClockProc m "portageq" args Nothing [] (\(c, _, _) -> Just c) $
-        readProcessWithExitCode "portageq" args ""
+        readProc "portageq" args ""
   pure $ case result of
     Left _ -> Nothing
     Right (ExitSuccess, out, _) ->
@@ -175,12 +185,11 @@ cleanManagerDistfiles m path = do
           setFileMode path 0o700
           pure (Right ())
 
--- | Merge parent env with @DISTDIR@ and empty @GENTOO_MIRRORS@ for ebuild manifest.
-ebuildManifestEnv :: FilePath -> [(String, String)] -> [(String, String)]
-ebuildManifestEnv distDir env0 =
-  ("DISTDIR", distDir)
-    : ("GENTOO_MIRRORS", "")
-    : filter (\(k, _) -> k /= "DISTDIR" && k /= "GENTOO_MIRRORS") env0
+-- | @DISTDIR@ and empty @GENTOO_MIRRORS@ for ebuild manifest, set on top of
+-- the tools container's own environment.
+ebuildManifestEnv :: FilePath -> [(String, String)]
+ebuildManifestEnv distDir =
+  [("DISTDIR", distDir), ("GENTOO_MIRRORS", "")]
 
 -- | Detect sticky/EPERM/distfiles rename failure signatures in ebuild stderr.
 looksLikeStickyDistfilesError :: Text -> Bool

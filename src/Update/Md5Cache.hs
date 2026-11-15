@@ -2,19 +2,20 @@
 
 -- | Portage md5-dict cache: layout gate, consistency checks, and @egencache@.
 --
--- Production @egencache@ argv (spike-confirmed on Gentoo with Portage masters):
+-- Production @egencache@ argv, run in the Portage tools container
+-- (spike-confirmed on Gentoo with Portage masters):
 --
 -- @
 -- egencache --repo mndz
 --   --repositories-configuration=$'\[gentoo\]\\nlocation = \<gentoo\>\\nmasters =\\n\\n\[mndz\]\\nlocation = \<overlay\>\\nmasters = gentoo\\nauto-sync = false\\n'
+--   --cache-dir \<writable dir\>
 --   --update [category/package ...]
 --   [-j N]
 -- @
 --
 -- The repositories-configuration fragment always sets @mndz@ @location@ to the
 -- absolute effective overlay path so ambient @repos.conf@ cannot redirect writes.
--- Gentoo location is resolved via @portageq get_repo_path / gentoo@ when that
--- succeeds, otherwise @\/var\/db\/repos\/gentoo@ when that directory exists.
+-- The gentoo @location@ is the managed tree as the runner's process sees it.
 module Update.Md5Cache
   ( VersionCacheStatus (..),
     PackageCacheIssue (..),
@@ -23,7 +24,6 @@ module Update.Md5Cache
     productionEgencacheRunner,
     mkEgencacheRunner,
     buildRepositoriesConfiguration,
-    discoverGentooLocationWith,
     checkLayoutCacheFormats,
     layoutConfPath,
     ebuildFileMd5,
@@ -50,15 +50,12 @@ where
 import Crypto.Hash (Digest, MD5 (..), hash)
 import Data.ByteArray.Encoding (Base (Base16), convertToBase)
 import Data.ByteString qualified as BS
-import Data.Char (isSpace)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Maybe (isNothing, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8)
 import Data.Text.IO qualified as TIO
-import Metrics.Core (Metrics)
-import Metrics.Process (timedRunner)
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Version (parseEbuildVersion)
 import System.Directory
@@ -84,7 +81,12 @@ import Update.Process
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
-    productionCommandRunner,
+  )
+import Update.Process.Docker
+  ( ToolsSession,
+    toolsEgencacheCacheDir,
+    toolsGentooTreeDir,
+    toolsSessionRunner,
   )
 import Update.Types (PackageKey (..), packageKeyText, splitPackageKey)
 
@@ -116,7 +118,7 @@ type EgencacheRunner = EgencacheRequest -> IO (Either Text ())
 
 -- | Tools required on PATH for @gencache@.
 gencacheRequiredTools :: [String]
-gencacheRequiredTools = ["git", "egencache", "gpg"]
+gencacheRequiredTools = ["git", "gpg", "docker"]
 
 preflightGencacheWith :: (String -> IO (Maybe FilePath)) -> IO (Either Text ())
 preflightGencacheWith findTool = do
@@ -357,47 +359,6 @@ collectPackageCachePathspecs overlayRoot category pn before = do
 -- egencache runner
 ------------------------------------------------------------------------
 
--- | Resolve gentoo master location for the injected repositories configuration.
-discoverGentooLocationWith :: CommandRunner -> IO (Either Text FilePath)
-discoverGentooLocationWith run = do
-  res <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "portageq" ["get_repo_path", "/", "gentoo"],
-          prCwd = Nothing,
-          prEnv = Nothing,
-          prStdin = "",
-          prMeasure = Timed
-        }
-  let fromPq =
-        if prExitCode res == ExitSuccess
-          then
-            let p = stripSpaces (prStdout res)
-             in if null p then Nothing else Just p
-          else Nothing
-  case fromPq of
-    Just p -> do
-      ok <- doesDirectoryExist p
-      if ok
-        then pure (Right p)
-        else tryDefault
-    Nothing -> tryDefault
-  where
-    tryDefault = do
-      let def = "/var/db/repos/gentoo"
-      ok <- doesDirectoryExist def
-      pure $
-        if ok
-          then Right def
-          else
-            Left
-              "could not resolve gentoo repository location \
-              \(portageq get_repo_path / gentoo failed and /var/db/repos/gentoo \
-              \is missing)"
-
-stripSpaces :: String -> String
-stripSpaces = reverse . dropWhile isSpace . reverse . dropWhile isSpace
-
 -- | Build the @--repositories-configuration@ string (repos.conf format).
 buildRepositoriesConfiguration :: FilePath -> FilePath -> Text
 buildRepositoriesConfiguration gentooLoc overlayLoc =
@@ -413,43 +374,47 @@ buildRepositoriesConfiguration gentooLoc overlayLoc =
     ]
 
 -- | Build egencache runner over an injectable command runner (Unit heat surface).
-mkEgencacheRunner :: CommandRunner -> EgencacheRunner
-mkEgencacheRunner run req = do
-  gentoo <- discoverGentooLocationWith run
-  case gentoo of
-    Left err -> pure (Left err)
-    Right gentooLoc -> do
-      rootAbs <- makeAbsolute (erOverlayRoot req)
-      let reposConf = T.unpack (buildRepositoriesConfiguration gentooLoc rootAbs)
-          atoms = map T.unpack (erAtoms req)
-          jobsArgs = case erJobs req of
-            Just n | n > 0 -> ["--jobs", show n]
-            _ -> []
-          args =
-            [ "--repo",
-              "mndz",
-              "--repositories-configuration",
-              reposConf,
-              "--update"
-            ]
-              <> atoms
-              <> jobsArgs
-      res <-
-        run
-          ProcessRequest
-            { prMode = ExecCmd "egencache" args,
-              prCwd = Nothing,
-              prEnv = Nothing,
-              prStdin = "",
-              prMeasure = Timed
-            }
-      pure $
-        if prExitCode res == ExitSuccess
-          then Right ()
-          else Left ("egencache failed: " <> T.pack (prStderr res))
+--
+-- @gentooLoc@ is the managed tree and @cacheDir@ a writable @--cache-dir@, both
+-- as seen by the process @run@ starts.
+mkEgencacheRunner :: FilePath -> FilePath -> CommandRunner -> EgencacheRunner
+mkEgencacheRunner gentooLoc cacheDir run req = do
+  rootAbs <- makeAbsolute (erOverlayRoot req)
+  let reposConf = T.unpack (buildRepositoriesConfiguration gentooLoc rootAbs)
+      atoms = map T.unpack (erAtoms req)
+      jobsArgs = case erJobs req of
+        Just n | n > 0 -> ["--jobs", show n]
+        _ -> []
+      args =
+        [ "--repo",
+          "mndz",
+          "--repositories-configuration",
+          reposConf,
+          "--cache-dir",
+          cacheDir,
+          "--update"
+        ]
+          <> atoms
+          <> jobsArgs
+  res <-
+    run
+      ProcessRequest
+        { prMode = ExecCmd "egencache" args,
+          prCwd = Nothing,
+          prEnv = Nothing,
+          prStdin = "",
+          prMeasure = Timed
+        }
+  pure $
+    if prExitCode res == ExitSuccess
+      then Right ()
+      else Left ("egencache failed: " <> T.pack (prStderr res))
 
-productionEgencacheRunner :: Metrics -> EgencacheRunner
-productionEgencacheRunner m = mkEgencacheRunner (timedRunner m productionCommandRunner)
+-- | Production egencache runner: @egencache@ in the run's Portage tools
+-- container against the managed tree bound there.
+productionEgencacheRunner :: ToolsSession -> EgencacheRunner
+productionEgencacheRunner tools =
+  mkEgencacheRunner toolsGentooTreeDir toolsEgencacheCacheDir (toolsSessionRunner tools)
 
 -- | Run package-scoped egencache and return pathspecs for git (before∪after).
 runPackageEgencache ::

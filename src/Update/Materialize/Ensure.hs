@@ -29,6 +29,7 @@ module Update.Materialize.Ensure
     readOverlayQlotFloor,
     readOverlayNodeGypFloor,
     ensureMaterializeImage,
+    ensureToolsImage,
     prunePreviousMaterializeImage,
     defaultMaterializeSidecarDir,
     hostMachineArch,
@@ -38,7 +39,7 @@ module Update.Materialize.Ensure
 where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent.MVar (MVar, modifyMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar, withMVar)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
 import Data.Containers.ListUtils (nubOrd)
@@ -47,7 +48,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Data.Time (UTCTime, getCurrentTime)
+import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import System.Directory
   ( createDirectoryIfMissing,
     doesDirectoryExist,
@@ -166,8 +167,18 @@ data EnsureConfig = EnsureConfig
     ecOverrideTag :: Maybe String,
     -- | Previous default-tag image id remembered for prune-after-mutate.
     ecPrevImageId :: MVar (Maybe String),
-    -- | Gentoo repository root (@portageq get_repo_path / gentoo@ in production).
-    ecGentooRoot :: IO (Either Text FilePath)
+    -- | Managed Gentoo tree root (atom choice and the build's @gentoo@ context).
+    ecGentooTree :: FilePath,
+    -- | Managed tree commit recorded on a built image.
+    ecGentooCommit :: Text,
+    -- | Current registry digest of a @gentoo/stage3@ tag (no pull).
+    ecStage3Digest :: Text -> IO (Either Text Text),
+    -- | @materialize-base-check-interval@.
+    ecBaseCheckInterval :: NominalDiffTime,
+    ecWarn :: Text -> IO (),
+    -- | Serializes default-tag ensures of one run (full-path prepare and the
+    -- Portage tools image).
+    ecBuildLock :: MVar ()
   }
 
 overrideUnusableMessage :: String -> Text
@@ -331,16 +342,19 @@ ensureDefault ::
   EnsureConfig ->
   NeededFloors ->
   IO (Either Text EnsureOutcome)
-ensureDefault lock cfg needed = do
+ensureDefault lock cfg needed = withMVar (ecBuildLock cfg) $ \() -> do
   let tag = defaultMaterializeImage
       sidecarDir = ecSidecarDir cfg
   eId <- inspectImageId (ecRun cfg) tag
   mSide <- readSidecar sidecarDir
+  base <- checkBaseFreshness cfg mSide
   case (eId, mSide) of
     (Right iid, Just side)
       | T.unpack (isId side) == iid,
         floorsSatisfy (isSatisfies side) needed,
-        isGenerator side == materializeGeneratorId ->
+        isGenerator side == materializeGeneratorId,
+        not (baseMoved base) -> do
+          recordBaseCheck sidecarDir side base
           pure (Right EnsureSkipped)
     _ ->
       case lookupRecipeArch (ecUname cfg) of
@@ -350,35 +364,116 @@ ensureDefault lock cfg needed = do
           let oldSatisfies = maybe emptyFloors isSatisfies mSide
               unioned = unionFloors oldSatisfies needed
               oldId = either (const Nothing) Just eId
-          eRoot <- ecGentooRoot cfg
-          case eRoot of
-            Left err ->
-              pure (Left (ensureFailedMessage err))
-            Right gentooRoot -> do
-              metas <- loadGentooToolchainMetas gentooRoot
-              eOverlay <-
-                withOverlayTreeChecked lock $ \tree -> do
-                  bun <- loadBunMetas tree (ecOverlayRoot cfg)
-                  qlot <- loadQlotMetas tree (ecOverlayRoot cfg)
-                  nodeGyp <- loadNodeGypMetas tree (ecOverlayRoot cfg)
-                  pure ((,,) <$> bun <*> qlot <*> nodeGyp)
-              case eOverlay of
-                Left err -> pure (Left (ensureFailedMessage err))
-                Right (Left err) -> pure (Left (ensureFailedMessage err))
-                Right (Right (bunMetas, qlotMetas, nodeGypMetas)) ->
-                  case resolveNeededInstalls (raKeywords arch) unioned metas bunMetas qlotMetas nodeGypMetas of
-                    Left err ->
-                      pure (Left (ensureFailedMessage err))
-                    Right installs -> do
-                      eDisk <- imageDiskGate cfg (isFirstImage mSide eId)
-                      case eDisk of
-                        Left err -> pure (Left (ensureFailedMessage err))
-                        Right () ->
-                          buildAndRecord cfg tag oldId unioned arch installs
+          do
+            metas <- loadGentooToolchainMetas (ecGentooTree cfg)
+            eOverlay <-
+              withOverlayTreeChecked lock $ \tree -> do
+                bun <- loadBunMetas tree (ecOverlayRoot cfg)
+                qlot <- loadQlotMetas tree (ecOverlayRoot cfg)
+                nodeGyp <- loadNodeGypMetas tree (ecOverlayRoot cfg)
+                pure ((,,) <$> bun <*> qlot <*> nodeGyp)
+            case eOverlay of
+              Left err -> pure (Left (ensureFailedMessage err))
+              Right (Left err) -> pure (Left (ensureFailedMessage err))
+              Right (Right (bunMetas, qlotMetas, nodeGypMetas)) ->
+                case resolveNeededInstalls (raKeywords arch) unioned metas bunMetas qlotMetas nodeGypMetas of
+                  Left err ->
+                    pure (Left (ensureFailedMessage err))
+                  Right installs -> do
+                    eDisk <- imageDiskGate cfg (isFirstImage mSide eId)
+                    case (eDisk, buildBase base mSide) of
+                      (Left err, _) -> pure (Left (ensureFailedMessage err))
+                      (Right (), Nothing) ->
+                        pure (Left (ensureFailedMessage "no gentoo/stage3 digest is recorded and the registry check failed"))
+                      (Right (), Just pinned) ->
+                        buildAndRecord cfg tag oldId unioned arch pinned installs
   where
     isFirstImage mSide' eId' = case (eId', mSide') of
       (Right _, Just _) -> False
       _ -> True
+
+-- | Image for the Portage tools container: the override tag when set, else
+-- the recorded current image while it exists, else the image ensure builds
+-- for an empty floor set (base-only on a host with no recorded image).
+ensureToolsImage :: TreeLock -> EnsureConfig -> IO (Either Text String)
+ensureToolsImage lock cfg =
+  case ecOverrideTag cfg of
+    Just tag -> pure (Right tag)
+    Nothing -> do
+      current <- recordedImage
+      case current of
+        Just iid -> pure (Right iid)
+        Nothing -> do
+          built <- ensureDefault lock cfg emptyFloors
+          case built of
+            Left err -> pure (Left err)
+            Right _ ->
+              maybe (Left (ensureFailedMessage "no image recorded after build")) Right
+                <$> recordedImage
+  where
+    recordedImage = do
+      mSide <- readSidecar (ecSidecarDir cfg)
+      case mSide of
+        Nothing -> pure Nothing
+        Just side -> do
+          let iid = T.unpack (isId side)
+          present <- inspectImageId (ecRun cfg) iid
+          pure (either (const Nothing) (const (Just iid)) present)
+
+-- | Outcome of the stage3 base freshness check.
+data BaseCheck
+  = -- | Interval not elapsed (or no mapped arch to check).
+    BaseNotDue
+  | -- | Registry digest equals the recorded one.
+    BaseSame Text UTCTime
+  | -- | Registry digest differs from the recorded one (or none recorded).
+    BaseMoved Text UTCTime
+  | -- | Registry request failed; warned, the check stays due.
+    BaseCheckFailed
+
+baseMoved :: BaseCheck -> Bool
+baseMoved = \case
+  BaseMoved {} -> True
+  _ -> False
+
+-- | Due when no digest or check time is recorded, or the interval passed.
+checkBaseFreshness :: EnsureConfig -> Maybe ImageSidecar -> IO BaseCheck
+checkBaseFreshness cfg mSide =
+  case lookupRecipeArch (ecUname cfg) of
+    Nothing -> pure BaseNotDue
+    Just arch -> do
+      now <- ecNow cfg
+      let recorded = mSide >>= isStage3Digest
+          due = case (recorded, mSide >>= isLastBaseCheck) of
+            (Just _, Just at) -> diffUTCTime now at >= ecBaseCheckInterval cfg
+            _ -> True
+      if not due
+        then pure BaseNotDue
+        else do
+          eDigest <- ecStage3Digest cfg (raHubTag arch)
+          case eDigest of
+            Left err -> do
+              ecWarn cfg ("gentoo/stage3 base check failed (" <> err <> "); keeping the current materialize image")
+              pure BaseCheckFailed
+            Right digest
+              | Just digest == recorded -> pure (BaseSame digest now)
+              | otherwise -> pure (BaseMoved digest now)
+
+-- | Digest and base check time a build pins and records.
+buildBase :: BaseCheck -> Maybe ImageSidecar -> Maybe (Text, Maybe UTCTime)
+buildBase base mSide = case base of
+  BaseSame d at -> Just (d, Just at)
+  BaseMoved d at -> Just (d, Just at)
+  _ -> (,mSide >>= isLastBaseCheck) <$> (mSide >>= isStage3Digest)
+
+-- | A same-digest check without a build resets the interval.
+recordBaseCheck :: FilePath -> ImageSidecar -> BaseCheck -> IO ()
+recordBaseCheck sidecarDir side = \case
+  BaseSame _ at ->
+    BS.writeFile
+      (sidecarImageJsonPath sidecarDir)
+      (LBS.toStrict (encodeImageSidecar side {isLastBaseCheck = Just at}))
+  _ -> pure ()
 
 buildAndRecord ::
   EnsureConfig ->
@@ -386,15 +481,16 @@ buildAndRecord ::
   Maybe String ->
   NeededFloors ->
   RecipeArch ->
+  (Text, Maybe UTCTime) ->
   [ResolvedInstall] ->
   IO (Either Text EnsureOutcome)
-buildAndRecord cfg tag oldId unioned arch installs = do
+buildAndRecord cfg tag oldId unioned arch (digest, lastCheck) installs = do
   let sidecarDir = ecSidecarDir cfg
       dfPath = sidecarDockerfilePath sidecarDir
       ctxDir = sidecarDir </> "context"
       overlay = ecOverlayRoot cfg
       dockerfile =
-        renderMaterializeDockerfile arch installs
+        renderMaterializeDockerfile arch digest installs
   createDirectoryIfMissing True ctxDir
   TIO.writeFile dfPath dockerfile
   -- Remember previous id before retag.
@@ -410,6 +506,8 @@ buildAndRecord cfg tag oldId unioned arch installs = do
         dfPath,
         "--build-context",
         "overlay=" <> overlay,
+        "--build-context",
+        "gentoo=" <> ecGentooTree cfg,
         ctxDir
       ]
   if prExitCode buildRes /= ExitSuccess
@@ -431,7 +529,10 @@ buildAndRecord cfg tag oldId unioned arch installs = do
                     isTag = T.pack tag,
                     isSatisfies = unioned,
                     isGenerator = materializeGeneratorId,
-                    isBuiltAt = now
+                    isBuiltAt = now,
+                    isTreeCommit = Just (ecGentooCommit cfg),
+                    isStage3Digest = Just digest,
+                    isLastBaseCheck = lastCheck
                   }
           BS.writeFile
             (sidecarImageJsonPath sidecarDir)

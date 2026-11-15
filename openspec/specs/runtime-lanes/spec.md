@@ -37,13 +37,13 @@ Runtime-lane planning for `DepsAndAssets` packages SHALL apply to all supported 
 
 For `DepsAndAssets` planning, the library SHALL compute plain and tilde version ceilings per architecture for the package’s runtime dependency package(s):
 
-- **Go:** gentoo repository path via `portageq get_repo_path / gentoo`, package directory `dev-lang/go`
-- **Npm:** gentoo repository path, package directory `net-libs/nodejs`
+- **Go:** managed Gentoo tree (`gentoo-tree`), package directory `dev-lang/go`
+- **Npm:** managed Gentoo tree, package directory `net-libs/nodejs`
 - **Bun:** configured overlay path (`mndz-overlay-path`), package directory `dev-lang/bun-bin`
-- **Cargo:** gentoo repository path, package directories `dev-lang/rust` and `dev-lang/rust-bin`, combined with U1 max per arch×tier as specified below
-- **Sbcl:** gentoo repository path via `portageq get_repo_path / gentoo`, package directory `dev-lisp/sbcl`
-- **Uv:** gentoo repository path, package directory `dev-lang/python`. Slot ceilings and the chosen slot atom SHALL follow the Uv slot requirements in this capability
-- **Pdm:** gentoo repository path, package directory `dev-lang/python`. Slot ceilings and the chosen slot atom SHALL follow the Pdm slot requirements in this capability
+- **Cargo:** managed Gentoo tree, package directories `dev-lang/rust` and `dev-lang/rust-bin`, combined with U1 max per arch×tier as specified below
+- **Sbcl:** managed Gentoo tree, package directory `dev-lisp/sbcl`
+- **Uv:** managed Gentoo tree, package directory `dev-lang/python`. Slot ceilings and the chosen slot atom SHALL follow the Uv slot requirements in this capability
+- **Pdm:** managed Gentoo tree, package directory `dev-lang/python`. Slot ceilings and the chosen slot atom SHALL follow the Pdm slot requirements in this capability
 
 The library SHALL scan non-live ebuilds only (excluding live/`9999` versions). If a required runtime package directory is missing or unreadable, ceiling discovery SHALL fail with an error suitable for the caller.
 
@@ -76,6 +76,11 @@ The library SHALL scan non-live ebuilds only (excluding live/`9999` versions). I
 
 - **WHEN** planning a `DepsAndAssets Pdm` package
 - **THEN** ceilings are computed from non-live gentoo `dev-lang/python` ebuilds as slots, not from profile `PYTHON_TARGETS`
+
+#### Scenario: Gentoo ceilings ignore the host tree
+
+- **WHEN** planning a `DepsAndAssets Go` package and the host has a Gentoo tree whose `dev-lang/go` ebuilds differ from the managed tree
+- **THEN** ceilings are computed from the managed tree’s `dev-lang/go` ebuilds
 
 ### Requirement: Arches discovered from runtime KEYWORDS
 

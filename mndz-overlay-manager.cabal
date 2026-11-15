@@ -102,12 +102,14 @@ library
       , Update.DiskSpace
       , Update.Distfiles
       , Update.EbuildEdit
+      , Update.FileLock
       , Update.Engines
       , Update.Gastown.Gates
       , Update.Git
       , Update.GitHub
       , Update.GitHubHealth
       , Update.GitHubToken
+      , Update.GentooTree
       , Update.Go.Lanes
       , Update.Go.ModFetch
       , Update.Go.Plan
@@ -164,6 +166,7 @@ library
       , Update.Materialize.Floors
       , Update.Materialize.ImageLayout
       , Update.Materialize.Recipe
+      , Update.Materialize.Registry
       , Update.Materialize.Resolve
       , Update.Materialize.Sidecar
 
@@ -272,6 +275,7 @@ test-suite mndz-overlay-manager-test
         Test.Gastown
         Test.Git
         Test.GitHubResilience
+        Test.GentooTree
         Test.Gpg
         Test.HttpFake
         Test.Lanes
@@ -290,6 +294,7 @@ test-suite mndz-overlay-manager-test
         Test.Support
         Test.Targets
         Test.TempWorkspace
+        Test.ToolsContainer
         Test.Uv
         Test.Waves
 

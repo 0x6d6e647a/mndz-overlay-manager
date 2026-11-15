@@ -6,7 +6,7 @@ module Test.GitHubResilience (unitTests, integrationTests) where
 
 import CLI.Progress (noopMultiHandle)
 import Config.TokenEnvelope (testEnvelopeParams, wrapTokenWith)
-import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl)
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, defaultGentooTreeMaxAge, defaultMaterializeBaseCheckInterval)
 import Control.Concurrent.Async (concurrently)
 import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy.Char8 qualified as L8
@@ -482,7 +482,9 @@ testCfg tok =
       githubToken = tok,
       distfilesPath = Nothing,
       checkCacheTtl = defaultCheckCacheTtl,
-      sshIdentity = Nothing
+      sshIdentity = Nothing,
+      gentooTreeMaxAge = defaultGentooTreeMaxAge,
+      materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval
     }
 
 countingPrompt :: IORef Int -> SecretPrompt
@@ -903,7 +905,7 @@ testOutdatedAbortEmitsLines =
           GitHub "fukamachi" "qlot" _ ->
             fetchGitHubWithHttpLbsOn latch http403 Nothing src
           _ -> pure (Left "unexpected source")
-    depsOps <- productionDepsPlanOps Nothing 1 Nothing
+    depsOps <- productionDepsPlanOps "/nonexistent/gentoo-tree" Nothing 1 Nothing
     reports <-
       checkOverlayWithDepsPlan 1 noopMultiHandle fetch depsOps cache ebuilds
     (keep, mAbort) <- finishOutdatedReports latch reports

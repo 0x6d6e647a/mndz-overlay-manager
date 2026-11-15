@@ -38,7 +38,7 @@ import Config.Loader
     loadConfig,
     loadConfigAllowPlaintextToken,
   )
-import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, parseCheckCacheTtl)
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, defaultGentooTreeMaxAge, defaultMaterializeBaseCheckInterval, parseCheckCacheTtl)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
@@ -288,6 +288,9 @@ tests =
       testCase "Parse Check Cache TTL" testParseCheckCacheTtl,
       testCase "Config Check Cache TTL Zero" testConfigCheckCacheTtlZero,
       testCase "Config Check Cache TTL Invalid" testConfigCheckCacheTtlInvalid,
+      testCase "Config duration keys default" testConfigDurationKeysDefault,
+      testCase "Config duration keys valid" testConfigDurationKeysValid,
+      testCase "Config duration keys invalid" testConfigDurationKeysInvalid,
       testCase "Config mode 0644 hard-fails" testConfigModeWrong,
       testCase "Config mode 0600 loads" testConfigModeOk,
       testCase "Config unreadable mode hard-fails" testConfigModeUnreadable,
@@ -482,6 +485,56 @@ testConfigCheckCacheTtlInvalid =
       other -> do
         hPutStrLn stderr $ "expected DecodeError, got " <> show other
         exitFailure
+
+testConfigDurationKeysDefault :: IO ()
+testConfigDurationKeysDefault =
+  withSystemTempDirectory "om-dur-default" $ \tmp -> do
+    let path = tmp </> "c.toml"
+    TIO.writeFile path "overlay-path = \"/tmp/ov\"\n"
+    chmodConfig600 path
+    cfg <- assertRight "defaults" =<< loadConfig (Just path)
+    assertEq "gentoo-tree-max-age default 6h" (6 * 60 * 60) (gentooTreeMaxAge cfg)
+    assertEq "default constant" defaultGentooTreeMaxAge (gentooTreeMaxAge cfg)
+    assertEq "materialize-base-check-interval default 3d" (3 * 24 * 60 * 60) (materializeBaseCheckInterval cfg)
+    assertEq "default constant" defaultMaterializeBaseCheckInterval (materializeBaseCheckInterval cfg)
+
+testConfigDurationKeysValid :: IO ()
+testConfigDurationKeysValid =
+  withSystemTempDirectory "om-dur-valid" $ \tmp -> do
+    let path = tmp </> "c.toml"
+    TIO.writeFile path $
+      "overlay-path = \"/tmp/ov\"\n"
+        <> "gentoo-tree-max-age = \"30m\"\n"
+        <> "materialize-base-check-interval = \"7d\"\n"
+    chmodConfig600 path
+    cfg <- assertRight "valid durations" =<< loadConfig (Just path)
+    assertEq "gentoo-tree-max-age 30m" (30 * 60) (gentooTreeMaxAge cfg)
+    assertEq "materialize-base-check-interval 7d" (7 * 24 * 60 * 60) (materializeBaseCheckInterval cfg)
+    let zeroPath = tmp </> "z.toml"
+    TIO.writeFile zeroPath "overlay-path = \"/tmp/ov\"\ngentoo-tree-max-age = \"0s\"\n"
+    chmodConfig600 zeroPath
+    zeroCfg <- assertRight "zero max age" =<< loadConfig (Just zeroPath)
+    assertEq "zero max age" 0 (gentooTreeMaxAge zeroCfg)
+
+testConfigDurationKeysInvalid :: IO ()
+testConfigDurationKeysInvalid =
+  withSystemTempDirectory "om-dur-bad" $ \tmp -> do
+    let check key val = do
+          let path = tmp </> (key <> ".toml")
+          TIO.writeFile path $
+            "overlay-path = \"/tmp/ov\"\n" <> T.pack key <> " = \"" <> val <> "\"\n"
+          chmodConfig600 path
+          err <- assertLeft (key <> " invalid") =<< loadConfig (Just path)
+          case err of
+            DecodeError msg ->
+              assertTrue ("error names " <> key) (T.pack key `T.isInfixOf` T.pack msg)
+            other -> do
+              hPutStrLn stderr $ "expected DecodeError, got " <> show other
+              exitFailure
+    check "gentoo-tree-max-age" "6"
+    check "gentoo-tree-max-age" "1h30m"
+    check "materialize-base-check-interval" "3w"
+    check "materialize-base-check-interval" ""
 
 testConfigModeWrong :: IO ()
 testConfigModeWrong =

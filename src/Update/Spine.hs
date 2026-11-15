@@ -59,14 +59,13 @@ import Update.CheckCache
     flushCheckCache,
     recordCacheCounters,
   )
-import Update.Deps.Plan (DepsPlanOps, toGoPlanOps)
+import Update.Deps.Plan (DepsPlanOps (..), toGoPlanOps)
 import Update.DiskSpace
   ( DiskGateOk (..),
     DiskSpaceProbe,
     resolveTempRoot,
     runDiskSpaceGate,
   )
-import Update.Distfiles (lookupPortageDistDir)
 import Update.Git (GitOps (..))
 import Update.GitHub (GitHubLatch, gitHubAbortLog, parseGitHubOrigin, peekGitHubLatch)
 import Update.Go.Vendor (mkVendorOps)
@@ -370,13 +369,11 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
             withStepProgress pcfg 1 $ \step -> do
               shStep step "Checking free disk space"
               tempRoot <- resolveTempRoot
-              mPortage <- lookupPortageDistDir (pcMetrics pcfg)
               runDiskSpaceGate
                 (usdDiskProbe deps)
                 jobs
                 tempRoot
                 distDir
-                mPortage
                 units
           case diskGate of
             Left err -> pure (Left err)
@@ -483,14 +480,12 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                           then pure (Right planned')
                           else do
                             tempRoot <- resolveTempRoot
-                            mPortage <- lookupPortageDistDir (pcMetrics pcfg)
                             disk <-
                               runDiskSpaceGate
                                 (usdDiskProbe deps)
                                 jobs
                                 tempRoot
                                 distDir
-                                mPortage
                                 newUnits
                             pure $ case disk of
                               Left err -> Left err
@@ -587,7 +582,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                             Just inner
                               | null t0FullKeys -> pure Nothing
                               | otherwise -> do
-                                  cfg <- resolveMaterializeDockerCfg (rrRunId tempRun) (mTimeDir (pcMetrics pcfg))
+                                  cfg <- resolveMaterializeDockerCfg (rrRunId tempRun) (mTimeDir (pcMetrics pcfg)) (dpoGentooTree (usdDepsPlanOps deps))
                                   pure (Just (cfg, inner))
                         httpMgr <- newMetricsManager (pcMetrics pcfg)
                         compressSlot <- packSlotWithMetrics (pcMetrics pcfg) <$> newPackSlot

@@ -5,7 +5,7 @@
 --
 -- Pure need math (baselines × ecosystem factors + fixed margin), multi-unit
 -- max / concurrent-sum under @--jobs@, same-device merge, injectable free-space
--- probes (production uses POSIX @statvfs@), and Portage DISTDIR warn-only.
+-- probes (production uses POSIX @statvfs@).
 module Update.DiskSpace
   ( -- * Constants
     safetyMarginBytes,
@@ -25,7 +25,6 @@ module Update.DiskSpace
     floorPdmTemp,
     floorReuseTemp,
     floorGitMvDist,
-    portageWarnFreeThreshold,
 
     -- * Classification
     MaterializeClass (..),
@@ -156,10 +155,6 @@ floorReuseTemp = 512 * 1024 * 1024
 -- | Manager DISTDIR floor for GitMv / unknown missing distfile fetches.
 floorGitMvDist :: Integer
 floorGitMvDist = 512 * 1024 * 1024
-
--- | Portage DISTDIR free-space warn threshold (distinct path only).
-portageWarnFreeThreshold :: Integer
-portageWarnFreeThreshold = giB
 
 giB :: Integer
 giB = 1024 * 1024 * 1024
@@ -482,8 +477,6 @@ evaluateDiskFeasibility ::
   Integer ->
   -- | temp and manager on same device
   Bool ->
-  -- | optional Portage path + free (warn only when distinct)
-  Maybe (FilePath, Integer) ->
   [UnitDiskPlan] ->
   Either Text DiskGateOk
 evaluateDiskFeasibility
@@ -495,11 +488,10 @@ evaluateDiskFeasibility
   distFree
   distDev
   sameDevice
-  mPortage
   units =
     let tempNeeds = map udpTempNeed units
         distNeeds = map udpDistNeed units
-        warnings = portageWarnings mPortage distPath
+        warnings = []
      in if sameDevice || tempDev == distDev
           then
             let combined = combineSameDeviceNeeds tempNeeds distNeeds
@@ -550,19 +542,6 @@ checkOne jobs label free needs warnings =
                       "concurrent sum"
                 else Right (DiskGateOk warnings)
 
-portageWarnings :: Maybe (FilePath, Integer) -> FilePath -> [Text]
-portageWarnings Nothing _ = []
-portageWarnings (Just (pPath, pFree)) managerPath
-  | pPath == managerPath = []
-  | pFree < portageWarnFreeThreshold =
-      [ "Portage DISTDIR free space is low ("
-          <> formatBytesHuman pFree
-          <> " free at "
-          <> T.pack pPath
-          <> "); manager distfiles path is separate — continuing (warn only)"
-      ]
-  | otherwise = []
-
 insufficientMsg :: Int -> Text -> Integer -> Integer -> Text -> Text
 insufficientMsg jobs label free need reason =
   "insufficient free space for update under --jobs "
@@ -599,10 +578,9 @@ runDiskSpaceGate ::
   Int ->
   FilePath ->
   FilePath ->
-  Maybe FilePath ->
   [UnitDiskPlan] ->
   IO (Either Text DiskGateOk)
-runDiskSpaceGate probe jobs tempRoot distPath mPortage units = do
+runDiskSpaceGate probe jobs tempRoot distPath units = do
   if null units
     then pure (Right (DiskGateOk []))
     else do
@@ -610,13 +588,6 @@ runDiskSpaceGate probe jobs tempRoot distPath mPortage units = do
       eDistFree <- dspFreeBytes probe distPath
       eTempDev <- dspDeviceId probe tempRoot
       eDistDev <- dspDeviceId probe distPath
-      mPortageFree <- case mPortage of
-        Nothing -> pure Nothing
-        Just pp -> do
-          ef <- dspFreeBytes probe pp
-          pure $ case ef of
-            Right f -> Just (pp, f)
-            Left _ -> Nothing
       pure $ do
         tempFree <- eTempFree
         distFree <- eDistFree
@@ -631,7 +602,6 @@ runDiskSpaceGate probe jobs tempRoot distPath mPortage units = do
           distFree
           distDev
           (tempDev == distDev)
-          mPortageFree
           units
 
 ------------------------------------------------------------------------

@@ -116,30 +116,14 @@ testProbe =
           || "not usable" `T.isInfixOf` err
       )
 
+-- | Only the two overrides: the tools container keeps its own @PATH@ and
+-- @HOME@, and host agent sockets never reach it.
 testEbuildEnv :: IO ()
 testEbuildEnv = do
-  let parent =
-        [ ("PATH", "/usr/bin"),
-          ("HOME", "/home/op"),
-          ("DISTDIR", "/var/cache/distfiles"),
-          ("GENTOO_MIRRORS", "https://mirror.example/"),
-          ("SSH_AUTH_SOCK", "/tmp/agent")
-        ]
-      env' = ebuildManifestEnv "/tmp/private-dist" parent
+  let env' = ebuildManifestEnv "/tmp/private-dist"
   assertEq "DISTDIR" (Just "/tmp/private-dist") (lookup "DISTDIR" env')
   assertEq "GENTOO_MIRRORS empty" (Just "") (lookup "GENTOO_MIRRORS" env')
-  assertEq "PATH kept" (Just "/usr/bin") (lookup "PATH" env')
-  assertEq "SSH kept" (Just "/tmp/agent") (lookup "SSH_AUTH_SOCK" env')
-  assertEq "HOME kept" (Just "/home/op") (lookup "HOME" env')
-  -- No duplicate keys for overridden vars
-  assertEq
-    "single DISTDIR"
-    1
-    (length [k | (k, _) <- env', k == "DISTDIR"])
-  assertEq
-    "single GENTOO_MIRRORS"
-    1
-    (length [k | (k, _) <- env', k == "GENTOO_MIRRORS"])
+  assertEq "only the overrides" ["DISTDIR", "GENTOO_MIRRORS"] (map fst env')
 
 testStickyMessages :: IO ()
 testStickyMessages = do

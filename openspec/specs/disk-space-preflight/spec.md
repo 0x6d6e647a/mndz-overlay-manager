@@ -12,7 +12,8 @@ The program SHALL resolve at least these paths for free-space evaluation during 
 
 1. **Effective temp root** — the directory used as the filesystem root for free-space measurement for temporary work (environment `TMPDIR` when set and usable; otherwise the process default temporary directory, typically `/tmp`). Product temporary workspace trees defined by `temp-workspace` SHALL reside under this root; free-space evaluation SHALL measure this root’s filesystem (not a separate device solely because of the `mndz/overlay-manager/<run-id>` subdirectory).
 2. **Effective manager distfiles path** — as defined by `manager-distfiles` (CLI, config, or XDG default).
-3. **Live Portage DISTDIR** — best-effort query of the host Portage `DISTDIR` (or the canonical system fallback when the query is unavailable), solely for optional warning when it differs from the manager path.
+
+The program SHALL NOT query or measure the host Portage `DISTDIR` for the disk-space gate.
 
 Free-space measurements SHALL use the free bytes available on the filesystem that backs each resolved path.
 
@@ -30,6 +31,11 @@ Free-space measurements SHALL use the free bytes available on the filesystem tha
 
 - **WHEN** product temporary work will write under `<temp-root>/mndz/overlay-manager/<run-id>/` on the same filesystem as the effective temp root
 - **THEN** the disk-space gate’s temp free-space check still uses the effective temp root’s filesystem free bytes
+
+#### Scenario: Host Portage DISTDIR not measured
+
+- **WHEN** `update` runs the disk-space feasibility gate on a host whose Portage `DISTDIR` filesystem is nearly full
+- **THEN** the gate neither warns nor fails because of that filesystem
 
 ### Requirement: Disk gate units are needs-work heavy units only
 
@@ -190,15 +196,6 @@ The error message SHALL name the path or filesystem role (temp root and/or manag
 
 - **WHEN** free temp space can fit the largest unit alone but not the concurrent sum under the effective `--jobs`
 - **THEN** `update` hard-fails the command with a message that indicates concurrent demand and mentions lowering `--jobs` as a remediation
-
-### Requirement: Portage DISTDIR warn-only when distinct
-
-When the live Portage DISTDIR path differs from the effective manager distfiles path and free space on the Portage DISTDIR filesystem is below a conservative threshold (product-defined, at least covering a small fixed margin), the program SHALL **warn** and SHALL NOT hard-fail solely for that reason.
-
-#### Scenario: System distfiles full private path ok
-
-- **WHEN** manager distfiles has ample free space and live Portage DISTDIR on another filesystem is very low
-- **THEN** the program emits a warning about Portage DISTDIR free space and does not exit solely because of that low free space
 
 ### Requirement: Full-path admit recheck
 

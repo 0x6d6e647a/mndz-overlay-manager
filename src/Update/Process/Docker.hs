@@ -28,11 +28,28 @@ module Update.Process.Docker
     isLiveOverlayManagerPid,
     inspectMaterializeImage,
     missingImageMessage,
+
+    -- * Portage tools container
+    toolsGentooTreeDir,
+    toolsScratchDir,
+    toolsEgencacheCacheDir,
+    ToolsContainerCfg (..),
+    resolveToolsContainerCfg,
+    toolsContainerName,
+    toolsRepositoriesConfiguration,
+    toolsCreateArgs,
+    toolsExecArgs,
+    ToolsSession,
+    newToolsSession,
+    toolsSessionRunner,
+    closeToolsSession,
+    withToolsSession,
   )
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (IOException, SomeException, finally, mask, throwIO, try)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar)
+import Control.Exception (IOException, SomeException, bracket, finally, mask, throwIO, try)
 import Control.Monad (forM_)
 import Data.Aeson ((.=))
 import Data.Char (isSpace)
@@ -44,7 +61,7 @@ import Metrics.Container (CgroupRoots, cgroupOfPid, cgroupSnapshot)
 import Metrics.Core (Metrics (..), Outcome (..), withSpan)
 import Metrics.Process (ingestTimeFile, procEndAttrs, procStartAttrs, timeFileName, timeWrapArgs)
 import Metrics.Startup (gnuTimePath)
-import System.Directory (doesDirectoryExist, getSymbolicLinkTarget)
+import System.Directory (doesDirectoryExist, getSymbolicLinkTarget, makeAbsolute)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
@@ -122,7 +139,10 @@ data MaterializeDockerCfg = MaterializeDockerCfg
     -- | Host CLI pid recorded on the pid label (not parsed from run-id).
     mdcCliPid :: String,
     -- | Run metrics @time/@ directory, bind-mounted when recording.
-    mdcTimeDir :: Maybe FilePath
+    mdcTimeDir :: Maybe FilePath,
+    -- | Host path of the managed Gentoo tree, bound read-only at
+    -- @/var/db/repos/gentoo@ (for example @pycargoebuild@'s license mapping).
+    mdcGentooTree :: FilePath
   }
   deriving (Eq, Show)
 
@@ -143,9 +163,9 @@ resolveMaterializeImage = do
     nonEmpty _ = Nothing
 
 -- | Resolve image, host uid:gid, and this CLI pid for a run. @timeDir@ is the
--- run metrics @time/@ directory when recording.
-resolveMaterializeDockerCfg :: String -> Maybe FilePath -> IO MaterializeDockerCfg
-resolveMaterializeDockerCfg runId timeDir = do
+-- run metrics @time/@ directory when recording; @gentooTree@ the managed tree.
+resolveMaterializeDockerCfg :: String -> Maybe FilePath -> FilePath -> IO MaterializeDockerCfg
+resolveMaterializeDockerCfg runId timeDir gentooTree = do
   image <- resolveMaterializeImage
   uid <- getRealUserID
   gid <- getRealGroupID
@@ -156,7 +176,8 @@ resolveMaterializeDockerCfg runId timeDir = do
         mdcUser = show uid <> ":" <> show gid,
         mdcRunId = runId,
         mdcCliPid = show pid,
-        mdcTimeDir = timeDir
+        mdcTimeDir = timeDir,
+        mdcGentooTree = gentooTree
       }
 
 -- | @mndz-mat-\<runId\>-\<cat\>-\<pn\>-\<pv\>@ with @/@ replaced by @-@.
@@ -176,8 +197,9 @@ sanitizeDockerName :: String -> String
 sanitizeDockerName = map (\c -> if c == '/' then '-' else c)
 
 -- | @docker create@ argv (no @docker@ binary): @--rm@, name, labels, user,
--- forced env, unit @work/@ and @out/@ binds (plus the run metrics @time/@
--- directory when recording), image, @sleep infinity@.
+-- forced env, the managed tree read-only at @/var/db/repos/gentoo@, unit
+-- @work/@ and @out/@ binds (plus the run metrics @time/@ directory when
+-- recording), image, @sleep infinity@.
 materializeCreateArgs ::
   MaterializeDockerCfg ->
   MaterializeUnitRef ->
@@ -208,6 +230,8 @@ materializeCreateArgs cfg unit dirs =
     "npm_config_python=/usr/bin/python3",
     "--env",
     "PYTHON=/usr/bin/python3",
+    "--mount",
+    "type=bind,src=" <> mdcGentooTree cfg <> ",dst=" <> toolsGentooTreeDir <> ",readonly",
     "--mount",
     bindMount (udWork dirs),
     "--mount",
@@ -583,13 +607,16 @@ sweepOne run isLive cid = do
         pure ()
   pure ()
 
+procRoot :: FilePath
+procRoot = "/proc"
+
 -- | @True@ when @\/proc\/\<pid\>@ exists and its @exe@ is this CLI (or exe is
 -- unreadable while the pid is still live — do not sweep a concurrent run).
 isLiveOverlayManagerPid :: String -> IO Bool
 isLiveOverlayManagerPid pidStr =
   case readMaybe pidStr :: Maybe Int of
     Just pid | pid > 0 -> do
-      let procDir = "/proc" </> pidStr
+      let procDir = procRoot </> pidStr
       exists <- doesDirectoryExist procDir
       if not exists
         then pure False
@@ -631,3 +658,221 @@ missingImageMessage image =
 
 trim :: String -> String
 trim = T.unpack . T.strip . T.pack
+
+------------------------------------------------------------------------
+-- Portage tools container
+
+-- | Container path of the managed Gentoo tree (bound read-only).
+toolsGentooTreeDir :: FilePath
+toolsGentooTreeDir = "/var/db/repos/gentoo"
+
+-- | Writable tmpfs for @HOME@ and @PORTAGE_TMPDIR@ inside the tools container.
+toolsScratchDir :: FilePath
+toolsScratchDir = "/tmp/mndz-tools"
+
+-- | Writable tmpfs for @egencache --cache-dir@.
+toolsEgencacheCacheDir :: FilePath
+toolsEgencacheCacheDir = "/tmp/mndz-egencache"
+
+-- | Identity and binds of the run's Portage tools container. Overlay and
+-- distfiles bind at their host absolute paths, so request cwd and
+-- @DISTDIR@ carry over unchanged.
+data ToolsContainerCfg = ToolsContainerCfg
+  { -- | @uid:gid@ for create and exec.
+    tccUser :: String,
+    tccRunId :: String,
+    tccCliPid :: String,
+    -- | Host path of the managed Gentoo tree.
+    tccGentooTree :: FilePath,
+    -- | Absolute effective overlay path.
+    tccOverlay :: FilePath,
+    -- | Absolute effective manager distfiles path, when the command uses one.
+    tccDistDir :: Maybe FilePath
+  }
+  deriving (Eq, Show)
+
+-- | Operator uid:gid and this CLI pid, with absolute overlay and distfiles
+-- paths.
+resolveToolsContainerCfg :: String -> FilePath -> FilePath -> Maybe FilePath -> IO ToolsContainerCfg
+resolveToolsContainerCfg runId gentooTree overlay mDistDir = do
+  uid <- getRealUserID
+  gid <- getRealGroupID
+  pid <- getProcessID
+  overlayAbs <- makeAbsolute overlay
+  distAbs <- traverse makeAbsolute mDistDir
+  pure
+    ToolsContainerCfg
+      { tccUser = show uid <> ":" <> show gid,
+        tccRunId = runId,
+        tccCliPid = show pid,
+        tccGentooTree = gentooTree,
+        tccOverlay = overlayAbs,
+        tccDistDir = distAbs
+      }
+
+-- | @mndz-tools-\<runId\>@.
+toolsContainerName :: ToolsContainerCfg -> String
+toolsContainerName cfg = sanitizeDockerName ("mndz-tools-" <> tccRunId cfg)
+
+-- | @PORTAGE_REPOSITORIES@: gentoo at the container tree, mndz at the overlay.
+toolsRepositoriesConfiguration :: ToolsContainerCfg -> String
+toolsRepositoriesConfiguration cfg =
+  unlines
+    [ "[DEFAULT]",
+      "main-repo = gentoo",
+      "",
+      "[gentoo]",
+      "location = " <> toolsGentooTreeDir,
+      "auto-sync = no",
+      "",
+      "[mndz]",
+      "location = " <> tccOverlay cfg,
+      "masters = gentoo",
+      "auto-sync = no"
+    ]
+
+-- | @docker create@ argv (no @docker@ binary) for the tools container from
+-- @image@. No token, GPG, or SSH agent is passed.
+toolsCreateArgs :: ToolsContainerCfg -> String -> [String]
+toolsCreateArgs cfg image =
+  [ "create",
+    "--rm",
+    "--user",
+    tccUser cfg,
+    "--name",
+    toolsContainerName cfg,
+    "--label",
+    materializeProductLabel,
+    "--label",
+    materializeRunLabelKey <> "=" <> tccRunId cfg,
+    "--label",
+    materializePidLabelKey <> "=" <> tccCliPid cfg,
+    "--env",
+    "HOME=" <> toolsScratchDir,
+    "--env",
+    "PORTAGE_TMPDIR=" <> toolsScratchDir,
+    "--env",
+    "PORTAGE_REPOSITORIES=" <> toolsRepositoriesConfiguration cfg,
+    "--tmpfs",
+    toolsScratchDir <> ":rw,exec,mode=1777",
+    "--tmpfs",
+    toolsEgencacheCacheDir <> ":rw,mode=1777",
+    "--mount",
+    "type=bind,src=" <> tccGentooTree cfg <> ",dst=" <> toolsGentooTreeDir <> ",readonly",
+    "--mount",
+    bindSame (tccOverlay cfg)
+  ]
+    <> concat [["--mount", bindSame d] | Just d <- [tccDistDir cfg]]
+    <> [image, "sleep", "infinity"]
+  where
+    bindSame p = "type=bind,src=" <> p <> ",dst=" <> p
+
+-- | @docker exec@ argv for one tool request: operator user, request cwd,
+-- request environment (secrets dropped), then the command.
+toolsExecArgs :: ToolsContainerCfg -> ProcessRequest -> [String]
+toolsExecArgs cfg req =
+  ["exec", "--user", tccUser cfg]
+    <> maybe [] (\d -> ["--workdir", d]) (prCwd req)
+    <> concatMap envFlag (toolsEnv req)
+    <> ["-i" | not (null (prStdin req))]
+    <> [toolsContainerName cfg]
+    <> argv
+  where
+    argv = case prMode req of
+      ExecCmd cmd args -> cmd : args
+      ShellCmd sh -> ["sh", "-c", sh]
+
+toolsEnv :: ProcessRequest -> [(String, String)]
+toolsEnv req =
+  [ (k, v)
+  | (k, v) <- fromMaybe [] (prEnv req),
+    k `notElem` secretMaterializeEnvKeys,
+    not ("SSH_" `isPrefixOf` k),
+    k `notElem` ["HOME", "PATH", "PORTAGE_REPOSITORIES", "PORTAGE_TMPDIR"]
+  ]
+
+data ToolsState
+  = ToolsIdle
+  | ToolsRunning String
+  | ToolsFailed Text
+
+-- | The run's lazily created tools container.
+data ToolsSession = ToolsSession
+  { tsCfg :: ToolsContainerCfg,
+    tsInner :: CommandRunner,
+    -- | Image to create from; may build a base-only image (first use only).
+    tsImage :: IO (Either Text String),
+    tsState :: MVar ToolsState
+  }
+
+newToolsSession :: CommandRunner -> ToolsContainerCfg -> IO (Either Text String) -> IO ToolsSession
+newToolsSession inner cfg image = ToolsSession cfg inner image <$> newMVar ToolsIdle
+
+-- | Run a tool request in the session container, creating it on first use.
+-- A failure to create it fails this and every later request with an error
+-- naming the container failure.
+toolsSessionRunner :: ToolsSession -> CommandRunner
+toolsSessionRunner ts req = do
+  ready <- modifyMVar (tsState ts) $ \case
+    ToolsRunning name -> pure (ToolsRunning name, Right name)
+    ToolsFailed err -> pure (ToolsFailed err, Left err)
+    ToolsIdle -> do
+      started <- startTools ts
+      pure $ case started of
+        Right name -> (ToolsRunning name, Right name)
+        Left err -> (ToolsFailed err, Left err)
+  case ready of
+    Left err ->
+      pure
+        ProcessResult
+          { prExitCode = ExitFailure 1,
+            prStdout = "",
+            prStderr = T.unpack err
+          }
+    Right _ -> do
+      cwd <- traverse makeAbsolute (prCwd req)
+      tsInner
+        ts
+        ProcessRequest
+          { prMode = ExecCmd "docker" (toolsExecArgs (tsCfg ts) req {prCwd = cwd}),
+            prCwd = Nothing,
+            prEnv = Nothing,
+            prStdin = prStdin req,
+            prMeasure = prMeasure req
+          }
+
+startTools :: ToolsSession -> IO (Either Text String)
+startTools ts = do
+  let cfg = tsCfg ts
+      name = toolsContainerName cfg
+      failed = Left . ("could not start the Portage tools container: " <>)
+  eImage <- tsImage ts
+  case eImage of
+    Left err -> pure (failed err)
+    Right image -> do
+      created <- runDockerAs Lifecycle (tsInner ts) (toolsCreateArgs cfg image) ""
+      case created of
+        Left err -> pure (failed err)
+        Right _ -> do
+          started <- runDocker (tsInner ts) ["start", name] ""
+          ready <- either (pure . Left) (const (waitUntilRunning (tsInner ts) name)) started
+          case ready of
+            Left err -> failed err <$ dockerRm (tsInner ts) name
+            Right () -> pure (Right name)
+
+-- | Remove the container when one was created.
+closeToolsSession :: ToolsSession -> IO ()
+closeToolsSession ts =
+  modifyMVar_ (tsState ts) $ \case
+    ToolsRunning name -> ToolsIdle <$ dockerRm (tsInner ts) name
+    other -> pure other
+
+-- | 'newToolsSession' for the continuation, removed on exit.
+withToolsSession ::
+  CommandRunner ->
+  ToolsContainerCfg ->
+  IO (Either Text String) ->
+  (ToolsSession -> IO a) ->
+  IO a
+withToolsSession inner cfg image =
+  bracket (newToolsSession inner cfg image) closeToolsSession

@@ -2,6 +2,7 @@
 
 module Test.DiskSpace (tests) where
 
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Ratio ((%))
 import Data.Text qualified as T
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
@@ -83,7 +84,7 @@ tests =
       testCase "gate fails when free below max" testGateFailMax,
       testCase "gate fails when free below concurrent sum" testGateFailConcurrent,
       testCase "gate passes with ample free" testGatePass,
-      testCase "Portage warn does not hard-fail" testPortageWarnOnly,
+      testCase "Host Portage DISTDIR not measured" testPortageNotMeasured,
       testCase "Manifest DIST size parse" testManifestParse,
       testCase "present distfile zeros need" testPresentDistfileZero,
       testCase "production getFreeBytes smoke" testGetFreeBytesSmoke,
@@ -173,7 +174,6 @@ testGateFailMax = do
           (100 * giB)
           2
           False
-          Nothing
           sampleUnits
   case err of
     Left msg -> assertTrue "mentions temp" ("temp root" `T.isInfixOf` msg || "/tmp" `T.isInfixOf` msg)
@@ -192,7 +192,6 @@ testGateFailConcurrent = do
           (100 * giB)
           2
           False
-          Nothing
           sampleUnits
   case err of
     Left msg -> do
@@ -213,28 +212,27 @@ testGatePass = do
       2
       "/tmp"
       "/cache/dist"
-      Nothing
       sampleUnits
   DiskGateOk warns <- assertRight "gate pass" ok
   assertEq "no warnings" [] warns
 
-testPortageWarnOnly :: IO ()
-testPortageWarnOnly = do
-  let result =
-        evaluateDiskFeasibility
-          1
-          "/tmp"
-          (20 * giB)
-          1
-          "/cache/dist"
-          (20 * giB)
-          2
-          False
-          (Just ("/var/cache/distfiles", 100 * 1024 * 1024)) -- 100 MiB free
-          sampleUnits
-  DiskGateOk warns <- assertRight "portage does not hard-fail" result
-  assertTrue "has warning" (not (null warns))
-  assertTrue "mentions Portage" (any ("Portage DISTDIR" `T.isInfixOf`) warns)
+-- | A nearly full host Portage DISTDIR filesystem is never probed or warned
+-- about: only the temp root and manager distfiles are measured.
+testPortageNotMeasured :: IO ()
+testPortageNotMeasured = do
+  probed <- newIORef []
+  let probe =
+        DiskSpaceProbe
+          { dspFreeBytes = \p -> do
+              modifyIORef' probed (p :)
+              pure (Right (if p == "/var/cache/distfiles" then 100 * 1024 * 1024 else 20 * giB)),
+            dspDeviceId = \p -> pure (Right (if p == "/tmp" then 1 else 2))
+          }
+  ok <- runDiskSpaceGate probe 1 "/tmp" "/cache/dist" sampleUnits
+  DiskGateOk warns <- assertRight "gate passes" ok
+  assertEq "no warnings" [] warns
+  paths <- readIORef probed
+  assertTrue "host Portage DISTDIR not probed" ("/var/cache/distfiles" `notElem` paths)
 
 testManifestParse :: IO ()
 testManifestParse = do
@@ -326,7 +324,6 @@ testMixedReuseFullConcurrent = do
           (100 * giB)
           2
           False
-          Nothing
           units
   case err of
     Left msg -> assertTrue "concurrent" ("concurrent" `T.isInfixOf` msg)
@@ -502,7 +499,6 @@ testGateNeedsWorkOnly = do
     (100 * giB)
     2
     False
-    Nothing
     needsWorkUnits of
     Left err -> fail ("needs-work should pass: " <> T.unpack err)
     Right _ -> pure ()
@@ -515,7 +511,6 @@ testGateNeedsWorkOnly = do
     (100 * giB)
     2
     False
-    Nothing
     inventoryUnits of
     Left _ -> pure ()
     Right _ -> fail "full inventory should fail concurrent sum"

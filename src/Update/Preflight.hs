@@ -2,7 +2,6 @@
 
 module Update.Preflight
   ( updateRequiredTools,
-    dockerRequiredTools,
     assetsRequiredTools,
     goRequiredTools,
     npmRequiredTools,
@@ -58,13 +57,10 @@ import Update.Types
     splitPackageKey,
   )
 
--- | External tools required on PATH for every @update@ run.
+-- | External tools required on PATH for every @update@ run. @ebuild@ and
+-- @egencache@ run in the Portage tools container, so @docker@ is a spine tool.
 updateRequiredTools :: [String]
-updateRequiredTools = ["git", "ebuild", "egencache", "gpg"]
-
--- | Required on PATH when any classified unit is full-path materialize.
-dockerRequiredTools :: [String]
-dockerRequiredTools = ["docker"]
+updateRequiredTools = ["git", "gpg", "docker"]
 
 -- | Historical host-pack tool list (image provides xz; kept for tests).
 assetsRequiredTools :: [String]
@@ -115,14 +111,15 @@ data AssetsPreflight = AssetsPreflight
     apNeedNpm :: Bool,
     apNeedBun :: Bool,
     apNeedCargo :: Bool,
-    -- | Any classified unit is full path (image provides language tools).
+    -- | Any classified unit is full path: a materialize image with its
+    -- toolchains is required (@docker@ itself is a spine tool).
     apNeedDocker :: Bool
   }
   deriving (Eq, Show)
 
 -- | Derive tool/assets preflight from plan + classify results.
 --
--- Docker is required when any classified unit is full path. Host language
+-- A toolchain image is required when any classified unit is full path. Host language
 -- tools, xz, pycargoebuild, and fetchers are not required for that path.
 -- @apNeedCargo@ is true only for full-path cargo (reuse-only does not need
 -- host pycargoebuild).
@@ -183,10 +180,7 @@ preflightUpdateToolsWithImage ::
   AssetsPreflight ->
   IO (Either Text ())
 preflightUpdateToolsWithImage findTool inspectImage image ap = do
-  let tools =
-        updateRequiredTools
-          <> [t | apNeedDocker ap, t <- dockerRequiredTools]
-  missing <- checkToolsOnPath findTool tools
+  missing <- checkToolsOnPath findTool updateRequiredTools
   case missing of
     ms@(_ : _) ->
       pure $

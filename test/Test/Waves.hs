@@ -298,7 +298,7 @@ mkWavePlanOps listVers fetchBun overlay = do
   sbclCache <- newMVar Nothing
   pure
     DepsPlanOps
-      { dpoPortageq = \_ -> pure (Left "portageq unused"),
+      { dpoGentooTree = "/nonexistent/gentoo-tree",
         dpoListVersions = listVers,
         dpoFetchGoMod = \_ -> pure (Left "go.mod unused"),
         dpoFetchNpmEngines = \_ _ -> pure (Left "npm unused"),

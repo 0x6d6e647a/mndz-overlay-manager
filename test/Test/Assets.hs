@@ -39,7 +39,7 @@ import Config.TokenEnvelope
     testEnvelopeParams,
     wrapTokenWith,
   )
-import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl)
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, defaultGentooTreeMaxAge, defaultMaterializeBaseCheckInterval)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
@@ -413,7 +413,9 @@ testTokenResolverIO = do
             githubToken = Just "mndz1.from-config",
             distfilesPath = Nothing,
             checkCacheTtl = defaultCheckCacheTtl,
-            sshIdentity = Nothing
+            sshIdentity = Nothing,
+            gentooTreeMaxAge = defaultGentooTreeMaxAge,
+            materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "config envelope not decrypted" Nothing =<< resolveGitHubToken cfg
@@ -430,7 +432,9 @@ testTokenResolverIO = do
             githubToken = Nothing,
             distfilesPath = Nothing,
             checkCacheTtl = defaultCheckCacheTtl,
-            sshIdentity = Nothing
+            sshIdentity = Nothing,
+            gentooTreeMaxAge = defaultGentooTreeMaxAge,
+            materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "none" Nothing =<< resolveGitHubToken cfgNoTok
@@ -1009,7 +1013,9 @@ testGitHubTokenExistingKey = do
             githubToken = Just "mndz1.existing",
             distfilesPath = Nothing,
             checkCacheTtl = defaultCheckCacheTtl,
-            sshIdentity = Nothing
+            sshIdentity = Nothing,
+            gentooTreeMaxAge = defaultGentooTreeMaxAge,
+            materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval
           }
       boom = error "github-token should not prompt or probe without --force"
       ops =

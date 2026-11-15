@@ -125,13 +125,13 @@ The change that introduces this capability SHALL establish a baseline where `REA
 
 ### Requirement: README documents gencache and md5-cache tools
 
-`README.md` SHALL document the `gencache` work subcommand (purpose, optional package targets, `--force`, and at least one example), SHALL list `egencache` among runtime tools required for `update` and `gencache`, and SHALL briefly describe the operator bootstrap/recovery sequence: ensure `cache-formats = md5-dict` in overlay `layout.conf`, run `gencache` for initial cache, use `update` for version bumps, and use `gencache` / `gencache --force` when `update` reports missing or mismatched md5-cache.
+`README.md` SHALL document the `gencache` work subcommand (purpose, optional package targets, `--force`, and at least one example), SHALL state that `update` and `gencache` run `egencache` in a container (so they require `docker`, not host `egencache`), and SHALL briefly describe the operator bootstrap/recovery sequence: ensure `cache-formats = md5-dict` in overlay `layout.conf`, run `gencache` for initial cache, use `update` for version bumps, and use `gencache` / `gencache --force` when `update` reports missing or mismatched md5-cache.
 
 #### Scenario: README catalogs gencache
 
 - **WHEN** an operator reads `README.md`
 - **THEN** the document describes `gencache` with an example invocation
-- **AND** runtime requirements mention `egencache` for `update` and `gencache`
+- **AND** runtime requirements list `docker` for `update` and `gencache` and do not list host `egencache` or `ebuild`
 
 ### Requirement: README documents outdated package targets
 
@@ -234,7 +234,7 @@ When the product performs free-space feasibility checks for `update`, `README.md
 1. That `update` checks free space on the effective temp root (`TMPDIR` or system default) and the manager distfiles path before heavy concurrent mutation.
 2. That free-space estimates cover only packages that **need work** and heavy units, using prior Manifest/GitHub asset sizes with **reuse vs full-path** classification, ecosystem factors for full path, and a fixed safety margin—not a full-path estimate for every inventory package on bare `update`.
 3. That `update` plans which packages need work (using the check cache when enabled) before the free-space gate and conditional assets/language tool requirements that depend on needs-work.
-4. Remediation: free space, set `TMPDIR` to roomier storage (for example under `$HOME`), lower `--jobs`, and that system Portage DISTDIR low space may only warn when distinct from the manager path.
+4. Remediation: free space, set `TMPDIR` to roomier storage (for example under `$HOME`), and lower `--jobs`.
 5. That mid-materialize ENOSPC is a failure mode the gate is intended to prevent when free space is already insufficient for the planned concurrent work.
 6. That heavy product temporary work is nested under `$TMPDIR/mndz/overlay-manager/<run-id>/` (or the process default temp root when `TMPDIR` is unset), with per-unit trees; successful units are cleaned immediately; hard-fail retains the failing unit tree and names its path in the error; a fully successful run removes the run root and empty parent brand directories; residuals after crashes or hard-fails may be removed manually by the operator.
 7. That when `update` will `docker build` the materialize image, it also checks free space on the Docker data-root (BuildKit cache) and, when Docker stores image layers in containerd on a distinct filesystem, that containerd data-root; that those directories are discovered from Docker/containerd configuration rather than a hardcoded `/var/lib/docker`; that insufficient space names the probed path(s), role (image layers versus build cache), and free versus need; and that the overlay tree bind-mounted into the build is not part of that image-storage check.
@@ -284,8 +284,8 @@ Operator documentation in `README.md` SHALL document the optional `check-cache-t
 
 1. That `update` of DepsAndAssets packages that need **full-path** materialize requires `docker` on `PATH` and a product Gentoo materialize image (host CPU architecture), and does not require host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` for that path.
 2. That reuse of existing assets releases does not require Docker or those language tools.
-3. That GPG-signed commits, SSH `git push`, GitHub token, `ebuild` / `egencache`, and overlay/assets worktrees stay on the host.
-4. That `update` **ensures** the default materialize image when full-path work needs it (generate and `docker build` if the current image does not satisfy those floors); that GitMv/reuse may proceed while ensure runs; that Bun in the image comes from overlay `dev-lang/bun-bin::mndz`; that qlot in the image (when SBCL is installed) comes from overlay `dev-lisp/qlot::mndz` rather than a live Quicklisp installer fetch; that `node-gyp` in the image (when bun or node is installed) comes from overlay `dev-build/node-gyp::mndz`; that metadata lives under the XDG cache `…/mndz/overlay-manager/materialize/` (`image.json`); that `MNDZ_MATERIALIZE_IMAGE` uses an existing tag and is not built or deleted by the CLI; that a manual `docker build` of an in-repo Dockerfile is **not** a required prerequisite of `update`; that the git tree SHALL NOT ship `docker/materialize/` (recipe or pointer) as operator documentation; that ensure’s generated recipe uses an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture; and that a host architecture with no such official flavor hard-fails ensure (no host language-toolchain fallback).
+3. That GPG-signed commits, SSH `git push`, GitHub token, and overlay/assets worktrees stay on the host, while `ebuild … manifest` and `egencache` run in a container from the materialize image family.
+4. That `update` **ensures** the default materialize image when full-path work needs it (generate and `docker build` if the current image does not satisfy those floors); that GitMv/reuse may proceed while ensure runs; that Bun in the image comes from overlay `dev-lang/bun-bin::mndz`; that qlot in the image (when SBCL is installed) comes from overlay `dev-lisp/qlot::mndz` rather than a live Quicklisp installer fetch; that `node-gyp` in the image (when bun or node is installed) comes from overlay `dev-build/node-gyp::mndz`; that metadata lives under the XDG cache `…/mndz/overlay-manager/materialize/` (`image.json`); that `MNDZ_MATERIALIZE_IMAGE` uses an existing tag and is not built or deleted by the CLI; that a manual `docker build` of an in-repo Dockerfile is **not** a required prerequisite of `update`; that the git tree SHALL NOT ship `docker/materialize/` (recipe or pointer) as operator documentation; that ensure’s generated recipe uses an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture, pinned by digest and rechecked for a newer digest every `materialize-base-check-interval`; and that a host architecture with no such official flavor hard-fails ensure (no host language-toolchain fallback).
 5. That work commands hard-fail when the overlay-manager TOML is not exactly mode `0600` or its mode cannot be read, without changing token resolution.
 6. That the generated image installs language toolchains via Portage: prefers a Gentoo `-bin` package when one can meet the floor, accepts testing KEYWORDS per atom (`~arch`, `::gentoo` or `::mndz`) when the floor is not stable-visible, does not set whole-image `ACCEPT_KEYWORDS` to `~arch`, and reuses local binpkgs across image rebuilds.
 7. That image Portage DISTDIR, PKGDIR, and binhost fetch caches live in Docker BuildKit (not under XDG `…/mndz/overlay-manager/` except `image.json` / the last Dockerfile); that a successful default-tag `docker build` runs `eclean-pkg --deep` and `eclean-dist --deep` after toolchain install so those caches keep exact installed versions; that `docker builder prune` wipes them (ensure does not run it); that sizes appear in the ensure build log; and that moving a warm cache to another machine means copying `image.json` together with the docker image, not copying a host directory of binpkgs.
@@ -534,3 +534,31 @@ Operator-facing `README.md` SHALL document, at operator depth:
 
 - **WHEN** a contributor sees two runs with the same `git_rev` but different `exe_sha256`
 - **THEN** `CONTRIBUTING.md` explains why the revision label can be stale
+
+### Requirement: README documents the managed Gentoo tree
+
+`README.md` SHALL document that the program keeps its own Gentoo tree under the XDG cache (`…/mndz/overlay-manager/gentoo`) instead of reading the host's, that it comes from the Gentoo git mirror verified with host `gpg` against the Gentoo repository-mirror key, and that a sync targets the newest mirror commit the binhost has caught up with.
+
+#### Scenario: Operator finds the managed tree
+
+- **WHEN** an operator reads `README.md` cache documentation
+- **THEN** it names the managed tree path and its git and gpg verification
+- **AND** it states that the host's Gentoo tree and Portage tools are not used
+
+### Requirement: README documents tree and base freshness settings
+
+`README.md` SHALL document config keys `gentoo-tree-max-age` (default `6h`) and `materialize-base-check-interval` (default `3d`), that `--refresh` also syncs the tree, which commands sync, and that an existing tree is kept with a warning when the mirror or binhost is unreachable.
+
+#### Scenario: Operator finds the freshness keys
+
+- **WHEN** an operator reads `README.md` configuration documentation
+- **THEN** it lists both keys with their defaults and the offline behavior
+
+### Requirement: README runtime table matches host requirements
+
+`README.md` runtime requirements SHALL state: `list` needs neither Portage, GPG, nor Docker; `outdated` needs `git` and `gpg` (for the tree) but not Portage or Docker; `update` and `gencache` need `git`, `gpg`, and `docker` but not host `ebuild`, `egencache`, or `portageq`; and the first `update` or `gencache` on a host with no image builds a base-only image.
+
+#### Scenario: Operator reads outdated requirements
+
+- **WHEN** an operator reads the README runtime requirements for `outdated`
+- **THEN** it lists `git` and `gpg` and does not list Portage or Docker

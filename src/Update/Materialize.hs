@@ -7,6 +7,7 @@ module Update.Materialize
     module Update.Materialize.Sidecar,
     module Update.Materialize.Resolve,
     module Update.Materialize.Recipe,
+    module Update.Materialize.Registry,
     module Update.Materialize.Ensure,
   )
 where
@@ -14,5 +15,6 @@ where
 import Update.Materialize.Ensure
 import Update.Materialize.Floors
 import Update.Materialize.Recipe
+import Update.Materialize.Registry
 import Update.Materialize.Resolve
 import Update.Materialize.Sidecar

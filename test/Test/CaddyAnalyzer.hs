@@ -325,7 +325,7 @@ planWithCeilings ::
   (EbuildVersion -> IO (Either PlanError (Maybe T.Text))) ->
   IO RuntimeLanePlan
 planWithCeilings ceilings arches versions locals fetchReq = do
-  base <- productionDepsPlanOps (Just "tok") 2 Nothing
+  base <- productionDepsPlanOps "/nonexistent/gentoo-tree" (Just "tok") 2 Nothing
   cache <- newMVar (Just ceilings)
   budget <- newWorkBudget 4
   probed <- newIORef ([] :: [GoModKey])
@@ -473,7 +473,7 @@ planEither ::
   (GoModKey -> IO (Either T.Text T.Text)) ->
   IO (Either PlanError RuntimeLanePlan)
 planEither list fetch = do
-  base <- productionDepsPlanOps (Just "tok") 2 Nothing
+  base <- productionDepsPlanOps "/nonexistent/gentoo-tree" (Just "tok") 2 Nothing
   cache <- newMVar (Just (threeArchCeilings "1.26.5"))
   budget <- newWorkBudget 4
   let ops =
@@ -600,7 +600,7 @@ publish overlayRoot assetsRoot ent probe releaseOps vendorOps dockerArmed manife
       tarball = vendorTarballName "caddy-analyzer" "0.8.0"
       planOps =
         PlanOps
-          { poPortageq = \_ -> pure (Left "unused"),
+          { poGentooTree = "/nonexistent/gentoo-tree",
             poListVersions = \_ -> pure (Left "unused"),
             poFetchGoMod = \_ -> pure (Left "unused"),
             poWorkBudget = budget,
@@ -662,7 +662,8 @@ publish overlayRoot assetsRoot ent probe releaseOps vendorOps dockerArmed manife
             mdcUser = "1000:1000",
             mdcRunId = "caddy-test",
             mdcCliPid = "1",
-            mdcTimeDir = Nothing
+            mdcTimeDir = Nothing,
+            mdcGentooTree = "/managed/gentoo"
           }
       env =
         env0

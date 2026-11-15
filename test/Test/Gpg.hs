@@ -1163,21 +1163,19 @@ testSigningChildrenEnv =
     case eb of
       Just req -> do
         let env = fromMaybe [] (prEnv req)
-        assertEq "ebuild keeps the parent home" parentBefore (lookup "GNUPGHOME" env)
-        assertTrue "ebuild misses session" (lookup "GNUPGHOME" env /= Just session)
+        assertEq "ebuild gets no GPG home" Nothing (lookup "GNUPGHOME" env)
       Nothing -> do
         hPutStrLn stderr "ebuild did not run"
         exitFailure
     egRef <- newIORef (Nothing :: Maybe ProcessRequest)
     createDirectoryIfMissing True (tmp </> "gentoo")
     let egRun req = case execCmd req of
-          Just ("portageq", _) -> pure (okResult (tmp </> "gentoo"))
           Just ("egencache", _) -> do
             writeIORef egRef (Just req)
             pure (okResult "")
           _ -> pure (failResult "unexpected")
     eg <-
-      mkEgencacheRunner egRun $
+      mkEgencacheRunner (tmp </> "gentoo") (tmp </> "egencache-cache") egRun $
         EgencacheRequest
           { erOverlayRoot = tmp,
             erAtoms = ["dev-lang/haskell"],

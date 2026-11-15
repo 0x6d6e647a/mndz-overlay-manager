@@ -168,7 +168,7 @@ mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
   sbclCache <- newMVar (Just sbclCeilings)
   pure
     DepsPlanOps
-      { dpoPortageq = \_ -> pure (Left "portageq unused in Materialize tests"),
+      { dpoGentooTree = "/nonexistent/gentoo-tree",
         dpoListVersions = listVers,
         dpoFetchGoMod = fetchGo,
         dpoFetchNpmEngines = fetchNpm,
@@ -402,7 +402,7 @@ mkMatEnv gitOps assetsRoot _overlayRoot ebuildRun releaseOps depsOps npmOps bunO
   ceilingsCache <- newMVar Nothing
   let planOps =
         PlanOps
-          { poPortageq = dpoPortageq depsOps,
+          { poGentooTree = dpoGentooTree depsOps,
             poListVersions = dpoListVersions depsOps,
             poFetchGoMod = dpoFetchGoMod depsOps,
             poWorkBudget = budget,

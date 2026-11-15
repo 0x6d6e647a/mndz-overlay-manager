@@ -22,6 +22,7 @@ import Data.Aeson
     object,
     withObject,
     (.:),
+    (.:?),
     (.=),
   )
 import Data.Aeson.Types (Parser)
@@ -40,7 +41,7 @@ imageSidecarSchemaVersion = 1
 
 -- | Identity of the Dockerfile generator recorded in @image.json@.
 materializeGeneratorId :: Text
-materializeGeneratorId = "mndz-overlay-manager-materialize-9"
+materializeGeneratorId = "mndz-overlay-manager-materialize-10"
 
 -- | Record of the current product materialize image.
 data ImageSidecar = ImageSidecar
@@ -49,7 +50,15 @@ data ImageSidecar = ImageSidecar
     isTag :: Text,
     isSatisfies :: NeededFloors,
     isGenerator :: Text,
-    isBuiltAt :: UTCTime
+    isBuiltAt :: UTCTime,
+    -- | Managed Gentoo tree commit the image was built from. Informational;
+    -- missing in sidecars written before the managed tree.
+    isTreeCommit :: Maybe Text,
+    -- | @sha256:…@ digest of the @gentoo/stage3@ base the recipe pinned.
+    -- Missing makes the base freshness check due.
+    isStage3Digest :: Maybe Text,
+    -- | Last successful base freshness check. Missing makes the check due.
+    isLastBaseCheck :: Maybe UTCTime
   }
   deriving (Eq, Show)
 
@@ -73,7 +82,7 @@ sidecarDockerfilePath dir = dir </> "Dockerfile"
 
 instance ToJSON ImageSidecar where
   toJSON s =
-    object
+    object $
       [ "version" .= isVersion s,
         "id" .= isId s,
         "tag" .= isTag s,
@@ -81,6 +90,9 @@ instance ToJSON ImageSidecar where
         "generator" .= isGenerator s,
         "built_at" .= iso8601Show (isBuiltAt s)
       ]
+        <> ["tree_commit" .= c | Just c <- [isTreeCommit s]]
+        <> ["stage3_digest" .= d | Just d <- [isStage3Digest s]]
+        <> ["last_base_check" .= iso8601Show t | Just t <- [isLastBaseCheck s]]
 
 instance FromJSON ImageSidecar where
   parseJSON = withObject "image.json" $ \o -> do
@@ -93,6 +105,14 @@ instance FromJSON ImageSidecar where
     built <- case iso8601ParseM (T.unpack builtRaw) of
       Just t -> pure t
       Nothing -> fail "unparseable built_at"
+    tree <- o .:? "tree_commit"
+    digest <- o .:? "stage3_digest"
+    checkRaw <- o .:? "last_base_check" :: Parser (Maybe Text)
+    lastCheck <- case checkRaw of
+      Nothing -> pure Nothing
+      Just raw -> case iso8601ParseM (T.unpack raw) of
+        Just t -> pure (Just t)
+        Nothing -> fail "unparseable last_base_check"
     pure
       ImageSidecar
         { isVersion = ver,
@@ -100,7 +120,10 @@ instance FromJSON ImageSidecar where
           isTag = tag,
           isSatisfies = sat,
           isGenerator = gen,
-          isBuiltAt = built
+          isBuiltAt = built,
+          isTreeCommit = tree,
+          isStage3Digest = digest,
+          isLastBaseCheck = lastCheck
         }
 
 encodeImageSidecar :: ImageSidecar -> LBS.ByteString

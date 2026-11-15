@@ -14,9 +14,7 @@ import CLI.Progress (MultiHandle)
 import Control.Concurrent.MVar (MVar)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Metrics.Core (Metrics)
-import Metrics.Process (timedRunner)
-import System.Environment (getEnvironment)
+import System.Directory (makeAbsolute)
 import System.Exit (ExitCode (..))
 import Update.Assets.Release (ReleaseOps)
 import Update.AtomClosure (AtomClosureSession)
@@ -42,9 +40,8 @@ import Update.Process
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
-    productionCommandRunner,
   )
-import Update.Process.Docker (MaterializeDockerCfg)
+import Update.Process.Docker (MaterializeDockerCfg, ToolsSession, toolsSessionRunner)
 import Update.Sbcl.Deps (SbclDepsOps)
 import Update.TempWorkspace (RunRoot)
 import Update.Types (Fetcher)
@@ -54,17 +51,16 @@ type EbuildRunner = FilePath -> FilePath -> IO (Either Text ())
 
 -- | Build ebuild runner over an injectable command runner (shell mode).
 -- Sets @DISTDIR@ to the effective manager distfiles path and empties
--- @GENTOO_MIRRORS@; merges onto the full parent environment.
+-- @GENTOO_MIRRORS@; the runner's process keeps its other variables.
 mkEbuildRunner :: FilePath -> CommandRunner -> EbuildRunner
 mkEbuildRunner distDir run pkgDir ebuildFileName = do
-  env0 <- getEnvironment
   let cmd = "ebuild ./" <> ebuildFileName <> " manifest"
   res <-
     run
       ProcessRequest
         { prMode = ShellCmd cmd,
           prCwd = Just pkgDir,
-          prEnv = Just (ebuildManifestEnv distDir env0),
+          prEnv = Just (ebuildManifestEnv distDir),
           prStdin = "",
           prMeasure = Timed
         }
@@ -73,9 +69,13 @@ mkEbuildRunner distDir run pkgDir ebuildFileName = do
       then Right ()
       else Left (enrichEbuildManifestError distDir (T.pack (prStderr res)))
 
--- | Production ebuild runner for the given effective manager distfiles path.
-productionEbuildRunner :: Metrics -> FilePath -> EbuildRunner
-productionEbuildRunner m distDir = mkEbuildRunner distDir (timedRunner m productionCommandRunner)
+-- | Production ebuild runner: @ebuild … manifest@ in the run's Portage tools
+-- container, with the effective manager distfiles path.
+productionEbuildRunner :: ToolsSession -> FilePath -> EbuildRunner
+productionEbuildRunner tools distDir pkgDir ebuildFileName = do
+  -- The container binds distfiles at its absolute host path.
+  distAbs <- makeAbsolute distDir
+  mkEbuildRunner distAbs (toolsSessionRunner tools) pkgDir ebuildFileName
 
 data ApplyEnv = ApplyEnv
   { aeFetcher :: Fetcher,

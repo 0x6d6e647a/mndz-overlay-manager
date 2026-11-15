@@ -52,6 +52,7 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
+import Data.Time.Format.ISO8601 (iso8601Show)
 import Logging.Bootstrap (mkLogHold)
 import Metrics.Container (CgroupRoots (..), cgroupOfPid, cgroupSnapshot)
 import Metrics.Core
@@ -123,6 +124,17 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Check (PackageEntry (..), checkPackage)
 import Update.CheckCache (flushCheckCache, openCheckCacheAt, recordCacheCounters)
+import Update.DiskSpace (DiskSpaceProbe (..))
+import Update.Distfiles (lookupPortageDistDirWith)
+import Update.GentooTree
+  ( GentooTreePaths (..),
+    TreeEnv (..),
+    fileTreeLockOps,
+    gentooTreeCommit,
+    gentooTreePathsFromEnv,
+    releaseGentooTree,
+    resolveGentooTree,
+  )
 import Update.Git (gitPush, isGitWorkTree, pathsDirty)
 import Update.Process
   ( Measure (..),
@@ -207,7 +219,9 @@ unitTests =
           testCase "argv token is redacted in proc span" testTimedRedaction,
           testCase "real GNU time keeps stderr and exit 2" testTimedRealBinary,
           testCase "git ops record measured proc spans" testGitProcSpans,
-          testCase "git argv token is redacted in proc span" testGitArgvRedaction
+          testCase "git argv token is redacted in proc span" testGitArgvRedaction,
+          testCase "eclean Portage DISTDIR lookup is a wall-clock proc span" testPortageqWallClockSpan,
+          testCase "Gentoo tree git calls are measured proc spans" testTreeGitProcSpans
         ],
       testGroup
         "Container"
@@ -1156,6 +1170,50 @@ testGitProcSpans = do
       assertTrue "push time object" (KM.member "time" (spanEndAttrs evs s3))
     _ -> assertFailure "unexpected git spans"
 
+testPortageqWallClockSpan :: IO ()
+testPortageqWallClockSpan = do
+  (found, evs) <-
+    withRecorded $ \m ->
+      lookupPortageDistDirWith m (\_ _ _ -> pure (ExitSuccess, "/var/cache/distfiles\n", ""))
+  assertEq "DISTDIR read" (Just "/var/cache/distfiles") found
+  case [(sid, a) | (sid, _, "proc", a) <- spanStarts evs, KM.lookup "cmd" a == Just (String "portageq")] of
+    [(sid, _)] -> do
+      let end = spanEndAttrs evs sid
+      assertEq "exit recorded" (Just (Number 0)) (KM.lookup "exit" end)
+      assertTrue "no time object" (not (KM.member "time" end))
+    other -> assertFailure ("expected one portageq span, got " <> show (length other))
+
+-- | The tree resolver runs git through the shared measured runner.
+testTreeGitProcSpans :: IO ()
+testTreeGitProcSpans =
+  withSystemTempDirectory "mndz-tree-spans-" $ \tmp -> do
+    let paths = gentooTreePathsFromEnv (Just tmp) "/home/unused"
+    createDirectoryIfMissing True (gtpTree paths </> ".git")
+    now <- getCurrentTime
+    writeFile (gtpStamp paths) (iso8601Show now <> "\n")
+    (res, evs) <- withRecorded $ \m -> do
+      let env =
+            TreeEnv
+              { tePaths = paths,
+                teRun = timedRunner m fakeGitInner,
+                teHttp = \_ -> pure (Left "no network in this test"),
+                teNow = pure now,
+                teLock = fileTreeLockOps (gtpLock paths),
+                teProbe = DiskSpaceProbe (\_ -> pure (Right 0)) (\_ -> pure (Right 0)),
+                teUname = "x86_64",
+                teBaseEnv = [],
+                teMaxAge = 6 * 60 * 60,
+                teRefresh = False,
+                teInfo = \_ -> pure (),
+                teWarn = \_ -> pure ()
+              }
+      r <- resolveGentooTree env
+      either (pure . Left) (\t -> Right (gentooTreeCommit t) <$ releaseGentooTree t) r
+    assertEq "commit from rev-parse" (Right "true") res
+    case [sid | (sid, _, "proc", a) <- spanStarts evs, KM.lookup "cmd" a == Just (String "git")] of
+      [sid] -> assertTrue "git span has a time object" (KM.member "time" (spanEndAttrs evs sid))
+      other -> assertFailure ("expected one git span, got " <> show (length other))
+
 testGitArgvRedaction :: IO ()
 testGitArgvRedaction = do
   (_, evs) <- withRecorded $ \m -> do
@@ -1183,7 +1241,8 @@ dockerCfg timeDir =
       mdcUser = "1000:1000",
       mdcRunId = sampleRunId,
       mdcCliPid = "4242",
-      mdcTimeDir = timeDir
+      mdcTimeDir = timeDir,
+      mdcGentooTree = "/managed/gentoo"
     }
 
 unitRef :: MaterializeUnitRef
@@ -1210,11 +1269,12 @@ testCreateArgsMount = do
       on = materializeCreateArgs (dockerCfg (Just timeDir)) unitRef dirs
       off = materializeCreateArgs (dockerCfg Nothing) unitRef dirs
       bind p = "type=bind,src=" <> p <> ",dst=" <> p
+      tree = "type=bind,src=/managed/gentoo,dst=/var/db/repos/gentoo,readonly"
   assertEq
-    "recording mounts work, out, time"
-    [bind (udWork dirs), bind (udOut dirs), bind timeDir]
+    "recording mounts tree, work, out, time"
+    [tree, bind (udWork dirs), bind (udOut dirs), bind timeDir]
     (mountsOf on)
-  assertEq "opted out mounts work and out only" [bind (udWork dirs), bind (udOut dirs)] (mountsOf off)
+  assertEq "opted out mounts tree, work, and out only" [tree, bind (udWork dirs), bind (udOut dirs)] (mountsOf off)
   assertTrue "image then sleep infinity last" (drop (length on - 3) on == ["example/no-time:1", "sleep", "infinity"])
 
 testExecArgsInnerWrap :: IO ()

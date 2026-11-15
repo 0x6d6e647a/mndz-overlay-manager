@@ -408,7 +408,7 @@ testContentFixManifest =
             }
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
               poWorkBudget = error "unused budget",
@@ -548,7 +548,7 @@ testReuseVsFullPublish =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ ->
                 pure (Right "module x\ngo 1.26.5\n"),
@@ -752,7 +752,7 @@ testGitMvCommitsOnSuccess =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Left "unused"),
               poWorkBudget = error "unused",
@@ -787,7 +787,8 @@ testGitMvCommitsOnSuccess =
               mdcUser = "1000:1000",
               mdcRunId = "test-run",
               mdcCliPid = "1",
-              mdcTimeDir = Nothing
+              mdcTimeDir = Nothing,
+              mdcGentooTree = "/managed/gentoo"
             }
         env =
           env0
@@ -893,7 +894,7 @@ runGrokBotGitMv label body x64Body armBody =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Left "unused"),
               poWorkBudget = error "unused",
@@ -1047,7 +1048,7 @@ runWardenGitMv label body =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Left "unused"),
               poWorkBudget = error "unused",
@@ -1164,7 +1165,7 @@ runKiroGitMv label body =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Left "unused"),
               poWorkBudget = error "unused",
@@ -1283,7 +1284,7 @@ runKiroIdeGitMv label body =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Left "unused"),
               poWorkBudget = error "unused",
@@ -1442,7 +1443,7 @@ testGoMultiPvSequentialCommits =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
               poWorkBudget = error "unused",
@@ -1601,7 +1602,7 @@ testGoMultiPvStopOnHardFail =
               pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
               poWorkBudget = error "unused",
@@ -1817,7 +1818,7 @@ testFullPathApplyProgressSequence =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
               poWorkBudget = error "unused",
@@ -1989,7 +1990,7 @@ testReusePathApplyProgressSequence =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Right "module x\ngo 1.26.5\n"),
               poWorkBudget = error "unused",
@@ -2047,7 +2048,8 @@ testReusePathApplyProgressSequence =
               mdcUser = "1000:1000",
               mdcRunId = "test-run",
               mdcCliPid = "1",
-              mdcTimeDir = Nothing
+              mdcTimeDir = Nothing,
+              mdcGentooTree = "/managed/gentoo"
             }
         env =
           env0
@@ -2171,7 +2173,7 @@ testOverlayCommitLock = do
   ceilingsCache <- newMVar Nothing
   let planOps =
         PlanOps
-          { poPortageq = \_ -> pure (Left "unused"),
+          { poGentooTree = "/nonexistent/gentoo-tree",
             poListVersions = \_ -> pure (Left "unused"),
             poFetchGoMod = \_ -> pure (Left "unused"),
             poWorkBudget = budget,
@@ -2340,7 +2342,7 @@ testApplyOverlayJobs1SoftHardMix =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Left "unused"),
               poWorkBudget = error "unused",
@@ -2436,7 +2438,7 @@ testApplyOverlayJobsConcurrent =
           pure (Right ())
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Left "unused"),
               poWorkBudget = error "unused",
@@ -2480,7 +2482,7 @@ testGitMvResidualSoftHardDirty =
     let overlayRoot = tmp </> "overlay"
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Left "unused"),
               poWorkBudget = error "unused",
@@ -2681,7 +2683,7 @@ fakeManifestRun pkgDir name = do
 planOpsUnused :: PlanOps
 planOpsUnused =
   PlanOps
-    { poPortageq = \_ -> pure (Left "unused"),
+    { poGentooTree = "/nonexistent/gentoo-tree",
       poListVersions = \_ -> pure (Left "unused"),
       poFetchGoMod = \_ -> pure (Left "unused"),
       poWorkBudget = error "unused",

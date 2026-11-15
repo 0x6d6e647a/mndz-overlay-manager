@@ -36,7 +36,7 @@ import Config.Loader (ConfigError (..), loadConfig)
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
-import Control.Concurrent.MVar (MVar, newMVar)
+import Control.Concurrent.MVar (MVar, newMVar, readMVar)
 import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
@@ -294,6 +294,7 @@ unitTests =
   testGroup
     "Lanes"
     [ testCase "Go Tree Ceilings" testGoTreeCeilings,
+      testCase "Gentoo ceilings ignore the host tree" testCeilingsIgnoreHostTree,
       testCase "Multi Arch Ceilings" testMultiArchCeilings,
       testCase "Tilde Only Bun Ceilings" testTildeOnlyBunCeilings,
       testCase "Candidate Version Filter" testCandidateVersionFilter,
@@ -1706,6 +1707,50 @@ testGoStripAndParseList = do
       hPutStrLn stderr (T.unpack err)
       exitFailure
 
+-- | Planning reads only the tree it is given. A second, newer tree (standing
+-- in for the host's) never raises the Go ceilings.
+testCeilingsIgnoreHostTree :: IO ()
+testCeilingsIgnoreHostTree =
+  withSystemTempDirectory "mndz-host-tree-" $ \tmp -> do
+    let managed = tmp </> "managed-gentoo"
+        host = tmp </> "host-gentoo"
+        writeGo root pv kw = do
+          let dir = root </> "dev-lang" </> "go"
+          createDirectoryIfMissing True dir
+          TIO.writeFile (dir </> ("go-" <> pv <> ".ebuild")) ("KEYWORDS=\"" <> kw <> "\"\n")
+    writeGo managed "1.26.3" "amd64 arm64"
+    writeGo managed "1.26.5" "~amd64 ~arm64"
+    writeGo host "1.30.0" "amd64 arm64"
+    budget <- newWorkBudget 2
+    ceilingsCache <- newMVar Nothing
+    let planOps =
+          PlanOps
+            { poGentooTree = managed,
+              poListVersions = \_ ->
+                pure $
+                  Right
+                    [ parseEbuildVersion "0.90.0",
+                      parseEbuildVersion "0.84.0"
+                    ],
+              poFetchGoMod = \key ->
+                pure . Right $
+                  case gmkTag key of
+                    "v0.90.0" -> "module x\ngo 1.30.0\n"
+                    "v0.84.0" -> "module x\ngo 1.26.5\n"
+                    _ -> "module x\n",
+              poWorkBudget = budget,
+              poCeilingsCache = ceilingsCache
+            }
+    plan <-
+      assertRight "plan go package"
+        =<< planGoPackage planOps (GitHub "o" "r" "v") Nothing
+    assertEq "managed tree bounds the plan" [parseEbuildVersion "0.84.0"] (glpUniquePVs plan)
+    cached <- readMVar ceilingsCache
+    assertEq
+      "ceilings from the managed tree"
+      (Just (Just (parseEbuildVersion "1.26.3")))
+      (acPlain . Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" . rcByArch <$> cached)
+
 testGoPlanIntegrationMocked :: IO ()
 testGoPlanIntegrationMocked = do
   withSystemTempDirectory "mndz-go-tree-" $ \tmp -> do
@@ -1721,14 +1766,9 @@ testGoPlanIntegrationMocked = do
     TIO.writeFile
       (goDir </> "go-9999.ebuild")
       "KEYWORDS=\"~amd64\"\n"
-    let portageq args =
-          pure $
-            if args == ["get_repo_path", "/", "gentoo"]
-              then Right (T.pack gentoo)
-              else Left "unexpected portageq"
     ceilings <-
       assertRight "discover ceilings"
-        =<< discoverGoCeilingsWith portageq
+        =<< discoverGoCeilingsWith gentoo
     assertEq
       "mock plain"
       (Just (parseEbuildVersion "1.26.3"))
@@ -1741,7 +1781,7 @@ testGoPlanIntegrationMocked = do
     ceilingsCache <- newMVar Nothing
     let planOps =
           PlanOps
-            { poPortageq = portageq,
+            { poGentooTree = gentoo,
               -- Newest-first (production listGitHubVersionsWith order).
               poListVersions = \_ ->
                 pure $
@@ -1802,7 +1842,7 @@ mkEarlyExitPlanOps versions fetchBody = do
   fetchTags <- newIORef ([] :: [T.Text])
   let planOps =
         PlanOps
-          { poPortageq = \_ -> pure (Left "unused"),
+          { poGentooTree = "/nonexistent/gentoo-tree",
             poListVersions = \_ -> pure (Right versions),
             poFetchGoMod = \key -> do
               atomicModifyIORef' fetchTags (\ts -> (gmkTag key : ts, ()))
@@ -2059,7 +2099,7 @@ testGoModCacheHitNoRefetch = do
   assertEq "second hit" (Right "mod") r2
   assertEq "single fetch on hit" 1 fetches
 
--- | Empty-cache residual: fake portageq discovers nodejs/rust; bun from overlay dir.
+-- | Empty-cache residual: a temp tree root supplies nodejs/rust; bun from overlay dir.
 testRuntimeCeilingDiscoverResidual :: IO ()
 testRuntimeCeilingDiscoverResidual =
   withSystemTempDirectory "mndz-ceil-residual-" $ \tmp -> do
@@ -2096,15 +2136,9 @@ testRuntimeCeilingDiscoverResidual =
     TIO.writeFile
       (sbclDir </> "sbcl-2.6.6.ebuild")
       "KEYWORDS=\"~amd64 ~x86\"\n"
-    let portageq args =
-          pure $
-            if args == ["get_repo_path", "/", "gentoo"]
-              then Right (T.pack gentoo)
-              else Left "unexpected portageq"
     -- Missing package dir → Left (empty discover residual).
     missing <-
-      discoverNodejsCeilingsWith
-        (\_ -> pure (Right (T.pack (tmp </> "no-gentoo"))))
+      discoverNodejsCeilingsWith (tmp </> "no-gentoo")
     case missing of
       Left msg ->
         assertTrue "missing nodejs dir" ("not found" `T.isInfixOf` msg)
@@ -2112,7 +2146,7 @@ testRuntimeCeilingDiscoverResidual =
         hPutStrLn stderr "expected Left for missing nodejs"
         exitFailure
     nodeC <-
-      assertRight "nodejs ceilings" =<< discoverNodejsCeilingsWith portageq
+      assertRight "nodejs ceilings" =<< discoverNodejsCeilingsWith gentoo
     assertEq
       "nodejs plain"
       (Just (parseEbuildVersion "20.0.0"))
@@ -2132,7 +2166,7 @@ testRuntimeCeilingDiscoverResidual =
       "bun no plain"
       (isNothing (acPlain (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch bunC))))
     rustC <-
-      assertRight "rust union" =<< discoverRustUnionCeilingsWith portageq
+      assertRight "rust union" =<< discoverRustUnionCeilingsWith gentoo
     assertEq "rust union atom" "dev-lang/rust|rust-bin" (rcAtom rustC)
     assertEq
       "rust plain from rust"
@@ -2144,8 +2178,7 @@ testRuntimeCeilingDiscoverResidual =
       (acTilde (Map.findWithDefault (ArchCeilings Nothing Nothing) "amd64" (rcByArch rustC)))
     -- Both rust sides missing → error
     bothMissing <-
-      discoverRustUnionCeilingsWith
-        (\_ -> pure (Right (T.pack (tmp </> "empty-gentoo"))))
+      discoverRustUnionCeilingsWith (tmp </> "empty-gentoo")
     case bothMissing of
       Left msg ->
         assertTrue
@@ -2155,7 +2188,7 @@ testRuntimeCeilingDiscoverResidual =
         hPutStrLn stderr "expected Left when both rust dirs missing"
         exitFailure
     sbclC <-
-      assertRight "sbcl ceilings" =<< discoverSbclCeilingsWith portageq
+      assertRight "sbcl ceilings" =<< discoverSbclCeilingsWith gentoo
     assertEq "sbcl atom" "dev-lisp/sbcl" (rcAtom sbclC)
     assertEq
       "sbcl plain"

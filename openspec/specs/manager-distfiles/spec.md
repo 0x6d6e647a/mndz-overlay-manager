@@ -54,7 +54,7 @@ All package units in a single `update` run SHALL share the same effective manage
 
 ### Requirement: Ebuild manifest uses manager DISTDIR and empty GENTOO_MIRRORS
 
-Every Portage `ebuild … manifest` invocation performed by the program SHALL run with an environment that includes `DISTDIR` set to the effective manager distfiles path and `GENTOO_MIRRORS` set to the empty string, merged onto the process environment so that other variables (including agent and `PATH`) remain available. The program SHALL NOT rely on `FEATURES=-mirror` as the mechanism to disable Gentoo mirror URL construction.
+Every Portage `ebuild … manifest` invocation performed by the program SHALL run in the Portage tools container with an environment that includes `DISTDIR` set to the effective manager distfiles path (bound at the same absolute path) and `GENTOO_MIRRORS` set to the empty string, merged onto the container's environment so that its other variables (including `PATH`) remain available. The program SHALL NOT rely on `FEATURES=-mirror` as the mechanism to disable Gentoo mirror URL construction.
 
 #### Scenario: Manifest child sees private DISTDIR
 

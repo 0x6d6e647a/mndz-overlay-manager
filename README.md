@@ -14,19 +14,28 @@ The documented build and run commands use [just](https://just.systems/) **1.55 o
 
 | When | Tools on `PATH` |
 |------|------------------|
-| `update` (always) | `git`, `ebuild` (Portage), `egencache` (Portage), `gpg` |
-| `gencache` | `git`, `egencache`, `gpg` |
-| `update` of packages that **need work** and use **full-path** DepsAndAssets materialize (new vendor/deps/crates tarballs) | `docker` on `PATH` and a usable product Gentoo materialize image (host CPU architecture). The image provides `go`, `node`/`npm`, overlay `node-gyp` (`dev-build/node-gyp::mndz`), `bun`, `sbcl`, overlay `qlot` (`dev-lisp/qlot::mndz`), `cargo`, `pycargoebuild`, Python, uv, pdm, and Rust, plus `tar`, `xz`, `git`, and fetchers. Full-path Pdm packing runs in that image, which provides Python and pdm. Host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` / `xz` are **not** required for that path. |
-| `update` that only **reuses** existing GitHub release assets | no Docker and no host language toolchains (download + verify stay on the host) |
+| `outdated` | `git`, `gpg` (to sync and verify the [managed Gentoo tree](#managed-gentoo-tree)); no Portage and no Docker |
+| `update` (always) | `git`, `gpg`, `docker` (`ebuild … manifest` and `egencache` run in the [Portage tools container](#portage-tools-container)); no host `ebuild`, `egencache`, or `portageq` |
+| `gencache` | `git`, `gpg`, `docker` (`egencache` runs in the Portage tools container); no host `egencache` |
+| `update` of packages that **need work** and use **full-path** DepsAndAssets materialize (new vendor/deps/crates tarballs) | a usable product Gentoo materialize image with the needed toolchains (host CPU architecture). The image provides `go`, `node`/`npm`, overlay `node-gyp` (`dev-build/node-gyp::mndz`), `bun`, `sbcl`, overlay `qlot` (`dev-lisp/qlot::mndz`), `cargo`, `pycargoebuild`, Python, uv, pdm, and Rust, plus `tar`, `xz`, `git`, and fetchers. Full-path Pdm packing runs in that image, which provides Python and pdm. Host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` / `xz` are **not** required for that path. |
+| `update` that only **reuses** existing GitHub release assets | no toolchains in the image and no host language toolchains (download + verify stay on the host) |
 | `outdated`, `update`, `gencache`, `eclean` (unless `--no-metrics`) | GNU time at `/usr/bin/time` (`sys-process/time`) for [run metrics](#run-metrics) |
 
-`list` and `outdated` only need a readable overlay and a valid config (plus GNU `/usr/bin/time` for `outdated` unless `--no-metrics`); they do not require Portage, GPG, or Docker. Help (`--help`) does not load configuration and needs no overlay.
+`list` only needs a readable overlay and a valid config; it does not require Portage, GPG, or Docker. `outdated` also needs `git` and `gpg` for the managed Gentoo tree (plus GNU `/usr/bin/time` unless `--no-metrics`), and does not require Portage or Docker. No command runs `portageq` or reads the host's Gentoo tree or `repos.conf`. Help (`--help`) does not load configuration and needs no overlay.
 
-GPG-signed overlay/assets commits, SSH `git push`, the GitHub token, `ebuild` / `egencache`, and overlay/assets worktrees stay on the **host**. The materialize container does not receive `GITHUB_TOKEN`, `GNUPGHOME`, or `SSH_AUTH_SOCK`.
+GPG-signed overlay/assets commits, SSH `git push`, the GitHub token, the managed Gentoo tree sync, and overlay/assets worktrees stay on the **host**. `ebuild … manifest` and `egencache` run in a container from the materialize image family. No container receives `GITHUB_TOKEN`, `GNUPGHOME`, or `SSH_AUTH_SOCK`.
+
+### Portage tools container
+
+`update` and `gencache` run every Portage `ebuild … manifest` and `egencache` in one **Portage tools container** per run (`mndz-tools-<run-id>`), started on the first such call and removed when the command exits. It runs as your uid and gid, binds the [managed Gentoo tree](#managed-gentoo-tree) read-only at `/var/db/repos/gentoo`, and binds the overlay and the manager distfiles directory at their host paths, so `Manifest`, md5-cache files, and fetched distfiles are owned by you. Its repository configuration puts `gentoo` at that tree and `mndz` at the overlay; host `repos.conf` and profile are not used. A tool that exits non-zero fails the unit exactly as a host run would; a container that cannot start fails every unit that needs it, naming the container failure.
+
+The container uses the image `image.json` records as current, or `MNDZ_MATERIALIZE_IMAGE` when set. On a host with no recorded image, the first `update` or `gencache` that needs a Portage tool first builds a **base-only** materialize image (stage3 and base packages, no toolchains; this takes minutes) and records it with no toolchain floors. Later full-path work builds on it as usual.
 
 ### Materialize image (full-path `update`)
 
 When `update` has classified **full-path** DepsAndAssets work, it **ensures** the default Gentoo materialize image (`mndz-overlay-manager/materialize:local`): it reuses the current image when recorded floors still satisfy this prepare, otherwise it generates a Dockerfile from an official Gentoo `stage3` glibc OpenRC flavor for the host CPU architecture and `docker build`s it (after a free-space check on probed Docker/containerd storage). A host architecture with no such official flavor hard-fails ensure; host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` are not used instead. GitMv and reuse-path work may proceed while that ensure runs. There is no in-repo Dockerfile to `docker build`; a manual image build is **not** a prerequisite of `update`.
+
+The image has **no Gentoo tree of its own**. Every Portage `RUN` of the generated recipe bind-mounts the [managed Gentoo tree](#managed-gentoo-tree) read-only at `/var/db/repos/gentoo` (passed as the `gentoo` build context, with `.git` excluded by a `.dockerignore`), so ensure chooses atoms from and builds against the same commit the run planned with; the recipe never runs `emerge-webrsync`. The base step upgrades Portage, then runs `emerge --update --deep --newuse @world` before any toolchain. `FROM` pins the stage3 tag by digest (`gentoo/stage3:<tag>@sha256:…`). When ensure runs and `materialize-base-check-interval` (default 3d) has passed since the last check, it asks the Docker Hub registry for the tag's current digest (a `HEAD` request, no pull): a different digest rebuilds the image, the same digest only resets the timer, and a failed request keeps the image, warns, and leaves the check due. `MNDZ_MATERIALIZE_IMAGE` skips that check. A tree sync alone never triggers a build, but every build re-runs all Portage layers when the tree changed since the last build (mostly reinstalling binary packages from the caches below). `image.json` also records the tree commit, the stage3 digest, and the last base check.
 
 The generated image installs language toolchains via Portage: it prefers a Gentoo `-bin` package when one can meet the floor, accepts testing KEYWORDS per atom (`~arch`, `::gentoo` or `::mndz`) when the floor is not stable-visible, does not set whole-image `ACCEPT_KEYWORDS` to `~arch`, and reuses locally built binpkgs across image rebuilds.
 
@@ -39,9 +48,9 @@ Image Portage DISTDIR (`/var/cache/distfiles`), PKGDIR (`/var/cache/binpkgs`), a
 
 Override with `MNDZ_MATERIALIZE_IMAGE` to an **existing** tag: the CLI inspects/satisfies that tag only and does not `docker build` or `docker rmi` it. The image must match the **host CPU architecture** (no qemu/foreign-arch materialize). While run metrics record, the image must also provide GNU time at `/usr/bin/time`; a full-path unit whose image lacks it hard-fails with an error naming the image and `--no-metrics`.
 
-The generated image installs `sys-process/time` so run metrics can measure commands inside the container. Images built before that change are rebuilt once on the next full-path `update`.
+The generated image installs `sys-process/time` so run metrics can measure commands inside the container. Images from an older recipe generator are rebuilt once on the next ensure.
 
-While a **full-path** unit is running, `update` keeps one named Docker container for that unit (`mndz-mat-<run-id>-<category>-<package>-<pv>`, slashes replaced so the name is Docker-legal). `docker ps`, `docker stats`, and `docker exec` can target it **while the unit runs**. The container is removed when that unit ends (`--rm` / `docker rm`). Do not drop `--rm` or keep failed containers for debugging; a hard-fail retains the host unit `work/` directory (see temp workspace below) as the investigation artifact.
+Full-path materialize sessions also bind the managed tree read-only at `/var/db/repos/gentoo` (for example, `pycargoebuild` reads `metadata/license-mapping.conf` from it). While a **full-path** unit is running, `update` keeps one named Docker container for that unit (`mndz-mat-<run-id>-<category>-<package>-<pv>`, slashes replaced so the name is Docker-legal). `docker ps`, `docker stats`, and `docker exec` can target it **while the unit runs**. The container is removed when that unit ends (`--rm` / `docker rm`). Do not drop `--rm` or keep failed containers for debugging; a hard-fail retains the host unit `work/` directory (see temp workspace below) as the investigation artifact.
 
 ## Build and run
 
@@ -73,6 +82,8 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 | `distfiles-path` | no | Private Portage `DISTDIR` for `ebuild … manifest` during `update` (default: XDG cache path below) |
 | `check-cache-ttl` | no | How long successful outdated-check / plan results are reused (human duration, default **5m**). Single unit: `s` / `m` / `h` / `d` (for example `30s`, `5m`, `1h`). **`0` or `0s` disables** the check cache (never read, never write) |
 | `ssh-identity` | no | One private-key path for an assets `git push`. A leading `~` is allowed. Required only when that push will run |
+| `gentoo-tree-max-age` | no | How long a [managed Gentoo tree](#managed-gentoo-tree) sync check stays fresh before `outdated`, `update`, or `gencache` syncs again (same duration syntax as `check-cache-ttl`, default **6h**; `0s` syncs on every run) |
+| `materialize-base-check-interval` | no | How often ensure asks the registry whether the pinned `gentoo/stage3` digest moved (same duration syntax, default **3d**) |
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then the decrypted `github-token` envelope in the config. Using an environment token logs a warning (and an extra warning when that value is not a fine-grained PAT `github_pat_`). `outdated` and `update` use that token for live `api.github.com` version fetch when a token is available. If the winning source is the encrypted config envelope, they prompt for the wrap password on a controlling TTY when this run will call `api.github.com`. `outdated` does not prompt when every `api.github.com` read for the run is a valid check-cache hit, including when a cached plan still needs work. `update` still prompts when it will look up or publish an assets release. A cache miss or `--refresh` of a GitHub-source package also prompts. Unattended `outdated` / `update` **must** set `GITHUB_TOKEN` or `GH_TOKEN` rather than relying on TTY decrypt; without a controlling TTY the command exits `1` and does not fall back to unauthenticated fetch. Live unauthenticated fetch is still allowed when no token is configured, is limited to **60 requests per hour** per IP, and logs a warning. The program never logs the raw token, wrap password, or ciphertext.
 
@@ -84,7 +95,7 @@ Work commands **hard-fail** (error-level log, exit `1`) when the config file is 
 
 ### Manager distfiles (private DISTDIR)
 
-By default, `update` runs Portage `ebuild … manifest` with `DISTDIR` set to a **private, operator-owned cache** so fetches do not land in sticky system `/var/cache/distfiles` (where root/`portage` ownership and the sticky bit commonly cause `EPERM` rename failures mid-apply).
+By default, `update` runs Portage `ebuild … manifest` (in the [Portage tools container](#portage-tools-container), with this directory bound at the same path) with `DISTDIR` set to a **private, operator-owned cache** so fetches do not land in sticky system `/var/cache/distfiles` (where root/`portage` ownership and the sticky bit commonly cause `EPERM` rename failures mid-apply).
 
 Default path (XDG cache):
 
@@ -101,6 +112,8 @@ assets-path = "/path/to/mndz-overlay-assets"
 # github-token = "mndz1...."  # set with: mndz-overlay-manager github-token
 # distfiles-path = "/path/to/private-distfiles"  # optional; default is XDG cache
 # check-cache-ttl = "5m"  # optional; default 5m; use "0s" to disable
+# gentoo-tree-max-age = "6h"  # optional; default 6h
+# materialize-base-check-interval = "3d"  # optional; default 3d
 ssh-identity = "~/.ssh/keys/shanty_github_id"
 ```
 
@@ -117,7 +130,22 @@ Default location (XDG cache):
 - `$XDG_CACHE_HOME/mndz/overlay-manager/check-cache/` when `XDG_CACHE_HOME` is set and non-empty
 - otherwise `~/.cache/mndz/overlay-manager/check-cache/`
 
-One JSON file per overlay is named `<friendly>-<hash12>.json` (sanitized overlay directory basename plus a short hash of the absolute overlay path). Entries are invalidated when the package’s local non-live versions, update source, or ebuild/Manifest content change. DepsAndAssets Bun plans also fingerprint overlay `dev-lang/bun-bin` (a missing field is a miss). Use `--refresh` on either command to ignore existing entries for reads and force live network work (fresh entries are still written when caching is enabled).
+One JSON file per overlay is named `<friendly>-<hash12>.json` (sanitized overlay directory basename plus a short hash of the absolute overlay path). Entries are invalidated when the package’s local non-live versions, update source, or ebuild/Manifest content change. DepsAndAssets Bun plans also fingerprint overlay `dev-lang/bun-bin` (a missing field is a miss). Every DepsAndAssets plan records the managed Gentoo tree commit it was planned against, so a tree sync to a new commit makes those plans miss once (latest-version entries are unaffected). Use `--refresh` on either command to ignore existing entries for reads and force live network work (fresh entries are still written when caching is enabled). `--refresh` also syncs the managed Gentoo tree.
+
+### Managed Gentoo tree
+
+The manager keeps its **own** Gentoo ebuild tree and never reads the host's (`/var/db/repos/gentoo`, `repos.conf`, or `portageq`). Lane ceilings, materialize image atoms and builds, materialize sessions, and Portage tool runs all read this one tree:
+
+- `$XDG_CACHE_HOME/mndz/overlay-manager/gentoo` when `XDG_CACHE_HOME` is set and non-empty
+- otherwise `~/.cache/mndz/overlay-manager/gentoo`
+
+It is a shallow clone of the `stable` branch of the Gentoo git mirror (`https://github.com/gentoo-mirror/gentoo.git`), made and updated with host `git` (about 700 MB plus about 100 MB of `.git`; the first clone needs 1 GiB free on the cache filesystem). Every commit is verified with host `gpg` before checkout: the signature must be valid and made by the Gentoo repository-mirror key (primary fingerprint `EF9538C9E8E64311A52CDEDFA13D0EF1914E7A72`, built into the program). Verification uses an isolated keyring at `…/overlay-manager/gentoo-keyring/`, never your GnuPG home or agent. The key is fetched by Web Key Directory or from `keys.gentoo.org`, and refreshed from `keys.gentoo.org` on every sync. A commit that fails verification hard-fails the command and leaves the tree where it was.
+
+A sync does not move to the mirror tip. It reads the `TIMESTAMP` of the host-architecture Gentoo binhost index and checks out the newest mirror metadata commit at least one hour older than that, so image builds resolve versions the binhost already carries. The tree therefore lags the tip by up to about a day.
+
+`outdated`, `update`, and `gencache` sync when the tree is missing, when the last successful sync check is older than `gentoo-tree-max-age` (default 6h), or on `--refresh`. A check that finds no newer commit still counts as a successful check. `list`, `eclean`, and help never touch the tree. A run that reads the tree holds it until it exits; a sync waits for those runs (and logs that it is waiting), and other runs wait for a sync to finish. The tree identity is its commit id.
+
+When the binhost index or the mirror cannot be reached, or the binhost index appears stalled (no eligible commit within seven days), the command keeps the existing tree and logs a warning. On a host with no tree yet, a clone failure exits `1`; when only the binhost index is unavailable, the first clone uses the verified mirror tip and warns that image builds may compile from source. `eclean` does not delete the tree.
 
 ## Commands
 
@@ -158,7 +186,7 @@ Bun packages whose runtime ceiling comes from overlay `dev-lang/bun-bin` are pre
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name (same form as `update` / `gencache`). With no arguments, every discovered package is checked. With one or more targets, only the selected packages are checked.
 
-**Flags:** `--refresh` forces live check/plan work (ignores the check cache for reads). `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens in that same form. Those tokens are subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error.
+**Flags:** `--refresh` forces live check/plan work (ignores the check cache for reads) and a managed Gentoo tree sync. `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens in that same form. Those tokens are subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error.
 
 ```bash
 # All discovered packages
@@ -170,7 +198,7 @@ just run outdated dev-util/crush
 just run outdated crush dolt
 just run outdated caddy-analyzer
 
-# Force live network checks
+# Force live network checks and a Gentoo tree sync
 just run outdated --refresh
 
 # Skip one package
@@ -179,11 +207,11 @@ just run outdated --exclude dev-util/codex
 
 ### `update`
 
-Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, regenerate package-scoped Portage `egencache` md5-cache, and create GPG-signed git commits in the overlay (ebuild/Manifest and `metadata/md5-cache/` paths together). For packages under the **DepsAndAssets** technique (Go vendor, npm/Bun deps, Cargo crates, Sbcl/Autolith deps, Uv deps, or Pdm deps), it may also materialize cache/vendor/crates/deps tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token). **Full-path** materialize runs in the Gentoo Docker image (`docker` + image on `PATH`); reuse of an existing assets release stays on the host and does not require Docker or host `go`/`npm`/`bun`/`sbcl`/`pycargoebuild`. During a full-path unit a named `mndz-mat-…` container is visible to `docker ps` / `docker stats` and is removed when that unit finishes.
+Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, regenerate package-scoped Portage `egencache` md5-cache, and create GPG-signed git commits in the overlay (ebuild/Manifest and `metadata/md5-cache/` paths together). For packages under the **DepsAndAssets** technique (Go vendor, npm/Bun deps, Cargo crates, Sbcl/Autolith deps, Uv deps, or Pdm deps), it may also materialize cache/vendor/crates/deps tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token). **Full-path** materialize runs in the Gentoo Docker image; reuse of an existing assets release stays on the host and needs no toolchains in the image and no host `go`/`npm`/`bun`/`sbcl`/`pycargoebuild`. Manifests and md5-cache are generated in the [Portage tools container](#portage-tools-container). During a full-path unit a named `mndz-mat-…` container is visible to `docker ps` / `docker stats` and is removed when that unit finishes.
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every inventory package is planned; packages that need work are mutated and others soft-skipped. Explicit targets that do not need work are soft-skipped.
 
-**Flags:** `--refresh` forces live latest fetch / deps plan (ignores the check cache for reads). After a successful apply, the package’s cache entry is rewritten with the post-apply fingerprint when caching is enabled. `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens (`category/package` or an unambiguous package name), subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error. `update` does not pull an excluded package back into the selection. `--exclude dev-lang/bun-bin` leaves bun-bin an unselected ceiling provider and does not add bun-bin back. A dirty ensure-emerge atom is still checked when the materialize recipe will emerge it.
+**Flags:** `--refresh` forces live latest fetch / deps plan (ignores the check cache for reads) and a managed Gentoo tree sync. After a successful apply, the package’s cache entry is rewritten with the post-apply fingerprint when caching is enabled. `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens (`category/package` or an unambiguous package name), subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error. `update` does not pull an excluded package back into the selection. `--exclude dev-lang/bun-bin` leaves bun-bin an unselected ceiling provider and does not add bun-bin back. A dirty ensure-emerge atom is still checked when the materialize recipe will emerge it.
 
 ```bash
 # All packages that need work
@@ -204,7 +232,7 @@ just run update --exclude dev-util/codex
 just run update --exclude dev-lang/bun-bin
 ```
 
-`update` runs a **plan phase** first (using the check cache when enabled, same needs-work rules as `outdated` / apply), then an overlay **dirty preflight** on selected package directories and on overlay atoms the materialize image will emerge (`dev-lang/bun-bin` when the image installs overlay bun-bin, `dev-lisp/qlot` when the image installs overlay qlot, `dev-build/node-gyp` when the image installs overlay node-gyp): dirty, staged, untracked, or deleted paths there hard-fail with exit `1` before mutate or `docker build`. Restore or finish that tree relative to git HEAD (unrelated overlay-root files such as `README.md` do not fail this check). Then conditional assets/token checks for packages that need work, reuse vs full classification, `docker` + materialize-image checks when any unit is full path, the free-space gate, then concurrent mutate/apply. Spine tools (`git`, `ebuild`, `egencache`, `gpg`) and layout / manager-distfiles probes run before plan. When at least one package that needs work will attempt `DepsAndAssets`, it also checks that `assets-path` is a git work tree, that `origin` parses as `github.com/{owner}/{repo}` (SSH or HTTPS), and that a GitHub token can be resolved. GitHub Releases and assets `SRC_URI` use that origin `{owner}/{repo}` (not a hardcoded GitHub owner or repository name). Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
+`update` runs a **plan phase** first (using the check cache when enabled, same needs-work rules as `outdated` / apply), then an overlay **dirty preflight** on selected package directories and on overlay atoms the materialize image will emerge (`dev-lang/bun-bin` when the image installs overlay bun-bin, `dev-lisp/qlot` when the image installs overlay qlot, `dev-build/node-gyp` when the image installs overlay node-gyp): dirty, staged, untracked, or deleted paths there hard-fail with exit `1` before mutate or `docker build`. Restore or finish that tree relative to git HEAD (unrelated overlay-root files such as `README.md` do not fail this check). Then conditional assets/token checks for packages that need work, reuse vs full classification, materialize-image checks when any unit is full path, the free-space gate, then concurrent mutate/apply. Spine tools (`git`, `gpg`, `docker`), layout / manager-distfiles probes, and the managed Gentoo tree sync run before plan. When at least one package that needs work will attempt `DepsAndAssets`, it also checks that `assets-path` is a git work tree, that `origin` parses as `github.com/{owner}/{repo}` (SSH or HTTPS), and that a GitHub token can be resolved. GitHub Releases and assets `SRC_URI` use that origin `{owner}/{repo}` (not a hardcoded GitHub owner or repository name). Overlay commits are signed; ensure the overlay (and assets) repos have `user.signingkey` configured for GPG.
 
 If the winning token is the encrypted config envelope, `update` prompts once on a controlling TTY for the wrap password when this run will call `api.github.com` (live latest fetch, `/rate_limit` health, or assets-repository release lookup/create/upload) and keeps the decrypted token for that run. A cached lane plan that still needs work still prompts, because that apply looks up or publishes an assets release. GitMv-only updates with a full check-cache hit and no assets GitHub access do not decrypt. Unattended `update` must set `GITHUB_TOKEN` or `GH_TOKEN`. GitHub rate-limit exhaustion and rejected tokens abort plan/mutate with exit `1`.
 
@@ -236,8 +264,6 @@ After planning which packages **need work**, and after classifying each heavy un
 
 If free space is insufficient for the planned needs-work units, `update` **hard-fails early** with the path, free vs need, and remediation hints (free space, set `TMPDIR` to roomier disk storage such as `$HOME/local/tmp`, or lower `--jobs`). That is intended to prevent mid-materialize `no space left on device` when the planned concurrent work already cannot fit.
 
-Live **system Portage DISTDIR** (when it differs from the manager path) is **warn-only** if free space there looks tight; it does not hard-fail the command by itself.
-
 When `update` will `docker build` the materialize image, it also checks free space on the **Docker data-root** (BuildKit cache) and, when Docker stores image layers in **containerd** on a distinct filesystem, that containerd data-root. Those directories are discovered from live Docker/containerd configuration rather than a hardcoded `/var/lib/docker`. Insufficient space names the probed path(s), the role (**image layers** versus **build cache**), and free versus need. The overlay tree bind-mounted into the build is not part of that image-storage check.
 
 ```bash
@@ -252,7 +278,7 @@ If md5-cache is **missing**, hard-fail recovery is `gencache category/package`. 
 
 ### `gencache`
 
-Generate or repair Portage **md5-dict** cache under `metadata/md5-cache/` via `egencache`, then create **one** GPG-signed overlay commit of changed cache paths (message `metadata: regenerate md5-cache`). No empty commit when nothing changes.
+Generate or repair Portage **md5-dict** cache under `metadata/md5-cache/` via `egencache` in the [Portage tools container](#portage-tools-container) (eclass checksums come from the managed Gentoo tree), then create **one** GPG-signed overlay commit of changed cache paths (message `metadata: regenerate md5-cache`). No empty commit when nothing changes.
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every package that has at least one ebuild is selected. `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens in that same form, subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error. `--force` regenerates only the packages that remain.
 

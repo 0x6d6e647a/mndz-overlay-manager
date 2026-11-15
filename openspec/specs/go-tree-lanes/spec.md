@@ -6,35 +6,6 @@ Plan multi-PV maintenance for `DepsAndAssets` Go packages from Gentoo `dev-lang/
 
 ## Requirements
 
-### Requirement: Gentoo dev-lang/go ceilings via portageq
-
-The program SHALL resolve the Gentoo repository path by running `portageq get_repo_path / gentoo` (or an equivalent injectable runner). Under that path’s `dev-lang/go` directory, the program SHALL scan non-live `go-*.ebuild` files (excluding `9999` and other live versions) and, for each ebuild, parse PV and KEYWORDS. The program SHALL discover the set of architectures from those KEYWORDS (all arches present on non-live go ebuilds, not only amd64 and arm64) and compute plain and tilde Go version ceilings for each discovered arch:
-
-- plain arch: maximum Go PV among ebuilds whose KEYWORDS include the bare arch token (e.g. `amd64`) and not only the tilde form
-- tilde arch: maximum Go PV among ebuilds whose KEYWORDS include `~arch` or the bare arch token
-
-If `portageq` fails or the path/package dir is unreadable, ceiling discovery SHALL fail with an error suitable for the caller. The program SHALL NOT read a config-overridden Portage tree path for this capability. Shared ceiling and lane semantics for non-Go ecosystems are defined by `runtime-lanes`; this requirement remains the Go ceiling source.
-
-#### Scenario: Tilde ceiling at least as new as plain
-
-- **WHEN** gentoo has `go-1.26.3` with KEYWORDS including bare `amd64` and `go-1.26.4` with only `~amd64` among amd64-visible versions
-- **THEN** the amd64 plain ceiling is `1.26.3` and the amd64 tilde ceiling is at least `1.26.4`
-
-#### Scenario: Live ebuild ignored
-
-- **WHEN** `go-9999.ebuild` exists alongside versioned go ebuilds
-- **THEN** ceiling computation does not use `9999` as a maximum
-
-#### Scenario: portageq failure
-
-- **WHEN** `portageq get_repo_path / gentoo` fails
-- **THEN** ceiling discovery reports failure and does not invent ceilings
-
-#### Scenario: Non-amd64-arm64 arch
-
-- **WHEN** non-live go ebuilds include KEYWORDS with an arch other than amd64 and arm64
-- **THEN** ceiling discovery includes plain and/or tilde ceilings for that arch
-
 ### Requirement: Lane targets from upstream go.mod
 
 For a `DepsAndAssets` Go package, given the Go ceilings for all discovered arches and a list of candidate package versions (non-live overlay PVs union upstream versions newer than max overlay PV, as defined by `runtime-lanes`), the program SHALL determine each lane’s target package PV as the maximum version `v` such that the package’s `go.mod` `go` directive at that version’s tag is parseable and `go_req(v) ≤` that lane’s Go ceiling (using the same Go version comparison rules as host-vs-go.mod gating). The `go.mod` path SHALL honor the package’s configured subdirectory (repository root when unset). Tags with missing or unparseable `go` directives SHALL be skipped for selection. A lane with no ceiling or no qualifying package version SHALL have no target.
@@ -164,3 +135,32 @@ Go tree-lane planning used by `outdated` checks and by `update` apply planning S
 
 - **WHEN** planning runs without progress hooks
 - **THEN** planning still returns a correct plan or error and does not require a progress UI
+
+### Requirement: Gentoo dev-lang/go ceilings from the managed tree
+
+The program SHALL scan non-live `go-*.ebuild` files (excluding `9999` and other live versions) under `dev-lang/go` in the managed tree specified by `gentoo-tree`, parse PV and KEYWORDS, discover every arch present in those KEYWORDS, and compute per arch a plain ceiling (max PV with the bare arch token) and a tilde ceiling (max PV with `~arch` or the bare token). An unavailable tree or unreadable package dir SHALL fail discovery.
+
+#### Scenario: Tilde ceiling at least as new as plain
+
+- **WHEN** gentoo has `go-1.26.3` with KEYWORDS including bare `amd64` and `go-1.26.4` with only `~amd64` among amd64-visible versions
+- **THEN** the amd64 plain ceiling is `1.26.3` and the amd64 tilde ceiling is at least `1.26.4`
+
+#### Scenario: Live ebuild ignored
+
+- **WHEN** `go-9999.ebuild` exists alongside versioned go ebuilds
+- **THEN** ceiling computation does not use `9999` as a maximum
+
+#### Scenario: Managed tree unavailable
+
+- **WHEN** the managed tree is missing and could not be created
+- **THEN** ceiling discovery reports failure and does not invent ceilings
+
+#### Scenario: Non-amd64-arm64 arch
+
+- **WHEN** non-live go ebuilds include KEYWORDS with an arch other than amd64 and arm64
+- **THEN** ceiling discovery includes plain and/or tilde ceilings for that arch
+
+#### Scenario: Shared semantics for other ecosystems
+
+- **WHEN** planning a non-Go `DepsAndAssets` package
+- **THEN** ceiling and lane semantics follow `runtime-lanes`, and this requirement remains the Go ceiling source

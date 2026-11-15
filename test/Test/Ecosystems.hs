@@ -144,7 +144,6 @@ import Update.Process.Docker
     withUnitMaterializeSession,
     wrapMaterializeExecRequest,
   )
-import Update.Runtime.Ceilings (gentooRepoPath, mkPortageqRunner)
 import Update.Sbcl.Deps
   ( SbclDepsOps (..),
     SbclDepsProgress (..),
@@ -270,7 +269,7 @@ unitTests =
           testCase "vendor mk path success + failure" testVendorMkCommandRunner,
           testCase "cargo mk path success + failure" testCargoMkCommandRunner,
           testCase "pycargoFailureSummary" pycargoFailureSummary,
-          testCase "ebuild/egencache/portageq mk runners" testSimpleRunnersMk,
+          testCase "ebuild/egencache mk runners" testSimpleRunnersMk,
           testCase "docker create binds unit work/out not run root" testDockerCreateArgs,
           testCase "docker exec go version keeps GOMODCACHE strips secrets" testDockerExecGoVersion,
           testCase "session name sanitizes slash and includes labels" testDockerSessionNameAndLabels,
@@ -3122,7 +3121,8 @@ sampleDockerCfg =
       mdcUser = "1000:1000",
       mdcRunId = "20260810T154207-0700-4242.a8f3",
       mdcCliPid = "4242",
-      mdcTimeDir = Nothing
+      mdcTimeDir = Nothing,
+      mdcGentooTree = "/managed/gentoo"
     }
 
 sampleUnitRef :: MaterializeUnitRef
@@ -3229,6 +3229,9 @@ testDockerCreateArgs =
     assertTrue
       "run root is not a bind"
       (not (any (isInfixOf ("src=" <> runRoot <> ",dst=" <> runRoot)) args))
+    assertTrue
+      "managed tree read-only at /var/db/repos/gentoo"
+      (["--mount", "type=bind,src=/managed/gentoo,dst=/var/db/repos/gentoo,readonly"] `isInfixOf` args)
     assertTrue "PID 1 sleep infinity" (["sleep", "infinity"] `isInfixOf` args)
     assertTrue "image tag" (defaultMaterializeImage `elem` args)
     assertTrue
@@ -4032,31 +4035,23 @@ testSimpleRunnersMk =
       assertLeft "ebuild fail"
         =<< mkEbuildRunner (tmp </> "distfiles") ebuildFail overlay "pkg-1.0.ebuild"
     assertTrue "ebuild err" ("ebuild manifest failed" `T.isInfixOf` ebuildErr)
-    -- portageq success + failure
-    let pqOk = mkPortageqRunner $ \req -> case execCmd req of
-          Just ("portageq", ["get_repo_path", "/", "gentoo"]) ->
-            pure (okResult (gentoo <> "\n"))
-          _ -> pure (failResult ("unexpected portageq: " <> show req))
-        pqFail = mkPortageqRunner $ \_ -> pure (failResult "no portageq")
-    path <- assertRight "portageq path" =<< gentooRepoPath pqOk
-    assertEq "gentoo path" gentoo path
-    pqErr <- assertLeft "portageq fail" =<< gentooRepoPath pqFail
-    assertTrue "portageq err" ("portageq" `T.isInfixOf` pqErr)
-    -- egencache: portageq discover + egencache argv
+    -- egencache: managed tree location + egencache argv
     let egenOk req = case execCmd req of
-          Just ("portageq", ["get_repo_path", "/", "gentoo"]) ->
-            pure (okResult (gentoo <> "\n"))
           Just ("egencache", args) -> do
             assertTrue "repo mndz" ("--repo" `elem` args && "mndz" `elem` args)
             assertTrue "update" ("--update" `elem` args)
+            assertTrue
+              "gentoo at the tree path"
+              (any (("location = " <> gentoo) `isInfixOf`) args)
             pure (okResult "")
           _ -> pure (failResult ("unexpected egencache req: " <> show req))
         egenFail req = case execCmd req of
-          Just ("portageq", _) -> pure (okResult (gentoo <> "\n"))
           Just ("egencache", _) -> pure (failResult "egencache boom")
           _ -> pure (failResult "unexpected")
     assertRight "egencache ok"
       =<< mkEgencacheRunner
+        gentoo
+        (tmp </> "egencache-cache")
         egenOk
         EgencacheRequest
           { erOverlayRoot = overlay,
@@ -4066,6 +4061,8 @@ testSimpleRunnersMk =
     egenErr <-
       assertLeft "egencache fail"
         =<< mkEgencacheRunner
+          gentoo
+          (tmp </> "egencache-cache")
           egenFail
           EgencacheRequest
             { erOverlayRoot = overlay,
@@ -4093,7 +4090,7 @@ testApplyEnvFakeEcoOps =
             }
         planOps =
           PlanOps
-            { poPortageq = \_ -> pure (Left "unused"),
+            { poGentooTree = "/nonexistent/gentoo-tree",
               poListVersions = \_ -> pure (Left "unused"),
               poFetchGoMod = \_ -> pure (Left "unused"),
               poWorkBudget = error "unused",

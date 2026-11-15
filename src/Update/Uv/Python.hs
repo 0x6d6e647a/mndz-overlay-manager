@@ -63,8 +63,6 @@ import Update.Go.Lanes
 import Update.Runtime.Ceilings
   ( Arch,
     KeywordTier (..),
-    PortageqRunner,
-    gentooRepoPath,
     isLiveRuntimeVersion,
     keywordsHasBare,
     keywordsHasTildeOrBare,
@@ -109,12 +107,8 @@ data ProbeStep
   deriving (Eq, Show)
 
 -- | Non-live @dev-lang/python@ ebuilds grouped by SLOT. @_rc@ and @9999@ are ignored.
-discoverPythonSlotInventory :: PortageqRunner -> IO (Either Text PythonSlotInventory)
-discoverPythonSlotInventory run = do
-  pathResult <- gentooRepoPath run
-  case pathResult of
-    Left err -> pure (Left err)
-    Right gentooRoot -> readPythonDir (gentooRoot </> "dev-lang" </> "python")
+discoverPythonSlotInventory :: FilePath -> IO (Either Text PythonSlotInventory)
+discoverPythonSlotInventory gentooRoot = readPythonDir (gentooRoot </> "dev-lang" </> "python")
 
 readPythonDir :: FilePath -> IO (Either Text PythonSlotInventory)
 readPythonDir dir = do

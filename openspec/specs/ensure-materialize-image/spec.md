@@ -165,7 +165,7 @@ After an overlay wait-edge provider in this run creates a successful signed over
 
 ### Requirement: Image satisfies the union of previous and this prepare’s floors
 
-The program SHALL treat the materialize image as satisfying a prepare when every toolchain that prepare will use for full-path work is present in the image at a version greater than or equal to that prepare’s maximum required floor (Go from `go.mod`, Node from `engines.node`, Bun from `engines.bun` / overlay bun-bin including hypothetical working-plan floors for withheld Bun consumers, Rust and SBCL from their existing plan floors) **and**, when this prepare’s recipe will emerge overlay `dev-lisp/qlot`, the recorded image provides overlay qlot at a version greater than or equal to the PV that recipe would emerge **and**, when this prepare’s recipe will emerge overlay `dev-build/node-gyp`, the recorded image provides overlay node-gyp at a version greater than or equal to the PV that recipe would emerge. **This prepare’s** needed floors SHALL be the maximum requirement of classified **full-path** PV units only, including withheld hypo-planned Bun consumers as specified above. Reuse-path and GitMv units SHALL NOT contribute Go/Node/Bun/Rust/SBCL floors. The overlay qlot PV used for satisfy and for the recipe SHALL be the newest non-live overlay qlot ebuild (after qlot GitMv file work when that work must precede `docker build`). The overlay node-gyp PV used for satisfy and for the recipe SHALL be the newest non-live overlay node-gyp ebuild (after node-gyp file work when that work must precede `docker build`). Planned PVs of the same package that are not full-path in this prepare SHALL NOT raise language floors. When ensure must build, the resulting image SHALL satisfy the **union** of the previous image’s recorded satisfies (if any) and this prepare’s needed floors and qlot PV and node-gyp PV (monotonic; the program SHALL NOT drop a toolchain already paid for). When that union already holds and the recorded image id still exists, ensure SHALL NOT `docker build`. When overlay qlot PV is newer than the recorded image’s qlot, or overlay node-gyp PV is newer than the recorded image’s node-gyp, ensure SHALL `docker build` even if language floors and generator identity would otherwise satisfy.
+The program SHALL treat the materialize image as satisfying a prepare when every toolchain that prepare will use for full-path work is present in the image at a version greater than or equal to that prepare’s maximum required floor (Go from `go.mod`, Node from `engines.node`, Bun from `engines.bun` / overlay bun-bin including hypothetical working-plan floors for withheld Bun consumers, Rust and SBCL from their existing plan floors) **and**, when this prepare’s recipe will emerge overlay `dev-lisp/qlot`, the recorded image provides overlay qlot at a version greater than or equal to the PV that recipe would emerge **and**, when this prepare’s recipe will emerge overlay `dev-build/node-gyp`, the recorded image provides overlay node-gyp at a version greater than or equal to the PV that recipe would emerge. **This prepare’s** needed floors SHALL be the maximum requirement of classified **full-path** PV units only, including withheld hypo-planned Bun consumers as specified above. Reuse-path and GitMv units SHALL NOT contribute Go/Node/Bun/Rust/SBCL floors. The overlay qlot PV used for satisfy and for the recipe SHALL be the newest non-live overlay qlot ebuild (after qlot GitMv file work when that work must precede `docker build`). The overlay node-gyp PV used for satisfy and for the recipe SHALL be the newest non-live overlay node-gyp ebuild (after node-gyp file work when that work must precede `docker build`). Planned PVs of the same package that are not full-path in this prepare SHALL NOT raise language floors. When ensure must build, the resulting image SHALL satisfy the **union** of the previous image’s recorded satisfies (if any) and this prepare’s needed floors and qlot PV and node-gyp PV (monotonic; the program SHALL NOT drop a toolchain already paid for). When that union already holds and the recorded image id still exists, ensure SHALL NOT `docker build` unless the image base freshness check finds a newer stage3 digest, as specified in this capability. When overlay qlot PV is newer than the recorded image’s qlot, or overlay node-gyp PV is newer than the recorded image’s node-gyp, ensure SHALL `docker build` even if language floors and generator identity would otherwise satisfy.
 
 #### Scenario: Already satisfies skips build
 
@@ -203,11 +203,11 @@ The program SHALL treat the materialize image as satisfying a prepare when every
 
 ### Requirement: Generated Gentoo image; install order; no official tarballs
 
-The program SHALL generate the Dockerfile (or equivalent build recipe) used by ensure. The image SHALL be Gentoo on the host CPU architecture. The generated `FROM` line SHALL name an official `gentoo/stage3` **glibc OpenRC** flavor tag mapped from the host machine (`uname -m`), not the Portage KEYWORDS token concatenated onto `gentoo/stage3:`. The program SHALL NOT use Hub tags `amd64` or `arm64` as `FROM`, SHALL NOT use `gentoo/stage3:latest` as the generated `FROM`, and SHALL NOT use systemd, musl, llvm, hardened, or desktop flavor tags for that `FROM`. Portage `package.accept_keywords` SHALL use the Gentoo KEYWORDS token for the host (`amd64`, `arm64`, `ppc64`, `riscv`, `s390`, `x86`, `arm`).
+The program SHALL generate the Dockerfile (or equivalent build recipe) used by ensure. The image SHALL be Gentoo on the host CPU architecture. The generated `FROM` line SHALL name an official `gentoo/stage3` **glibc OpenRC** flavor tag mapped from the host machine (`uname -m`), pinned by the digest recorded for the image base (`gentoo/stage3:<tag>@sha256:<digest>`), not the Portage KEYWORDS token concatenated onto `gentoo/stage3:`. The program SHALL NOT use Hub tags `amd64` or `arm64` as `FROM`, SHALL NOT use `gentoo/stage3:latest` as the generated `FROM`, and SHALL NOT use systemd, musl, llvm, hardened, or desktop flavor tags for that `FROM`. Portage `package.accept_keywords` SHALL use the Gentoo KEYWORDS token for the host (`amd64`, `arm64`, `ppc64`, `riscv`, `s390`, `x86`, `arm`).
 
-Before `docker build`, the program SHALL choose **one** Portage atom per needed toolchain by scanning the gentoo (or overlay, for bun-bin) package directories: if a `-bin` package exists and has a host-arch ebuild whose version is greater than or equal to the floor (plain or tilde KEYWORDS), that `-bin` atom SHALL be used; otherwise the corresponding source package SHALL be used when it likewise has such an ebuild. The generated recipe SHALL `emerge` that single atom (`>=` the floor, or unversioned when the floor token is any-version). The recipe SHALL NOT trial-emerge a missing `-bin` package with a shell `||` fallback. A local binpkg of the chosen atom SHALL be preferred over compiling (`usepkg` / PKGDIR, then `getbinpkg` from the configured binhost, then compile). After a successful merge the build SHALL write a binpkg (`buildpkg`) into the image’s PKGDIR cache mount.
+Before `docker build`, the program SHALL choose **one** Portage atom per needed toolchain by scanning the managed Gentoo tree (or overlay, for bun-bin) package directories: if a `-bin` package exists and has a host-arch ebuild whose version is greater than or equal to the floor (plain or tilde KEYWORDS), that `-bin` atom SHALL be used; otherwise the corresponding source package SHALL be used when it likewise has such an ebuild. The generated recipe SHALL `emerge` that single atom (`>=` the floor, or unversioned when the floor token is any-version). The recipe SHALL NOT trial-emerge a missing `-bin` package with a shell `||` fallback. A local binpkg of the chosen atom SHALL be preferred over compiling (`usepkg` / PKGDIR, then `getbinpkg` from the configured binhost, then compile). After a successful merge the build SHALL write a binpkg (`buildpkg`) into the image’s PKGDIR cache mount.
 
-Every recipe `RUN` that invokes Portage (`emerge`, `emerge-webrsync`, `getuto`, `eclean-pkg`, or `eclean-dist`) SHALL cache-mount all three of:
+Every recipe `RUN` that invokes Portage (`emerge`, `getuto`, `eclean-pkg`, or `eclean-dist`) SHALL cache-mount all three of:
 
 - `/var/cache/distfiles` with BuildKit cache id `mndz-materialize-distfiles`
 - `/var/cache/binpkgs` with BuildKit cache id `mndz-materialize-binpkgs`
@@ -243,13 +243,13 @@ When generating a recipe, the program SHALL map host `uname -m` as follows:
 #### Scenario: amd64 recipe uses OpenRC flavor tag
 
 - **WHEN** the host machine is `x86_64` and ensure generates a Dockerfile
-- **THEN** the recipe `FROM` is `gentoo/stage3:amd64-openrc`
-- **AND** the recipe does not contain `FROM gentoo/stage3:amd64`
+- **THEN** the recipe `FROM` is `gentoo/stage3:amd64-openrc@sha256:<digest>` with the recorded base digest
+- **AND** the recipe does not contain `FROM gentoo/stage3:amd64@` or `FROM gentoo/stage3:amd64 `
 
 #### Scenario: KEYWORDS token is not the Hub tag
 
 - **WHEN** the host machine is `ppc64le` and ensure generates a Dockerfile that installs overlay bun-bin
-- **THEN** `FROM` is `gentoo/stage3:ppc64le-openrc`
+- **THEN** `FROM` names `gentoo/stage3:ppc64le-openrc` pinned by digest
 - **AND** bun-bin `package.accept_keywords` uses `~ppc64`
 
 #### Scenario: Testing SBCL floor is unmasked per-atom
@@ -397,12 +397,17 @@ When ensure will generate the default product tag and a needed toolchain floor h
 
 ### Requirement: Sidecar records the one current image
 
-When the check/cache XDG layout applies, the program SHALL store materialize image metadata under `${XDG_CACHE_HOME}/mndz/overlay-manager/materialize` when `XDG_CACHE_HOME` is set and non-empty, and under `${HOME}/.cache/mndz/overlay-manager/materialize` otherwise. That directory SHALL contain a file named `image.json` describing the current image (at least image id, satisfies floors, generator identity, built-at) and the last generated `Dockerfile` (or equivalent recipe) that produced it. The program SHALL NOT keep a catalog of previous image ids as required state.
+When the check/cache XDG layout applies, the program SHALL store materialize image metadata under `${XDG_CACHE_HOME}/mndz/overlay-manager/materialize` when `XDG_CACHE_HOME` is set and non-empty, and under `${HOME}/.cache/mndz/overlay-manager/materialize` otherwise. That directory SHALL contain a file named `image.json` describing the current image (at least image id, satisfies floors, generator identity, built-at, the managed tree commit the image was built from, the stage3 base digest, and the time of the last successful base freshness check) and the last generated `Dockerfile` (or equivalent recipe) that produced it. The program SHALL NOT keep a catalog of previous image ids as required state.
 
 #### Scenario: Default sidecar path
 
 - **WHEN** `XDG_CACHE_HOME` is unset, `HOME` is `/home/op`, and ensure writes metadata
 - **THEN** files are stored under `/home/op/.cache/mndz/overlay-manager/materialize/` including `image.json`
+
+#### Scenario: Sidecar records tree and base
+
+- **WHEN** ensure builds an image from managed tree commit `C` and stage3 digest `D`
+- **THEN** `image.json` records `C`, `D`, and the base check time
 
 ### Requirement: Prune previous image after a successful mutate run
 
@@ -626,3 +631,85 @@ When run metrics are recording and a materialize container session starts, the p
 
 - **WHEN** the same override image is used with `update --no-metrics`
 - **THEN** the session does not fail for lack of GNU time
+
+### Requirement: Image builds read the managed tree
+
+Each recipe `RUN` that invokes Portage SHALL bind the managed Gentoo tree read-only at `/var/db/repos/gentoo` from a build context that excludes the tree's git metadata. The recipe SHALL NOT run `emerge-webrsync` or another tree sync, and the built image SHALL NOT contain a Gentoo tree at `/var/db/repos/gentoo`.
+
+#### Scenario: No baked tree
+
+- **WHEN** ensure builds the materialize image
+- **THEN** the generated recipe contains no `emerge-webrsync`
+- **AND** a container from the built image without a bind has no ebuilds under `/var/db/repos/gentoo`
+
+#### Scenario: Build sees the planning tree
+
+- **WHEN** ensure chose atoms from managed tree commit `C`
+- **THEN** every Portage `RUN` in that build resolves against commit `C`
+
+#### Scenario: Git metadata stays out of the build
+
+- **WHEN** ensure builds with the managed tree as a build context
+- **THEN** the tree's `.git` directory is not sent to the builder
+
+### Requirement: Base step updates the world set
+
+The recipe's base step SHALL run `emerge --update --deep --newuse @world` after upgrading Portage and before any toolchain step, so every built image has the base packages current with the managed tree commit it was built from.
+
+#### Scenario: Stale stage3 packages are updated
+
+- **WHEN** the stage3 base ships `net-misc/curl` older than the version in the managed tree
+- **THEN** the built image has the managed tree's `net-misc/curl` version
+
+### Requirement: Tree changes alone do not trigger a build
+
+Ensure SHALL NOT `docker build` solely because the managed tree commit differs from the one recorded in `image.json`. When ensure does build for another reason, the build SHALL use the current managed tree commit.
+
+#### Scenario: Synced tree leaves a satisfying image
+
+- **WHEN** the managed tree moved to a new commit, the recorded image satisfies this prepare's floors, and the base check is not due
+- **THEN** ensure does not `docker build`
+
+### Requirement: Configurable base check interval
+
+The program SHALL read optional config key `materialize-base-check-interval` as a human duration with the same syntax as `check-cache-ttl`, defaulting to three days. Invalid durations SHALL fail configuration load.
+
+#### Scenario: Default interval
+
+- **WHEN** config omits `materialize-base-check-interval`
+- **THEN** the base freshness check is due three days after the last successful check
+
+### Requirement: Base freshness check
+
+When ensure runs for the default tag and the base check is due, the program SHALL read the current digest of the `gentoo/stage3` tag from the registry without pulling the image. A different digest SHALL make ensure `docker build` with the new digest. The same digest SHALL record a successful check without building. A failed check SHALL keep the image, warn, and leave the check due.
+
+#### Scenario: Newer stage3 rebuilds
+
+- **WHEN** the base check is due and the registry digest for `amd64-openrc` differs from the recorded digest
+- **THEN** ensure builds a new image from the new digest even though floors are satisfied
+- **AND** the new sidecar records the new digest
+
+#### Scenario: Same stage3 resets the timer
+
+- **WHEN** the base check is due and the registry digest equals the recorded digest
+- **THEN** ensure does not build and records the check time, so the next check is due one interval later
+
+#### Scenario: Registry unreachable
+
+- **WHEN** the base check is due and the registry request fails
+- **THEN** ensure keeps the current image, logs a warning, and the check remains due for the next run
+
+#### Scenario: Override tag skips the check
+
+- **WHEN** `MNDZ_MATERIALIZE_IMAGE` is set
+- **THEN** the program does not run the base freshness check
+
+### Requirement: Base-only image for Portage tools
+
+When the Portage tools container needs an image and none is recorded, ensure SHALL build an image with no toolchains (stage3, base step, managed tree bound) and record it as the current image with empty satisfied floors. A later prepare that needs toolchains SHALL build on that image as for any union.
+
+#### Scenario: GitMv-only update on a fresh host
+
+- **WHEN** no image is recorded and `update` needs only GitMv Manifest work
+- **THEN** ensure builds a base-only image and the Manifest runs in a tools container from it
+- **AND** `image.json` records no toolchain floors

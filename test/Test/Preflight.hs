@@ -212,7 +212,6 @@ import Update.Preflight
     cargoFetcherTools,
     cargoRequiredTools,
     checkToolsOnPath,
-    dockerRequiredTools,
     goAssetsRequiredTools,
     goRequiredTools,
     npmRequiredTools,
@@ -279,7 +278,7 @@ tests =
       testCase "Assets preflight reuse-only Go skips go" testAssetsPfReuseOnlyGo,
       testCase "Assets preflight cargo reuse-only skips docker and pycargo" testAssetsPfCargo,
       testCase "Full-path missing docker hard-fails" testFullPathMissingDocker,
-      testCase "Reuse-only without docker is ok" testReuseOnlyWithoutDocker,
+      testCase "Reuse-only needs no image or host language tools" testReuseOnlyWithoutDocker,
       testCase "Reuse-only cargo without pycargoebuild is ok" testReuseCargoWithoutPycargo,
       testCase "Full-path unusable image hard-fails" testFullPathMissingImage
     ]
@@ -290,12 +289,12 @@ testPreflightMissingTools = do
     checkToolsOnPath
       ( \name ->
           pure $
-            if name == "ebuild"
+            if name == "docker"
               then Nothing
               else Just ("/usr/bin/" <> name)
       )
       updateRequiredTools
-  assertEq "missing ebuild only" ["ebuild"] missing
+  assertEq "missing docker only" ["docker"] missing
   none <-
     checkToolsOnPath
       (\name -> pure (Just ("/bin/" <> name)))
@@ -304,8 +303,7 @@ testPreflightMissingTools = do
 
 testRequiredToolListConstants :: IO ()
 testRequiredToolListConstants = do
-  assertEq "update tools" ["git", "ebuild", "egencache", "gpg"] updateRequiredTools
-  assertEq "docker tools" ["docker"] dockerRequiredTools
+  assertEq "update tools" ["git", "gpg", "docker"] updateRequiredTools
   assertEq "assets tools" ["xz"] assetsRequiredTools
   assertEq "go tools" ["go"] goRequiredTools
   assertEq "npm tools" ["npm"] npmRequiredTools
@@ -385,9 +383,13 @@ testPreflightUpdateTools :: IO ()
 testPreflightUpdateTools = do
   okBase <- preflightUpdateToolsWith allPresent basePreflight
   assertEq "base tools ok" (Right ()) okBase
-  missEbuild <- preflightUpdateToolsWith (missingNamed ["ebuild"]) basePreflight
-  errEbuild <- assertLeft "missing ebuild" missEbuild
-  assertTrue "lists ebuild" ("ebuild" `T.isInfixOf` errEbuild)
+  -- Host Portage tools not required: they run in the tools container.
+  noPortage <- preflightUpdateToolsWith (missingNamed ["ebuild", "egencache", "portageq"]) basePreflight
+  assertEq "no host Portage tools needed" (Right ()) noPortage
+  -- Missing docker fails the spine even when no unit is full path.
+  missDockerSpine <- preflightUpdateToolsWith (missingNamed ["docker"]) basePreflight
+  errDockerSpine <- assertLeft "missing docker in spine" missDockerSpine
+  assertTrue "lists docker" ("docker" `T.isInfixOf` errDockerSpine)
   let full =
         basePreflight
           { apNeedAssets = True,
@@ -632,13 +634,17 @@ testFullPathMissingDocker = do
   err <- assertLeft "full-path needs docker" miss
   assertTrue "names docker" ("docker" `T.isInfixOf` err)
 
+-- | Reuse-only work inspects no image and needs no host language tools.
+-- @docker@ is still a spine tool (the Portage tools container).
 testReuseOnlyWithoutDocker :: IO ()
 testReuseOnlyWithoutDocker = do
   ok <-
-    preflightUpdateToolsWith
-      (missingNamed ["docker", "go", "npm", "bun", "xz"])
+    preflightUpdateToolsWithImage
+      (missingNamed ["go", "npm", "bun", "xz"])
+      (\_ -> pure (Left "image must not be inspected for reuse-only"))
+      "mndz-overlay-manager/materialize:local"
       basePreflight
-  assertEq "reuse-only without docker" (Right ()) ok
+  assertEq "reuse-only without image or host language tools" (Right ()) ok
 
 testReuseCargoWithoutPycargo :: IO ()
 testReuseCargoWithoutPycargo = do
@@ -646,7 +652,7 @@ testReuseCargoWithoutPycargo = do
   assertEq "reuse cargo no docker" False (apNeedDocker pf)
   ok <-
     preflightUpdateToolsWith
-      (missingNamed ["docker", "pycargoebuild", "wget", "aria2c"])
+      (missingNamed ["pycargoebuild", "wget", "aria2c"])
       pf
   assertEq "reuse cargo without host pycargo" (Right ()) ok
   where

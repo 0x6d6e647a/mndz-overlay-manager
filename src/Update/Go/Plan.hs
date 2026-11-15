@@ -36,15 +36,15 @@ import Update.Go.ModFetch
   )
 import Update.Go.Vendor (versionTag)
 import Update.Runtime.Ceilings
-  ( PortageqRunner,
-    RuntimeCeilings (..),
+  ( RuntimeCeilings (..),
     discoverGoCeilingsWith,
   )
 import Update.Types (UpdateSource (..))
 
 -- | Injectable dependencies for Go tree-lane planning.
 data PlanOps = PlanOps
-  { poPortageq :: PortageqRunner,
+  { -- | Managed Gentoo tree root (ceiling discovery).
+    poGentooTree :: FilePath,
     poListVersions :: UpdateSource -> IO (Either Text [EbuildVersion]),
     poFetchGoMod :: GoModFetcher,
     poWorkBudget :: WorkBudget,
@@ -98,7 +98,7 @@ discoverCeilingsCached ops = do
     Nothing -> do
       result <-
         withWorkSlot (poWorkBudget ops) $
-          discoverGoCeilingsWith (poPortageq ops)
+          discoverGoCeilingsWith (poGentooTree ops)
       case result of
         Left err -> pure (Left err)
         Right c -> do

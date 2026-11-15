@@ -54,7 +54,7 @@ The jobs limit SHALL bound concurrent per-package work for `outdated` checks and
 
 In addition to the package job limit, the program SHALL maintain a separate process-wide work budget for nested Go planning resource units with capacity equal to twice the resolved package jobs limit (`2 * jobs`, treating non-positive jobs as 1 before doubling). Package admission and the work budget SHALL use distinct concurrency limiters so nested work cannot deadlock against package slots.
 
-The work budget SHALL gate at least: Go ceiling discovery (portageq and associated gentoo go ebuild scan for that discovery), listing upstream versions for a Go package plan, and each go.mod fetch performed for version candidates. At most `2 * jobs` such work units SHALL be in flight at once across the process for a given command run.
+The work budget SHALL gate at least: Go ceiling discovery (the managed-tree go ebuild scan for that discovery), listing upstream versions for a Go package plan, and each go.mod fetch performed for version candidates. At most `2 * jobs` such work units SHALL be in flight at once across the process for a given command run.
 
 The work budget SHALL NOT replace the package job limit for how many package-level check or apply jobs may run concurrently. The work budget SHALL NOT force `update` signed commits or preflight to run concurrently.
 

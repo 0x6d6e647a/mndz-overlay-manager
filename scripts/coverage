@@ -293,7 +293,8 @@ PY
 [[ -f "${SUMMARY_JSON}" ]] || die "summary.json was not written"
 [[ -d "${HTML_DIR}" ]] || die "HTML markup directory missing"
 # At least one HTML index or module page
-if ! find "${HTML_DIR}" -type f \( -name '*.html' -o -name 'hpc_index*' \) | grep -q .; then
+# No pipe: under pipefail, grep -q closing early can SIGPIPE find and fail the check.
+if [[ -z "$(find "${HTML_DIR}" -type f \( -name '*.html' -o -name 'hpc_index*' \) -print -quit)" ]]; then
   die "no HTML markup files under ${HTML_DIR}"
 fi
 for label in overall unit integration; do

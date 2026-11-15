@@ -12,6 +12,7 @@ import CLI.Jobs
 import CLI.Parser
   ( ColorMode (..),
     Options (..),
+    commandTreeSync,
     parserInfo,
     resolveColorMode,
     resolveJobs,
@@ -303,6 +304,7 @@ tests =
       testCase "Resolve Color Mode" testResolveColorMode,
       testCase "Resolve Jobs" testResolveJobs,
       testCase "Parser Pure Commands" testParserPureCommands,
+      testCase "Commands that use the Gentoo tree" testCommandTreeSync,
       testCase "Parser github-token" testParserGitHubToken,
       testCase "Parser Residual Edges" testParserResidualEdges,
       testCase "ExcludeParser" testExcludeParser,
@@ -463,6 +465,21 @@ testResolveJobs = do
   assertEq "negative becomes one" 1 =<< resolveJobs (Just (-3))
   host <- resolveJobs Nothing
   assertTrue "default host jobs positive" (host > 0)
+
+-- | @list@, @eclean@, and @github-token@ never resolve the tree;
+-- @outdated --refresh@ and @update --refresh@ force a sync.
+testCommandTreeSync :: IO ()
+testCommandTreeSync = do
+  let parse args = getParseResult (execParserPure defaultPrefs parserInfo args)
+      sync args = commandTreeSync <$> (optCommand =<< parse args)
+  assertEq "list" (Just Nothing) (sync ["list"])
+  assertEq "eclean" (Just Nothing) (sync ["eclean"])
+  assertEq "github-token" (Just Nothing) (sync ["github-token"])
+  assertEq "outdated" (Just (Just False)) (sync ["outdated"])
+  assertEq "outdated --refresh" (Just (Just True)) (sync ["outdated", "--refresh"])
+  assertEq "update --refresh" (Just (Just True)) (sync ["update", "--refresh"])
+  assertEq "update" (Just (Just False)) (sync ["update"])
+  assertEq "gencache" (Just (Just False)) (sync ["gencache"])
 
 testParserPureCommands :: IO ()
 testParserPureCommands = do

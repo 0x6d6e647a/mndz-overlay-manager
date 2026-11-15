@@ -47,7 +47,7 @@ For a package `category/package`, the program SHALL treat cache as **complete an
 
 ### Requirement: egencache runner and repositories-configuration
 
-Production cache generation SHALL invoke the `egencache` executable on `PATH` with action `--update`, repository name `mndz`, and a `--repositories-configuration` value that defines the `mndz` repository with `location` set to the absolute effective overlay path so writes target that tree regardless of ambient `repos.conf`. When package atoms are specified, they SHALL be `category/package` form. The runner SHALL be injectable for tests. Failure of `egencache` (non-zero exit) SHALL be a hard failure for the calling unit or command.
+Production cache generation SHALL invoke `egencache` in the Portage tools container specified by `portage-tools-container` with action `--update`, repository name `mndz`, and a `--repositories-configuration` value that defines the `gentoo` repository at the managed Gentoo tree's container path and the `mndz` repository with `location` set to the absolute effective overlay path, so writes target that tree and eclass checksums come from the managed tree regardless of any ambient `repos.conf`. When package atoms are specified, they SHALL be `category/package` form. The runner SHALL be injectable for tests. Failure of `egencache` (non-zero exit) SHALL be a hard failure for the calling unit or command.
 
 #### Scenario: Injected location matches overlay-path
 
@@ -59,6 +59,11 @@ Production cache generation SHALL invoke the `egencache` executable on `PATH` wi
 
 - **WHEN** `egencache` exits non-zero during `gencache` or an `update` unit
 - **THEN** the operation is recorded as a hard failure and is not treated as success
+
+#### Scenario: Eclass checksums come from the managed tree
+
+- **WHEN** the host has its own Gentoo tree with a different `cargo.eclass` and `gencache` regenerates a Cargo package's cache
+- **THEN** the written `_eclasses_` checksum matches the managed tree's `cargo.eclass`
 
 ### Requirement: gencache subcommand spine
 
@@ -125,15 +130,6 @@ Without `--force`, for each selected package: if any required version is **missi
 - **WHEN** every selected package already matches and the user runs `gencache` without `--force`
 - **THEN** the program does not create an empty git commit
 
-### Requirement: gencache preflight tools
-
-Before cache mutation, `gencache` SHALL verify that `git`, `egencache`, and `gpg` are available on `PATH`. Missing tools SHALL log an error naming them and exit with status `1`. Signing SHALL NOT be optional for the gencache commit path.
-
-#### Scenario: Missing egencache on gencache
-
-- **WHEN** the user runs `gencache` and `egencache` is not on `PATH`
-- **THEN** the program exits with status `1` before generation
-
 ### Requirement: Update unit requires complete matching cache
 
 Before mutating an `update` apply unit for a package, after policy/outdated selection has chosen that package for work, the program SHALL verify that package’s non-live ebuilds are complete and matching per the consistency definition. If any version is **missing** cache, the unit SHALL hard-fail without mutating and the error SHALL recommend running `gencache category/package` to bootstrap. If any version has a **mismatch**, the unit SHALL hard-fail without mutating and the error SHALL recommend running `gencache --force category/package`. Soft-skipped packages that are not applied SHALL NOT require this gate.
@@ -178,3 +174,17 @@ On `update`, package-scoped `egencache` for a unit SHALL run inside the same ove
 
 - **WHEN** two packages finish manifest concurrently and both need overlay commits
 - **THEN** each package’s egencache and git commit pair still runs under mutual exclusion of the overlay critical section
+
+### Requirement: gencache preflight requires git gpg and docker
+
+Before cache mutation, `gencache` SHALL verify that `git`, `gpg`, and `docker` are available on `PATH`, and SHALL NOT require host `egencache`. Missing tools SHALL log an error naming them and exit with status `1`. Signing SHALL NOT be optional for the gencache commit path.
+
+#### Scenario: Missing docker on gencache
+
+- **WHEN** the user runs `gencache` and `docker` is not on `PATH`
+- **THEN** the program exits with status `1` before generation
+
+#### Scenario: Host egencache not required
+
+- **WHEN** the user runs `gencache`, `egencache` is not on `PATH`, and `git`, `gpg`, and `docker` are
+- **THEN** preflight does not fail because `egencache` is missing

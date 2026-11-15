@@ -299,11 +299,11 @@ mkTestApplyEnv ::
   IO ApplyEnv
 mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLock overlayLock = do
   treeLock <- newTreeLock
-  depsBase <- productionDepsPlanOps (Just "tok") 1 Nothing
+  depsBase <- productionDepsPlanOps "/nonexistent/gentoo-tree" (Just "tok") 1 Nothing
   tempRun <- newRunId >>= openRunRootWith
   let depsOps =
         depsBase
-          { dpoPortageq = poPortageq planOps,
+          { dpoGentooTree = poGentooTree planOps,
             dpoListVersions = poListVersions planOps,
             dpoFetchGoMod = poFetchGoMod planOps,
             dpoWorkBudget = poWorkBudget planOps,

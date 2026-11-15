@@ -15,6 +15,7 @@ import Test.EbuildEdit qualified as EbuildEdit
 import Test.Ecosystems qualified as Ecosystems
 import Test.Ensure qualified as Ensure
 import Test.Gastown qualified as Gastown
+import Test.GentooTree qualified as GentooTree
 import Test.Git qualified as Git
 import Test.GitHubResilience qualified as GitHubResilience
 import Test.Gpg qualified as Gpg
@@ -34,6 +35,7 @@ import Test.Ssh qualified as Ssh
 import Test.Targets qualified as Targets
 import Test.Tasty (defaultMain, testGroup)
 import Test.TempWorkspace qualified as TempWorkspace
+import Test.ToolsContainer qualified as ToolsContainer
 import Test.Uv qualified as Uv
 import Test.Waves qualified as Waves
 import Update.GpgAgent (takeGpgSessionSupervisor)
@@ -71,6 +73,8 @@ main = do
               AtomClosure.unitTests,
               Config.tests,
               CheckCache.tests,
+              GentooTree.tests,
+              ToolsContainer.tests,
               Distfiles.tests,
               DiskSpace.tests,
               TempWorkspace.tests,

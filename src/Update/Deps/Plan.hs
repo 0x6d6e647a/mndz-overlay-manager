@@ -95,14 +95,12 @@ import Update.Npm.Cache
 import Update.OverlayTree (withNewTreeLock)
 import Update.Pdm.Lock (parsePdmLock, pdmLockRequiresPython)
 import Update.Runtime.Ceilings
-  ( PortageqRunner,
-    RuntimeCeilings (..),
+  ( RuntimeCeilings (..),
     discoverBunBinCeilings,
     discoverGoCeilingsWith,
     discoverNodejsCeilingsWith,
     discoverRustUnionCeilingsWith,
     discoverSbclCeilingsWith,
-    productionPortageqRunner,
   )
 import Update.Sbcl.Deps (parseSbclVersionFloor)
 import Update.Types (EcosystemSpec (..), UpdateSource (..))
@@ -123,7 +121,8 @@ import Update.Uv.Python
 
 -- | Injectable ops for multi-ecosystem deps planning.
 data DepsPlanOps = DepsPlanOps
-  { dpoPortageq :: PortageqRunner,
+  { -- | Managed Gentoo tree root (ceilings and Python slot inventory).
+    dpoGentooTree :: FilePath,
     dpoListVersions :: UpdateSource -> IO (Either Text [EbuildVersion]),
     dpoFetchGoMod :: GoModFetcher,
     dpoFetchNpmEngines :: Text -> Text -> IO (Either Text Text),
@@ -156,11 +155,11 @@ data DepsPlanOps = DepsPlanOps
       IO (Either Text (Set Text))
   }
 
--- | View as Go PlanOps (shared go.mod / portageq / list for GitHub).
+-- | View as Go PlanOps (shared go.mod / tree / list for GitHub).
 toGoPlanOps :: DepsPlanOps -> PlanOps
 toGoPlanOps d =
   PlanOps
-    { poPortageq = dpoPortageq d,
+    { poGentooTree = dpoGentooTree d,
       poListVersions = dpoListVersions d,
       poFetchGoMod = dpoFetchGoMod d,
       poWorkBudget = dpoWorkBudget d,
@@ -204,19 +203,21 @@ withSuccessCache base = do
                 Just hit -> pure (cache, Right hit)
                 Nothing -> pure (Map.insert key val cache, Right val)
 
-productionDepsPlanOps :: Maybe Text -> Int -> Maybe FilePath -> IO DepsPlanOps
-productionDepsPlanOps mToken jobs mOverlay = do
+productionDepsPlanOps :: FilePath -> Maybe Text -> Int -> Maybe FilePath -> IO DepsPlanOps
+productionDepsPlanOps gentooTree mToken jobs mOverlay = do
   latch <- newGitHubLatch
-  productionDepsPlanOpsWithLatch noopMetrics latch mToken jobs mOverlay
+  productionDepsPlanOpsWithLatch noopMetrics latch gentooTree mToken jobs mOverlay
 
 productionDepsPlanOpsWithLatch ::
   Metrics ->
   GitHubLatch ->
+  -- | Managed Gentoo tree root.
+  FilePath ->
   Maybe Text ->
   Int ->
   Maybe FilePath ->
   IO DepsPlanOps
-productionDepsPlanOpsWithLatch m latch mToken jobs mOverlay = do
+productionDepsPlanOpsWithLatch m latch gentooTree mToken jobs mOverlay = do
   mgr <- newMetricsManager m
   baseMod <- productionGoModFetcher m mToken
   cachedMod <- withGoModCache baseMod
@@ -234,7 +235,7 @@ productionDepsPlanOpsWithLatch m latch mToken jobs mOverlay = do
   sbclCache <- newMVar Nothing
   pure
     DepsPlanOps
-      { dpoPortageq = productionPortageqRunner m,
+      { dpoGentooTree = gentooTree,
         dpoListVersions = cachedList,
         dpoFetchGoMod = cachedMod,
         dpoFetchNpmEngines = fetchNpmEnginesNode mgr,
@@ -340,7 +341,7 @@ planGo ops progress src mSub locals allowlist =
         src
         locals
         allowlist
-        (discoverCeilingsCached (dpoGoCeilingsCache ops) (discoverGoCeilingsWith (dpoPortageq ops)))
+        (discoverCeilingsCached (dpoGoCeilingsCache ops) (discoverGoCeilingsWith (dpoGentooTree ops)))
         ( \pv -> do
             let tag = versionTag prefix (renderPVNoRev pv)
                 key =
@@ -381,7 +382,7 @@ planNpm ops progress src locals allowlist mDonor =
         allowlist
         ( discoverCeilingsCached
             (dpoNodeCeilingsCache ops)
-            (discoverNodejsCeilingsWith (dpoPortageq ops))
+            (discoverNodejsCeilingsWith (dpoGentooTree ops))
         )
         ( \pv -> do
             eres <- dpoFetchNpmEngines ops npmPkg (renderPVNoRev pv)
@@ -503,7 +504,7 @@ planCargo ops progress src mLockSub mPkgSub locals allowlist =
           allowlist
           ( discoverCeilingsCached
               (dpoRustCeilingsCache ops)
-              (discoverRustUnionCeilingsWith (dpoPortageq ops))
+              (discoverRustUnionCeilingsWith (dpoGentooTree ops))
           )
           ( \pv -> do
               let pvText = renderPVNoRev pv
@@ -613,7 +614,7 @@ planSbcl ops progress src locals allowlist =
         allowlist
         ( discoverCeilingsCached
             (dpoSbclCeilingsCache ops)
-            (discoverSbclCeilingsWith (dpoPortageq ops))
+            (discoverSbclCeilingsWith (dpoGentooTree ops))
         )
         ( \pv -> do
             eres <-
@@ -645,7 +646,7 @@ planUv ops progress src mSub locals allowlist =
   case src of
     GitHub owner repo prefix -> do
       ppOnCeilingsStart progress
-      invE <- discoverPythonSlotInventory (dpoPortageq ops)
+      invE <- discoverPythonSlotInventory (dpoGentooTree ops)
       case invE of
         Left err -> pure (Left (PlanCeilingFailed err))
         Right inv -> do
@@ -834,7 +835,7 @@ planPdm ops progress src mSub locals allowlist =
   case src of
     GitHub owner repo prefix -> do
       ppOnCeilingsStart progress
-      invE <- discoverPythonSlotInventory (dpoPortageq ops)
+      invE <- discoverPythonSlotInventory (dpoGentooTree ops)
       case invE of
         Left err -> pure (Left (PlanCeilingFailed err))
         Right inv -> do

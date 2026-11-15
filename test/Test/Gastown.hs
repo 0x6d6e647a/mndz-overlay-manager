@@ -161,7 +161,7 @@ testNoWrite = do
   overlayLock <- newMVar ()
   let planOps =
         PlanOps
-          { poPortageq = \_ -> pure (Left "unused"),
+          { poGentooTree = "/nonexistent/gentoo-tree",
             poListVersions = \_ -> pure (Left "unused"),
             poFetchGoMod = \_ -> pure (Left "unused"),
             poWorkBudget = budget,

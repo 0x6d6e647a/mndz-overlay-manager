@@ -216,7 +216,7 @@ mkDepsPlanOps listVers fetchGo fetchNpm fetchBun fetchCargo mOverlay = do
   sbclCache <- newMVar (Just sbclCeilings)
   pure
     DepsPlanOps
-      { dpoPortageq = \_ -> pure (Left "portageq unused in CheckPlan tests"),
+      { dpoGentooTree = "/nonexistent/gentoo-tree",
         dpoListVersions = listVers,
         dpoFetchGoMod = fetchGo,
         dpoFetchNpmEngines = fetchNpm,

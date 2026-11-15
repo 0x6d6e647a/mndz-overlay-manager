@@ -34,6 +34,7 @@ module Update.CheckCache
     openCheckCacheAt,
     lookupLatest,
     lookupDeps,
+    withCheckCacheTreeCommit,
     cachedCargoPlanUsable,
     storeLatest,
     storeDeps,
@@ -49,7 +50,7 @@ where
 
 import Config.Types (CheckCacheTtl (..))
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
-import Control.Exception (bracket, try)
+import Control.Exception (try)
 import Crypto.Hash (Digest, SHA256 (..), hash, hashFinalize, hashInit, hashUpdate)
 import Data.Aeson
   ( FromJSON (..),
@@ -95,18 +96,8 @@ import System.Directory
   )
 import System.Environment (lookupEnv)
 import System.FilePath (takeBaseName, takeDirectory, (</>))
-import System.IO (SeekMode (AbsoluteSeek))
-import System.Posix.IO
-  ( LockRequest (WriteLock),
-    OpenFileFlags (..),
-    OpenMode (ReadWrite),
-    closeFd,
-    defaultFileFlags,
-    openFd,
-    waitToSetLock,
-  )
-import System.Posix.Types (Fd)
 import Update.Cargo.Msrv (cargoFloorPolicyKey)
+import Update.FileLock (LockMode (..), withFileLock)
 import Update.Go.Lanes
   ( CargoFloorCoverage (..),
     CargoPathProvenance (..),
@@ -321,6 +312,9 @@ data CacheEntry = CacheEntry
     -- | Overlay ceiling-provider fingerprint for DepsAndAssets Bun entries.
     -- Missing on a deps entry that requires it is a miss at lookup.
     ceOverlayProviderFp :: Maybe CacheFingerprint,
+    -- | Managed Gentoo tree commit a deps plan was made against. A deps
+    -- entry whose commit differs from the run's (or is missing) is a miss.
+    ceTreeCommit :: Maybe Text,
     cePayload :: CachePayload
   }
   deriving (Eq, Show)
@@ -351,6 +345,7 @@ instance ToJSON CacheEntry where
             "plan" .= planToJSON plan
           ]
             <> overlayProviderFields e
+            <> ["gentoo_tree_commit" .= c | Just c <- [ceTreeCommit e]]
 
 overlayProviderFields :: CacheEntry -> [Pair]
 overlayProviderFields e =
@@ -367,6 +362,7 @@ instance FromJSON CacheEntry where
         Nothing -> fail $ "invalid checked_at: " <> checkedAtTxt
     fp <- o .: "fingerprint"
     mProv <- o .:? "overlay_provider_fingerprint"
+    mTree <- o .:? "gentoo_tree_commit"
     kind <- o .: "kind" :: Parser Text
     payload <- case kind of
       "latest" -> LatestPayload <$> o .: "remote_pv"
@@ -381,6 +377,7 @@ instance FromJSON CacheEntry where
         { ceCheckedAt = checkedAt,
           ceFingerprint = fp,
           ceOverlayProviderFp = mProv,
+          ceTreeCommit = mTree,
           cePayload = payload
         }
 
@@ -629,8 +626,15 @@ data CheckCacheHandle = CheckCacheHandle
     cchPath :: FilePath,
     cchOverlayAbs :: FilePath,
     cchClock :: IO UTCTime,
+    -- | Managed Gentoo tree commit for this run (see 'withCheckCacheTreeCommit').
+    cchTreeCommit :: Maybe Text,
     cchState :: MVar HandleState
   }
+
+-- | Bind the run's managed Gentoo tree commit: deps entries record it and
+-- only deps entries recorded against it hit.
+withCheckCacheTreeCommit :: Text -> CheckCacheHandle -> CheckCacheHandle
+withCheckCacheTreeCommit commit h = h {cchTreeCommit = Just commit}
 
 emptyState :: HandleState
 emptyState =
@@ -671,6 +675,7 @@ openCheckCacheAt clock mCacheDir ttl refresh overlayPath = do
               cchPath = "",
               cchOverlayAbs = absOverlay,
               cchClock = clock,
+              cchTreeCommit = Nothing,
               cchState = st
             },
           Nothing
@@ -693,6 +698,7 @@ openCheckCacheAt clock mCacheDir ttl refresh overlayPath = do
               cchPath = path,
               cchOverlayAbs = absOverlay,
               cchClock = clock,
+              cchTreeCommit = Nothing,
               cchState = st
             },
           warn
@@ -804,6 +810,7 @@ lookupDeps h key fp mWantProv = do
         Just e
           | entryValid (cchTtl h) False now fp e,
             overlayProviderMatches mWantProv (ceOverlayProviderFp e),
+            ceTreeCommit e == cchTreeCommit h,
             DepsPayload plan <- cePayload e ->
               Just plan
         _ -> Nothing
@@ -840,7 +847,7 @@ storeLatest ::
   EbuildVersion ->
   IO ()
 storeLatest h key fp remote =
-  storeEntry h key fp Nothing (LatestPayload (renderPV remote))
+  storeEntry h key fp Nothing Nothing (LatestPayload (renderPV remote))
 
 storeDeps ::
   CheckCacheHandle ->
@@ -850,16 +857,17 @@ storeDeps ::
   RuntimeLanePlan ->
   IO ()
 storeDeps h key fp mProv plan =
-  storeEntry h key fp mProv (DepsPayload plan)
+  storeEntry h key fp mProv (cchTreeCommit h) (DepsPayload plan)
 
 storeEntry ::
   CheckCacheHandle ->
   PackageKey ->
   CacheFingerprint ->
   Maybe CacheFingerprint ->
+  Maybe Text ->
   CachePayload ->
   IO ()
-storeEntry h key fp mProv payload
+storeEntry h key fp mProv mTree payload
   | not (cchEnabled h) = pure ()
   | otherwise = do
       now <- cchClock h
@@ -869,6 +877,7 @@ storeEntry h key fp mProv payload
               { ceCheckedAt = now,
                 ceFingerprint = fp,
                 ceOverlayProviderFp = mProv,
+                ceTreeCommit = mTree,
                 cePayload = payload
               }
       modifyMVar_ (cchState h) $ \st ->
@@ -887,7 +896,7 @@ flushCheckCache h
       st <- readMVar (cchState h)
       if not (hsDirty st) || Map.null (hsTouched st)
         then pure ()
-        else withExclusiveLock (cchPath h <> ".lock") $ do
+        else withFileLock ExclusiveLock (cchPath h <> ".lock") $ do
           (diskPkgs, _) <- loadPackagesSoft (cchPath h)
           st' <- readMVar (cchState h)
           let merged = Map.union (hsTouched st') diskPkgs
@@ -913,23 +922,6 @@ atomicWriteDoc path doc = do
       body = LBS.toStrict (encodeCheckCacheDoc doc)
   BS.writeFile tmp body -- allow-non-ebuild: check-cache
   renameFile tmp path -- allow-non-ebuild: check-cache
-
-withExclusiveLock :: FilePath -> IO a -> IO a
-withExclusiveLock lockPath action = do
-  createDirectoryIfMissing True (takeDirectory lockPath)
-  bracket acquire release (const action)
-  where
-    acquire :: IO Fd
-    acquire = do
-      fd <-
-        openFd
-          lockPath
-          ReadWrite
-          defaultFileFlags {creat = Just 0o600}
-      waitToSetLock fd (WriteLock, AbsoluteSeek, 0, 0)
-      pure fd
-    release :: Fd -> IO ()
-    release = closeFd
 
 cacheStats :: CheckCacheHandle -> IO CacheStats
 cacheStats h = do

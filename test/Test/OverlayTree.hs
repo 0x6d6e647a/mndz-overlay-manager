@@ -183,6 +183,7 @@ nonEbuildAllowlist =
     "src/Update/DiskSpace.hs",
     "src/Update/Distfiles.hs",
     "src/Update/Gastown/Gates.hs",
+    "src/Update/GentooTree.hs",
     "src/Update/GitHubToken.hs",
     "src/Update/GpgAgent.hs",
     "src/Update/Go/Vendor.hs",

@@ -7,10 +7,6 @@ module Update.Runtime.Ceilings
     ArchCeilings (..),
     RuntimeCeilings (..),
     RuntimeEbuildMeta (..),
-    PortageqRunner,
-    productionPortageqRunner,
-    mkPortageqRunner,
-    gentooRepoPath,
     goPackageDir,
     goBinPackageDir,
     nodejsPackageDir,
@@ -65,12 +61,9 @@ import Data.Maybe (catMaybes, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Metrics.Core (Metrics)
-import Metrics.Process (timedRunner)
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion)
 import System.Directory (doesDirectoryExist, listDirectory)
-import System.Exit (ExitCode (..))
 import System.FilePath (takeFileName, (</>))
 import Update.EbuildEdit (parseEbuildSlot)
 import Update.OverlayTree
@@ -78,14 +71,6 @@ import Update.OverlayTree
     listEbuildNames,
     readEbuildEither,
     tryEbuild,
-  )
-import Update.Process
-  ( CommandRunner,
-    Measure (..),
-    ProcessMode (..),
-    ProcessRequest (..),
-    ProcessResult (..),
-    productionCommandRunner,
   )
 import Update.TextUtil (stripSurroundingQuotes)
 
@@ -161,45 +146,6 @@ data RuntimeEbuildMeta = RuntimeEbuildMeta
     remKeywords :: [Text]
   }
   deriving (Eq, Show)
-
--- | Injectable @portageq@ runner: args → stdout or error.
-type PortageqRunner = [String] -> IO (Either Text Text)
-
--- | Build portageq runner over an injectable command runner (Unit heat surface).
-mkPortageqRunner :: CommandRunner -> PortageqRunner
-mkPortageqRunner run args = do
-  res <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "portageq" args,
-          prCwd = Nothing,
-          prEnv = Nothing,
-          prStdin = "",
-          prMeasure = Timed
-        }
-  pure $
-    if prExitCode res == ExitSuccess
-      then Right (T.strip (T.pack (prStdout res)))
-      else
-        Left
-          ( "portageq "
-              <> T.intercalate " " (map T.pack args)
-              <> " failed: "
-              <> T.pack (prStderr res)
-          )
-
-productionPortageqRunner :: Metrics -> PortageqRunner
-productionPortageqRunner m = mkPortageqRunner (timedRunner m productionCommandRunner)
-
--- | Resolve Gentoo repository path via @portageq get_repo_path / gentoo@.
-gentooRepoPath :: PortageqRunner -> IO (Either Text FilePath)
-gentooRepoPath run = do
-  result <- run ["get_repo_path", "/", "gentoo"]
-  pure $ case result of
-    Left err -> Left err
-    Right path
-      | T.null path -> Left "portageq get_repo_path / gentoo returned empty path"
-      | otherwise -> Right (T.unpack path)
 
 goPackageDir :: FilePath -> FilePath
 goPackageDir gentooRoot = gentooRoot </> "dev-lang" </> "go"
@@ -496,26 +442,18 @@ discoverRuntimeCeilingsInDir atom pkgDir mPrefix = do
         )
     Right metas -> Right (computeCeilings atom metas)
 
--- | Discover Go ceilings with injectable portageq; scans @dev-lang/go@.
-discoverGoCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)
-discoverGoCeilingsWith run = do
-  pathResult <- gentooRepoPath run
-  case pathResult of
-    Left err -> pure (Left err)
-    Right gentooRoot ->
-      discoverRuntimeCeilingsInDir goRuntimeAtom (goPackageDir gentooRoot) (Just "go-")
+-- | Discover Go ceilings from the managed tree root; scans @dev-lang/go@.
+discoverGoCeilingsWith :: FilePath -> IO (Either Text RuntimeCeilings)
+discoverGoCeilingsWith gentooRoot =
+  discoverRuntimeCeilingsInDir goRuntimeAtom (goPackageDir gentooRoot) (Just "go-")
 
 -- | Discover nodejs ceilings from gentoo @net-libs/nodejs@.
-discoverNodejsCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)
-discoverNodejsCeilingsWith run = do
-  pathResult <- gentooRepoPath run
-  case pathResult of
-    Left err -> pure (Left err)
-    Right gentooRoot ->
-      discoverRuntimeCeilingsInDir
-        nodejsRuntimeAtom
-        (nodejsPackageDir gentooRoot)
-        (Just "nodejs-")
+discoverNodejsCeilingsWith :: FilePath -> IO (Either Text RuntimeCeilings)
+discoverNodejsCeilingsWith gentooRoot =
+  discoverRuntimeCeilingsInDir
+    nodejsRuntimeAtom
+    (nodejsPackageDir gentooRoot)
+    (Just "nodejs-")
 
 -- | Discover bun-bin ceilings from the overlay package directory.
 discoverBunBinCeilings :: InTree -> FilePath -> IO (Either Text RuntimeCeilings)
@@ -527,60 +465,52 @@ discoverBunBinCeilings tree overlayRoot = do
     Right metas -> Right (computeCeilings bunBinRuntimeAtom metas)
 
 -- | Discover SBCL ceilings from gentoo @dev-lisp/sbcl@.
-discoverSbclCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)
-discoverSbclCeilingsWith run = do
-  pathResult <- gentooRepoPath run
-  case pathResult of
-    Left err -> pure (Left err)
-    Right gentooRoot ->
-      discoverRuntimeCeilingsInDir
-        sbclRuntimeAtom
-        (sbclPackageDir gentooRoot)
-        (Just "sbcl-")
+discoverSbclCeilingsWith :: FilePath -> IO (Either Text RuntimeCeilings)
+discoverSbclCeilingsWith gentooRoot =
+  discoverRuntimeCeilingsInDir
+    sbclRuntimeAtom
+    (sbclPackageDir gentooRoot)
+    (Just "sbcl-")
 
 -- | Discover cargo ceilings: U1 max of gentoo @dev-lang/rust@ ∪ @dev-lang/rust-bin@.
 -- Missing side is ignored; both missing is an error.
-discoverRustUnionCeilingsWith :: PortageqRunner -> IO (Either Text RuntimeCeilings)
-discoverRustUnionCeilingsWith run = do
-  pathResult <- gentooRepoPath run
-  case pathResult of
-    Left err -> pure (Left err)
-    Right gentooRoot -> do
-      rustExists <- doesDirectoryExist (rustPackageDir gentooRoot)
-      binExists <- doesDirectoryExist (rustBinPackageDir gentooRoot)
-      if not rustExists && not binExists
-        then
-          pure $
-            Left
-              ( "neither "
-                  <> "dev-lang/rust"
-                  <> " nor "
-                  <> "dev-lang/rust-bin"
-                  <> " found under "
-                  <> T.pack gentooRoot
-              )
-        else do
-          rustC <-
-            if rustExists
-              then
-                discoverRuntimeCeilingsInDir
-                  "dev-lang/rust"
-                  (rustPackageDir gentooRoot)
-                  (Just "rust-")
-              else pure (Right (emptyCeilings "dev-lang/rust"))
-          binC <-
-            if binExists
-              then
-                discoverRuntimeCeilingsInDir
-                  "dev-lang/rust-bin"
-                  (rustBinPackageDir gentooRoot)
-                  (Just "rust-bin-")
-              else pure (Right (emptyCeilings "dev-lang/rust-bin"))
-          pure $ case (rustC, binC) of
-            (Left err, _) -> Left err
-            (_, Left err) -> Left err
-            (Right a, Right b) ->
-              Right (mergeCeilingsMax rustUnionRuntimeAtom a b)
+discoverRustUnionCeilingsWith :: FilePath -> IO (Either Text RuntimeCeilings)
+discoverRustUnionCeilingsWith gentooRoot = do
+  rustExists <- doesDirectoryExist (rustPackageDir gentooRoot)
+  binExists <- doesDirectoryExist (rustBinPackageDir gentooRoot)
+  if not rustExists && not binExists
+    then
+      pure $
+        Left
+          ( "neither "
+              <> "dev-lang/rust"
+              <> " nor "
+              <> "dev-lang/rust-bin"
+              <> " found under "
+              <> T.pack gentooRoot
+          )
+    else do
+      rustC <-
+        if rustExists
+          then
+            discoverRuntimeCeilingsInDir
+              "dev-lang/rust"
+              (rustPackageDir gentooRoot)
+              (Just "rust-")
+          else pure (Right (emptyCeilings "dev-lang/rust"))
+      binC <-
+        if binExists
+          then
+            discoverRuntimeCeilingsInDir
+              "dev-lang/rust-bin"
+              (rustBinPackageDir gentooRoot)
+              (Just "rust-bin-")
+          else pure (Right (emptyCeilings "dev-lang/rust-bin"))
+      pure $ case (rustC, binC) of
+        (Left err, _) -> Left err
+        (_, Left err) -> Left err
+        (Right a, Right b) ->
+          Right (mergeCeilingsMax rustUnionRuntimeAtom a b)
 
 -- | Per arch×tier ceiling = max of the two inputs (U1).
 mergeCeilingsMax :: Text -> RuntimeCeilings -> RuntimeCeilings -> RuntimeCeilings

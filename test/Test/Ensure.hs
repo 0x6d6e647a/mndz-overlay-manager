@@ -6,19 +6,23 @@ module Test.Ensure (unitTests) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar)
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as B8
 import Data.ByteString.Lazy qualified as LBS
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Data.List (isInfixOf)
 import Data.Maybe (isNothing)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Text.IO qualified as TIO
-import Data.Time (UTCTime (..), fromGregorian)
+import Data.Time (UTCTime (..), addUTCTime, fromGregorian)
+import Network.HTTP.Client (getUri, method, requestHeaders)
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertRight, assertTrue)
+import Test.HttpFake (fakeResponse, fakeResponseHeaders)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Apply
@@ -61,6 +65,7 @@ import Update.Materialize
     encodeImageSidecar,
     ensureFailedMessage,
     ensureMaterializeImage,
+    ensureToolsImage,
     firstImageCacheNeedBytes,
     firstImageLayerNeedBytes,
     firstImageNeedBytes,
@@ -82,6 +87,7 @@ import Update.Materialize
     resolveNeededInstalls,
     resolveToolchain,
     sidecarImageJsonPath,
+    stage3DigestWith,
     unionFloors,
     unmappedArchMessage,
   )
@@ -133,6 +139,17 @@ unitTests =
       testCase "i686 SBCL recipe uses /usr/lib/sbcl ENV" testRenderSbclX86Libdir,
       testCase "missing sidecar field is a miss" testMissingSidecarField,
       testCase "skip docker build when satisfies" testSkipWhenSatisfies,
+      testCase "recipe reads the managed tree and pins stage3" testRecipeManagedTree,
+      testCase "Synced tree leaves a satisfying image" testSyncedTreeNoBuild,
+      testCase "Build sees the planning tree" testBuildSeesPlanningTree,
+      testCase "Newer stage3 rebuilds" testNewerStage3Rebuilds,
+      testCase "Same stage3 resets the timer" testSameStage3ResetsTimer,
+      testCase "Registry unreachable keeps the image" testRegistryUnreachable,
+      testCase "Override tag skips the base check" testOverrideSkipsBaseCheck,
+      testCase "registry digest: token then HEAD manifest" testRegistryDigest,
+      testCase "tools image reuses the recorded image" testToolsImageRecorded,
+      testCase "tools image uses the override tag" testToolsImageOverride,
+      testCase "GitMv-only update on a fresh host builds a base-only image" testToolsImageBaseOnly,
       testCase "generator mismatch rebuilds despite floors" testGeneratorMismatchRebuilds,
       testCase "newer overlay qlot rebuilds despite language floors" testNewerQlotRebuilds,
       testCase "newer overlay node-gyp rebuilds despite language floors" testNewerNodeGypRebuilds,
@@ -202,6 +219,8 @@ testUnionSatisfy = do
     Right side ->
       assertEq "old sidecar nodeGyp missing" Nothing (nfNodeGyp (isSatisfies side))
         >> assertEq "old sidecar pdm missing" Nothing (nfPdm (isSatisfies side))
+        >> assertEq "old sidecar has no stage3 digest (base check due)" Nothing (isStage3Digest side)
+        >> assertEq "old sidecar has no base check" Nothing (isLastBaseCheck side)
 
 testBunOnlyOmitsSbcl :: IO ()
 testBunOnlyOmitsSbcl = do
@@ -658,7 +677,7 @@ renderMapped :: String -> [ResolvedInstall] -> IO T.Text
 renderMapped uname installs =
   case lookupRecipeArch uname of
     Nothing -> assertFailure (uname <> " should map")
-    Just arch -> pure (renderMaterializeDockerfile arch installs)
+    Just arch -> pure (renderMaterializeDockerfile arch testStage3Digest installs)
 
 threeCacheIds :: [T.Text]
 threeCacheIds =
@@ -900,13 +919,26 @@ testMissingSidecarField = do
             isTag = T.pack defaultMaterializeImage,
             isSatisfies = emptyFloors {nfGo = Just "1.26.5"},
             isGenerator = materializeGeneratorId,
-            isBuiltAt = now
+            isBuiltAt = now,
+            isTreeCommit = Nothing,
+            isStage3Digest = Nothing,
+            isLastBaseCheck = Nothing
           }
   case decodeImageSidecar (LBS.toStrict (encodeImageSidecar full)) of
     Left err -> assertFailure ("roundtrip failed: " <> err)
     Right got -> do
       assertEq "id" (isId full) (isId got)
       assertEq "go floor" (nfGo (isSatisfies full)) (nfGo (isSatisfies got))
+      assertEq "old-format fields stay missing" (Nothing, Nothing, Nothing) (isTreeCommit got, isStage3Digest got, isLastBaseCheck got)
+  let withBase =
+        full
+          { isTreeCommit = Just "15034c13615c2da8b1353a4a784c28d82ef53286",
+            isStage3Digest = Just "sha256:d1g3st",
+            isLastBaseCheck = Just now
+          }
+  case decodeImageSidecar (LBS.toStrict (encodeImageSidecar withBase)) of
+    Left err -> assertFailure ("tree/base roundtrip failed: " <> err)
+    Right got -> assertEq "tree, digest, and base check round-trip" withBase got
 
 epoch :: UTCTime
 epoch = UTCTime (fromGregorian 2026 1 1) 0
@@ -1137,6 +1169,7 @@ mkCfgUname ::
   IO EnsureConfig
 mkCfgUname overlay sidecar fake probe mOverride uname = do
   prev <- newMVar Nothing
+  buildLock <- newMVar ()
   pure
     EnsureConfig
       { ecRun = fakeRunner fake,
@@ -1147,8 +1180,17 @@ mkCfgUname overlay sidecar fake probe mOverride uname = do
         ecUname = uname,
         ecOverrideTag = mOverride,
         ecPrevImageId = prev,
-        ecGentooRoot = pure (Right (takeDirectory overlay </> "gentoo"))
+        ecGentooTree = takeDirectory overlay </> "gentoo",
+        ecGentooCommit = "c0ffee",
+        ecStage3Digest = \_ -> pure (Right testStage3Digest),
+        ecBaseCheckInterval = 3 * 24 * 60 * 60,
+        ecWarn = \_ -> pure (),
+        ecBuildLock = buildLock
       }
+
+-- | Digest the fake registry reports; sidecar fixtures record it too.
+testStage3Digest :: T.Text
+testStage3Digest = "sha256:5ta6e3"
 
 writeRuntimeEbuild :: FilePath -> T.Text -> T.Text -> T.Text -> IO ()
 writeRuntimeEbuild pkgDir pn ver keywords = do
@@ -1184,9 +1226,201 @@ writeSidecarGoGen dir iid goVer gen = do
             isTag = T.pack defaultMaterializeImage,
             isSatisfies = emptyFloors {nfGo = Just goVer},
             isGenerator = gen,
-            isBuiltAt = epoch
+            isBuiltAt = epoch,
+            isTreeCommit = Nothing,
+            isStage3Digest = Just testStage3Digest,
+            isLastBaseCheck = Just epoch
           }
   BS.writeFile (sidecarImageJsonPath dir) (LBS.toStrict (encodeImageSidecar side))
+
+-- | Sidecar recording Go @goVer@, tree commit, stage3 digest, and last check.
+writeSidecarBase :: FilePath -> String -> T.Text -> Maybe T.Text -> Maybe UTCTime -> IO ()
+writeSidecarBase dir iid tree digest lastCheck = do
+  createDirectoryIfMissing True dir
+  let side =
+        ImageSidecar
+          { isVersion = imageSidecarSchemaVersion,
+            isId = T.pack iid,
+            isTag = T.pack defaultMaterializeImage,
+            isSatisfies = emptyFloors {nfGo = Just "1.26.5"},
+            isGenerator = materializeGeneratorId,
+            isBuiltAt = epoch,
+            isTreeCommit = Just tree,
+            isStage3Digest = digest,
+            isLastBaseCheck = lastCheck
+          }
+  BS.writeFile (sidecarImageJsonPath dir) (LBS.toStrict (encodeImageSidecar side))
+
+readSide :: FilePath -> IO ImageSidecar
+readSide dir = do
+  bs <- BS.readFile (sidecarImageJsonPath dir)
+  either assertFailure pure (decodeImageSidecar bs)
+
+fourDaysBefore :: UTCTime
+fourDaysBefore = addUTCTime (-(4 * 24 * 60 * 60)) epoch
+
+testRecipeManagedTree :: IO ()
+testRecipeManagedTree = do
+  df <- renderMapped "x86_64" [bunInstall "1.2.21" "amd64"]
+  assertTrue "no emerge-webrsync" (not ("emerge-webrsync" `T.isInfixOf` df))
+  assertTrue "FROM pinned by digest" (("FROM gentoo/stage3:amd64-openrc@" <> testStage3Digest <> "\n") `T.isInfixOf` df)
+  let portageRuns =
+        [ r
+        | r <- drop 1 (dockerfileRuns df),
+          any (`T.isInfixOf` r) ["emerge", "eclean", "getuto"]
+        ]
+      treeBind = "--mount=type=bind,from=gentoo,target=/var/db/repos/gentoo "
+  assertTrue "has Portage RUNs" (length portageRuns >= 3)
+  mapM_ (\r -> assertTrue ("tree bound in: " <> T.unpack (T.take 80 r)) (treeBind `T.isInfixOf` r)) portageRuns
+  assertTrue "tree bind is read-only (no rw)" (not ("from=gentoo,target=/var/db/repos/gentoo,rw" `T.isInfixOf` df))
+  let (beforeBun, _) = T.breakOn "dev-lang/bun-bin" df
+  assertTrue "@world before the first toolchain" ("emerge --update --deep --newuse @world" `T.isInfixOf` beforeBun)
+  mapM_ (\cid -> assertTrue ("cache id " <> T.unpack cid) (cid `T.isInfixOf` df)) threeCacheIds
+
+testSyncedTreeNoBuild :: IO ()
+testSyncedTreeNoBuild =
+  withSystemTempDirectory "om-ensure-synced" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:current"
+    createDirectoryIfMissing True overlay
+    writeSidecarBase sidecar iid "old-tree-commit" (Just testStage3Digest) (Just epoch)
+    builds <- mkLogRef
+    fake <- mkFakeDocker True iid builds
+    cfg0 <- mkCfg overlay sidecar fake plentyDisk Nothing
+    let cfg = cfg0 {ecGentooCommit = "new-tree-commit"}
+    got <- ensureImage cfg neededGo
+    assertEq "skipped" (Right EnsureSkipped) got
+    assertEq "no docker build" [] =<< readIORef builds
+
+testBuildSeesPlanningTree :: IO ()
+testBuildSeesPlanningTree =
+  withSystemTempDirectory "om-ensure-tree" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+    createDirectoryIfMissing True overlay
+    seedGoAmd64 (tmp </> "gentoo")
+    builds <- mkLogRef
+    fake <- mkFakeDocker False "" builds
+    cfg0 <- mkCfg overlay sidecar fake plentyDisk Nothing
+    let cfg = cfg0 {ecGentooCommit = "15034c13615c2da8b1353a4a784c28d82ef53286"}
+    got <- ensureImage cfg neededGo
+    assertEq "built" (Right EnsureBuilt) got
+    calls <- readIORef builds
+    case [args | args <- calls, "-t" `elem` args] of
+      [args] -> assertTrue "gentoo build context is the planning tree" (("gentoo=" <> (tmp </> "gentoo")) `elem` args)
+      other -> assertFailure ("expected one build, got " <> show other)
+    side <- readSide sidecar
+    assertEq "records the resolver's commit" (Just (ecGentooCommit cfg)) (isTreeCommit side)
+    assertEq "records the stage3 digest" (Just testStage3Digest) (isStage3Digest side)
+    assertEq "records the base check" (Just epoch) (isLastBaseCheck side)
+
+testNewerStage3Rebuilds :: IO ()
+testNewerStage3Rebuilds =
+  withSystemTempDirectory "om-ensure-newer" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:current"
+    createDirectoryIfMissing True overlay
+    seedGoAmd64 (tmp </> "gentoo")
+    writeSidecarBase sidecar iid "tree" (Just "sha256:older") (Just fourDaysBefore)
+    builds <- mkLogRef
+    fake <- mkFakeDocker True iid builds
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    got <- ensureImage cfg neededGo
+    assertEq "rebuilt though floors satisfy" (Right EnsureBuilt) got
+    side <- readSide sidecar
+    assertEq "new digest recorded" (Just testStage3Digest) (isStage3Digest side)
+    df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
+    assertTrue "recipe pins the new digest" (("@" <> testStage3Digest) `T.isInfixOf` df)
+
+testSameStage3ResetsTimer :: IO ()
+testSameStage3ResetsTimer =
+  withSystemTempDirectory "om-ensure-same" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:current"
+    createDirectoryIfMissing True overlay
+    writeSidecarBase sidecar iid "tree" (Just testStage3Digest) (Just fourDaysBefore)
+    builds <- mkLogRef
+    fake <- mkFakeDocker True iid builds
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    got <- ensureImage cfg neededGo
+    assertEq "skipped" (Right EnsureSkipped) got
+    assertEq "no docker build" [] =<< readIORef builds
+    side <- readSide sidecar
+    assertEq "check time reset" (Just epoch) (isLastBaseCheck side)
+
+testRegistryUnreachable :: IO ()
+testRegistryUnreachable =
+  withSystemTempDirectory "om-ensure-offline" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:current"
+    createDirectoryIfMissing True overlay
+    writeSidecarBase sidecar iid "tree" (Just "sha256:older") (Just fourDaysBefore)
+    builds <- mkLogRef
+    warns <- newIORef []
+    fake <- mkFakeDocker True iid builds
+    cfg0 <- mkCfg overlay sidecar fake plentyDisk Nothing
+    let cfg =
+          cfg0
+            { ecStage3Digest = \_ -> pure (Left "ConnectionFailure registry-1.docker.io"),
+              ecWarn = \w -> modifyIORef' warns (<> [w])
+            }
+    got <- ensureImage cfg neededGo
+    assertEq "keeps the image" (Right EnsureSkipped) got
+    assertEq "no docker build" [] =<< readIORef builds
+    ws <- readIORef warns
+    assertTrue "warns" (any ("base check failed" `T.isInfixOf`) ws)
+    side <- readSide sidecar
+    assertEq "check stays due" (Just fourDaysBefore) (isLastBaseCheck side)
+
+testOverrideSkipsBaseCheck :: IO ()
+testOverrideSkipsBaseCheck =
+  withSystemTempDirectory "om-ensure-ovr-base" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+    createDirectoryIfMissing True overlay
+    writeSidecarBase sidecar "sha256:x" "tree" Nothing Nothing
+    builds <- mkLogRef
+    asked <- newIORef (0 :: Int)
+    fake <- mkFakeDocker True "sha256:x" builds
+    cfg0 <- mkCfg overlay sidecar fake plentyDisk (Just "op/override:tag")
+    let cfg = cfg0 {ecStage3Digest = \_ -> modifyIORef' asked (+ 1) >> pure (Right "sha256:new")}
+    _ <- ensureImage cfg neededGo
+    assertEq "registry not asked" 0 =<< readIORef asked
+
+testRegistryDigest :: IO ()
+testRegistryDigest = do
+  seen <- newIORef []
+  let http req = do
+        modifyIORef' seen (<> [req])
+        let url = show (getUri req)
+        pure $
+          if "auth.docker.io" `isInfixOf` url
+            then Right (fakeResponse 200 "{\"token\":\"tok123\"}")
+            else Right (fakeResponseHeaders 200 [("Docker-Content-Digest", "sha256:abc123")] "")
+  got <- stage3DigestWith http "amd64-openrc"
+  assertEq "digest" (Right "sha256:abc123") got
+  reqs <- readIORef seen
+  case reqs of
+    [tokReq, headReq] -> do
+      assertTrue "anonymous pull scope" ("scope=repository:gentoo/stage3:pull" `isInfixOf` show (getUri tokReq))
+      assertEq "HEAD, not GET" "HEAD" (method headReq)
+      assertTrue "manifest of the tag" ("/v2/gentoo/stage3/manifests/amd64-openrc" `isInfixOf` show (getUri headReq))
+      assertEq "bearer token" (Just "Bearer tok123") (lookup "Authorization" (requestHeaders headReq))
+      let accept = maybe "" B8.unpack (lookup "Accept" (requestHeaders headReq))
+      assertTrue "OCI index accepted" ("application/vnd.oci.image.index.v1+json" `isInfixOf` accept)
+      assertTrue "manifest list accepted" ("application/vnd.docker.distribution.manifest.list.v2+json" `isInfixOf` accept)
+    other -> assertFailure ("expected token + HEAD, got " <> show (length other))
+  noTok <- stage3DigestWith (\_ -> pure (Right (fakeResponse 503 ""))) "amd64-openrc"
+  assertTrue "token failure is Left" (either (const True) (const False) noTok)
+  noHeader <-
+    stage3DigestWith
+      (\req -> pure (Right (if "auth.docker.io" `isInfixOf` show (getUri req) then fakeResponse 200 "{\"token\":\"t\"}" else fakeResponse 200 "")))
+      "amd64-openrc"
+  assertTrue "missing digest header is Left" (either (const True) (const False) noHeader)
 
 testSkipWhenSatisfies :: IO ()
 testSkipWhenSatisfies =
@@ -1204,6 +1438,57 @@ testSkipWhenSatisfies =
     calls <- readIORef builds
     assertEq "no docker build" [] calls
     assertNoEcleanDocker "skip satisfies" calls
+
+testToolsImageRecorded :: IO ()
+testToolsImageRecorded =
+  withSystemTempDirectory "om-tools-recorded" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+        iid = "sha256:recorded"
+    createDirectoryIfMissing True overlay
+    writeSidecarGo sidecar iid "1.26.5"
+    builds <- mkLogRef
+    fake <- mkFakeDocker True iid builds
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    lock <- newTreeLock
+    got <- ensureToolsImage lock cfg
+    assertEq "recorded image id" (Right iid) got
+    assertEq "no docker build" [] =<< readIORef builds
+
+testToolsImageOverride :: IO ()
+testToolsImageOverride =
+  withSystemTempDirectory "om-tools-override" $ \tmp -> do
+    let overlay = tmp </> "ov"
+    createDirectoryIfMissing True overlay
+    builds <- mkLogRef
+    fake <- mkFakeDocker False "" builds
+    cfg <- mkCfg overlay (tmp </> "side") fake plentyDisk (Just "op/portage:tag")
+    lock <- newTreeLock
+    got <- ensureToolsImage lock cfg
+    assertEq "override tag" (Right "op/portage:tag") got
+    assertEq "no docker build" [] =<< readIORef builds
+
+testToolsImageBaseOnly :: IO ()
+testToolsImageBaseOnly =
+  withSystemTempDirectory "om-tools-base" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        sidecar = tmp </> "side"
+    createDirectoryIfMissing True overlay
+    createDirectoryIfMissing True (tmp </> "gentoo")
+    builds <- mkLogRef
+    fake <- mkFakeDocker False "" builds
+    cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
+    lock <- newTreeLock
+    got <- ensureToolsImage lock cfg
+    assertEq "built image id" (Right "sha256:built") got
+    calls <- readIORef builds
+    assertTrue "docker build ran" (any ("-t" `elem`) calls)
+    bs <- BS.readFile (sidecarImageJsonPath sidecar)
+    case decodeImageSidecar bs of
+      Left err -> assertFailure err
+      Right side -> assertEq "no toolchain floors" emptyFloors (isSatisfies side)
+    df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
+    assertTrue "no toolchains emerged" (not (any (`T.isInfixOf` df) ["dev-lang/go", "net-libs/nodejs", "dev-lang/rust", "dev-lisp/sbcl"]))
 
 testGeneratorMismatchRebuilds :: IO ()
 testGeneratorMismatchRebuilds =
@@ -1228,8 +1513,8 @@ testGeneratorMismatchRebuilds =
       Right side -> do
         assertEq "records current generator" materializeGeneratorId (isGenerator side)
         assertEq
-          "generator is materialize-9"
-          "mndz-overlay-manager-materialize-9"
+          "generator is materialize-10"
+          "mndz-overlay-manager-materialize-10"
           materializeGeneratorId
     df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
     assertPruneRun "generator rebuild" df
@@ -1256,7 +1541,10 @@ testNewerQlotRebuilds =
                     nfQlot = Just "1.8.4"
                   },
               isGenerator = materializeGeneratorId,
-              isBuiltAt = epoch
+              isBuiltAt = epoch,
+              isTreeCommit = Nothing,
+              isStage3Digest = Just testStage3Digest,
+              isLastBaseCheck = Just epoch
             }
     BS.writeFile (sidecarImageJsonPath sidecar) (LBS.toStrict (encodeImageSidecar side0))
     builds <- mkLogRef
@@ -1302,7 +1590,10 @@ testNewerNodeGypRebuilds =
                     nfNodeGyp = Just "13.0.0"
                   },
               isGenerator = materializeGeneratorId,
-              isBuiltAt = epoch
+              isBuiltAt = epoch,
+              isTreeCommit = Nothing,
+              isStage3Digest = Just testStage3Digest,
+              isLastBaseCheck = Just epoch
             }
     BS.writeFile (sidecarImageJsonPath sidecar) (LBS.toStrict (encodeImageSidecar side0))
     builds <- mkLogRef
