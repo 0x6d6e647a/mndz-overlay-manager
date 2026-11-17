@@ -211,6 +211,8 @@ just coverage              # gate coverage: coverage-dev tests + Overall/Unit/In
 just coverage-release      # optimized coverage reports; does not replace coverage-dev products
 ```
 
+Smoke tests (`Test.SmokePlan`, `Test.SmokeImage`, `Test.SmokeContainer`, `Test.SmokeCheck`, and `Test.SmokeDefinitions` under **Unit**; `Test.SmokeRun` under **Integration**) drive the smoke planner, image ensure, tree snapshot, container adapter, check interpreter, and command pipeline through injected command fakes; they need no Docker daemon. `just test Smoke` runs them all.
+
 Tasty’s `-p` / `--pattern` accepts a pattern over test names (see [tasty’s pattern syntax](https://github.com/UnkindPartition/tasty#patterns)). `just test <pattern>` passes that pattern through. Prefer `just coverage` or full `just check` before shipping; uninstrumented filters are for local iteration.
 
 ### Coverage reports

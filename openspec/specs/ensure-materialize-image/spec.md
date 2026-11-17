@@ -436,7 +436,7 @@ When `MNDZ_MATERIALIZE_IMAGE` is set to a non-empty image tag, the program SHALL
 
 ### Requirement: Conservative free space before docker build
 
-When ensure will `docker build`, the program SHALL hard-fail before starting that build if free space on the filesystems that back **image layers** and **BuildKit cache** is below a conservative bound for the work that build will run. The program SHALL discover those directories from live Docker and, when needed, containerd configuration (Docker data-root and, when the containerd snapshotter holds image layers, containerd’s data root including a non-empty snapshotter `root_path`). The program SHALL NOT treat a hardcoded docker data directory as the image store, SHALL NOT fall back to a path literal when discovery fails, and SHALL NOT charge the overlay bind-mount used as a read-only build context. Paths that share a filesystem SHALL use one **combined** bound (first full image versus adding one toolchain). Distinct filesystems SHALL use **role** bounds (layers versus cache) for that same first-image versus add-toolchain distinction; the program SHALL hard-fail if **either** distinct volume is short. The program SHALL NOT attempt to subtract BuildKit cache hit-rate. When `image.json` already satisfies and no build will run, this check SHALL NOT fail the run solely for image-build space.
+When ensure will `docker build`, the program SHALL hard-fail before starting that build if free space on the filesystems that back **image layers** and **BuildKit cache** is below a conservative bound for the work that build will run. The program SHALL discover those directories from live Docker and, when needed, containerd configuration (Docker data-root and, when the containerd snapshotter holds image layers, containerd’s data root including a non-empty snapshotter `root_path`). When image layers are in a containerd instance that is not the engine-bundled one, BuildKit cache SHALL be treated as residing with those layers on containerd’s data root, not on the Docker data-root. The program SHALL NOT treat a hardcoded docker data directory as the image store, SHALL NOT fall back to a path literal when discovery fails, and SHALL NOT charge the overlay bind-mount used as a read-only build context. Paths that share a filesystem SHALL use one **combined** bound (first full image versus adding one toolchain). Distinct filesystems SHALL use **role** bounds (layers versus cache) for that same first-image versus add-toolchain distinction; the program SHALL hard-fail if **either** distinct volume is short. The program SHALL NOT attempt to subtract BuildKit cache hit-rate. When `image.json` already satisfies and no build will run, this check SHALL NOT fail the run solely for image-build space.
 
 When Docker’s storage driver is the containerd snapshotter and containerd is not the engine-bundled instance (layers are not under the Docker data-root), and the program cannot resolve containerd’s data root from configuration, ensure SHALL hard-fail before `docker build` with a message that the image store could not be resolved. That message SHALL NOT be a free-space line. The program SHALL NOT contact the containerd gRPC socket for this gate.
 
@@ -476,6 +476,12 @@ When the gate fails for insufficient space and layer and cache paths are on dist
 - **THEN** ensure hard-fails before `docker build`
 - **AND** the error states that the image store could not be resolved
 - **AND** the program does not `docker build`
+
+#### Scenario: System containerd keeps cache with layers
+
+- **WHEN** ensure will `docker build`, Docker uses the containerd snapshotter with a containerd instance that is not the engine-bundled one, containerd’s data root has at least the combined bound free, and the Docker data-root is on a distinct filesystem below the cache bound
+- **THEN** ensure does not hard-fail for image-build space
+- **AND** the probed path is containerd’s data root with the combined bound
 
 ### Requirement: Image SBCL locates its core without a login shell
 
@@ -713,3 +719,22 @@ When the Portage tools container needs an image and none is recorded, ensure SHA
 - **WHEN** no image is recorded and `update` needs only GitMv Manifest work
 - **THEN** ensure builds a base-only image and the Manifest runs in a tools container from it
 - **AND** `image.json` records no toolchain floors
+
+### Requirement: Recipe does not opt out of Portage sandboxes
+
+The generated materialize recipe SHALL NOT remove `network-sandbox`, `ipc-sandbox`, `pid-sandbox`, `sandbox`, `usersandbox`, or `userpriv` from `FEATURES`. Portage warnings that a sandbox could not be set up during `docker build` SHALL NOT fail the build.
+
+#### Scenario: FEATURES line has no sandbox opt-out
+
+- **WHEN** ensure renders the recipe
+- **THEN** the recipe's `FEATURES` value contains no token beginning with `-` that names a sandbox feature
+
+#### Scenario: Image from an older recipe is rebuilt once
+
+- **WHEN** the recorded image was built from a recipe that disabled the namespace sandboxes
+- **THEN** the next ensure treats the generator identity as a mismatch and builds a new image
+
+#### Scenario: Build tolerates denied namespaces
+
+- **WHEN** Docker denies namespace creation during a recipe `RUN` and Portage logs that it is unable to unshare
+- **THEN** the emerge continues and the build succeeds

@@ -5,7 +5,8 @@
 -- to the newest mirror metadata commit the Gentoo binhost index covers.
 --
 -- Every tree reader takes the path from 'resolveGentooTree'. The resolver
--- holds a shared lock on @gentoo.lock@ until the process exits; a due sync
+-- holds a shared lock on @gentoo.lock@ until the process exits (@smoke@ releases
+-- it once its snapshot exists); a due sync
 -- takes it exclusively, syncs, and downgrades. git, gpg, HTTP, the clock, the
 -- disk probe, and the lock are all injected through 'TreeEnv'.
 module Update.GentooTree
@@ -427,7 +428,8 @@ gentooTreePath = gtPath
 gentooTreeCommit :: GentooTree -> Text
 gentooTreeCommit = gtCommit
 
--- | Drop the shared lock early (tests; production holds it to exit).
+-- | Drop the shared lock early: @smoke@ once its tree snapshot exists (and
+-- tests). Other commands hold it until exit.
 releaseGentooTree :: GentooTree -> IO ()
 releaseGentooTree = hlRelease . gtLock
 

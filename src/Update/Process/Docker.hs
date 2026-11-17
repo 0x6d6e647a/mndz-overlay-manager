@@ -24,6 +24,10 @@ module Update.Process.Docker
     materializeExecArgs,
     wrapMaterializeExecRequest,
     withUnitMaterializeSession,
+    measuredContainerExec,
+    waitUntilRunning,
+    registerContainerCgroup,
+    snapshotContainer,
     sweepStaleMaterializeSessions,
     isLiveOverlayManagerPid,
     inspectMaterializeImage,
@@ -405,35 +409,11 @@ sessionExecRunner ::
   CommandRunner
 sessionExecRunner m inner cfg name req = do
   res <- case (mEnabled m, mdcTimeDir cfg, prMeasure req) of
-    (True, Just dir, Timed) -> measuredExec dir
+    (True, Just dir, Timed) ->
+      measuredContainerExec m inner name dir (\f -> wrapMaterializeExecRequest cfg name f req) req
     _ -> inner (wrapMaterializeExecRequest cfg name Nothing req)
   checkSession res
   where
-    (cmd, args) = case prMode req of
-      ExecCmd c as -> (c, as)
-      ShellCmd s -> ("sh", ["-c", s])
-    -- One @container.exec@ parent; the inner @proc@ (in-container GNU time,
-    -- @.inner@) and the outer @proc@ (host @docker exec@, @.outer@) under it.
-    measuredExec dir = do
-      innerAttrs <- procStartAttrs m cmd args (prCwd req)
-      mask $ \restore -> do
-        parent <- mSpanStart m "container.exec" ["container" .= name, "cmd" .= T.pack cmd]
-        innerSid <- mSpanStart m "proc" (innerAttrs <> ["container" .= name, "side" .= ("inner" :: Text)])
-        pkg <- mCurrentPackage m
-        let innerFile = dir </> timeFileName innerSid pkg cmd ".inner"
-            execReq = wrapMaterializeExecRequest cfg name (Just innerFile) req
-        r <- try @SomeException (restore (mWithParent m (Just parent) (inner execReq)))
-        case r of
-          Left e -> do
-            mSpanEnd m innerSid OutcomeFail []
-            mSpanEnd m parent OutcomeFail []
-            throwIO e
-          Right res -> do
-            timeAttrs <- ingestTimeFile innerFile
-            let outcome = if prExitCode res == ExitSuccess then OutcomeOk else OutcomeFail
-            mSpanEnd m innerSid outcome (procEndAttrs res <> timeAttrs)
-            mSpanEnd m parent outcome []
-            pure res
     checkSession res =
       if prExitCode res == ExitSuccess
         then pure res
@@ -447,6 +427,43 @@ sessionExecRunner m inner cfg name req = do
                   { prExitCode = ExitFailure 1,
                     prStderr = T.unpack deadSessionMessage
                   }
+
+-- | One @container.exec@ parent span named after the container, with the
+-- inner @proc@ (in-container GNU time, @.inner@) and the outer @proc@ (host
+-- @docker exec@, @.outer@) under it. @wrap@ builds the host request given
+-- the @.inner@ time file; @req@ is the in-container command it runs.
+measuredContainerExec ::
+  Metrics ->
+  CommandRunner ->
+  String ->
+  FilePath ->
+  (Maybe FilePath -> ProcessRequest) ->
+  ProcessRequest ->
+  IO ProcessResult
+measuredContainerExec m inner name dir wrap req = do
+  innerAttrs <- procStartAttrs m cmd args (prCwd req)
+  mask $ \restore -> do
+    parent <- mSpanStart m "container.exec" ["container" .= name, "cmd" .= T.pack cmd]
+    innerSid <- mSpanStart m "proc" (innerAttrs <> ["container" .= name, "side" .= ("inner" :: Text)])
+    pkg <- mCurrentPackage m
+    let innerFile = dir </> timeFileName innerSid pkg cmd ".inner"
+        execReq = wrap (Just innerFile)
+    r <- try @SomeException (restore (mWithParent m (Just parent) (inner execReq)))
+    case r of
+      Left e -> do
+        mSpanEnd m innerSid OutcomeFail []
+        mSpanEnd m parent OutcomeFail []
+        throwIO e
+      Right res -> do
+        timeAttrs <- ingestTimeFile innerFile
+        let outcome = if prExitCode res == ExitSuccess then OutcomeOk else OutcomeFail
+        mSpanEnd m innerSid outcome (procEndAttrs res <> timeAttrs)
+        mSpanEnd m parent outcome []
+        pure res
+  where
+    (cmd, args) = case prMode req of
+      ExecCmd c as -> (c, as)
+      ShellCmd s -> ("sh", ["-c", s])
 
 deadSessionMessage :: Text
 deadSessionMessage = "materialize session is not running"

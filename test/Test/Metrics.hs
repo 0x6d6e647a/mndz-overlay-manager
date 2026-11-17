@@ -112,7 +112,15 @@ import Network.HTTP.Client
     requestHeaders,
   )
 import Network.HTTP.Client.Internal (makeConnection)
+import Overlay.Types (Ebuild (..))
 import Overlay.Version (parseEbuildVersion)
+import Smoke.Container
+  ( ExecUser (..),
+    SmokeContainerCfg (..),
+    SmokeSession (..),
+    withSmokeContainer,
+  )
+import Smoke.Plan (SmokeRun (..))
 import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory, removeFile)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
@@ -230,6 +238,8 @@ unitTests =
           testCase "recorded exec: inner/outer under one parent, lifecycle create" testSessionRecorded,
           testCase "image without GNU time hard-fails naming image and --no-metrics" testSessionNoGnuTime,
           testCase "--no-metrics skips the in-container time check" testSessionNoMetricsSkipsCheck,
+          testCase "smoke container: inner/outer pair and container event" testSmokeSessionRecorded,
+          testCase "smoke container: --no-metrics wraps nothing" testSmokeSessionNoMetrics,
           testCase "cgroup snapshot from fixture proc and sysfs" testCgroupSnapshot,
           testCase "cgroup snapshot records the reason when a file is missing" testCgroupMissing
         ],
@@ -1380,6 +1390,70 @@ testSessionNoGnuTime =
       reqs <- seen
       assertTrue "no docker build" (null [() | ProcessRequest {prMode = ExecCmd "docker" ("build" : _)} <- reqs])
       assertTrue "container removed" (not (null [() | ProcessRequest {prMode = ExecCmd "docker" ("rm" : _)} <- reqs]))
+
+smokeCfg :: Maybe FilePath -> SmokeContainerCfg
+smokeCfg timeDir =
+  SmokeContainerCfg
+    { sccRunId = "r1",
+      sccCliPid = "4242",
+      sccImage = "mndz-overlay-manager/smoke:local",
+      sccSnapshot = "mndz-overlay-manager/smoke-tree:r1",
+      sccOverlay = "/ov",
+      sccTimeDir = timeDir,
+      sccOperatorUid = 1000,
+      sccJobs = 4,
+      sccOverlayNames = ["dev-util/crush"]
+    }
+
+smokeRun :: SmokeRun
+smokeRun =
+  SmokeRun
+    { srKey = mkPackageKey "dev-util" "crush",
+      srEbuild = Ebuild "dev-util" "crush" "0.101.0" "/ov/dev-util/crush/crush-0.101.0.ebuild",
+      srVersion = parseEbuildVersion "0.101.0",
+      srArch = "amd64",
+      srCap = Nothing,
+      srPythonSlot = Nothing
+    }
+
+testSmokeSessionRecorded :: IO ()
+testSmokeSessionRecorded =
+  withCgroupFixture $ \roots -> do
+    (run, seen) <- fakeDocker "time (GNU Time) 1.9\n"
+    (result, evs) <- withRecorded $ \m ->
+      withSmokeContainer m roots run (smokeCfg (mTimeDir m)) smokeRun $ \session ->
+        ssExec session AsRoot (execReq "emerge" ["--oneshot", "=dev-util/crush-0.101.0::mndz"])
+    case result of
+      Right res -> assertEq "exec ok" ExitSuccess (prExitCode res)
+      Left err -> assertFailure (T.unpack err)
+    reqs <- seen
+    let execs = [args | ProcessRequest {prMode = ExecCmd "docker" args@("exec" : _), prMeasure = TimedContainerExec} <- reqs]
+    case execs of
+      [args] -> assertTrue "inner GNU time wraps emerge" (isJust (lookup "/usr/bin/time" (zip args (drop 1 args))) && "emerge" `elem` args)
+      other -> assertFailure ("expected one outer exec, got " <> show other)
+    let starts = spanStarts evs
+    parent <- firstId "container.exec" evs
+    case [a | (_, Just p, "proc", a) <- starts, p == parent] of
+      [attrs] -> assertEq "inner side" (Just (String "inner")) (KM.lookup "side" attrs)
+      other -> assertFailure ("expected the inner proc under container.exec, got " <> show (length other))
+    case filter ((== "container") . evKind) evs of
+      [e] -> assertEq "memory peak" (Just (Number 4194304)) (field "memory_peak_bytes" e)
+      other -> assertFailure ("expected one container event, got " <> show (length other))
+
+testSmokeSessionNoMetrics :: IO ()
+testSmokeSessionNoMetrics = do
+  (run, seen) <- fakeDocker "time (GNU Time) 1.9\n"
+  result <-
+    withSmokeContainer noopMetrics (CgroupRoots "/nonexistent" "/nonexistent") run (smokeCfg Nothing) smokeRun $ \session ->
+      ssExec session AsRoot (execReq "emerge" ["--version"])
+  case result of
+    Right res -> assertEq "exec ok" ExitSuccess (prExitCode res)
+    Left err -> assertFailure (T.unpack err)
+  reqs <- seen
+  assertTrue
+    "no GNU time anywhere"
+    (null [() | ProcessRequest {prMode = ExecCmd "docker" args} <- reqs, "/usr/bin/time" `elem` args])
+  assertTrue "no time bind" (null [() | ProcessRequest {prMode = ExecCmd "docker" ("create" : args)} <- reqs, any (("time" `T.isInfixOf`) . T.pack) args])
 
 testSessionNoMetricsSkipsCheck :: IO ()
 testSessionNoMetricsSkipsCheck =

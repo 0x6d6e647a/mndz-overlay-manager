@@ -175,6 +175,8 @@ nonEbuildAllowlist =
     "src/Metrics/Sampler.hs",
     "src/Metrics/Startup.hs",
     "src/Overlay/Validation.hs",
+    "src/Smoke/Container.hs",
+    "src/Smoke/Image.hs",
     "src/Update/Assets/Hash.hs",
     "src/Update/Assets/Release.hs",
     "src/Update/Bun/Cache.hs",

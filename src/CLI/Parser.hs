@@ -52,6 +52,10 @@ data Command
         gencacheForce :: Bool,
         gencacheExcludeTokens :: [String]
       }
+  | Smoke
+      { smokeTargets :: [String],
+        smokeExcludeTokens :: [String]
+      }
   | Eclean
   | GitHubToken
       { githubTokenForce :: Bool
@@ -193,6 +197,7 @@ commandTreeSync = \case
   Outdated {outdatedRefresh} -> Just outdatedRefresh
   Update {updateRefresh} -> Just updateRefresh
   Gencache {} -> Just False
+  Smoke {} -> Just False
   List -> Nothing
   Eclean -> Nothing
   GitHubToken {} -> Nothing
@@ -368,6 +373,39 @@ gencacheInfo =
           )
     )
 
+smokeParser :: Parser Command
+smokeParser =
+  Smoke
+    <$> many
+      ( strArgument
+          ( metavar "PACKAGE..."
+              <> help
+                "Package targets as category/package or an unambiguous package \
+                \name; omit to test all discovered packages"
+          )
+      )
+    <*> excludeTokens
+
+smokeInfo :: ParserInfo Command
+smokeInfo =
+  info
+    smokeParser
+    ( fullDesc
+        <> progDesc "Install and check overlay packages in a clean container"
+        <> footer
+          ( "Install every on-disk version of each selected package in a fresh \
+            \Docker container with Portage's sandboxes on, then run the \
+            \package's checks. Runs happen one at a time; --jobs sets the build \
+            \parallelism inside the container (MAKEOPTS), not the number of \
+            \runs. PACKAGE may be category/package or an unambiguous package \
+            \name. With no PACKAGE arguments, test all discovered packages. \
+            \Prints one result line per run and exits 1 when any run fails. \
+            \Needs Docker Engine 28.0 or newer with the containerd image store. "
+              <> excludeFooter
+              <> globalsFooter
+          )
+    )
+
 ecleanInfo :: ParserInfo Command
 ecleanInfo =
   info
@@ -420,6 +458,7 @@ commandParser =
           <> command "outdated" outdatedInfo
           <> command "update" updateInfo
           <> command "gencache" gencacheInfo
+          <> command "smoke" smokeInfo
           <> command "eclean" ecleanInfo
           <> command "github-token" githubTokenInfo
           <> metavar "COMMAND"

@@ -78,6 +78,7 @@ commandName = \case
   Outdated {} -> "outdated"
   Update {} -> "update"
   Gencache {} -> "gencache"
+  Smoke {} -> "smoke"
   Eclean -> "eclean"
   GitHubToken {} -> "github-token"
 
@@ -87,6 +88,7 @@ metricsCommandName cmd = case cmd of
   Outdated {} -> Just (commandName cmd)
   Update {} -> Just (commandName cmd)
   Gencache {} -> Just (commandName cmd)
+  Smoke {} -> Just (commandName cmd)
   Eclean -> Just (commandName cmd)
   List -> Nothing
   GitHubToken {} -> Nothing

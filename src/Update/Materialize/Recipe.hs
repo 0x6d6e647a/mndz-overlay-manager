@@ -97,7 +97,7 @@ renderMaterializeDockerfile arch digest installs =
       <> mndzReposStage
       <> [ "FROM gentoo/stage3:" <> raHubTag arch <> "@" <> digest,
            "",
-           "ENV FEATURES=\"getbinpkg buildpkg -news -ipc-sandbox -network-sandbox -pid-sandbox\"",
+           "ENV FEATURES=\"getbinpkg buildpkg -news\"",
            "ENV EMERGE_DEFAULT_OPTS=\"--quiet-build=y --with-bdeps=n --usepkg\"",
            ""
          ]

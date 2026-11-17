@@ -31,6 +31,12 @@ import Test.Policy qualified as Policy
 import Test.Preflight qualified as Preflight
 import Test.Progress qualified as Progress
 import Test.Properties qualified as Properties
+import Test.SmokeCheck qualified as SmokeCheck
+import Test.SmokeContainer qualified as SmokeContainer
+import Test.SmokeDefinitions qualified as SmokeDefinitions
+import Test.SmokeImage qualified as SmokeImage
+import Test.SmokePlan qualified as SmokePlan
+import Test.SmokeRun qualified as SmokeRun
 import Test.Ssh qualified as Ssh
 import Test.Targets qualified as Targets
 import Test.Tasty (defaultMain, testGroup)
@@ -101,6 +107,11 @@ main = do
               Ecosystems.unitTests,
               CheckPlan.unitTests,
               CaddyAnalyzer.unitTests,
+              SmokePlan.tests,
+              SmokeImage.tests,
+              SmokeCheck.tests,
+              SmokeContainer.tests,
+              SmokeDefinitions.tests,
               Properties.tests
             ],
           testGroup
@@ -114,6 +125,7 @@ main = do
               CheckPlan.integrationTests,
               CaddyAnalyzer.integrationTests,
               GitHubResilience.integrationTests,
-              Waves.integrationTests
+              Waves.integrationTests,
+              SmokeRun.tests
             ]
         ]

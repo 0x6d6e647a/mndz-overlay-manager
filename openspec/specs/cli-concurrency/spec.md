@@ -88,3 +88,23 @@ The executable SHOULD enable multi-capability RTS defaults (for example `-with-r
 
 - **WHEN** the user runs `outdated` against more packages than one, with `--jobs` greater than 1 (or the default host processor count when that value is greater than 1), and at least one package performs long blocking network work (for example many go.mod probes)
 - **THEN** more than one package-level check may be in flight at once, subject to the jobs limit, rather than only a single package progressing until its network work completes
+
+### Requirement: Jobs sets build parallelism for smoke
+
+For `smoke`, the resolved `--jobs` value `N` SHALL set the build parallelism inside each container as `MAKEOPTS="-j<N> -l<N+1>"`, and each emerge SHALL run one package job at a time. `--jobs` SHALL NOT cause more than one smoke run or more than one smoke container to be active at once.
+
+#### Scenario: Explicit jobs
+
+- **WHEN** the operator runs `--jobs 8 smoke crush`
+- **THEN** the emerges in the container run with `MAKEOPTS="-j8 -l9"`
+- **AND** each emerge runs with one package job
+
+#### Scenario: Default jobs
+
+- **WHEN** the operator runs `smoke` without `--jobs` on a host with 16 processors
+- **THEN** the emerges run with `MAKEOPTS="-j16 -l17"`
+
+#### Scenario: Runs stay sequential
+
+- **WHEN** the operator runs `--jobs 4 smoke` with many packages selected
+- **THEN** at most one smoke container exists at any time

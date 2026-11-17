@@ -131,6 +131,7 @@ unitTests =
       testCase "Cargo declared tag floor feeds ensure" testCargoDeclaredTagFloorFeedsEnsure,
       testCase "Cargo selection 0.0.0 is not an image floor" testCargoAbsenceNotImageFloor,
       testCase "render contains ::mndz and no official tarball URLs" testRenderMndzNoOfficial,
+      testCase "FEATURES keeps Portage sandboxes on" testRenderFeaturesKeepSandboxes,
       testCase "prune RUN follows Go and SBCL toolchain emerges" testRenderPruneAfterToolchains,
       testCase "uname map splits KEYWORDS from OpenRC Hub tag" testLookupRecipeArch,
       testCase "x86_64 recipe uses amd64-openrc FROM and ~amd64 keywords" testAmd64OpenrcRecipe,
@@ -150,7 +151,8 @@ unitTests =
       testCase "tools image reuses the recorded image" testToolsImageRecorded,
       testCase "tools image uses the override tag" testToolsImageOverride,
       testCase "GitMv-only update on a fresh host builds a base-only image" testToolsImageBaseOnly,
-      testCase "generator mismatch rebuilds despite floors" testGeneratorMismatchRebuilds,
+      testCase "generator mismatch rebuilds despite floors" (testGeneratorMismatchRebuilds "mndz-overlay-manager-materialize-8"),
+      testCase "sandbox opt-out generator rebuilds once" (testGeneratorMismatchRebuilds "mndz-overlay-manager-materialize-10"),
       testCase "newer overlay qlot rebuilds despite language floors" testNewerQlotRebuilds,
       testCase "newer overlay node-gyp rebuilds despite language floors" testNewerNodeGypRebuilds,
       testCase "bun recipe emerges overlay node-gyp after node" testBunRecipeEmergesNodeGypAfterNode,
@@ -167,8 +169,8 @@ unitTests =
       testCase "role bounds combined vs split" testRoleBounds,
       testCase "image disk gate skipped when satisfies" testDiskGateSkippedWhenSatisfies,
       testCase "first build fails early on tiny disk" testFirstBuildDiskFail,
-      testCase "split store fails on cache filesystem" testSplitCacheShort,
-      testCase "split store fails on layer filesystem" testSplitLayersShort,
+      testCase "system containerd: tight data-root still builds" testSystemDataRootTight,
+      testCase "system containerd: tight containerd root fails" testSystemContainerdShort,
       testCase "split store ample overlay tiny still builds" testSplitAmpleOverlayTiny,
       testCase "system snapshotter dump miss fails closed" testSnapshotterDumpMiss,
       testCase "system snapshotter missing root fails closed" testSnapshotterRootMissing,
@@ -483,6 +485,21 @@ testCargoAbsenceNotImageFloor = do
       needed = neededFloorsFromClassified classify plan Nothing Nothing (Just "13.0.0")
   assertTrue "not 0.0.0" (nfRust needed /= Just "0.0.0")
   assertEq "absence is unversioned rust" (Just "0") (nfRust needed)
+
+testRenderFeaturesKeepSandboxes :: IO ()
+testRenderFeaturesKeepSandboxes = do
+  df <- renderMapped "x86_64" [goInstall "1.26.5"]
+  let featureLines = [l | l <- T.lines df, "ENV FEATURES=" `T.isPrefixOf` l]
+  case featureLines of
+    [line] -> do
+      let tokens = T.words (T.filter (/= '"') (T.drop (T.length "ENV FEATURES=") line))
+      assertTrue "getbinpkg" ("getbinpkg" `elem` tokens)
+      assertTrue "buildpkg" ("buildpkg" `elem` tokens)
+      assertTrue
+        "no sandbox opt-out"
+        (not (any (\t -> "-" `T.isPrefixOf` t && "sandbox" `T.isInfixOf` t) tokens))
+      assertTrue "no userpriv opt-out" ("-userpriv" `notElem` tokens)
+    other -> assertFailure ("expected one FEATURES line, got " <> show other)
 
 testRenderMndzNoOfficial :: IO ()
 testRenderMndzNoOfficial = do
@@ -1490,16 +1507,17 @@ testToolsImageBaseOnly =
     df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
     assertTrue "no toolchains emerged" (not (any (`T.isInfixOf` df) ["dev-lang/go", "net-libs/nodejs", "dev-lang/rust", "dev-lisp/sbcl"]))
 
-testGeneratorMismatchRebuilds :: IO ()
-testGeneratorMismatchRebuilds =
+-- | A sidecar from an older generator (the pre-GNU-time recipe, or the
+-- recipe that disabled Portage's namespace sandboxes) is a miss.
+testGeneratorMismatchRebuilds :: T.Text -> IO ()
+testGeneratorMismatchRebuilds staleGen =
   withSystemTempDirectory "om-ensure-gen" $ \tmp -> do
     let overlay = tmp </> "ov"
         sidecar = tmp </> "side"
         iid = "sha256:stale-gen"
     createDirectoryIfMissing True overlay
     seedGoAmd64 (tmp </> "gentoo")
-    -- The pre-GNU-time generator is a miss.
-    writeSidecarGoGen sidecar iid "1.26.5" "mndz-overlay-manager-materialize-8"
+    writeSidecarGoGen sidecar iid "1.26.5" staleGen
     builds <- mkLogRef
     fake <- mkFakeDocker True iid builds
     cfg <- mkCfg overlay sidecar fake plentyDisk Nothing
@@ -1513,8 +1531,8 @@ testGeneratorMismatchRebuilds =
       Right side -> do
         assertEq "records current generator" materializeGeneratorId (isGenerator side)
         assertEq
-          "generator is materialize-10"
-          "mndz-overlay-manager-materialize-10"
+          "generator is materialize-11"
+          "mndz-overlay-manager-materialize-11"
           materializeGeneratorId
     df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
     assertPruneRun "generator rebuild" df
@@ -2228,7 +2246,7 @@ testImageStoreLayout = do
         "system layers"
         ["/var/lib/containerd"]
         (islLayerPaths layout)
-      assertEq "system cache" ["/var/lib/docker"] (islCachePaths layout)
+      assertEq "system cache" ["/var/lib/containerd"] (islCachePaths layout)
 
 testRoleBounds :: IO ()
 testRoleBounds = do
@@ -2296,8 +2314,8 @@ assertNoBuild builds = do
   calls <- readIORef builds
   assertEq "no docker build" [] calls
 
-testSplitCacheShort :: IO ()
-testSplitCacheShort =
+testSystemDataRootTight :: IO ()
+testSystemDataRootTight =
   withSystemTempDirectory "om-ensure-split-cache" $ \tmp -> do
     let overlay = tmp </> "ov"
         sidecar = tmp </> "side"
@@ -2309,22 +2327,15 @@ testSplitCacheShort =
     seedGoAmd64 (tmp </> "gentoo")
     builds <- mkLogRef
     fake <- systemSnapshotterFake dockerRoot (Just layerRoot) builds
+    -- BuildKit cache lives in the system containerd, so a tight Docker
+    -- data-root does not block the build.
     let probe = splitProbe dockerRoot layerRoot giB (50 * giB)
     cfg <- mkCfg overlay sidecar fake probe Nothing
     got <- ensureImage cfg neededGo
-    case got of
-      Left msg -> do
-        assertTrue "names cache path" (T.pack dockerRoot `T.isInfixOf` msg)
-        assertTrue "names layer path" (T.pack layerRoot `T.isInfixOf` msg)
-        assertTrue "names cache role" ("build cache" `T.isInfixOf` msg)
-        assertTrue "names layer role" ("image layers" `T.isInfixOf` msg)
-        assertTrue "mentions free" ("free:" `T.isInfixOf` msg)
-        assertTrue "mentions need" ("need:" `T.isInfixOf` msg)
-      Right o -> assertFailure ("expected cache-short fail, got " <> show o)
-    assertNoBuild builds
+    assertEq "built despite tight data-root" (Right EnsureBuilt) got
 
-testSplitLayersShort :: IO ()
-testSplitLayersShort =
+testSystemContainerdShort :: IO ()
+testSystemContainerdShort =
   withSystemTempDirectory "om-ensure-split-layers" $ \tmp -> do
     let overlay = tmp </> "ov"
         sidecar = tmp </> "side"
@@ -2341,11 +2352,11 @@ testSplitLayersShort =
     got <- ensureImage cfg neededGo
     case got of
       Left msg -> do
-        assertTrue "names cache path" (T.pack dockerRoot `T.isInfixOf` msg)
-        assertTrue "names layer path" (T.pack layerRoot `T.isInfixOf` msg)
-        assertTrue "names cache role" ("build cache" `T.isInfixOf` msg)
-        assertTrue "names layer role" ("image layers" `T.isInfixOf` msg)
-      Right o -> assertFailure ("expected layers-short fail, got " <> show o)
+        assertTrue "names containerd root" (T.pack layerRoot `T.isInfixOf` msg)
+        assertTrue "omits data-root" (not (T.pack dockerRoot `T.isInfixOf` msg))
+        assertTrue "mentions free" ("free:" `T.isInfixOf` msg)
+        assertTrue "mentions need" ("need:" `T.isInfixOf` msg)
+      Right o -> assertFailure ("expected containerd-short fail, got " <> show o)
     assertNoBuild builds
 
 testSplitAmpleOverlayTiny :: IO ()

@@ -185,7 +185,9 @@ containerdDumpNeeded facts =
     && not (maybe False isBundledContainerdAddress (difContainerdAddress facts))
 
 -- | Classic / bundled → layers and cache under Docker data-root.
--- System snapshotter → layers at containerd root, cache at Docker data-root.
+-- System snapshotter → layers and cache at containerd root: BuildKit keeps
+-- its cache as snapshots in the same store, and the Docker data-root holds
+-- only its metadata.
 imageStoreLayout ::
   DockerInfoFacts ->
   Maybe FilePath ->
@@ -207,7 +209,7 @@ imageStoreLayout facts mContainerdRoot
               Right
                 ImageStoreLayout
                   { islLayerPaths = [cr],
-                    islCachePaths = [root]
+                    islCachePaths = [cr]
                   }
         _ -> Left containerdRootUnresolvedMessage
   where

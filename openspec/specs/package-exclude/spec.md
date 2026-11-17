@@ -8,7 +8,7 @@ Define the shared `--exclude` flag that removes packages from the `outdated`, `u
 
 ### Requirement: Exclude flag is subcommand-local
 
-`outdated`, `update`, and `gencache` SHALL each accept a repeatable long option `--exclude`. `list`, `eclean`, and `github-token` SHALL reject `--exclude`. The program SHALL NOT read exclusions from its configuration file, and SHALL NOT accept a short form of this option.
+`outdated`, `update`, `gencache`, and `smoke` SHALL each accept a repeatable long option `--exclude`. `list`, `eclean`, and `github-token` SHALL reject `--exclude`. The program SHALL NOT read exclusions from its configuration file, and SHALL NOT accept a short form of this option.
 
 #### Scenario: Outdated accepts the long option
 
@@ -19,6 +19,12 @@ Define the shared `--exclude` flag that removes packages from the `outdated`, `u
 
 - **WHEN** the user runs `update --exclude dev-util/codex --exclude dev-util/crush`
 - **THEN** the program accepts both `--exclude` options on `update`
+
+#### Scenario: Smoke accepts the long option
+
+- **WHEN** the user runs `smoke --exclude dev-util/codex`
+- **THEN** the program accepts `--exclude` as a subcommand option of `smoke`
+- **AND** `dev-util/codex` is not tested
 
 #### Scenario: List rejects the option
 

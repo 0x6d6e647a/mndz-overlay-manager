@@ -309,6 +309,7 @@ tests =
       testCase "Parser Residual Edges" testParserResidualEdges,
       testCase "ExcludeParser" testExcludeParser,
       testCase "ExcludeHelp" testExcludeHelp,
+      testCase "Parser smoke" testParserSmoke,
       testCase "Help Catalogs Eclean And Distfiles" testHelpCatalogDistfiles,
       testCase "Show Top Level Help Exit 1" testShowTopLevelHelpExit1,
       testCase "Logger Hold And Filter" testLoggerHoldAndFilter
@@ -480,6 +481,7 @@ testCommandTreeSync = do
   assertEq "update --refresh" (Just (Just True)) (sync ["update", "--refresh"])
   assertEq "update" (Just (Just False)) (sync ["update"])
   assertEq "gencache" (Just (Just False)) (sync ["gencache"])
+  assertEq "smoke syncs only when due" (Just (Just False)) (sync ["smoke"])
 
 testParserPureCommands :: IO ()
 testParserPureCommands = do
@@ -800,6 +802,33 @@ testExcludeHelp = do
   (listMsg, listCode) <- helpOf "list" ["list", "--help"]
   assertEq "list help exits 0 without config" ExitSuccess listCode
   assertTrue "list help does not document --exclude" (not ("--exclude" `isInfixOf` listMsg))
+
+testParserSmoke :: IO ()
+testParserSmoke = do
+  let parse = execParserPure defaultPrefs parserInfo
+      cmdOf args = optCommand =<< getParseResult (parse args)
+      helpOf args = case parse args of
+        Failure failure -> pure (renderFailure failure "mndz-overlay-manager")
+        _ -> do
+          hPutStrLn stderr ("expected help for " <> unwords args)
+          exitFailure
+  assertEq "no targets" (Just (CLI.Smoke [] [])) (cmdOf ["smoke"])
+  assertEq
+    "targets and exclude"
+    (Just (CLI.Smoke ["crush", "deno-bin"] ["dev-util/codex", "dev-util/hk"]))
+    (cmdOf ["smoke", "crush", "deno-bin", "--exclude", "dev-util/codex,dev-util/hk"])
+  assertEq "refresh rejected" Nothing (cmdOf ["smoke", "--refresh"])
+  assertEq "jobs is global" (Just (Just 8)) (optJobs <$> getParseResult (parse ["--jobs", "8", "smoke", "crush"]))
+  (msg, code) <- helpOf ["smoke", "--help"]
+  assertEq "smoke help exits 0 without config" ExitSuccess code
+  mapM_
+    (\needle -> assertTrue ("smoke help mentions " <> needle) (needle `isInfixOf` unwords (words msg)))
+    ["PACKAGE...", "test all discovered packages", "--exclude", "comma-separated", "--jobs", "build", "one at a time", "fresh", "containerd image store", "accepted before the subcommand"]
+  assertTrue "smoke help has no --refresh" (not ("--refresh" `isInfixOf` msg))
+  (topMsg, topCode) <- helpOf ["--help"]
+  assertEq "top help exits 0" ExitSuccess topCode
+  assertTrue "top help lists smoke" ("smoke" `isInfixOf` topMsg)
+  assertTrue "top help describes smoke" ("in a clean container" `isInfixOf` unwords (words topMsg))
 
 -- | Top-level and @eclean --help@ catalog manager distfiles surfaces.
 testHelpCatalogDistfiles :: IO ()

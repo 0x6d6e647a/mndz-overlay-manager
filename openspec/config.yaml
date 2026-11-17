@@ -7,7 +7,7 @@ context: |
   commits, regenerate Portage md5-cache).
 
   Domain vocabulary:
-  - Work commands: list, outdated, update, gencache.
+  - Work commands: list, outdated, update, gencache, smoke.
   - Package targets: zero or more PACKAGE tokens as category/package or unambiguous
     bare package name; empty means all inventory keys (outdated/gencache) or all that
     need work (update). Shared resolution via Update.Targets.resolveTargets; unknown

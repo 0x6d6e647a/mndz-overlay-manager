@@ -42,16 +42,12 @@ import Control.Applicative ((<|>))
 import Control.Concurrent.MVar (MVar, modifyMVar, withMVar)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
-import Data.Containers.ListUtils (nubOrd)
-import Data.List (sortOn)
-import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
+import Data.Time (NominalDiffTime, UTCTime, getCurrentTime)
 import System.Directory
   ( createDirectoryIfMissing,
-    doesDirectoryExist,
     doesFileExist,
     getHomeDirectory,
   )
@@ -59,10 +55,7 @@ import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.Posix.Unistd (SystemID (..), getSystemID)
-import Update.DiskSpace
-  ( DiskSpaceProbe (..),
-    formatBytesHuman,
-  )
+import Update.DiskSpace (DiskSpaceProbe)
 import Update.Materialize.Floors
   ( NeededFloors,
     emptyFloors,
@@ -88,6 +81,18 @@ import Update.Materialize.ImageLayout
     parseContainerdDump,
     parseDockerInfoJson,
   )
+import Update.Materialize.ImageOps
+  ( BaseCheck (..),
+    BaseCheckEnv (..),
+    DiskBounds (..),
+    baseMoved,
+    buildBase,
+    checkBaseFreshness,
+    docker,
+    dockerIgnore,
+    inspectImageId,
+  )
+import Update.Materialize.ImageOps qualified as Ops
 import Update.Materialize.Recipe
   ( RecipeArch (..),
     lookupRecipeArch,
@@ -111,9 +116,6 @@ import Update.Materialize.Sidecar
 import Update.OverlayTree (InTree, TreeLock, withOverlayTreeChecked)
 import Update.Process
   ( CommandRunner,
-    Measure (..),
-    ProcessMode (..),
-    ProcessRequest (..),
     ProcessResult (..),
   )
 import Update.Process.Docker
@@ -200,36 +202,7 @@ unmappedArchMessage uname =
     <> T.pack uname
 
 imageDiskInsufficientMessage :: FilePath -> Integer -> Integer -> Text
-imageDiskInsufficientMessage path free need =
-  "insufficient free space to docker build the materialize image:\n  "
-    <> T.pack path
-    <> "  free: "
-    <> formatBytesHuman free
-    <> "  need: "
-    <> formatBytesHuman need
-
-imageDiskInsufficientSplitMessage :: [VolumeNeed] -> Text
-imageDiskInsufficientSplitMessage vols =
-  "insufficient free space to docker build the materialize image:\n"
-    <> T.intercalate "\n" (map splitVolumeLine vols)
-
-splitVolumeLine :: VolumeNeed -> Text
-splitVolumeLine v =
-  "  "
-    <> volumeRoleLabel (vnRoles v)
-    <> "  "
-    <> T.pack (vnPath v)
-    <> "  free: "
-    <> formatBytesHuman (vnFree v)
-    <> "  need: "
-    <> formatBytesHuman (vnNeed v)
-
-volumeRoleLabel :: [ImageDiskRole] -> Text
-volumeRoleLabel roles
-  | ImageRoleLayers `elem` roles && ImageRoleCache `elem` roles =
-      "image layers + build cache"
-  | ImageRoleLayers `elem` roles = "image layers"
-  | otherwise = "build cache"
+imageDiskInsufficientMessage = Ops.imageDiskInsufficientMessage "materialize"
 
 productionEnsureNow :: IO UTCTime
 productionEnsureNow = getCurrentTime
@@ -347,7 +320,7 @@ ensureDefault lock cfg needed = withMVar (ecBuildLock cfg) $ \() -> do
       sidecarDir = ecSidecarDir cfg
   eId <- inspectImageId (ecRun cfg) tag
   mSide <- readSidecar sidecarDir
-  base <- checkBaseFreshness cfg mSide
+  base <- materializeBaseCheck cfg mSide
   case (eId, mSide) of
     (Right iid, Just side)
       | T.unpack (isId side) == iid,
@@ -381,7 +354,7 @@ ensureDefault lock cfg needed = withMVar (ecBuildLock cfg) $ \() -> do
                     pure (Left (ensureFailedMessage err))
                   Right installs -> do
                     eDisk <- imageDiskGate cfg (isFirstImage mSide eId)
-                    case (eDisk, buildBase base mSide) of
+                    case (eDisk, buildBase base (mSide >>= isStage3Digest) (mSide >>= isLastBaseCheck)) of
                       (Left err, _) -> pure (Left (ensureFailedMessage err))
                       (Right (), Nothing) ->
                         pure (Left (ensureFailedMessage "no gentoo/stage3 digest is recorded and the registry check failed"))
@@ -420,51 +393,20 @@ ensureToolsImage lock cfg =
           present <- inspectImageId (ecRun cfg) iid
           pure (either (const Nothing) (const (Just iid)) present)
 
--- | Outcome of the stage3 base freshness check.
-data BaseCheck
-  = -- | Interval not elapsed (or no mapped arch to check).
-    BaseNotDue
-  | -- | Registry digest equals the recorded one.
-    BaseSame Text UTCTime
-  | -- | Registry digest differs from the recorded one (or none recorded).
-    BaseMoved Text UTCTime
-  | -- | Registry request failed; warned, the check stays due.
-    BaseCheckFailed
-
-baseMoved :: BaseCheck -> Bool
-baseMoved = \case
-  BaseMoved {} -> True
-  _ -> False
-
--- | Due when no digest or check time is recorded, or the interval passed.
-checkBaseFreshness :: EnsureConfig -> Maybe ImageSidecar -> IO BaseCheck
-checkBaseFreshness cfg mSide =
-  case lookupRecipeArch (ecUname cfg) of
-    Nothing -> pure BaseNotDue
-    Just arch -> do
-      now <- ecNow cfg
-      let recorded = mSide >>= isStage3Digest
-          due = case (recorded, mSide >>= isLastBaseCheck) of
-            (Just _, Just at) -> diffUTCTime now at >= ecBaseCheckInterval cfg
-            _ -> True
-      if not due
-        then pure BaseNotDue
-        else do
-          eDigest <- ecStage3Digest cfg (raHubTag arch)
-          case eDigest of
-            Left err -> do
-              ecWarn cfg ("gentoo/stage3 base check failed (" <> err <> "); keeping the current materialize image")
-              pure BaseCheckFailed
-            Right digest
-              | Just digest == recorded -> pure (BaseSame digest now)
-              | otherwise -> pure (BaseMoved digest now)
-
--- | Digest and base check time a build pins and records.
-buildBase :: BaseCheck -> Maybe ImageSidecar -> Maybe (Text, Maybe UTCTime)
-buildBase base mSide = case base of
-  BaseSame d at -> Just (d, Just at)
-  BaseMoved d at -> Just (d, Just at)
-  _ -> (,mSide >>= isLastBaseCheck) <$> (mSide >>= isStage3Digest)
+-- | Base freshness check of the materialize sidecar's stage3 pin.
+materializeBaseCheck :: EnsureConfig -> Maybe ImageSidecar -> IO BaseCheck
+materializeBaseCheck cfg mSide =
+  checkBaseFreshness
+    BaseCheckEnv
+      { bceUname = ecUname cfg,
+        bceNow = ecNow cfg,
+        bceInterval = ecBaseCheckInterval cfg,
+        bceStage3Digest = ecStage3Digest cfg,
+        bceWarn = ecWarn cfg,
+        bceImageLabel = "materialize"
+      }
+    (mSide >>= isStage3Digest)
+    (mSide >>= isLastBaseCheck)
 
 -- | A same-digest check without a build resets the interval.
 recordBaseCheck :: FilePath -> ImageSidecar -> BaseCheck -> IO ()
@@ -563,188 +505,14 @@ prunePreviousMaterializeImage cfg =
               dockerIgnore (ecRun cfg) ["rmi", oldId]
               dockerIgnore (ecRun cfg) ["image", "prune", "-f"]
 
-data ImageDiskRole
-  = ImageRoleLayers
-  | ImageRoleCache
-  deriving (Eq, Ord, Show)
-
-data VolumeNeed = VolumeNeed
-  { vnPath :: FilePath,
-    vnRoles :: [ImageDiskRole],
-    vnFree :: Integer,
-    vnNeed :: Integer
-  }
-  deriving (Eq, Show)
-
+-- | Materialize image bounds: a first image, or one that adds toolchains.
 imageDiskGate :: EnsureConfig -> Bool -> IO (Either Text ())
-imageDiskGate cfg firstImage = do
-  eLayout <- discoverImageStoreLayout (ecRun cfg)
-  case eLayout of
-    Left err -> pure (Left err)
-    Right layout -> do
-      layout' <- addBuildkitIfPresent layout
-      evalImageDisk (ecProbe cfg) firstImage layout'
-
--- | @docker info --format '{{json .}}'@, then @containerd config dump@ when
--- layers live on a system snapshotter (never the containerd gRPC socket).
-discoverImageStoreLayout :: CommandRunner -> IO (Either Text ImageStoreLayout)
-discoverImageStoreLayout run = do
-  res <- docker run ["info", "--format", "{{json .}}"]
-  let out = T.strip (T.pack (prStdout res))
-  if prExitCode res /= ExitSuccess || T.null out
-    then pure (Left (imageStoreUnresolvedMessage "docker info failed"))
-    else case parseDockerInfoJson out of
-      Left err -> pure (Left err)
-      Right facts
-        | containerdDumpNeeded facts -> discoverSystemSnapshotter run facts
-        | otherwise -> pure (imageStoreLayout facts Nothing)
-
-discoverSystemSnapshotter ::
-  CommandRunner ->
-  DockerInfoFacts ->
-  IO (Either Text ImageStoreLayout)
-discoverSystemSnapshotter run facts = do
-  res <-
-    run
-      ProcessRequest
-        { prMode = ExecCmd "containerd" ["config", "dump"],
-          prCwd = Nothing,
-          prEnv = Nothing,
-          prStdin = "",
-          prMeasure = Timed
-        }
-  let out = T.strip (T.pack (prStdout res))
-  if prExitCode res /= ExitSuccess || T.null out
-    then pure (Left containerdRootUnresolvedMessage)
-    else case parseContainerdDump out of
-      Left _ -> pure (Left containerdRootUnresolvedMessage)
-      Right root -> do
-        exists <- doesDirectoryExist root
-        if not exists
-          then pure (Left containerdRootUnresolvedMessage)
-          else pure (imageStoreLayout facts (Just root))
-
-addBuildkitIfPresent :: ImageStoreLayout -> IO ImageStoreLayout
-addBuildkitIfPresent layout =
-  case islCachePaths layout of
-    [] -> pure layout
-    (root : _) -> do
-      let bk = root </> "buildkit"
-      exists <- doesDirectoryExist bk
-      pure $
-        if exists && bk `notElem` islCachePaths layout
-          then layout {islCachePaths = islCachePaths layout ++ [bk]}
-          else layout
-
-evalImageDisk ::
-  DiskSpaceProbe ->
-  Bool ->
-  ImageStoreLayout ->
-  IO (Either Text ())
-evalImageDisk probe firstImage layout = do
-  let paths = nubOrd (islLayerPaths layout ++ islCachePaths layout)
-  eMeasured <- probePaths probe paths
-  pure $ do
-    measured <- eMeasured
-    let measuredMap = Map.fromList [(p, (f, d)) | (p, f, d) <- measured]
-        entries =
-          expand ImageRoleLayers (islLayerPaths layout) measuredMap
-            ++ expand ImageRoleCache (islCachePaths layout) measuredMap
-        grouped =
-          Map.fromListWith
-            (++)
-            [(d, [(p, r, f)]) | (p, r, f, d) <- entries]
-        vols =
-          sortOn
-            volumeSortKey
-            (map reduceDevice (Map.elems grouped))
-    checkVolumes firstImage vols
-
-probePaths ::
-  DiskSpaceProbe ->
-  [FilePath] ->
-  IO (Either Text [(FilePath, Integer, Integer)])
-probePaths probe = go []
+imageDiskGate cfg firstImage =
+  Ops.imageDiskGate (ecRun cfg) (ecProbe cfg) "materialize" bounds
   where
-    go acc [] = pure (Right (reverse acc))
-    go acc (p : ps) = do
-      eFree <- dspFreeBytes probe p
-      eDev <- dspDeviceId probe p
-      case (,) <$> eFree <*> eDev of
-        Left err -> pure (Left err)
-        Right (free, dev) -> go ((p, free, dev) : acc) ps
-
-expand ::
-  ImageDiskRole ->
-  [FilePath] ->
-  Map.Map FilePath (Integer, Integer) ->
-  [(FilePath, ImageDiskRole, Integer, Integer)]
-expand role paths measured =
-  [ (p, role, free, dev)
-  | p <- paths,
-    Just (free, dev) <- [Map.lookup p measured]
-  ]
-
-reduceDevice :: [(FilePath, ImageDiskRole, Integer)] -> VolumeNeed
-reduceDevice xs =
-  let roles = nubOrd [r | (_, r, _) <- xs]
-      free = minimum [f | (_, _, f) <- xs]
-      path = case [p | (p, ImageRoleCache, _) <- xs] of
-        (p : _) -> p
-        [] -> case [p | (p, ImageRoleLayers, _) <- xs] of
-          (p : _) -> p
-          [] -> case xs of
-            ((p, _, _) : _) -> p
-            [] -> ""
-   in VolumeNeed
-        { vnPath = path,
-          vnRoles = roles,
-          vnFree = free,
-          vnNeed = 0
-        }
-
-volumeNeed :: Bool -> [ImageDiskRole] -> Integer
-volumeNeed firstImage roles
-  | ImageRoleLayers `elem` roles && ImageRoleCache `elem` roles =
-      if firstImage then firstImageNeedBytes else addToolchainNeedBytes
-  | ImageRoleLayers `elem` roles =
-      if firstImage then firstImageLayerNeedBytes else addToolchainLayerNeedBytes
-  | otherwise =
-      if firstImage then firstImageCacheNeedBytes else addToolchainCacheNeedBytes
-
-volumeSortKey :: VolumeNeed -> Int
-volumeSortKey v
-  | ImageRoleLayers `elem` vnRoles v = 0
-  | otherwise = 1
-
-checkVolumes :: Bool -> [VolumeNeed] -> Either Text ()
-checkVolumes firstImage vols =
-  let withNeed =
-        [ v {vnNeed = volumeNeed firstImage (vnRoles v)}
-        | v <- vols
-        ]
-      short = any (\v -> vnFree v < vnNeed v) withNeed
-   in if not short
-        then Right ()
-        else case withNeed of
-          [v] ->
-            Left (imageDiskInsufficientMessage (vnPath v) (vnFree v) (vnNeed v))
-          vs -> Left (imageDiskInsufficientSplitMessage vs)
-
-inspectImageId :: CommandRunner -> String -> IO (Either Text String)
-inspectImageId run image = do
-  res <-
-    docker run ["image", "inspect", "--format", "{{.Id}}", image]
-  let out = T.unpack (T.strip (T.pack (prStdout res)))
-  if prExitCode res == ExitSuccess && not (null out)
-    then pure (Right out)
-    else
-      pure $
-        Left $
-          "docker image inspect failed for "
-            <> T.pack image
-            <> ": "
-            <> T.pack (prStderr res)
+    bounds
+      | firstImage = DiskBounds firstImageNeedBytes firstImageLayerNeedBytes firstImageCacheNeedBytes
+      | otherwise = DiskBounds addToolchainNeedBytes addToolchainLayerNeedBytes addToolchainCacheNeedBytes
 
 readSidecar :: FilePath -> IO (Maybe ImageSidecar)
 readSidecar dir = do
@@ -757,19 +525,3 @@ readSidecar dir = do
       pure $ case decodeImageSidecar bs of
         Right s -> Just s
         Left _ -> Nothing
-
-docker :: CommandRunner -> [String] -> IO ProcessResult
-docker run args =
-  run
-    ProcessRequest
-      { prMode = ExecCmd "docker" args,
-        prCwd = Nothing,
-        prEnv = Nothing,
-        prStdin = "",
-        prMeasure = Timed
-      }
-
-dockerIgnore :: CommandRunner -> [String] -> IO ()
-dockerIgnore run args = do
-  _ <- docker run args
-  pure ()

@@ -31,16 +31,21 @@ import Config.Loader
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
-import Control.Monad (unless, when)
+import Control.Monad (forM, unless, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.Aeson ((.=))
 import Data.Bifunctor (first)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
 import Data.IORef (newIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
+import Data.Text.IO qualified as TIO
+import Data.Time (getCurrentTime)
 import Logging.Bootstrap (LogHold, mkLogHold, mkLogger)
-import Metrics.Core (Metrics (..), setCount)
+import Metrics.Container (productionCgroupRoots)
+import Metrics.Core (Metrics (..), setCount, withSpan)
 import Metrics.Process (timedRunner)
 import Metrics.Run (RunSetup (..), invocationFor, withRunMetrics)
 import Metrics.Sampler (productionSamplerConfig, startSampler)
@@ -52,11 +57,45 @@ import Metrics.Startup
   )
 import Options.Applicative (execParser)
 import Overlay.Discovery (collectEbuilds, discoveryErrorMessage)
-import Overlay.Types (Ebuild, ebuildAtom, ebuildCategory, ebuildPackage)
+import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (EbuildVersion (..), prettyVersion)
+import Smoke.Ceilings (loadHostCeilings)
+import Smoke.Container
+  ( FailStage (..),
+    RunResult (..),
+    SmokeContainerCfg (..),
+    performRun,
+    runSandboxProbe,
+    withSmokeContainer,
+  )
+import Smoke.Definitions (lookupSmokeDef)
+import Smoke.Image
+  ( SmokeImageConfig (..),
+    defaultSmokeCacheDir,
+    ensureSmokeImage,
+    smokeImageTag,
+  )
+import Smoke.Plan (PackageInput (..), SmokeRun (..), laneRuntimeFor, planSmokeRuns, runAtom)
+import Smoke.Preflight (smokePreflight)
+import Smoke.Run
+  ( SmokeOps (..),
+    SmokeSummary (..),
+    missingDefinitions,
+    pruneRunLogs,
+    runSmoke,
+    smokeLogsRoot,
+    summaryLines,
+    uncommittedPackages,
+  )
+import Smoke.Tree (SnapshotCfg (..), dockerSafe, snapshotTag, sweepStaleSnapshots, withSnapshot)
+import System.Directory (createDirectoryIfMissing, findExecutable, makeAbsolute)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
+import System.FilePath ((</>))
+import System.IO (hFlush, stdout)
+import System.Posix.Process (getProcessID)
+import System.Posix.User (getRealUserID)
 import Update.Apply (foldExitHardFail, productionEbuildRunner)
 import Update.Assets.Release (ReleaseOps (..), productionReleaseOpsWithLatch)
 import Update.Auth
@@ -88,7 +127,7 @@ import Update.Distfiles
     probeDistfilesDir,
     resolveDistfilesPath,
   )
-import Update.GentooTree (GentooTree, gentooTreeCommit, gentooTreePath, productionTreeEnv, resolveGentooTree)
+import Update.GentooTree (GentooTree, gentooTreeCommit, gentooTreePath, productionTreeEnv, releaseGentooTree, resolveGentooTree)
 import Update.Git (isGitWorkTree, productionGitOps)
 import Update.GitHub
   ( GitHubLatch,
@@ -114,24 +153,16 @@ import Update.GpgAgent
     takeGpgSessionSupervisor,
     teardownGpgHandle,
   )
+import Update.Hardcoded (lookupPolicy)
 import Update.Http (httpLbsEither, newMetricsManager)
-import Update.Materialize
-  ( EnsureConfig (..),
-    defaultMaterializeSidecarDir,
-    ensureMaterializeImage,
-    ensureToolsImage,
-    hostMachineArch,
-    productionEnsureNow,
-    prunePreviousMaterializeImage,
-    stage3DigestWith,
-  )
+import Update.Materialize (EnsureConfig (..), RecipeArch (..), defaultMaterializeSidecarDir, ensureMaterializeImage, ensureToolsImage, hostMachineArch, lookupRecipeArch, productionEnsureNow, prunePreviousMaterializeImage, stage3DigestWith)
 import Update.Md5Cache
   ( checkLayoutCacheFormats,
     gencachePackages,
     preflightGencache,
     productionEgencacheRunner,
   )
-import Update.OverlayTree (newTreeLock)
+import Update.OverlayTree (newTreeLock, readEbuildEither, withNewTreeLock)
 import Update.Preflight
   ( AssetsPreflight (..),
     preflightUpdateTools,
@@ -160,15 +191,7 @@ import Update.Targets
     targetErrorMessage,
   )
 import Update.TempWorkspace (newRunId, openRunRootWith, rrPath)
-import Update.Types
-  ( ApplyOutcome (..),
-    PackageKey (..),
-    SuccessLine (..),
-    UpdateReport (..),
-    formatOutdatedLine,
-    mkPackageKey,
-    packageKeyText,
-  )
+import Update.Types (ApplyOutcome (..), PackageKey (..), PackagePolicy (..), SuccessLine (..), UpdateReport (..), formatOutdatedLine, mkPackageKey, packageKeyText)
 import Update.Types qualified as U
 
 data Runtime = Runtime
@@ -255,6 +278,7 @@ runCommand rt cmd =
       runUpdate rt refresh pkgs excludeArgs
     Cmd.Gencache targets force excludeArgs ->
       runGencache rt targets force excludeArgs
+    Cmd.Smoke pkgs excludeArgs -> runSmokeCommand rt pkgs excludeArgs
     Cmd.Eclean -> runEclean rt
     Cmd.GitHubToken force -> runGitHubToken rt force
 
@@ -697,6 +721,141 @@ emitOutcome = \case
       logWarning $
         packageKeyText key
           <> ": assets release may already be published but the overlay update did not complete"
+
+-- | @smoke@: spine, preflight, selection, tree, plan, then 'runSmoke'.
+runSmokeCommand ::
+  (WithLog env Message m, MonadIO m) =>
+  Runtime ->
+  [String] ->
+  [String] ->
+  m ()
+runSmokeCommand rt pkgArgs excludeArgs = do
+  enterPhase rt "config"
+  (cfg, overlayPath', ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
+  let m = rtMetrics rt
+      run = timedRunner m productionCommandRunner
+  overlay <- liftIO (makeAbsolute overlayPath')
+  enterPhase rt "preflight"
+  preflight <- liftIO (smokePreflight findExecutable run overlay)
+  either (dieError . T.unpack) pure preflight
+  enterPhase rt "select"
+  keys <- resolveCommandSelection (groupNewest ebuilds) (map T.pack pkgArgs) (map T.pack excludeArgs)
+  case missingDefinitions lookupSmokeDef keys of
+    [] -> pure ()
+    missing ->
+      dieError . T.unpack $
+        "no smoke definition for: "
+          <> T.intercalate ", " (map packageKeyText missing)
+          <> " (exclude them with --exclude to test the rest)"
+  dirty <- liftIO (uncommittedPackages run overlay keys)
+  tree <- resolveTreeOrDie rt cfg
+  enterPhase rt "plan"
+  uname <- liftIO hostMachineArch
+  arch <- case lookupRecipeArch uname of
+    Just a -> pure (raKeywords a)
+    Nothing -> dieError ("no official gentoo/stage3 OpenRC flavor for host architecture " <> uname)
+  inputs <- fmap concat . forM keys $ \key -> do
+    let pkgEbuilds = [e | e <- ebuilds, mkPackageKey (ebuildCategory e) (ebuildPackage e) == key]
+    texts <- liftIO (withNewTreeLock (\inTree -> traverse (readEbuildEither inTree . ebuildPath) pkgEbuilds))
+    case (sequence texts, lookupPolicy key) of
+      (Left err, _) -> dieError ("could not read the ebuilds of " <> T.unpack (packageKeyText key) <> ": " <> T.unpack err)
+      (_, Nothing) -> dieError ("no update policy for " <> T.unpack (packageKeyText key))
+      (Right bodies, Just policy) ->
+        pure [PackageInput {piKey = key, piTechnique = policyTechnique policy, piEbuilds = zip pkgEbuilds bodies}]
+  let runtimes = nubOrd [r | i <- inputs, Just r <- [laneRuntimeFor (piTechnique i)]]
+  eCeilings <- liftIO (loadHostCeilings arch (gentooTreePath tree) overlay runtimes)
+  ceilings <- either (dieError . T.unpack) pure eCeilings
+  let items = planSmokeRuns arch ceilings inputs
+  liftIO (setCount m "packages.selected" (length keys))
+  enterPhase rt "smoke"
+  cacheDir <- liftIO defaultSmokeCacheDir
+  let logsRoot = smokeLogsRoot cacheDir
+      logsDir = logsRoot </> dockerSafe (rtRunId rt)
+  liftIO (pruneRunLogs logsRoot)
+  mgr <- liftIO (newMetricsManager m)
+  uid <- liftIO getRealUserID
+  pid <- liftIO getProcessID
+  let say f = usingLoggerT (rtLogger rt) . f
+      ccfg =
+        SmokeContainerCfg
+          { sccRunId = rtRunId rt,
+            sccCliPid = show pid,
+            sccImage = smokeImageTag,
+            sccSnapshot = snapshotTag (rtRunId rt),
+            sccOverlay = overlay,
+            sccTimeDir = if mEnabled m then mTimeDir m else Nothing,
+            sccOperatorUid = fromIntegral uid,
+            sccJobs = rtJobs rt,
+            sccOverlayNames = nubOrd [ebuildCategory e <> "/" <> ebuildPackage e | e <- ebuilds]
+          }
+      imageCfg =
+        SmokeImageConfig
+          { sicRun = run,
+            sicProbe = productionDiskSpaceProbe,
+            sicCacheDir = cacheDir,
+            sicUname = uname,
+            sicGentooTree = gentooTreePath tree,
+            sicGentooCommit = gentooTreeCommit tree,
+            sicNow = getCurrentTime,
+            sicStage3Digest = stage3DigestWith (httpLbsEither mgr),
+            sicBaseCheckInterval = materializeBaseCheckInterval cfg,
+            sicWarn = say logWarning
+          }
+      snapCfg =
+        SnapshotCfg
+          { scRunId = rtRunId rt,
+            scCliPid = show pid,
+            scImage = smokeImageTag,
+            scTree = gentooTreePath tree
+          }
+      defFor key = case lookupSmokeDef key of
+        Just d -> d
+        Nothing -> error "selected key without a definition"
+  result <-
+    liftIO $
+      withStepProgress (rtProgress rt) (length items) $ \step ->
+        runSmoke
+          SmokeOps
+            { soSweep = do
+                sweepStaleMaterializeSessions run isLiveOverlayManagerPid
+                sweepStaleSnapshots run isLiveOverlayManagerPid,
+              soEnsureImage =
+                withSpan m "smoke.image" [] (void <$> ensureSmokeImage imageCfg),
+              soWithSnapshot = withSpan m "smoke.snapshot" [] . withSnapshot run snapCfg . const,
+              soReleaseTree = releaseGentooTree tree,
+              soProbe = withSpan m "smoke.probe" [] (runSandboxProbe run ccfg),
+              soRun = \smokeRun def dir ->
+                withSpan m "smoke.run" ["atom" .= runAtom smokeRun] $ do
+                  r <-
+                    withSmokeContainer m productionCgroupRoots run ccfg smokeRun $ \session ->
+                      performRun session ccfg (srKey smokeRun) def smokeRun dir $ \stage ->
+                        shStep step (runAtom smokeRun <> ": " <> stage)
+                  case r of
+                    Right res -> pure res
+                    Left err -> do
+                      createDirectoryIfMissing True dir
+                      let file = dir </> "container.log"
+                      TIO.writeFile file err
+                      pure (RunFail FailDependencies err file),
+              soEmit = \line -> T.putStrLn line >> hFlush stdout,
+              soLogFailure = say logError,
+              soProgress = \i total atom ->
+                shStep step ("[" <> T.pack (show i) <> "/" <> T.pack (show total) <> "] " <> atom)
+            }
+          defFor
+          logsDir
+          items
+  case result of
+    Left err -> dieError (T.unpack err)
+    Right summary -> do
+      liftIO $ do
+        setCount m "runs.passed" (ssPassed summary)
+        setCount m "runs.failed" (ssFailed summary)
+        setCount m "runs.skipped" (ssSkipped summary)
+      let lines_ = summaryLines summary logsDir dirty
+          report = if ssFailed summary > 0 || not (null dirty) then logWarning else logInfo
+      mapM_ report lines_
+      when (ssFailed summary > 0) $ liftIO (exitWith (ExitFailure 1))
 
 -- | Clean the manager private distfiles cache (never system Portage DISTDIR).
 runGitHubToken :: (WithLog env Message m, MonadIO m) => Runtime -> Bool -> m ()

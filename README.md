@@ -19,7 +19,8 @@ The documented build and run commands use [just](https://just.systems/) **1.55 o
 | `gencache` | `git`, `gpg`, `docker` (`egencache` runs in the Portage tools container); no host `egencache` |
 | `update` of packages that **need work** and use **full-path** DepsAndAssets materialize (new vendor/deps/crates tarballs) | a usable product Gentoo materialize image with the needed toolchains (host CPU architecture). The image provides `go`, `node`/`npm`, overlay `node-gyp` (`dev-build/node-gyp::mndz`), `bun`, `sbcl`, overlay `qlot` (`dev-lisp/qlot::mndz`), `cargo`, `pycargoebuild`, Python, uv, pdm, and Rust, plus `tar`, `xz`, `git`, and fetchers. Full-path Pdm packing runs in that image, which provides Python and pdm. Host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` / `xz` are **not** required for that path. |
 | `update` that only **reuses** existing GitHub release assets | no toolchains in the image and no host language toolchains (download + verify stay on the host) |
-| `outdated`, `update`, `gencache`, `eclean` (unless `--no-metrics`) | GNU time at `/usr/bin/time` (`sys-process/time`) for [run metrics](#run-metrics) |
+| `smoke` | `git`, `gpg`, `docker`; **Docker Engine 28.0 or newer with the containerd image store** (image mounts need both). The first `smoke` builds its own [smoke image](#smoke) (minutes). No host Portage. |
+| `outdated`, `update`, `gencache`, `smoke`, `eclean` (unless `--no-metrics`) | GNU time at `/usr/bin/time` (`sys-process/time`) for [run metrics](#run-metrics) |
 
 `list` only needs a readable overlay and a valid config; it does not require Portage, GPG, or Docker. `outdated` also needs `git` and `gpg` for the managed Gentoo tree (plus GNU `/usr/bin/time` unless `--no-metrics`), and does not require Portage or Docker. No command runs `portageq` or reads the host's Gentoo tree or `repos.conf`. Help (`--help`) does not load configuration and needs no overlay.
 
@@ -48,7 +49,7 @@ Image Portage DISTDIR (`/var/cache/distfiles`), PKGDIR (`/var/cache/binpkgs`), a
 
 Override with `MNDZ_MATERIALIZE_IMAGE` to an **existing** tag: the CLI inspects/satisfies that tag only and does not `docker build` or `docker rmi` it. The image must match the **host CPU architecture** (no qemu/foreign-arch materialize). While run metrics record, the image must also provide GNU time at `/usr/bin/time`; a full-path unit whose image lacks it hard-fails with an error naming the image and `--no-metrics`.
 
-The generated image installs `sys-process/time` so run metrics can measure commands inside the container. Images from an older recipe generator are rebuilt once on the next ensure.
+The generated image installs `sys-process/time` so run metrics can measure commands inside the container. The recipe leaves Portage's `sandbox`, `usersandbox`, `userpriv`, `network-sandbox`, `ipc-sandbox`, and `pid-sandbox` features on; inside `docker build` Portage logs that it is unable to unshare the namespaces and continues. Images from an older recipe generator are rebuilt once on the next ensure.
 
 Full-path materialize sessions also bind the managed tree read-only at `/var/db/repos/gentoo` (for example, `pycargoebuild` reads `metadata/license-mapping.conf` from it). While a **full-path** unit is running, `update` keeps one named Docker container for that unit (`mndz-mat-<run-id>-<category>-<package>-<pv>`, slashes replaced so the name is Docker-legal). `docker ps`, `docker stats`, and `docker exec` can target it **while the unit runs**. The container is removed when that unit ends (`--rm` / `docker rm`). Do not drop `--rm` or keep failed containers for debugging; a hard-fail retains the host unit `work/` directory (see temp workspace below) as the investigation artifact.
 
@@ -143,7 +144,7 @@ It is a shallow clone of the `stable` branch of the Gentoo git mirror (`https://
 
 A sync does not move to the mirror tip. It reads the `TIMESTAMP` of the host-architecture Gentoo binhost index and checks out the newest mirror metadata commit at least one hour older than that, so image builds resolve versions the binhost already carries. The tree therefore lags the tip by up to about a day.
 
-`outdated`, `update`, and `gencache` sync when the tree is missing, when the last successful sync check is older than `gentoo-tree-max-age` (default 6h), or on `--refresh`. A check that finds no newer commit still counts as a successful check. `list`, `eclean`, and help never touch the tree. A run that reads the tree holds it until it exits; a sync waits for those runs (and logs that it is waiting), and other runs wait for a sync to finish. The tree identity is its commit id.
+`outdated`, `update`, `gencache`, and `smoke` sync when the tree is missing, when the last successful sync check is older than `gentoo-tree-max-age` (default 6h), or on `--refresh` (`smoke` has no `--refresh`). A check that finds no newer commit still counts as a successful check. `list`, `eclean`, and help never touch the tree. A run that reads the tree holds it until it exits, except `smoke`, which releases it as soon as its tree snapshot exists; a sync waits for those runs (and logs that it is waiting), and other runs wait for a sync to finish. The tree identity is its commit id.
 
 When the binhost index or the mirror cannot be reached, or the binhost index appears stalled (no eligible commit within seven days), the command keeps the existing tree and logs a warning. On a host with no tree yet, a clone failure exits `1`; when only the binhost index is unavailable, the first clone uses the verified mirror tip and warns that image builds may compile from source. `eclean` does not delete the tree.
 
@@ -264,7 +265,7 @@ After planning which packages **need work**, and after classifying each heavy un
 
 If free space is insufficient for the planned needs-work units, `update` **hard-fails early** with the path, free vs need, and remediation hints (free space, set `TMPDIR` to roomier disk storage such as `$HOME/local/tmp`, or lower `--jobs`). That is intended to prevent mid-materialize `no space left on device` when the planned concurrent work already cannot fit.
 
-When `update` will `docker build` the materialize image, it also checks free space on the **Docker data-root** (BuildKit cache) and, when Docker stores image layers in **containerd** on a distinct filesystem, that containerd data-root. Those directories are discovered from live Docker/containerd configuration rather than a hardcoded `/var/lib/docker`. Insufficient space names the probed path(s), the role (**image layers** versus **build cache**), and free versus need. The overlay tree bind-mounted into the build is not part of that image-storage check.
+When `update` will `docker build` the materialize image, it also checks free space where Docker keeps image layers and the BuildKit cache: the **Docker data-root**, or, when Docker uses a system **containerd** (not the engine-bundled one), containerd's data root, which then holds both. Those directories are discovered from live Docker/containerd configuration rather than a hardcoded `/var/lib/docker`. Insufficient space names the probed path(s), the role (**image layers** versus **build cache**), and free versus need. The overlay tree bind-mounted into the build is not part of that image-storage check.
 
 ```bash
 # Prefer a disk-backed temp root when /tmp is a small tmpfs
@@ -298,6 +299,37 @@ just run gencache --force crush
 # Skip one package
 just run gencache --exclude dev-util/crush
 ```
+
+### `smoke`
+
+Install every on-disk (non-live) version of each selected package in a fresh Docker container, with Portage's sandboxes on, and run the package's checks. The worktree is tested as it is, including uncommitted changes; nothing in the overlay is written and nothing is committed or published. No GitHub token, GPG key, or SSH agent is needed.
+
+**Targets:** zero or more package arguments as `category/package` or an unambiguous package name; with none, every discovered package. `--exclude PACKAGE,...` works as for `outdated`. Every selected package must have a smoke definition in the program (all packages with an update policy do); a package without one hard-fails the command before any Docker work, naming it, and `--exclude` skips it.
+
+```bash
+# Every package
+just run smoke
+
+# One or more packages
+just run smoke crush deno-bin craft-fonts
+
+# Skip one package
+just run smoke --exclude dev-util/codex
+```
+
+**Runs.** Packages outside runtime lanes (GitMv, Unsupported, Uv, Pdm) get one run per ebuild. A lane-gated DepsAndAssets ebuild (Go, Npm, Bun, Cargo, SBCL) is installed with its runtime (for example `dev-lang/go`) capped at each lane ceiling it serves on the host architecture, read from the managed tree (or the overlay, for Bun) and the ebuild's own runtime floor; equal plain and tilde ceilings collapse to one run. An ebuild not keyworded for the host is skipped. Runs happen one at a time in package, version, and lane order; `--jobs N` sets `MAKEOPTS="-jN -l(N+1)"` inside the container (one emerge job), not the number of runs.
+
+**Output.** Each run prints one line to stdout, for example `dev-util/beads-1.3.4 (dev-lang/go ~amd64): pass`, `…: skip: <reason>`, or `…: fail: <stage>`, where the stage is `plan`, `dependencies`, `build`, or `check` followed by the failed check names. A failed run does not stop the command. The summary logs the counts, the log directory, and every package tested with uncommitted changes. The exit status is `1` when any run failed and `0` otherwise (skips do not fail).
+
+**Environment.** Each run uses a new container (`mndz-smoke-<run-id>-…`) from the **smoke image** `mndz-overlay-manager/smoke:local`, which is separate from the materialize image and holds only a stage3, an updated `@world`, and GNU time. `MNDZ_MATERIALIZE_IMAGE` does not affect it. Its sidecar and last recipe live in `…/overlay-manager/smoke/` under the XDG cache. It is rebuilt when the recipe generator changes, the image is gone, or the stage3 digest moved; the base check uses the same `materialize-base-check-interval` as the materialize image. A rebuild is gated on Docker storage free space and removes the previous smoke image.
+
+- Containers get `--cap-add SYS_ADMIN` and nothing more (not privileged, default seccomp), so Portage's network, IPC, and PID sandboxes stay on. Before the first run, a probe container checks that those namespaces can be created; when they cannot (for example under an AppArmor profile that denies them), `smoke` exits `1`.
+- At start, the managed tree is copied (without `.git`) into a per-command image `mndz-overlay-manager/smoke-tree:<run-id>` (about 670 MB of Docker storage), mounted read-only at `/var/db/repos/gentoo` in every container, and deleted when the command ends. Snapshots left by a killed command are deleted by the next `smoke`.
+- The overlay is bound read-only at `/var/db/repos/mndz`. Every `::mndz` package is accepted as `~arch`; other Gentoo packages stay on the stable keyword except the runtime cap, the Python slot of a Uv or Pdm ebuild, and atoms a definition names. USE flags follow the profile, plus any `package.use` lines a definition names (for example `x11-libs/libxkbcommon X` for the craft apps). All licenses are accepted.
+- Dependencies install first, from the Gentoo binhost or the Docker volume `mndz-smoke-binpkgs`, with their distfiles in the volume `mndz-smoke-distfiles`. Overlay packages are always built from source and never stored as binary packages. The package under test is then built from source with an empty container-local `DISTDIR`, so a dead download URL fails the run. The manager never prunes the two volumes; remove them by hand (`docker volume rm mndz-smoke-binpkgs mndz-smoke-distfiles`) to reclaim space.
+- The container is detached from the network after the installs. Checks run as an unprivileged `smoke` user (your uid) with the environment from `/etc/profile`. A definition may add that user to a package's group for its own runs (`witen-warden-bin` joins `witen-warden` to read its configuration). Each command has a 60-second limit unless the check sets another; a check that needs the network is attached for that check only.
+
+**Logs.** Each emerge step and each check writes its full output under `…/overlay-manager/smoke/logs/<run-id>/<category>-<package>-<pvr>[-plain|-tilde]/`, for passing runs too; a failed run's error names its log file. Each `smoke` keeps the log directories of the ten most recent earlier commands and deletes older ones. `eclean` does not touch them.
 
 ### md5-cache bootstrap and recovery
 
@@ -336,7 +368,7 @@ just run --distfiles-path /path/to/private-distfiles eclean
 
 ## Run metrics
 
-`outdated`, `update`, `gencache`, and `eclean` record each run by default, so you can see where a run spent its time and compare runs across builds. `list` and `github-token` never record.
+`outdated`, `update`, `gencache`, `smoke`, and `eclean` record each run by default, so you can see where a run spent its time and compare runs across builds. `list` and `github-token` never record.
 
 Each run writes one directory:
 
@@ -344,6 +376,8 @@ Each run writes one directory:
 - otherwise `~/.local/state/mndz/overlay-manager/metrics/<run-id>-<command>/`
 
 The run id is the same one used for the temp workspace run root and the materialize container names. The directory holds `run.jsonl`: one JSON object per line, starting with a `run_start` header (build identity, host, invocation) and ending with a `run_end` footer (outcome, resource use, counters such as check-cache hits). Between them are timed spans for phases, package steps, subprocesses, HTTP requests, and slot waits, plus machine `sample` lines every 5 seconds. Subprocesses are measured with GNU time. Command arguments are recorded with the GitHub token and other known secrets replaced by `<redacted>`; environment variables are never recorded. A `time/` subdirectory holds per-process GNU time files only while they are being read (a file that cannot be parsed is kept there).
+
+`smoke` measures each emerge step and check command in its containers like a materialize container command (an `.outer` result for the host `docker exec` and an `.inner` result for the command, under one span per container), records one span per run named by its atom and lane, and writes a `container` resource event before each container is removed.
 
 Runs are kept; the manager never prunes the metrics directory. Delete old run directories by hand when you no longer need them.
 
