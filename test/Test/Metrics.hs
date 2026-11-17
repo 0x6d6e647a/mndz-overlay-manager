@@ -114,10 +114,28 @@ import Network.HTTP.Client
 import Network.HTTP.Client.Internal (makeConnection)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (parseEbuildVersion)
+import Smoke.Check (argv, check, exitsWith, smokeDef, step)
+import Smoke.CompileCache
+  ( Apply (..),
+    CacheReport (..),
+    CacheUse (..),
+    CleanupPlan (..),
+    HelperCfg (..),
+    PrepareCfg (..),
+    PrepareResult (..),
+    RemovalReason (..),
+    TrimCheck (..),
+    newGoChecks,
+    prepareCompileCache,
+    recordCacheReport,
+    recordCleanup,
+  )
 import Smoke.Container
   ( ExecUser (..),
+    RunOutcome (..),
     SmokeContainerCfg (..),
     SmokeSession (..),
+    performRun,
     withSmokeContainer,
   )
 import Smoke.Plan (SmokeRun (..))
@@ -240,6 +258,10 @@ unitTests =
           testCase "--no-metrics skips the in-container time check" testSessionNoMetricsSkipsCheck,
           testCase "smoke container: inner/outer pair and container event" testSmokeSessionRecorded,
           testCase "smoke container: --no-metrics wraps nothing" testSmokeSessionNoMetrics,
+          testCase "smoke compile cache: run statistics" testCompileCacheRunStats,
+          testCase "smoke compile cache: failed trim check is recorded" testCompileCacheTrimFail,
+          testCase "smoke compile cache: cleanup sizes and removals" testCompileCacheCleanup,
+          testCase "smoke compile cache: opt-out records nothing" testCompileCacheOptOut,
           testCase "cgroup snapshot from fixture proc and sysfs" testCgroupSnapshot,
           testCase "cgroup snapshot records the reason when a file is missing" testCgroupMissing
         ],
@@ -1402,7 +1424,8 @@ smokeCfg timeDir =
       sccTimeDir = timeDir,
       sccOperatorUid = 1000,
       sccJobs = 4,
-      sccOverlayNames = ["dev-util/crush"]
+      sccOverlayNames = ["dev-util/crush"],
+      sccCache = CacheOff
     }
 
 smokeRun :: SmokeRun
@@ -1783,3 +1806,86 @@ testLifecycleDetached = do
   assertEq "lifecycle under command" [Just cmdId] [p | (_, p, "lifecycle", _) <- spanStarts evs]
   assertEq "work not under lifecycle" [Just cmdId] [p | (_, p, "work", _) <- spanStarts evs]
   assertEq "closed" (Just "ok") (spanEndOutcome evs life)
+
+------------------------------------------------------------------------
+-- Smoke compile cache
+
+compileCacheEvents :: [Event] -> [Event]
+compileCacheEvents = filter (("compile-cache" `T.isPrefixOf`) . evKind)
+
+testCompileCacheRunStats :: IO ()
+testCompileCacheRunStats = do
+  ((), evs) <- withRecorded $ \m ->
+    withSpan m "smoke.run" [] $
+      recordCacheReport m "dev-util/crush-0.101.0" (CacheReport 33 73 12 Nothing)
+  runSpan <- firstId "smoke.run" evs
+  case compileCacheEvents evs of
+    [e] -> do
+      assertEq "kind" "compile-cache" (evKind e)
+      assertEq "under the run span" (Just (Number (fromIntegral runSpan))) (field "span" e)
+      assertEq "atom" (Just (String "dev-util/crush-0.101.0")) (field "atom" e)
+      assertEq "hits" (Just (Number 33)) (field "ccache_hits" e)
+      assertEq "misses" (Just (Number 73)) (field "ccache_misses" e)
+      assertEq "go entries" (Just (Number 12)) (field "go_entries_added" e)
+      assertEq "no trim check" Nothing (field "go_trim_check" e)
+    other -> assertFailure ("expected one compile-cache event, got " <> show (length other))
+
+testCompileCacheTrimFail :: IO ()
+testCompileCacheTrimFail = do
+  ((), evs) <- withRecorded $ \m ->
+    recordCacheReport m "dev-util/crush-0.101.0" (CacheReport 0 0 0 (Just ("go1.28.0", TrimFail)))
+  case compileCacheEvents evs of
+    [e] -> do
+      assertEq "result" (Just (String "fail")) (field "go_trim_check" e)
+      assertEq "go version" (Just (String "go1.28.0")) (field "go_version" e)
+    other -> assertFailure ("expected one compile-cache event, got " <> show (length other))
+
+testCompileCacheCleanup :: IO ()
+testCompileCacheCleanup = do
+  let plan =
+        CleanupPlan
+          { cpRemoved = [("dev-util/old", RemovedNotInInventory), ("dev-util/beads", RemovedOverBudget)],
+            cpApply = Apply ["dev-util/old", "dev-util/beads"] [] [] True,
+            cpBudget = 300,
+            cpSizeBefore = 400,
+            cpSizeAfter = 250,
+            cpWarning = Nothing
+          }
+  ((), evs) <- withRecorded (`recordCleanup` plan)
+  case compileCacheEvents evs of
+    [e] -> do
+      assertEq "kind" "compile-cache.cleanup" (evKind e)
+      assertEq "before" (Just (Number 400)) (field "size_before" e)
+      assertEq "after" (Just (Number 250)) (field "size_after" e)
+      assertEq "removed count" (Just (Number 2)) (field "packages_removed" e)
+    other -> assertFailure ("expected one cleanup event, got " <> show (length other))
+
+-- | With @--no-compile-cache@ the preparation has no plan and runs return
+-- no report, so the command records no compile cache event.
+testCompileCacheOptOut :: IO ()
+testCompileCacheOptOut =
+  withSystemTempDirectory "mndz-cc-optout-" $ \tmp -> do
+    (run, _) <- fakeDocker "time (GNU Time) 1.9\n"
+    ((), evs) <- withRecorded $ \m -> do
+      prepared <-
+        prepareCompileCache
+          PrepareCfg
+            { pcRun = run,
+              pcHelper = HelperCfg "mndz-overlay-manager/smoke:local" "r1" "4242",
+              pcLockPath = tmp </> "compile-cache.lock",
+              pcNow = pure 0,
+              pcMaxSize = 1,
+              pcInventory = ["dev-util/crush"],
+              pcSelected = ["dev-util/crush"],
+              pcReset = [],
+              pcEnabled = False
+            }
+      mapM_ (recordCleanup m) (prPlan prepared)
+      checks <- newGoChecks
+      r <-
+        withSmokeContainer m (CgroupRoots "/nonexistent" "/nonexistent") run (smokeCfg Nothing) smokeRun $ \session ->
+          performRun session (smokeCfg Nothing) checks (srKey smokeRun) (smokeDef (check "v" (step (const (argv ["true"])) (exitsWith 0)) []) []) smokeRun (tmp </> "logs") (\_ -> pure ())
+      case r of
+        Right o -> mapM_ (recordCacheReport m "dev-util/crush-0.101.0") (roCache o)
+        Left err -> assertFailure (T.unpack err)
+    assertEq "no compile cache events" 0 (length (compileCacheEvents evs))

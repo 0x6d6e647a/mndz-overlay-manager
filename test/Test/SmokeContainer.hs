@@ -26,9 +26,20 @@ import Smoke.Check
     smokeDef,
     step,
   )
+import Smoke.CompileCache
+  ( CacheReport (..),
+    CacheUse (..),
+    TrimCheck (..),
+    configureCacheNote,
+    goTrimCheckScript,
+    newGoChecks,
+    portageBashrc,
+    reportScript,
+  )
 import Smoke.Container
   ( ExecUser (..),
     FailStage (..),
+    RunOutcome (..),
     RunResult (..),
     SmokeContainerCfg (..),
     SmokeSession (..),
@@ -60,7 +71,7 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Process (ProcessMode (..), ProcessRequest (..), ProcessResult (..))
 import Update.Runtime.Ceilings (KeywordTier (..))
-import Update.Types (mkPackageKey)
+import Update.Types (PackageKey, mkPackageKey)
 
 tests :: TestTree
 tests =
@@ -95,6 +106,18 @@ tests =
           testCase "check user, timeout wrapper, failed check named" testCheckExec,
           testCase "check groups joined after the installs, before checks" testCheckGroups,
           testCase "check group failure runs no check" testCheckGroupsFail
+        ],
+      testGroup
+        "compile cache"
+        [ testCase "create argv: cache on and off" testCreateArgsCache,
+          testCase "setup: plain-lane Go run" testCacheSetupPlain,
+          testCase "setup: tilde-lane and unlabeled runs" testCacheSetupLanes,
+          testCase "setup: cache off" testCacheSetupOff,
+          testCase "trim check once per Go version" testTrimCheckOnce,
+          testCase "failed trim check leaves the result unchanged" testTrimCheckFail,
+          testCase "no Go, no trim check" testTrimCheckNoGo,
+          testCase "configure failure names the configure cache" testConfigureNote,
+          testCase "report collected with the cache on, not off" testReportCollected
         ]
     ]
 
@@ -227,7 +250,8 @@ cfg =
       sccTimeDir = Nothing,
       sccOperatorUid = 1000,
       sccJobs = 8,
-      sccOverlayNames = ["dev-util/crush", "dev-lang/bun-bin"]
+      sccOverlayNames = ["dev-util/crush", "dev-lang/bun-bin"],
+      sccCache = CacheOff
     }
 
 mkRun :: Text -> Text -> Text -> Maybe RuntimeCap -> Maybe Text -> SmokeRun
@@ -371,11 +395,11 @@ testConfigUse = do
     (lookup path (portageConfigFiles run [] ["x11-libs/libxkbcommon X", "media-libs/libpulse X"]))
   assertTrue
     "setup writes it"
-    ("/etc/portage/package.use/smoke" `T.isInfixOf` setupScript 1000 8 run [] ["x11-libs/libxkbcommon X"])
+    ("/etc/portage/package.use/smoke" `T.isInfixOf` setupScript 1000 8 CacheOff run [] ["x11-libs/libxkbcommon X"])
 
 testSetupScript :: IO ()
 testSetupScript = do
-  let script = setupScript 1000 8 crushTilde [] []
+  let script = setupScript 1000 8 CacheOff crushTilde [] []
   assertTrue "MAKEOPTS" ("'MAKEOPTS=\"-j8 -l9\"'" `T.isInfixOf` script)
   assertTrue "FEATURES" ("'FEATURES=\"getbinpkg buildpkg\"'" `T.isInfixOf` script)
   assertTrue "license" ("'ACCEPT_LICENSE=\"*\"'" `T.isInfixOf` script)
@@ -410,12 +434,18 @@ testEmergeArgv = do
   assertTrue "from source" ("--usepkg=n" `elem` pkg && "--buildpkg=n" `elem` pkg)
   withSystemTempDirectory "om-smoke-run" $ \tmp -> do
     (session, seen) <- scriptedSession (const (Just okOutcome))
-    r <- performRun session cfg (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
+    r <- runPlain session cfg (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
     assertEq "pass" RunPass r
     reqs <- seen
     case [req | (AsRoot, req@ProcessRequest {prMode = ExecCmd "emerge" as}) <- reqs, "--usepkg=n" `elem` as] of
       [req] -> assertEq "empty DISTDIR" (Just [("DISTDIR", smokeDistDir)]) (prEnv req)
       other -> assertFailure ("expected one package step, got " <> show other)
+
+-- | 'performRun' with a fresh trim-check state, result only.
+runPlain :: SmokeSession -> SmokeContainerCfg -> PackageKey -> SmokeDef -> SmokeRun -> FilePath -> (Text -> IO ()) -> IO RunResult
+runPlain session c key def run dir progress = do
+  checks <- newGoChecks
+  roResult <$> performRun session c checks key def run dir progress
 
 okOutcome :: ProcessResult
 okOutcome = ok "ok 0.101.0\n"
@@ -451,7 +481,7 @@ testDepsFailure =
     (session, seen) <- scriptedSession $ \(_, req) -> case prMode req of
       ExecCmd "emerge" as | "--onlydeps" `elem` as -> Just (ProcessResult (ExitFailure 1) "emerge: there are no ebuilds to satisfy foo\n" "")
       _ -> Nothing
-    r <- performRun session cfg (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
+    r <- runPlain session cfg (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
     case r of
       RunFail FailDependencies _ file -> do
         assertEq "log file" (tmp </> "dependencies.log") file
@@ -468,7 +498,7 @@ testBuildFailure =
     (session, seen) <- scriptedSession $ \(_, req) -> case prMode req of
       ExecCmd "emerge" as | "--usepkg=n" `elem` as -> Just (ProcessResult (ExitFailure 1) "" "!!! Fetch failed for crush-0.101.0.tar.gz\n")
       _ -> Nothing
-    r <- performRun session cfg (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
+    r <- runPlain session cfg (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
     case r of
       RunFail FailBuild why file -> do
         assertEq "log" (tmp </> "build.log") file
@@ -490,7 +520,7 @@ testErrorNote =
                   " \ESC[31;01m*\ESC[0m ERROR: media-fonts/craft-fonts-0.0.1::mndz failed (compile phase):\n \ESC[31;01m*\ESC[0m   intentional smoke failure\n *\n * noise after\n"
               )
       _ -> Nothing
-    r <- performRun session cfg (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
+    r <- runPlain session cfg (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
     case r of
       RunFail FailBuild why _ ->
         assertEq
@@ -509,7 +539,7 @@ testNetworkOrder =
             [networked (check "online" (step (const (argv ["tool", "fetch"])) (exitsWith 0)) [])]
     r <-
       withSmokeContainer noopMetrics noRoots (runFake fake) cfg crushTilde $ \session ->
-        performRun session cfg (srKey crushTilde) def crushTilde tmp (\_ -> pure ())
+        runPlain session cfg (srKey crushTilde) def crushTilde tmp (\_ -> pure ())
     assertEq "pass" (Right RunPass) r
     calls <- dockerCalls fake
     let name = smokeContainerName cfg crushTilde
@@ -545,7 +575,7 @@ testCheckExec =
           smokeDef
             (check "version" (step (const (argv ["crush", "--version"])) (exitsWith 0)) [])
             [check "help" (step (const (argv ["crush", "help"])) (exitsWith 0)) []]
-    r <- performRun session cfg (srKey crushTilde) def crushTilde tmp (\_ -> pure ())
+    r <- runPlain session cfg (srKey crushTilde) def crushTilde tmp (\_ -> pure ())
     case r of
       RunFail (FailCheck names) _ file -> do
         assertEq "only help failed" ["help"] names
@@ -564,7 +594,7 @@ testCheckGroups :: IO ()
 testCheckGroups =
   withSystemTempDirectory "om-smoke-run" $ \tmp -> do
     (session, seen) <- scriptedSession (const Nothing)
-    r <- performRun session cfg (srKey crushTilde) groupsDef crushTilde tmp (\_ -> pure ())
+    r <- runPlain session cfg (srKey crushTilde) groupsDef crushTilde tmp (\_ -> pure ())
     assertEq "pass" RunPass r
     reqs <- seen
     let order =
@@ -585,7 +615,7 @@ testCheckGroupsFail =
     (session, seen) <- scriptedSession $ \(_, req) -> case prMode req of
       ExecCmd "usermod" _ -> Just (ProcessResult (ExitFailure 6) "" "usermod: group 'witen-warden' does not exist\n")
       _ -> Nothing
-    r <- performRun session cfg (srKey crushTilde) groupsDef crushTilde tmp (\_ -> pure ())
+    r <- runPlain session cfg (srKey crushTilde) groupsDef crushTilde tmp (\_ -> pure ())
     case r of
       RunFail (FailCheck ["groups"]) why file -> do
         assertEq "log" (tmp </> "groups.log") file
@@ -593,3 +623,181 @@ testCheckGroupsFail =
       other -> assertFailure ("expected groups failure, got " <> show other)
     reqs <- seen
     assertTrue "no check command" (null [() | (AsCheckUser, _) <- reqs])
+
+------------------------------------------------------------------------
+-- Compile cache
+
+gib :: Integer
+gib = 1024 * 1024 * 1024
+
+cacheCfg :: SmokeContainerCfg
+cacheCfg = cfg {sccCache = CacheOn gib}
+
+testCreateArgsCache :: IO ()
+testCreateArgsCache = do
+  let on = smokeCreateArgs cacheCfg crushTilde
+      off = smokeCreateArgs cfg crushTilde
+  assertTrue
+    "package subpath mount"
+    (isSub ["--mount", "type=volume,src=mndz-smoke-compile-cache,dst=/var/cache/mndz-compile,volume-subpath=dev-util/crush"] on)
+  assertEq "one mount more" (length (filter (== "--mount") off) + 1) (length (filter (== "--mount") on))
+  assertTrue "off has no compile cache mount" (not (any ("mndz-smoke-compile-cache" `isInfixOf`) off))
+  assertEq "still one capability" 1 (length (filter (== "--cap-add") on))
+  assertTrue "still SYS_ADMIN" (isSub ["--cap-add", "SYS_ADMIN"] on)
+  assertTrue "still no seccomp option" (not (any ("seccomp" `isInfixOf`) on))
+  assertTrue "still no privileged" ("--privileged" `notElem` on)
+
+testCacheSetupPlain :: IO ()
+testCacheSetupPlain = do
+  let script = setupScript 1000 8 (CacheOn gib) crushPlain [] []
+  mapM_
+    (\needle -> assertTrue ("setup has " <> T.unpack needle) (needle `T.isInfixOf` script))
+    [ "'FEATURES=\"getbinpkg buildpkg ccache\"'",
+      "'CCACHE_DIR=\"/var/cache/mndz-compile/ccache\"'",
+      "'CCACHE_CONFIGPATH=\"/etc/mndz-ccache.conf\"'",
+      "'CCACHE_MAXSIZE=\"1048576Ki\"'",
+      "'CCACHE_STATSLOG=\"/var/tmp/mndz-ccache-stats.log\"'",
+      "'MNDZ_SMOKE_LANE=\"plain\"'",
+      "> '/etc/mndz-ccache.conf'",
+      "max_size = 1048576Ki",
+      "> '/etc/portage/bashrc'",
+      "date +%s > /var/cache/mndz-compile/.last-used",
+      "> /var/tmp/mndz-go-entries-before",
+      "install -m 0664 -o root -g portage /dev/null /var/tmp/mndz-ccache-stats.log",
+      "install -d -m 2775 -o root -g portage /var/tmp/mndz-confcache-used"
+    ]
+  assertTrue "no CCACHE_SIZE (Portage would rewrite the config)" (not ("CCACHE_SIZE" `T.isInfixOf` script))
+  mapM_
+    (\needle -> assertTrue ("bashrc has " <> T.unpack needle) (needle `T.isInfixOf` portageBashrc))
+    [ "pre_src_compile() { mndz_cache_hook; }",
+      "pre_src_test() { mndz_cache_hook; }",
+      "pre_src_install() { mndz_cache_hook; }",
+      "export GOCACHE=${root}/go",
+      "export GOFLAGS=\"${GOFLAGS} -trimpath\"",
+      "trim.txt",
+      "export ZIG_GLOBAL_CACHE_DIR=${root}/zig",
+      "--cache-file=${T}/mndz-confcache/\\${ABI:-default}",
+      "ac_cv_env_|ac_cv_lib_|ac_cv_path_install"
+    ]
+  assertTrue "no top-level conditionals: every if is inside a function" (not (any ("if " `T.isPrefixOf`) (T.lines portageBashrc)))
+
+testCacheSetupLanes :: IO ()
+testCacheSetupLanes = do
+  assertTrue "tilde" ("'MNDZ_SMOKE_LANE=\"tilde\"'" `T.isInfixOf` setupScript 1000 8 (CacheOn gib) crushTilde [] [])
+  let unlabeled = mkRun "dev-lang" "deno-bin" "2.9.8" Nothing Nothing
+  assertTrue "unlabeled" ("'MNDZ_SMOKE_LANE=\"none\"'" `T.isInfixOf` setupScript 1000 8 (CacheOn gib) unlabeled [] [])
+
+testCacheSetupOff :: IO ()
+testCacheSetupOff = do
+  let script = setupScript 1000 8 CacheOff crushPlain [] []
+  assertTrue "no ccache feature" ("'FEATURES=\"getbinpkg buildpkg\"'" `T.isInfixOf` script)
+  mapM_
+    (\needle -> assertTrue ("off has no " <> T.unpack needle) (not (needle `T.isInfixOf` script)))
+    ["ccache", "CCACHE", "bashrc", "mndz-compile", "MNDZ_SMOKE_LANE"]
+
+-- | A session whose container has @go1.27.3@ and whose trim check prints
+-- @verdict@; build steps succeed.
+goSession :: Text -> IO (SmokeSession, IO [(ExecUser, ProcessRequest)])
+goSession verdict = scriptedSession $ \(_, req) -> case prMode req of
+  ExecCmd "sh" ["-c", s] | "go env GOVERSION" `isInfixOf` s -> Just (ok "go1.27.3\n")
+  ExecCmd "sh" ["-s"] | prStdin req == T.unpack goTrimCheckScript -> Just (ok (T.unpack verdict <> "\n"))
+  _ -> Nothing
+
+trimChecks :: [(ExecUser, ProcessRequest)] -> Int
+trimChecks reqs = length [() | (AsRoot, req) <- reqs, prStdin req == T.unpack goTrimCheckScript]
+
+testTrimCheckOnce :: IO ()
+testTrimCheckOnce =
+  withSystemTempDirectory "om-smoke-trim" $ \tmp -> do
+    (session, seen) <- goSession "ok"
+    checks <- newGoChecks
+    o1 <- performRun session cacheCfg checks (srKey crushPlain) defOneCheck crushPlain (tmp </> "plain") (\_ -> pure ())
+    o2 <- performRun session cacheCfg checks (srKey crushTilde) defOneCheck crushTilde (tmp </> "tilde") (\_ -> pure ())
+    reqs <- seen
+    assertEq "one check for two runs with the same Go" 1 (trimChecks reqs)
+    assertEq "first run reports it" (Just (Just ("go1.27.3", TrimOk))) (crTrimCheck <$> roCache o1)
+    assertEq "second run does not" (Just Nothing) (crTrimCheck <$> roCache o2)
+    case [req | (AsRoot, req) <- reqs, prStdin req == T.unpack goTrimCheckScript] of
+      [req] -> assertEq "runs in /var/tmp" (Just [("TMPDIR", "/var/tmp")]) (prEnv req)
+      _ -> assertFailure "expected one trim check"
+    let order = [label | (_, req) <- reqs, Just label <- [describe req]]
+        describe :: ProcessRequest -> Maybe String
+        describe req = case prMode req of
+          ExecCmd "emerge" as | "--onlydeps" `elem` as -> Just "deps"
+          ExecCmd "emerge" as | "--usepkg=n" `elem` as -> Just "build"
+          ExecCmd "sh" ["-s"] | prStdin req == T.unpack goTrimCheckScript -> Just "trim"
+          _ -> Nothing
+    assertEq "after the dependencies step, before the package step" ["deps", "trim", "build", "deps", "build"] order
+
+testTrimCheckFail :: IO ()
+testTrimCheckFail =
+  withSystemTempDirectory "om-smoke-trim" $ \tmp -> do
+    (session, _) <- goSession "fail"
+    checks <- newGoChecks
+    o <- performRun session cacheCfg checks (srKey crushPlain) defOneCheck crushPlain tmp (\_ -> pure ())
+    assertEq "run still passes" RunPass (roResult o)
+    assertEq "failure reported" (Just (Just ("go1.27.3", TrimFail))) (crTrimCheck <$> roCache o)
+    body <- TIO.readFile (tmp </> "go-trim-check.log")
+    assertEq "check log" "fail\n" body
+
+testTrimCheckNoGo :: IO ()
+testTrimCheckNoGo =
+  withSystemTempDirectory "om-smoke-trim" $ \tmp -> do
+    (session, seen) <- scriptedSession (const Nothing)
+    checks <- newGoChecks
+    o <- performRun session cacheCfg checks (srKey crushPlain) defOneCheck crushPlain tmp (\_ -> pure ())
+    reqs <- seen
+    assertEq "no check" 0 (trimChecks reqs)
+    assertEq "nothing reported" (Just Nothing) (crTrimCheck <$> roCache o)
+
+configureFailure :: ProcessResult
+configureFailure =
+  ProcessResult
+    (ExitFailure 1)
+    ""
+    " * ERROR: dev-libs/foo-1.0::gentoo failed (configure phase):\n *   econf failed\n"
+
+testConfigureNote :: IO ()
+testConfigureNote =
+  withSystemTempDirectory "om-smoke-conf" $ \tmp -> do
+    let failingDeps markers = scriptedSession $ \(_, req) -> case prMode req of
+          ExecCmd "emerge" as | "--onlydeps" `elem` as -> Just configureFailure
+          ExecCmd "sh" ["-c", s] | "mndz-confcache-used" `isInfixOf` s -> Just (ok markers)
+          _ -> Nothing
+    (session, _) <- failingDeps "dev-libs_foo\n"
+    checks <- newGoChecks
+    o <- performRun session cacheCfg checks (srKey crushPlain) defOneCheck crushPlain (tmp </> "a") (\_ -> pure ())
+    case roResult o of
+      RunFail FailDependencies why _ -> do
+        assertTrue "names the configure cache" (configureCacheNote `T.isInfixOf` why)
+        assertTrue "names --no-compile-cache" ("--no-compile-cache" `T.isInfixOf` why)
+      other -> assertFailure ("expected a dependencies failure, got " <> show other)
+    (noMarker, _) <- failingDeps ""
+    o2 <- performRun noMarker cacheCfg checks (srKey crushPlain) defOneCheck crushPlain (tmp </> "b") (\_ -> pure ())
+    case roResult o2 of
+      RunFail FailDependencies why _ -> assertTrue "no note without a marker" (not (configureCacheNote `T.isInfixOf` why))
+      other -> assertFailure ("expected a dependencies failure, got " <> show other)
+    (off, _) <- failingDeps "dev-libs_foo\n"
+    o3 <- performRun off cfg checks (srKey crushPlain) defOneCheck crushPlain (tmp </> "c") (\_ -> pure ())
+    case roResult o3 of
+      RunFail FailDependencies why _ -> assertTrue "no note with the cache off" (not (configureCacheNote `T.isInfixOf` why))
+      other -> assertFailure ("expected a dependencies failure, got " <> show other)
+
+testReportCollected :: IO ()
+testReportCollected =
+  withSystemTempDirectory "om-smoke-report" $ \tmp -> do
+    let respond (_, req) = case prMode req of
+          ExecCmd "sh" ["-c", s]
+            | s == T.unpack reportScript ->
+                Just (ok "ccache direct_cache_hit\t5\nccache preprocessed_cache_hit\t1\nccache cache_miss\t2\ngo-before 10\ngo-after 14\n")
+          _ -> Nothing
+    (session, _) <- scriptedSession respond
+    checks <- newGoChecks
+    on <- performRun session cacheCfg checks (srKey crushPlain) defOneCheck crushPlain (tmp </> "on") (\_ -> pure ())
+    assertEq "report" (Just (CacheReport 6 2 4 Nothing)) (roCache on)
+    (offSession, offSeen) <- scriptedSession respond
+    off <- performRun offSession cfg checks (srKey crushPlain) defOneCheck crushPlain (tmp </> "off") (\_ -> pure ())
+    assertEq "no report with the cache off" Nothing (roCache off)
+    reqs <- offSeen
+    assertTrue "no statistics collected" (null [() | (_, ProcessRequest {prMode = ExecCmd "sh" ["-c", s]}) <- reqs, s == T.unpack reportScript])
+    assertTrue "no go version probe" (null [() | (_, ProcessRequest {prMode = ExecCmd "sh" ["-c", s]}) <- reqs, "GOVERSION" `isInfixOf` s])

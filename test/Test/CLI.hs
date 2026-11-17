@@ -812,10 +812,14 @@ testParserSmoke = do
         _ -> do
           hPutStrLn stderr ("expected help for " <> unwords args)
           exitFailure
-  assertEq "no targets" (Just (CLI.Smoke [] [])) (cmdOf ["smoke"])
+  assertEq "no targets" (Just (CLI.Smoke [] [] False False)) (cmdOf ["smoke"])
+  assertEq
+    "compile cache flags"
+    (Just (CLI.Smoke ["crush"] [] True True))
+    (cmdOf ["smoke", "--no-compile-cache", "--reset-compile-cache", "crush"])
   assertEq
     "targets and exclude"
-    (Just (CLI.Smoke ["crush", "deno-bin"] ["dev-util/codex", "dev-util/hk"]))
+    (Just (CLI.Smoke ["crush", "deno-bin"] ["dev-util/codex", "dev-util/hk"] False False))
     (cmdOf ["smoke", "crush", "deno-bin", "--exclude", "dev-util/codex,dev-util/hk"])
   assertEq "refresh rejected" Nothing (cmdOf ["smoke", "--refresh"])
   assertEq "jobs is global" (Just (Just 8)) (optJobs <$> getParseResult (parse ["--jobs", "8", "smoke", "crush"]))
@@ -823,7 +827,7 @@ testParserSmoke = do
   assertEq "smoke help exits 0 without config" ExitSuccess code
   mapM_
     (\needle -> assertTrue ("smoke help mentions " <> needle) (needle `isInfixOf` unwords (words msg)))
-    ["PACKAGE...", "test all discovered packages", "--exclude", "comma-separated", "--jobs", "build", "one at a time", "fresh", "containerd image store", "accepted before the subcommand"]
+    ["PACKAGE...", "test all discovered packages", "--exclude", "comma-separated", "--jobs", "build", "one at a time", "fresh", "containerd image store", "accepted before the subcommand", "--no-compile-cache", "--reset-compile-cache", "mndz-smoke-compile-cache"]
   assertTrue "smoke help has no --refresh" (not ("--refresh" `isInfixOf` msg))
   (topMsg, topCode) <- helpOf ["--help"]
   assertEq "top help exits 0" ExitSuccess topCode

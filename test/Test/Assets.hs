@@ -39,7 +39,7 @@ import Config.TokenEnvelope
     testEnvelopeParams,
     wrapTokenWith,
   )
-import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, defaultGentooTreeMaxAge, defaultMaterializeBaseCheckInterval)
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, defaultGentooTreeMaxAge, defaultMaterializeBaseCheckInterval, defaultSmokeCompileCacheMaxSize)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
@@ -415,7 +415,8 @@ testTokenResolverIO = do
             checkCacheTtl = defaultCheckCacheTtl,
             sshIdentity = Nothing,
             gentooTreeMaxAge = defaultGentooTreeMaxAge,
-            materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval
+            materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval,
+            smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "config envelope not decrypted" Nothing =<< resolveGitHubToken cfg
@@ -434,7 +435,8 @@ testTokenResolverIO = do
             checkCacheTtl = defaultCheckCacheTtl,
             sshIdentity = Nothing,
             gentooTreeMaxAge = defaultGentooTreeMaxAge,
-            materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval
+            materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval,
+            smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "none" Nothing =<< resolveGitHubToken cfgNoTok
@@ -1015,7 +1017,8 @@ testGitHubTokenExistingKey = do
             checkCacheTtl = defaultCheckCacheTtl,
             sshIdentity = Nothing,
             gentooTreeMaxAge = defaultGentooTreeMaxAge,
-            materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval
+            materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval,
+            smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize
           }
       boom = error "github-token should not prompt or probe without --force"
       ops =

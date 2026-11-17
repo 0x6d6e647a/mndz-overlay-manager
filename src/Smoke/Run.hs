@@ -2,8 +2,9 @@
 {-# LANGUAGE RankNTypes #-}
 
 -- | Orchestration of a @smoke@ command after planning: leftover sweep, smoke
--- image, tree snapshot (then the tree lock is released), sandbox probe, the
--- runs one at a time, result lines, and the summary. Every effect is a field
+-- image, tree snapshot (then the tree lock is released), sandbox probe,
+-- compile cache preparation, the runs one at a time, result lines, and the
+-- summary. Every effect is a field
 -- of 'SmokeOps', so the pipeline runs over fakes in tests.
 module Smoke.Run
   ( -- * Selection
@@ -33,7 +34,8 @@ import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Smoke.Check (SmokeDef)
-import Smoke.Container (RunResult (..), renderFailStage, runLogDir)
+import Smoke.CompileCache (CacheUse, reportLine, reportWarning)
+import Smoke.Container (RunOutcome (..), RunResult (..), renderFailStage, runLogDir)
 import Smoke.Plan (PlannedItem (..), SmokeRun (..), itemAtom)
 import System.Directory
   ( createDirectoryIfMissing,
@@ -66,12 +68,17 @@ data SmokeOps = SmokeOps
     -- | Release the shared tree lock (called once the snapshot exists).
     soReleaseTree :: IO (),
     soProbe :: IO (Either Text ()),
+    -- | Clean, reset, and prepare the compile cache; decides whether the
+    -- runs use it (never fails the command).
+    soPrepareCache :: IO CacheUse,
     -- | One run in a fresh container, logs under the given directory.
-    soRun :: SmokeRun -> SmokeDef -> FilePath -> IO RunResult,
+    soRun :: CacheUse -> SmokeRun -> SmokeDef -> FilePath -> IO RunOutcome,
     -- | Write one result line to stdout.
     soEmit :: Text -> IO (),
     -- | Report a failed run with its log path.
     soLogFailure :: Text -> IO (),
+    soLogWarning :: Text -> IO (),
+    soLogInfo :: Text -> IO (),
     -- | Progress: item index (1-based), total, and the item's atom.
     soProgress :: Int -> Int -> Text -> IO ()
   }
@@ -108,14 +115,18 @@ runSmoke ops defFor logsDir items = do
     total = length items
     runAll = do
       createDirectoryIfMissing True logsDir
+      cache <- soPrepareCache ops
       results <- forM (zip [1 ..] items) $ \(i, item) -> do
         soProgress ops i total (itemAtom item)
         outcome <- case item of
           PlannedSkip _ reason -> pure (Skipped reason)
           PlannedFail _ reason -> pure (Failed "plan" reason Nothing)
           PlannedRun run -> do
-            r <- soRun ops run (defFor (srKey run)) (runLogDir logsDir run)
-            pure $ case r of
+            r <- soRun ops cache run (defFor (srKey run)) (runLogDir logsDir run)
+            forM_ (roCache r) $ \report -> do
+              soLogInfo ops (itemAtom item <> ": " <> reportLine report)
+              forM_ (reportWarning report) (soLogWarning ops)
+            pure $ case roResult r of
               RunPass -> Passed
               RunFail stage why file -> Failed (renderFailStage stage) why (Just file)
         soEmit ops (resultLine item outcome)

@@ -5,6 +5,8 @@
 module Test.Distfiles (tests) where
 
 import Data.Bits ((.&.))
+import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.List (isInfixOf)
 import Data.Text qualified as T
 import Metrics.Core (noopMetrics)
 import System.Directory
@@ -12,6 +14,7 @@ import System.Directory
     doesDirectoryExist,
     listDirectory,
   )
+import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (fileMode, getFileStatus)
@@ -20,6 +23,7 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
 import Update.Distfiles
   ( cleanManagerDistfiles,
+    cleanManagerDistfilesWith,
     defaultDistfilesPathFromEnv,
     ebuildManifestEnv,
     enrichEbuildManifestError,
@@ -44,7 +48,8 @@ tests =
       testCase "Probe success and fail" testProbe,
       testCase "Ebuild env DISTDIR and empty GENTOO_MIRRORS" testEbuildEnv,
       testCase "Sticky error detection and guidance" testStickyMessages,
-      testCase "Eclean refuse system and clean manager" testEclean
+      testCase "Eclean refuse system and clean manager" testEclean,
+      testCase "Eclean runs no docker and keeps the compile cache volume" testEcleanNoDocker
     ]
 
 testDefaultPathXdg :: IO ()
@@ -161,3 +166,17 @@ testEclean =
     -- system path must not have been deleted by us (if it exists on host, still there)
     -- We only assert the refuse outcome.
     pure ()
+
+testEcleanNoDocker :: IO ()
+testEcleanNoDocker =
+  withSystemTempDirectory "om-dist-eclean-docker" $ \tmp -> do
+    calls <- newIORef []
+    let readProc cmd args _ = do
+          modifyIORef' calls (++ [cmd : args])
+          pure (ExitSuccess, "/var/cache/distfiles\n", "")
+        manager = tmp </> "cache"
+    createDirectoryIfMissing True manager
+    assertRight "clean" =<< cleanManagerDistfilesWith noopMetrics readProc manager
+    seen <- readIORef calls
+    assertEq "only portageq" [["portageq", "envvar", "DISTDIR"]] seen
+    assertTrue "never names the compile cache volume" (not (any (any ("mndz-smoke-compile-cache" `isInfixOf`)) seen))

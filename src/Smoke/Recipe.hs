@@ -1,8 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Pure Dockerfile render for the smoke image: stage3, Portage upgrade,
--- @\@world@ update, and GNU time. Nothing else is installed, and Portage's
--- sandbox features are left at their defaults.
+-- @\@world@ update, GNU time, and ccache. Nothing else is installed, and
+-- Portage's sandbox features are left at their defaults.
 module Smoke.Recipe
   ( smokeGeneratorId,
     renderSmokeDockerfile,
@@ -15,12 +15,13 @@ import Update.Materialize.Recipe (RecipeArch (..))
 
 -- | Identity of the smoke Dockerfile generator recorded in the sidecar.
 smokeGeneratorId :: Text
-smokeGeneratorId = "mndz-overlay-manager-smoke-1"
+smokeGeneratorId = "mndz-overlay-manager-smoke-2"
 
 -- | Render the smoke recipe. @digest@ pins the stage3 tag (@sha256:…@). The
 -- single Portage @RUN@ binds the build context named @gentoo@ (the managed
 -- tree, without @.git@) read-only; cache ids are distinct from the
--- materialize recipe's.
+-- materialize recipe's. Every package the binhost lacks is built into the
+-- smoke-only binary-package cache and installed from it on later builds.
 renderSmokeDockerfile :: RecipeArch -> Text -> Text
 renderSmokeDockerfile arch digest =
   T.unlines
@@ -29,15 +30,16 @@ renderSmokeDockerfile arch digest =
       "",
       "FROM gentoo/stage3:" <> raHubTag arch <> "@" <> digest,
       "",
-      "ENV FEATURES=\"getbinpkg\"",
+      "ENV FEATURES=\"getbinpkg buildpkg\"",
       "ENV EMERGE_DEFAULT_OPTS=\"--quiet-build=y --with-bdeps=n --usepkg\"",
       "",
       "RUN --mount=type=bind,from=gentoo,target=/var/db/repos/gentoo \\",
       "    --mount=type=cache,id=mndz-smoke-build-binhost,target=/var/cache/binhost \\",
       "    --mount=type=cache,id=mndz-smoke-build-distfiles,target=/var/cache/distfiles \\",
+      "    --mount=type=cache,id=mndz-smoke-build-binpkgs,target=/var/cache/binpkgs \\",
       "    (command -v getuto >/dev/null && getuto || true) \\",
       " && emerge --oneshot sys-apps/portage \\",
       " && emerge --update --deep --newuse @world \\",
-      " && emerge -n sys-process/time",
+      " && emerge -n sys-process/time dev-util/ccache",
       ""
     ]

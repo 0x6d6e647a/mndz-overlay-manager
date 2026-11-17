@@ -16,7 +16,8 @@ import Data.Time (addUTCTime, getCurrentTime)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (parseEbuildVersion)
 import Smoke.Check (SmokeDef)
-import Smoke.Container (FailStage (..), RunResult (..))
+import Smoke.CompileCache (CacheReport (..), CacheUse (..), TrimCheck (..))
+import Smoke.Container (FailStage (..), RunOutcome (..), RunResult (..))
 import Smoke.Definitions (lookupSmokeDef, smokeDefinitions)
 import Smoke.Plan (HostCeilings (..), LaneRuntime (..), PackageInput (..), PlannedItem (..), RuntimeCap (..), SmokeRun (..), planSmokeRuns)
 import Smoke.Run
@@ -48,6 +49,7 @@ tests =
     "SmokeRun"
     [ testCase "mixed results: lines, summary, failure exit, continuation" testMixed,
       testCase "tree lock is released before the first run" testLockRelease,
+      testCase "compile cache report is logged, stdout unchanged" testCacheReportLogged,
       testCase "probe failure stops before any run" testProbeFails,
       testCase "missing definitions are named" testMissingDefinitions,
       testCase "eleventh earlier log directory is pruned" testPrune,
@@ -93,11 +95,14 @@ fakeOps t runOne =
         pure (Right r),
       soReleaseTree = note t "release",
       soProbe = note t "probe" >> pure (Right ()),
-      soRun = \run _ _ -> do
+      soPrepareCache = note t "compile cache" >> pure CacheOff,
+      soRun = \_ run _ _ -> do
         note t ("run " <> ebuildVersion (srEbuild run))
-        runOne run,
+        (`RunOutcome` Nothing) <$> runOne run,
       soEmit = \l -> modifyIORef' (tLines t) (++ [l]),
       soLogFailure = \e -> modifyIORef' (tErrors t) (++ [e]),
+      soLogWarning = \e -> modifyIORef' (tErrors t) (++ ["warning: " <> e]),
+      soLogInfo = \e -> modifyIORef' (tErrors t) (++ ["info: " <> e]),
       soProgress = \_ _ _ -> pure ()
     }
 
@@ -135,6 +140,41 @@ testMixed = withSystemTempDirectory "om-smoke-mixed" $ \tmp -> do
       assertTrue "uncommitted" ("dev-util/hk was tested with uncommitted changes" `elem` ls)
     Left err -> assertFailure (T.unpack err)
 
+testCacheReportLogged :: IO ()
+testCacheReportLogged = withSystemTempDirectory "om-smoke-report" $ \tmp -> do
+  t <- newTrace
+  used <- newIORef []
+  let report run = case srCap run of
+        Just cap | capTier cap == Plain -> CacheReport 3 4 12 (Just ("go1.27.3", TrimFail))
+        _ -> CacheReport 0 1 0 Nothing
+      ops =
+        (fakeOps t (\_ -> pure RunPass))
+          { soPrepareCache = pure (CacheOn 1024),
+            soRun = \cache run _ _ -> do
+              modifyIORef' used (++ [cache])
+              pure (RunOutcome RunPass (Just (report run)))
+          }
+  _ <- runSmoke ops defFor (tmp </> "r1") items
+  outLines <- readIORef (tLines t)
+  assertEq
+    "stdout result lines unchanged"
+    [ "dev-lang/deno-bin-2.9.8: pass",
+      "dev-util/beads-1.3.4 (dev-lang/go amd64): pass",
+      "dev-util/beads-1.3.4 (dev-lang/go ~amd64): pass",
+      "dev-util/kiro-cli-bin-3.3.0: skip: KEYWORDS has neither amd64 nor ~amd64"
+    ]
+    outLines
+  logs <- readIORef (tErrors t)
+  assertTrue
+    "report names atom and lane"
+    ( "info: dev-util/beads-1.3.4 (dev-lang/go amd64): compile cache: ccache 3 hits, 4 misses; go cache +12 entries; go trim check fail (go1.27.3)"
+        `elem` logs
+    )
+  assertEq "one report per run" 3 (length (filter ("info: " `T.isPrefixOf`) logs))
+  assertTrue "failed trim check warns" (any (\l -> "warning: " `T.isPrefixOf` l && "go1.27.3" `T.isInfixOf` l) logs)
+  seen <- readIORef used
+  assertEq "every run gets the prepared cache" (replicate 3 (CacheOn 1024)) seen
+
 testLockRelease :: IO ()
 testLockRelease =
   withSystemTempDirectory "om-smoke-lock" $ \tmp -> do
@@ -145,20 +185,20 @@ testLockRelease =
     let ops =
           (fakeOps t (\_ -> pure RunPass))
             { soReleaseTree = note t "release" >> releaseFileLock shared,
-              soRun = \run _ _ -> do
+              soRun = \_ run _ _ -> do
                 note t ("run " <> ebuildVersion (srEbuild run))
                 -- Blocking with a limit: a process forked by a parallel test
                 -- holds the released lock's description until it execs.
                 ex <- timeout 5000000 (acquireFileLock ExclusiveLock lockPath)
                 modifyIORef' exclusiveSeen (++ [isJust ex])
                 mapM_ releaseFileLock ex
-                pure RunPass
+                pure (RunOutcome RunPass Nothing)
             }
     _ <- runSmoke ops defFor (tmp </> "logs") items
     events <- readIORef (tEvents t)
     assertEq
       "order"
-      ["sweep", "image", "snapshot", "release", "probe", "run 2.9.8", "run 1.3.4", "run 1.3.4", "snapshot removed"]
+      ["sweep", "image", "snapshot", "release", "probe", "compile cache", "run 2.9.8", "run 1.3.4", "run 1.3.4", "snapshot removed"]
       events
     seen <- readIORef exclusiveSeen
     assertTrue "a second resolver can take the exclusive lock during runs" (not (null seen) && and seen)

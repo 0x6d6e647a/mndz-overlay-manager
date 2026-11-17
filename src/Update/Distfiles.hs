@@ -9,10 +9,10 @@ module Update.Distfiles
     ensureDistfilesDir,
     isSystemDistfilesPath,
     isSystemDistfilesPathWith,
-    lookupPortageDistDir,
     lookupPortageDistDirWith,
     probeDistfilesDir,
     cleanManagerDistfiles,
+    cleanManagerDistfilesWith,
     ebuildManifestEnv,
     looksLikeStickyDistfilesError,
     stickyDistfilesGuidance,
@@ -90,13 +90,9 @@ ensureDistfilesDir path = do
               <> T.pack (show e)
         Right () -> Right ()
 
--- | Query live Portage @DISTDIR@ via @portageq envvar DISTDIR@ (best-effort).
--- Only the @eclean@ system-DISTDIR guard asks.
-lookupPortageDistDir :: Metrics -> IO (Maybe FilePath)
-lookupPortageDistDir m = lookupPortageDistDirWith m readProcessWithExitCode
-
--- | 'lookupPortageDistDir' over an injectable process reader. The call is a
--- wall-clock @proc@ span (no GNU time).
+-- | Query live Portage @DISTDIR@ via @portageq envvar DISTDIR@ (best-effort)
+-- over an injectable process reader. Only the @eclean@ system-DISTDIR guard
+-- asks. The call is a wall-clock @proc@ span (no GNU time).
 lookupPortageDistDirWith ::
   Metrics ->
   (FilePath -> [String] -> String -> IO (ExitCode, String, String)) ->
@@ -117,10 +113,15 @@ lookupPortageDistDirWith m readProc = do
     isSpaceAscii c = c == ' ' || c == '\n' || c == '\r' || c == '\t'
     dropWhileEnd p = reverse . dropWhile p . reverse
 
--- | Whether @path@ is the system Portage DISTDIR (canonical fallback and/or live).
-isSystemDistfilesPath :: Metrics -> FilePath -> IO Bool
-isSystemDistfilesPath m path = do
-  mLive <- lookupPortageDistDir m
+-- | Whether @path@ is the system Portage DISTDIR (canonical fallback and/or
+-- live, read with @readProc@).
+isSystemDistfilesPath ::
+  Metrics ->
+  (FilePath -> [String] -> String -> IO (ExitCode, String, String)) ->
+  FilePath ->
+  IO Bool
+isSystemDistfilesPath m readProc path = do
+  mLive <- lookupPortageDistDirWith m readProc
   let systems = case mLive of
         Just live | live /= systemDistfilesFallback -> [systemDistfilesFallback, live]
         _ -> [systemDistfilesFallback]
@@ -162,10 +163,20 @@ probeDistfilesDir dir = do
         Right () -> Right ()
 
 -- | Delete manager distfiles cache contents. Refuses system Portage DISTDIR.
--- Missing path is success (nothing to clean).
+-- Missing path is success (nothing to clean). Touches no Docker object (the
+-- smoke volumes are never cleaned here).
 cleanManagerDistfiles :: Metrics -> FilePath -> IO (Either Text ())
-cleanManagerDistfiles m path = do
-  system <- isSystemDistfilesPath m path
+cleanManagerDistfiles m = cleanManagerDistfilesWith m readProcessWithExitCode
+
+-- | 'cleanManagerDistfiles' over an injectable process reader (its only
+-- process is @portageq@).
+cleanManagerDistfilesWith ::
+  Metrics ->
+  (FilePath -> [String] -> String -> IO (ExitCode, String, String)) ->
+  FilePath ->
+  IO (Either Text ())
+cleanManagerDistfilesWith m readProc path = do
+  system <- isSystemDistfilesPath m readProc path
   if system
     then
       pure $

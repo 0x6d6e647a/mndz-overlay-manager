@@ -6,7 +6,7 @@ module Test.GitHubResilience (unitTests, integrationTests) where
 
 import CLI.Progress (noopMultiHandle)
 import Config.TokenEnvelope (testEnvelopeParams, wrapTokenWith)
-import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, defaultGentooTreeMaxAge, defaultMaterializeBaseCheckInterval)
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, defaultGentooTreeMaxAge, defaultMaterializeBaseCheckInterval, defaultSmokeCompileCacheMaxSize)
 import Control.Concurrent.Async (concurrently)
 import Data.ByteString.Char8 qualified as BSC
 import Data.ByteString.Lazy.Char8 qualified as L8
@@ -484,7 +484,8 @@ testCfg tok =
       checkCacheTtl = defaultCheckCacheTtl,
       sshIdentity = Nothing,
       gentooTreeMaxAge = defaultGentooTreeMaxAge,
-      materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval
+      materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval,
+      smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize
     }
 
 countingPrompt :: IORef Int -> SecretPrompt

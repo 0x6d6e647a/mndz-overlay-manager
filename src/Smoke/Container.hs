@@ -41,6 +41,7 @@ module Smoke.Container
     -- * One run
     FailStage (..),
     RunResult (..),
+    RunOutcome (..),
     renderFailStage,
     runLogDir,
     performRun,
@@ -48,8 +49,9 @@ module Smoke.Container
 where
 
 import Control.Exception (finally)
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Data.Aeson ((.=))
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -68,6 +70,26 @@ import Smoke.Check
     SmokeDef (..),
     failedCheckNames,
     runChecks,
+  )
+import Smoke.CompileCache
+  ( CacheReport,
+    CacheUse (..),
+    GoChecks,
+    TrimCheck,
+    cacheMakeConfLines,
+    cacheSetupLines,
+    ccacheConf,
+    ccacheConfPath,
+    claimGoCheck,
+    compileCacheMount,
+    confcacheMarkerScript,
+    configureCacheNote,
+    goTrimCheckScript,
+    goVersionScript,
+    parseReport,
+    parseTrimCheck,
+    portageBashrc,
+    reportScript,
   )
 import Smoke.Plan
   ( RuntimeCap (..),
@@ -113,7 +135,9 @@ data SmokeContainerCfg = SmokeContainerCfg
     -- | Resolved @--jobs@.
     sccJobs :: Int,
     -- | Every overlay @category/package@, excluded from binary packages.
-    sccOverlayNames :: [Text]
+    sccOverlayNames :: [Text],
+    -- | Compile cache use for this command's runs.
+    sccCache :: CacheUse
   }
   deriving (Eq, Show)
 
@@ -155,7 +179,8 @@ tierSlug = \case
   Tilde -> "tilde"
 
 -- | @docker create@ argv (no @docker@ binary). @SYS_ADMIN@ is the only added
--- capability; no token, GPG, or SSH variable is passed.
+-- capability; no token, GPG, or SSH variable is passed. With the compile
+-- cache on, the package's part of the cache volume is mounted.
 smokeCreateArgs :: SmokeContainerCfg -> SmokeRun -> [String]
 smokeCreateArgs cfg run =
   [ "create",
@@ -178,19 +203,24 @@ smokeCreateArgs cfg run =
     "--mount",
     "type=volume,src=" <> smokeDistfilesVolume <> ",dst=/var/cache/distfiles"
   ]
+    <> concat [["--mount", compileCacheMount (srKey run)] | CacheOn _ <- [sccCache cfg]]
     <> concat [["--mount", "type=bind,src=" <> d <> ",dst=" <> d] | Just d <- [sccTimeDir cfg]]
     <> [sccImage cfg, "sleep", "infinity"]
 
 ------------------------------------------------------------------------
 -- Portage configuration
 
--- | Lines appended to @/etc/portage/make.conf@.
-makeConfLines :: Int -> [Text]
-makeConfLines jobs =
+-- | Lines appended to @/etc/portage/make.conf@. With the compile cache on,
+-- @FEATURES@ gains @ccache@ and the cache settings follow.
+makeConfLines :: Int -> CacheUse -> SmokeRun -> [Text]
+makeConfLines jobs cache run =
   [ "MAKEOPTS=\"-j" <> tshow jobs <> " -l" <> tshow (jobs + 1) <> "\"",
-    "FEATURES=\"getbinpkg buildpkg\"",
+    "FEATURES=\"getbinpkg buildpkg" <> (case cache of CacheOn _ -> " ccache"; CacheOff -> "") <> "\"",
     "ACCEPT_LICENSE=\"*\""
   ]
+    <> case cache of
+      CacheOn size -> cacheMakeConfLines size (capTier <$> srCap run)
+      CacheOff -> []
 
 -- | Files written under @/etc/portage@ for a run: the @mndz@ repository, the
 -- overlay and runtime-cap keyword accepts, the Python slot and definition
@@ -221,13 +251,15 @@ portageConfigFiles run extraAccepts uses =
       ]
 
 -- | Root script: write the configuration, append to @make.conf@, and create
--- the check user with @uid@.
-setupScript :: Int -> Int -> SmokeRun -> [Text] -> [Text] -> Text
-setupScript uid jobs run extraAccepts uses =
+-- the check user with @uid@. With the compile cache on, it also writes the
+-- ccache configuration and the bashrc hooks, and marks the cache used.
+setupScript :: Int -> Int -> CacheUse -> SmokeRun -> [Text] -> [Text] -> Text
+setupScript uid jobs cache run extraAccepts uses =
   T.unlines $
     ["set -eu"]
-      <> concatMap writeFile' (portageConfigFiles run extraAccepts uses)
-      <> ["printf '%s\\n' " <> T.unwords (map q (makeConfLines jobs)) <> " >> /etc/portage/make.conf"]
+      <> concatMap writeFile' (portageConfigFiles run extraAccepts uses <> cacheFiles)
+      <> ["printf '%s\\n' " <> T.unwords (map q (makeConfLines jobs cache run)) <> " >> /etc/portage/make.conf"]
+      <> (case cache of CacheOn _ -> cacheSetupLines; CacheOff -> [])
       <> ["useradd --create-home --uid " <> tshow uid <> " --user-group " <> T.pack checkUser]
   where
     writeFile' (path, body) =
@@ -235,6 +267,9 @@ setupScript uid jobs run extraAccepts uses =
         "printf '%s' " <> q body <> " > " <> q (T.pack path)
       ]
     q = T.pack . shellQuote . T.unpack
+    cacheFiles = case cache of
+      CacheOn size -> [(T.unpack ccacheConfPath, ccacheConf size), ("/etc/portage/bashrc", portageBashrc)]
+      CacheOff -> []
 
 ------------------------------------------------------------------------
 -- Sandbox probe
@@ -422,6 +457,13 @@ data RunResult
     RunFail FailStage Text FilePath
   deriving (Eq, Show)
 
+-- | A run's result and, with the compile cache on, its cache statistics.
+data RunOutcome = RunOutcome
+  { roResult :: RunResult,
+    roCache :: Maybe CacheReport
+  }
+  deriving (Eq, Show)
+
 -- | @\<logs\>/\<cat\>-\<pn\>-\<pvr\>[-plain|-tilde]@.
 runLogDir :: FilePath -> SmokeRun -> FilePath
 runLogDir logsRoot run = logsRoot </> runSlug run
@@ -429,16 +471,23 @@ runLogDir logsRoot run = logsRoot </> runSlug run
 -- | Configure the container, run the three emerge steps, detach the
 -- network, and run the checks. Each step's output goes to its own log file
 -- under @logDir@. @progress@ receives the stage name as each begins.
+--
+-- With the compile cache on, the Go trim check runs after the dependencies
+-- step for a Go version not yet checked in this command (its result never
+-- changes the run's), a failure in a configure phase that used the
+-- configure cache says so, and the run's cache statistics are collected at
+-- the end.
 performRun ::
   SmokeSession ->
   SmokeContainerCfg ->
+  GoChecks ->
   PackageKey ->
   SmokeDef ->
   SmokeRun ->
   FilePath ->
   (Text -> IO ()) ->
-  IO RunResult
-performRun session cfg key def run logDir progress = do
+  IO RunOutcome
+performRun session cfg goChecks key def run logDir progress = do
   createDirectoryIfMissing True logDir
   progress "dependencies"
   setup <-
@@ -447,14 +496,25 @@ performRun session cfg key def run logDir progress = do
       AsRoot
       (ExecCmd "sh" ["-s"])
       Nothing
-      (T.unpack (setupScript (checkUidFor (sccOperatorUid cfg)) (sccJobs cfg) run (sdAcceptKeywords def) (sdPackageUse def)))
+      (T.unpack (setupScript (checkUidFor (sccOperatorUid cfg)) (sccJobs cfg) (sccCache cfg) run (sdAcceptKeywords def) (sdPackageUse def)))
   case setup of
-    Left (why, file) -> pure (RunFail FailDependencies ("container setup failed: " <> why) file)
+    Left (why, file) -> pure (RunOutcome (RunFail FailDependencies ("container setup failed: " <> why) file) Nothing)
     Right () -> do
+      trimRef <- newIORef Nothing
+      result <- afterSetup trimRef
+      report <- case sccCache cfg of
+        CacheOff -> pure Nothing
+        CacheOn _ -> do
+          res <- rootSh reportScript
+          Just . parseReport (T.pack (prStdout res)) <$> readIORef trimRef
+      pure (RunOutcome result report)
+  where
+    afterSetup trimRef = do
       deps <- emerge "dependencies" (dependenciesArgv (sccOverlayNames cfg) run) Nothing
       case deps of
         Left (why, file) -> pure (RunFail FailDependencies why file)
         Right () -> do
+          goTrimCheck trimRef
           progress "build"
           pkg <- emerge "build" (packageArgv run) (Just [("DISTDIR", smokeDistDir)])
           case pkg of
@@ -483,7 +543,6 @@ performRun session cfg key def run logDir progress = do
                       TIO.writeFile file err
                       pure (RunFail (FailCheck ["network"]) ("could not detach the network: " <> err) file)
                     Right () -> checks
-  where
     ctx =
       CheckCtx
         { ccKey = key,
@@ -503,8 +562,50 @@ performRun session cfg key def run logDir progress = do
           then Right ()
           else Left (exitText (prExitCode res) <> tailNote res, file)
     emerge label args env = case args of
-      c : as -> step label AsRoot (ExecCmd c as) env ""
+      c : as -> step label AsRoot (ExecCmd c as) env "" >>= either (fmap Left . configureNote) (pure . Right)
       [] -> pure (Right ())
+    rootSh :: Text -> IO ProcessResult
+    rootSh script =
+      ssExec
+        session
+        AsRoot
+        ProcessRequest {prMode = ExecCmd "sh" ["-c", T.unpack script], prCwd = Nothing, prEnv = Nothing, prStdin = "", prMeasure = Timed}
+    -- A failure in a configure phase that loaded a configure cache names it.
+    configureNote (why, file) = case sccCache cfg of
+      CacheOff -> pure (why, file)
+      CacheOn _ -> do
+        body <- TIO.readFile file
+        if "failed (configure phase)" `T.isInfixOf` body
+          then do
+            markers <- rootSh (T.pack confcacheMarkerScript)
+            pure $
+              if T.null (T.strip (T.pack (prStdout markers)))
+                then (why, file)
+                else (why <> "; " <> configureCacheNote, file)
+          else pure (why, file)
+    goTrimCheck :: IORef (Maybe (Text, TrimCheck)) -> IO ()
+    goTrimCheck ref = case sccCache cfg of
+      CacheOff -> pure ()
+      CacheOn _ -> do
+        found <- rootSh (T.pack goVersionScript)
+        let version = T.strip (T.pack (prStdout found))
+        when (prExitCode found == ExitSuccess && not (T.null version)) $ do
+          first <- claimGoCheck goChecks version
+          when first $ do
+            progress "go trim check"
+            res <-
+              ssExec
+                session
+                AsRoot
+                ProcessRequest
+                  { prMode = ExecCmd "sh" ["-s"],
+                    prCwd = Nothing,
+                    prEnv = Just [("TMPDIR", "/var/tmp")],
+                    prStdin = T.unpack goTrimCheckScript,
+                    prMeasure = Timed
+                  }
+            TIO.writeFile (logDir </> "go-trim-check.log") (T.pack (prStdout res) <> T.pack (prStderr res))
+            writeIORef ref (Just (version, parseTrimCheck (T.pack (prStdout res))))
     checks = do
       results <- runChecks checkIO ctx (sdChecks def)
       mapM_ writeCheckLog results

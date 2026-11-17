@@ -38,12 +38,12 @@ import Config.Loader
     loadConfig,
     loadConfigAllowPlaintextToken,
   )
-import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, defaultGentooTreeMaxAge, defaultMaterializeBaseCheckInterval, parseCheckCacheTtl)
+import Config.Types (CheckCacheTtl (..), OverlayConfig (..), defaultCheckCacheTtl, defaultGentooTreeMaxAge, defaultMaterializeBaseCheckInterval, defaultSmokeCompileCacheMaxSize, parseByteSizeFor, parseCheckCacheTtl)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.MVar (MVar, newMVar)
 import Control.Exception (SomeException, bracket_, throwIO, try)
-import Control.Monad (forever, unless, void)
+import Control.Monad (forM_, forever, unless, void)
 import Data.Aeson (eitherDecodeStrict')
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
@@ -291,6 +291,8 @@ tests =
       testCase "Config duration keys default" testConfigDurationKeysDefault,
       testCase "Config duration keys valid" testConfigDurationKeysValid,
       testCase "Config duration keys invalid" testConfigDurationKeysInvalid,
+      testCase "Parse byte size" testParseByteSize,
+      testCase "Config compile cache max size" testConfigCompileCacheMaxSize,
       testCase "Config mode 0644 hard-fails" testConfigModeWrong,
       testCase "Config mode 0600 loads" testConfigModeOk,
       testCase "Config unreadable mode hard-fails" testConfigModeUnreadable,
@@ -535,6 +537,42 @@ testConfigDurationKeysInvalid =
     check "gentoo-tree-max-age" "1h30m"
     check "materialize-base-check-interval" "3w"
     check "materialize-base-check-interval" ""
+
+testParseByteSize :: IO ()
+testParseByteSize = do
+  let p = parseByteSizeFor "k"
+      gib = 1024 * 1024 * 1024
+  assertEq "3GiB" (Right (3 * gib)) (p "3GiB")
+  assertEq "512MiB" (Right (512 * 1024 * 1024)) (p "512MiB")
+  assertEq "1KiB" (Right 1024) (p "1KiB")
+  assertEq "plain bytes" (Right 1073741824) (p "1073741824")
+  assertEq "case-insensitive" (Right (2 * gib)) (p "2gib")
+  assertTrue "lots rejected" (case p "lots" of Left _ -> True; Right _ -> False)
+  assertTrue "negative rejected" (case p "-1GiB" of Left _ -> True; Right _ -> False)
+  assertTrue "empty rejected" (case p "" of Left _ -> True; Right _ -> False)
+  assertTrue "unknown unit rejected" (case p "3GB" of Left _ -> True; Right _ -> False)
+
+testConfigCompileCacheMaxSize :: IO ()
+testConfigCompileCacheMaxSize =
+  withSystemTempDirectory "om-cc-size" $ \tmp -> do
+    let load name body = do
+          let path = tmp </> name
+          TIO.writeFile path ("overlay-path = \"/tmp/ov\"\n" <> body)
+          chmodConfig600 path
+          loadConfig (Just path)
+        key = "smoke-compile-cache-max-size"
+    dflt <- assertRight "omitted" =<< load "d.toml" ""
+    assertEq "default 3GiB" (3 * 1024 * 1024 * 1024) (smokeCompileCacheMaxSize dflt)
+    assertEq "default constant" defaultSmokeCompileCacheMaxSize (smokeCompileCacheMaxSize dflt)
+    set <- assertRight "512MiB" =<< load "s.toml" (key <> " = \"512MiB\"\n")
+    assertEq "512MiB" (512 * 1024 * 1024) (smokeCompileCacheMaxSize set)
+    forM_ [("lots", "lots"), ("neg", "-5MiB")] $ \(name, val) -> do
+      err <- assertLeft (name <> " rejected") =<< load (name <> ".toml") (key <> " = \"" <> val <> "\"\n")
+      case err of
+        DecodeError msg -> assertTrue "error names the key" (key `T.isInfixOf` T.pack msg)
+        other -> do
+          hPutStrLn stderr $ "expected DecodeError, got " <> show other
+          exitFailure
 
 testConfigModeWrong :: IO ()
 testConfigModeWrong =

@@ -87,6 +87,7 @@ library
       , Overlay.Validation
       , Overlay.Version
       , Smoke.Ceilings
+      , Smoke.CompileCache
       , Smoke.Check
       , Smoke.Container
       , Smoke.Definitions
@@ -309,6 +310,7 @@ test-suite mndz-overlay-manager-test
         Test.Progress
         Test.Properties
         Test.SmokeCheck
+        Test.SmokeCompileCache
         Test.SmokeContainer
         Test.SmokeDefinitions
         Test.SmokeImage

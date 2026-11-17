@@ -290,3 +290,12 @@ The top-level usage/help text SHALL list the `smoke` subcommand among available 
 - **AND** the text mentions `--jobs` as build parallelism
 - **AND** the text does not mention `--refresh`
 - **AND** the program exits with status `0` without loading configuration
+
+### Requirement: Smoke help documents the compile cache flags
+
+`smoke --help` SHALL document `--no-compile-cache` as running without the per-package compile cache and `--reset-compile-cache` as deleting the selected packages' compile caches before their runs.
+
+#### Scenario: Compile cache flags in help
+
+- **WHEN** the user runs `smoke --help`
+- **THEN** the usage text documents `--no-compile-cache` and `--reset-compile-cache`

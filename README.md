@@ -85,6 +85,7 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 | `ssh-identity` | no | One private-key path for an assets `git push`. A leading `~` is allowed. Required only when that push will run |
 | `gentoo-tree-max-age` | no | How long a [managed Gentoo tree](#managed-gentoo-tree) sync check stays fresh before `outdated`, `update`, or `gencache` syncs again (same duration syntax as `check-cache-ttl`, default **6h**; `0s` syncs on every run) |
 | `materialize-base-check-interval` | no | How often ensure asks the registry whether the pinned `gentoo/stage3` digest moved (same duration syntax, default **3d**) |
+| `smoke-compile-cache-max-size` | no | Size budget of the [smoke compile cache](#smoke-compile-cache): a byte count with an optional `KiB`, `MiB`, or `GiB` suffix (for example `512MiB`), default **3GiB**. An invalid or negative value is a configuration error |
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then the decrypted `github-token` envelope in the config. Using an environment token logs a warning (and an extra warning when that value is not a fine-grained PAT `github_pat_`). `outdated` and `update` use that token for live `api.github.com` version fetch when a token is available. If the winning source is the encrypted config envelope, they prompt for the wrap password on a controlling TTY when this run will call `api.github.com`. `outdated` does not prompt when every `api.github.com` read for the run is a valid check-cache hit, including when a cached plan still needs work. `update` still prompts when it will look up or publish an assets release. A cache miss or `--refresh` of a GitHub-source package also prompts. Unattended `outdated` / `update` **must** set `GITHUB_TOKEN` or `GH_TOKEN` rather than relying on TTY decrypt; without a controlling TTY the command exits `1` and does not fall back to unauthenticated fetch. Live unauthenticated fetch is still allowed when no token is configured, is limited to **60 requests per hour** per IP, and logs a warning. The program never logs the raw token, wrap password, or ciphertext.
 
@@ -115,6 +116,7 @@ assets-path = "/path/to/mndz-overlay-assets"
 # check-cache-ttl = "5m"  # optional; default 5m; use "0s" to disable
 # gentoo-tree-max-age = "6h"  # optional; default 6h
 # materialize-base-check-interval = "3d"  # optional; default 3d
+# smoke-compile-cache-max-size = "3GiB"  # optional; default 3GiB
 ssh-identity = "~/.ssh/keys/shanty_github_id"
 ```
 
@@ -315,19 +317,45 @@ just run smoke crush deno-bin craft-fonts
 
 # Skip one package
 just run smoke --exclude dev-util/codex
+
+# Empty crush's compile cache before testing it
+just run smoke --reset-compile-cache crush
+
+# Test without any compile cache
+just run smoke --no-compile-cache crush
 ```
+
+**Compile cache flags.** `--no-compile-cache` runs every run of the command without the [compile cache](#smoke-compile-cache): no cache volume is mounted, ccache is off, and Go, configure, and Zig results stay in Portage's per-build directories. `--reset-compile-cache` deletes the compile caches of the selected packages before the first run (also with `--no-compile-cache`); other packages' caches are kept. An unknown or ambiguous target fails the command before anything is deleted.
 
 **Runs.** Packages outside runtime lanes (GitMv, Unsupported, Uv, Pdm) get one run per ebuild. A lane-gated DepsAndAssets ebuild (Go, Npm, Bun, Cargo, SBCL) is installed with its runtime (for example `dev-lang/go`) capped at each lane ceiling it serves on the host architecture, read from the managed tree (or the overlay, for Bun) and the ebuild's own runtime floor; equal plain and tilde ceilings collapse to one run. An ebuild not keyworded for the host is skipped. Runs happen one at a time in package, version, and lane order; `--jobs N` sets `MAKEOPTS="-jN -l(N+1)"` inside the container (one emerge job), not the number of runs.
 
 **Output.** Each run prints one line to stdout, for example `dev-util/beads-1.3.4 (dev-lang/go ~amd64): pass`, `…: skip: <reason>`, or `…: fail: <stage>`, where the stage is `plan`, `dependencies`, `build`, or `check` followed by the failed check names. A failed run does not stop the command. The summary logs the counts, the log directory, and every package tested with uncommitted changes. The exit status is `1` when any run failed and `0` otherwise (skips do not fail).
 
-**Environment.** Each run uses a new container (`mndz-smoke-<run-id>-…`) from the **smoke image** `mndz-overlay-manager/smoke:local`, which is separate from the materialize image and holds only a stage3, an updated `@world`, and GNU time. `MNDZ_MATERIALIZE_IMAGE` does not affect it. Its sidecar and last recipe live in `…/overlay-manager/smoke/` under the XDG cache. It is rebuilt when the recipe generator changes, the image is gone, or the stage3 digest moved; the base check uses the same `materialize-base-check-interval` as the materialize image. A rebuild is gated on Docker storage free space and removes the previous smoke image.
+**Environment.** Each run uses a new container (`mndz-smoke-<run-id>-…`) from the **smoke image** `mndz-overlay-manager/smoke:local`, which is separate from the materialize image and holds only a stage3, an updated `@world`, GNU time, and ccache. Packages the binhost lacks are compiled once into a BuildKit cache used only by smoke image builds, and later image builds install them from there. `MNDZ_MATERIALIZE_IMAGE` does not affect it. Its sidecar and last recipe live in `…/overlay-manager/smoke/` under the XDG cache. It is rebuilt when the recipe generator changes, the image is gone, or the stage3 digest moved; the base check uses the same `materialize-base-check-interval` as the materialize image. A rebuild is gated on Docker storage free space and removes the previous smoke image.
 
 - Containers get `--cap-add SYS_ADMIN` and nothing more (not privileged, default seccomp), so Portage's network, IPC, and PID sandboxes stay on. Before the first run, a probe container checks that those namespaces can be created; when they cannot (for example under an AppArmor profile that denies them), `smoke` exits `1`.
 - At start, the managed tree is copied (without `.git`) into a per-command image `mndz-overlay-manager/smoke-tree:<run-id>` (about 670 MB of Docker storage), mounted read-only at `/var/db/repos/gentoo` in every container, and deleted when the command ends. Snapshots left by a killed command are deleted by the next `smoke`.
 - The overlay is bound read-only at `/var/db/repos/mndz`. Every `::mndz` package is accepted as `~arch`; other Gentoo packages stay on the stable keyword except the runtime cap, the Python slot of a Uv or Pdm ebuild, and atoms a definition names. USE flags follow the profile, plus any `package.use` lines a definition names (for example `x11-libs/libxkbcommon X` for the craft apps). All licenses are accepted.
 - Dependencies install first, from the Gentoo binhost or the Docker volume `mndz-smoke-binpkgs`, with their distfiles in the volume `mndz-smoke-distfiles`. Overlay packages are always built from source and never stored as binary packages. The package under test is then built from source with an empty container-local `DISTDIR`, so a dead download URL fails the run. The manager never prunes the two volumes; remove them by hand (`docker volume rm mndz-smoke-binpkgs mndz-smoke-distfiles`) to reclaim space.
 - The container is detached from the network after the installs. Checks run as an unprivileged `smoke` user (your uid) with the environment from `/etc/profile`. A definition may add that user to a package's group for its own runs (`witen-warden-bin` joins `witen-warden` to read its configuration). Each command has a 60-second limit unless the check sets another; a check that needs the network is attached for that check only.
+
+#### Smoke compile cache
+
+Builds keep compiler and configure results between `smoke` commands in one Docker volume, `mndz-smoke-compile-cache`, with one directory per package (`<category>/<package>/`). A run container mounts only its own package's directory, at `/var/cache/mndz-compile`, so a build can neither see nor change another package's cache; dependencies built from source during a run use the cache of the package under test. Inside a package directory:
+
+- `ccache/`: C and C++ compiles (ccache, through Portage's `FEATURES=ccache`). ccache reads its settings only from `/etc/mndz-ccache.conf` in the container and its environment, never from a file in the cache. Per package it is limited to 1 GiB or the budget, whichever is smaller.
+- `go/`: Go's build cache, with builds using `-trimpath` so results survive version and revision bumps.
+- `autoconf/<category>/<package>/<plain|tilde|none>/<ABI>`: `econf` configure results per built package, lane, and ABI, without environment, library, or install program results. When a run fails in a configure phase that used this cache, its error says so; rerun with `--no-compile-cache` to rule the cache out.
+- `zig/`: Zig's global cache for packages built with Portage's Zig support.
+- `.last-used`: when a run last started with the cache (builds cannot write it).
+
+**Go trim workaround (fragile).** Go deletes build cache entries unused for five days whenever it runs, which would empty the Go cache between infrequent `smoke` commands. Before each build phase, smoke writes the current time to `go/trim.txt`, which makes Go skip that trimming. `trim.txt` is an undocumented internal of the `go` command, not a supported interface, and a Go release may stop honoring it (Go's developers declined to support it, and Go 1.28 work makes trimming more aggressive). The first run with each Go version in a command checks inside the container that trimming is still suppressed, and the test suite runs the same check against the development machine's `go`. When the check fails, `smoke` logs a warning that Go cache trimming is not suppressed for that Go version. Builds still succeed and results are still correct; only Go cache reuse between commands is lost.
+
+**Cleanup and budget.** Before the first run of every `smoke` command that uses the cache, a short-lived helper container (no network, only the program's own scripts) removes, in order: the caches of packages no longer in the overlay; caches unused for 30 days; then the least recently used caches until the volume fits the budget. In the caches it keeps, it deletes Go and Zig entries unchanged for 30 days. The budget is `smoke-compile-cache-max-size` (default `3GiB`), lowered so that at least 2 GiB stays free on the filesystem holding Docker volumes. A cache used within the last 24 hours is never removed for age or budget, so a concurrent `smoke` command keeps its caches; when only such caches are over budget, cleanup logs a warning. Two commands never clean at the same time (they take `…/overlay-manager/smoke/compile-cache.lock`). If inspecting or cleaning the cache fails, `smoke` logs a warning and runs the whole command without the compile cache.
+
+After each run that used the cache, `smoke` logs one line with that run's atom and lane, its ccache hits and misses, the Go cache entries it added, and the Go trim check result when the run checked; the stdout result line is unchanged. The same numbers go into [run metrics](#run-metrics).
+
+To reclaim space: `--reset-compile-cache PACKAGE` empties one package's cache; removing the whole volume is manual, with `docker volume rm mndz-smoke-compile-cache` (the next `smoke` recreates it). `eclean` never touches the volume.
 
 **Logs.** Each emerge step and each check writes its full output under `…/overlay-manager/smoke/logs/<run-id>/<category>-<package>-<pvr>[-plain|-tilde]/`, for passing runs too; a failed run's error names its log file. Each `smoke` keeps the log directories of the ten most recent earlier commands and deletes older ones. `eclean` does not touch them.
 
@@ -377,7 +405,7 @@ Each run writes one directory:
 
 The run id is the same one used for the temp workspace run root and the materialize container names. The directory holds `run.jsonl`: one JSON object per line, starting with a `run_start` header (build identity, host, invocation) and ending with a `run_end` footer (outcome, resource use, counters such as check-cache hits). Between them are timed spans for phases, package steps, subprocesses, HTTP requests, and slot waits, plus machine `sample` lines every 5 seconds. Subprocesses are measured with GNU time. Command arguments are recorded with the GitHub token and other known secrets replaced by `<redacted>`; environment variables are never recorded. A `time/` subdirectory holds per-process GNU time files only while they are being read (a file that cannot be parsed is kept there).
 
-`smoke` measures each emerge step and check command in its containers like a materialize container command (an `.outer` result for the host `docker exec` and an `.inner` result for the command, under one span per container), records one span per run named by its atom and lane, and writes a `container` resource event before each container is removed.
+`smoke` measures each emerge step and check command in its containers like a materialize container command (an `.outer` result for the host `docker exec` and an `.inner` result for the command, under one span per container), records one span per run named by its atom and lane, and writes a `container` resource event before each container is removed. With the compile cache on, each run also writes a `compile-cache` event (its span and atom, ccache hits and misses, Go cache entries added, and the Go trim check result and Go version when that run checked), and each command writes one `compile-cache.cleanup` event (cache size before and after cleanup, the budget, and the packages removed). `--no-compile-cache` writes neither.
 
 Runs are kept; the manager never prunes the metrics directory. Delete old run directories by hand when you no longer need them.
 

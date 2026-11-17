@@ -54,7 +54,11 @@ data Command
       }
   | Smoke
       { smokeTargets :: [String],
-        smokeExcludeTokens :: [String]
+        smokeExcludeTokens :: [String],
+        -- | @--no-compile-cache@.
+        smokeNoCompileCache :: Bool,
+        -- | @--reset-compile-cache@.
+        smokeResetCompileCache :: Bool
       }
   | Eclean
   | GitHubToken
@@ -385,6 +389,19 @@ smokeParser =
           )
       )
     <*> excludeTokens
+    <*> switch
+      ( long "no-compile-cache"
+          <> help
+            "Run without the per-package compile cache: no cache volume is \
+            \mounted, ccache is off, and the Go, configure, and Zig caches \
+            \stay at Portage's per-build defaults"
+      )
+    <*> switch
+      ( long "reset-compile-cache"
+          <> help
+            "Delete the selected packages' compile caches before their runs \
+            \(other packages' caches are kept)"
+      )
 
 smokeInfo :: ParserInfo Command
 smokeInfo =
@@ -400,6 +417,10 @@ smokeInfo =
             \runs. PACKAGE may be category/package or an unambiguous package \
             \name. With no PACKAGE arguments, test all discovered packages. \
             \Prints one result line per run and exits 1 when any run fails. \
+            \Builds reuse the package's compile cache (ccache, Go, configure, \
+            \and Zig results) in the Docker volume mndz-smoke-compile-cache; \
+            \--no-compile-cache runs without it and --reset-compile-cache \
+            \empties it for the selected packages first. \
             \Needs Docker Engine 28.0 or newer with the containerd image store. "
               <> excludeFooter
               <> globalsFooter

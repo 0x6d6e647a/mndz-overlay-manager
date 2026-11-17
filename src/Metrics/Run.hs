@@ -106,7 +106,7 @@ invocationFor jobs cmd =
     Outdated refresh targets excludes -> inv (Just refresh) targets excludes
     Update refresh targets excludes -> inv (Just refresh) targets excludes
     Gencache targets _ excludes -> inv Nothing targets excludes
-    Smoke targets excludes -> inv Nothing targets excludes
+    Smoke targets excludes _ _ -> inv Nothing targets excludes
     Eclean -> inv Nothing [] []
     List -> inv Nothing [] []
     GitHubToken _ -> inv Nothing [] []

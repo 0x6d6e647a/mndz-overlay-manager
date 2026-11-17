@@ -7,6 +7,8 @@ module Config.Types
     parseCheckCacheTtl,
     defaultGentooTreeMaxAge,
     defaultMaterializeBaseCheckInterval,
+    defaultSmokeCompileCacheMaxSize,
+    parseByteSizeFor,
   )
 where
 
@@ -52,6 +54,29 @@ defaultGentooTreeMaxAge = 6 * 60 * 60
 -- | Default when @materialize-base-check-interval@ is omitted: three days.
 defaultMaterializeBaseCheckInterval :: NominalDiffTime
 defaultMaterializeBaseCheckInterval = 3 * 24 * 60 * 60
+
+-- | Default when @smoke-compile-cache-max-size@ is omitted: 3 GiB.
+defaultSmokeCompileCacheMaxSize :: Integer
+defaultSmokeCompileCacheMaxSize = 3 * 1024 * 1024 * 1024
+
+-- | Byte-size parser: a non-negative integer with an optional
+-- case-insensitive @KiB@, @MiB@, or @GiB@ suffix (for example @3GiB@,
+-- @512MiB@, @1073741824@). Errors name @key@.
+parseByteSizeFor :: String -> Text -> Either String Integer
+parseByteSizeFor key raw =
+  let t = T.unpack (T.strip raw)
+      (digits, unitStr) = span isDigit t
+      invalid = Left $ key <> ": invalid size " <> show t <> " (expected e.g. 3GiB, 512MiB, or a byte count)"
+   in case (t, digits) of
+        ([], _) -> Left $ key <> ": empty size"
+        ('-' : _, _) -> Left $ key <> ": negative size " <> show t
+        (_, []) -> invalid
+        _ -> case map toLower unitStr of
+          "" -> Right (read digits)
+          "kib" -> Right (read digits * 1024)
+          "mib" -> Right (read digits * 1024 * 1024)
+          "gib" -> Right (read digits * 1024 * 1024 * 1024)
+          _ -> invalid
 
 -- | Single-unit duration parser shared by every duration key. Same syntax as
 -- 'parseCheckCacheTtl'; bare @0@ and zero coefficients parse as zero. Errors
@@ -125,7 +150,9 @@ data OverlayConfig = OverlayConfig
     -- | Managed Gentoo tree max age (default 6h). Zero makes every run sync.
     gentooTreeMaxAge :: NominalDiffTime,
     -- | Materialize stage3 base check interval (default 3d).
-    materializeBaseCheckInterval :: NominalDiffTime
+    materializeBaseCheckInterval :: NominalDiffTime,
+    -- | Smoke compile cache size budget in bytes (default 3 GiB).
+    smokeCompileCacheMaxSize :: Integer
   }
   deriving (Eq, Show, Generic)
 
@@ -141,6 +168,9 @@ instance FromValue OverlayConfig where
         <*> optKey "ssh-identity"
         <*> durationKey "gentoo-tree-max-age" defaultGentooTreeMaxAge
         <*> durationKey "materialize-base-check-interval" defaultMaterializeBaseCheckInterval
+        <*> ( fromMaybe defaultSmokeCompileCacheMaxSize
+                <$> optKeyOf "smoke-compile-cache-max-size" (fromValue >=> either fail pure . parseByteSizeFor "smoke-compile-cache-max-size")
+            )
     where
       durationKey key def =
         fromMaybe def

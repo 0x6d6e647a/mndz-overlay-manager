@@ -44,7 +44,8 @@ tests =
         "recipe"
         [ testCase "FROM is digest-pinned to the OpenRC stage3" testRecipeFrom,
           testCase "Portage RUN binds the managed tree" testRecipeTreeBind,
-          testCase "updates @world and installs GNU time only" testRecipeContents,
+          testCase "updates @world and installs GNU time and ccache only" testRecipeContents,
+          testCase "builds binary packages into a smoke-only cache" testRecipeBinpkgs,
           testCase "no sandbox opt-out" testRecipeSandboxes,
           testCase "no cache id shared with materialize" testRecipeCacheIds
         ],
@@ -97,7 +98,7 @@ testRecipeContents :: IO ()
 testRecipeContents = do
   assertTrue "@world" ("emerge --update --deep --newuse @world" `T.isInfixOf` recipe)
   assertTrue "portage" ("emerge --oneshot sys-apps/portage" `T.isInfixOf` recipe)
-  assertTrue "time" ("sys-process/time" `T.isInfixOf` recipe)
+  assertTrue "time and ccache" ("emerge -n sys-process/time dev-util/ccache" `T.isInfixOf` recipe)
   let forbidden =
         [ "dev-lang/go",
           "net-libs/nodejs",
@@ -112,6 +113,14 @@ testRecipeContents = do
           "::mndz"
         ]
   assertEq "no toolchain or fetch-tool atom" [] (filter (`T.isInfixOf` recipe) forbidden)
+
+testRecipeBinpkgs :: IO ()
+testRecipeBinpkgs = do
+  assertTrue "buildpkg" ("ENV FEATURES=\"getbinpkg buildpkg\"" `elem` T.lines recipe)
+  assertTrue
+    "binpkgs cache mount on the Portage RUN"
+    ("--mount=type=cache,id=mndz-smoke-build-binpkgs,target=/var/cache/binpkgs" `T.isInfixOf` recipe)
+  assertEq "generator id" "mndz-overlay-manager-smoke-2" smokeGeneratorId
 
 testRecipeSandboxes :: IO ()
 testRecipeSandboxes = do

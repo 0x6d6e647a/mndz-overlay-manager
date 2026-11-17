@@ -43,6 +43,7 @@ import Data.Text qualified as T
 import Data.Text.IO qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Time (getCurrentTime)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Logging.Bootstrap (LogHold, mkLogHold, mkLogger)
 import Metrics.Container (productionCgroupRoots)
 import Metrics.Core (Metrics (..), setCount, withSpan)
@@ -61,8 +62,20 @@ import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (EbuildVersion (..), prettyVersion)
 import Smoke.Ceilings (loadHostCeilings)
+import Smoke.CompileCache
+  ( CacheUse (..),
+    HelperCfg (..),
+    PrepareCfg (..),
+    PrepareResult (..),
+    compileCacheLockPath,
+    newGoChecks,
+    prepareCompileCache,
+    recordCacheReport,
+    recordCleanup,
+  )
 import Smoke.Container
   ( FailStage (..),
+    RunOutcome (..),
     RunResult (..),
     SmokeContainerCfg (..),
     performRun,
@@ -76,7 +89,7 @@ import Smoke.Image
     ensureSmokeImage,
     smokeImageTag,
   )
-import Smoke.Plan (PackageInput (..), SmokeRun (..), laneRuntimeFor, planSmokeRuns, runAtom)
+import Smoke.Plan (PackageInput (..), PlannedItem (..), SmokeRun (..), laneRuntimeFor, planSmokeRuns, runAtom)
 import Smoke.Preflight (smokePreflight)
 import Smoke.Run
   ( SmokeOps (..),
@@ -278,7 +291,7 @@ runCommand rt cmd =
       runUpdate rt refresh pkgs excludeArgs
     Cmd.Gencache targets force excludeArgs ->
       runGencache rt targets force excludeArgs
-    Cmd.Smoke pkgs excludeArgs -> runSmokeCommand rt pkgs excludeArgs
+    Cmd.Smoke pkgs excludeArgs noCache resetCache -> runSmokeCommand rt pkgs excludeArgs noCache resetCache
     Cmd.Eclean -> runEclean rt
     Cmd.GitHubToken force -> runGitHubToken rt force
 
@@ -728,8 +741,12 @@ runSmokeCommand ::
   Runtime ->
   [String] ->
   [String] ->
+  -- | @--no-compile-cache@
+  Bool ->
+  -- | @--reset-compile-cache@
+  Bool ->
   m ()
-runSmokeCommand rt pkgArgs excludeArgs = do
+runSmokeCommand rt pkgArgs excludeArgs noCompileCache resetCompileCache = do
   enterPhase rt "config"
   (cfg, overlayPath', ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   let m = rtMetrics rt
@@ -786,7 +803,20 @@ runSmokeCommand rt pkgArgs excludeArgs = do
             sccTimeDir = if mEnabled m then mTimeDir m else Nothing,
             sccOperatorUid = fromIntegral uid,
             sccJobs = rtJobs rt,
-            sccOverlayNames = nubOrd [ebuildCategory e <> "/" <> ebuildPackage e | e <- ebuilds]
+            sccOverlayNames = nubOrd [ebuildCategory e <> "/" <> ebuildPackage e | e <- ebuilds],
+            sccCache = CacheOff
+          }
+      prepareCfg =
+        PrepareCfg
+          { pcRun = run,
+            pcHelper = HelperCfg {hcImage = smokeImageTag, hcRunId = rtRunId rt, hcCliPid = show pid},
+            pcLockPath = compileCacheLockPath cacheDir,
+            pcNow = floor <$> getPOSIXTime,
+            pcMaxSize = smokeCompileCacheMaxSize cfg,
+            pcInventory = sccOverlayNames ccfg,
+            pcSelected = nubOrd [packageKeyText (srKey r) | PlannedRun r <- items],
+            pcReset = if resetCompileCache then map packageKeyText keys else [],
+            pcEnabled = not noCompileCache
           }
       imageCfg =
         SmokeImageConfig
@@ -811,6 +841,7 @@ runSmokeCommand rt pkgArgs excludeArgs = do
       defFor key = case lookupSmokeDef key of
         Just d -> d
         Nothing -> error "selected key without a definition"
+  goChecks <- liftIO newGoChecks
   result <-
     liftIO $
       withStepProgress (rtProgress rt) (length items) $ \step ->
@@ -824,21 +855,31 @@ runSmokeCommand rt pkgArgs excludeArgs = do
               soWithSnapshot = withSpan m "smoke.snapshot" [] . withSnapshot run snapCfg . const,
               soReleaseTree = releaseGentooTree tree,
               soProbe = withSpan m "smoke.probe" [] (runSandboxProbe run ccfg),
-              soRun = \smokeRun def dir ->
+              soPrepareCache = withSpan m "smoke.compile-cache" [] $ do
+                prepared <- prepareCompileCache prepareCfg
+                mapM_ (say logWarning) (prWarnings prepared)
+                for_ (prPlan prepared) (recordCleanup m)
+                pure (prUse prepared),
+              soRun = \cache smokeRun def dir ->
                 withSpan m "smoke.run" ["atom" .= runAtom smokeRun] $ do
+                  let runCfg = ccfg {sccCache = cache}
                   r <-
-                    withSmokeContainer m productionCgroupRoots run ccfg smokeRun $ \session ->
-                      performRun session ccfg (srKey smokeRun) def smokeRun dir $ \stage ->
+                    withSmokeContainer m productionCgroupRoots run runCfg smokeRun $ \session ->
+                      performRun session runCfg goChecks (srKey smokeRun) def smokeRun dir $ \stage ->
                         shStep step (runAtom smokeRun <> ": " <> stage)
                   case r of
-                    Right res -> pure res
+                    Right res -> do
+                      for_ (roCache res) (recordCacheReport m (runAtom smokeRun))
+                      pure res
                     Left err -> do
                       createDirectoryIfMissing True dir
                       let file = dir </> "container.log"
                       TIO.writeFile file err
-                      pure (RunFail FailDependencies err file),
+                      pure (RunOutcome (RunFail FailDependencies err file) Nothing),
               soEmit = \line -> T.putStrLn line >> hFlush stdout,
               soLogFailure = say logError,
+              soLogWarning = say logWarning,
+              soLogInfo = say logInfo,
               soProgress = \i total atom ->
                 shStep step ("[" <> T.pack (show i) <> "/" <> T.pack (show total) <> "] " <> atom)
             }

@@ -32,6 +32,7 @@ import Test.Preflight qualified as Preflight
 import Test.Progress qualified as Progress
 import Test.Properties qualified as Properties
 import Test.SmokeCheck qualified as SmokeCheck
+import Test.SmokeCompileCache qualified as SmokeCompileCache
 import Test.SmokeContainer qualified as SmokeContainer
 import Test.SmokeDefinitions qualified as SmokeDefinitions
 import Test.SmokeImage qualified as SmokeImage
@@ -110,6 +111,7 @@ main = do
               SmokePlan.tests,
               SmokeImage.tests,
               SmokeCheck.tests,
+              SmokeCompileCache.tests,
               SmokeContainer.tests,
               SmokeDefinitions.tests,
               Properties.tests
