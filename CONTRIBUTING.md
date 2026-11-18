@@ -67,6 +67,12 @@ Each flavor has its own build directory, so switching flavors does not rebuild t
 
 Stan and weeder read HIE collected from the release build into `dist/release/hie/{lib,exe,test}/`. Coverage builds do not write that tree. There is no `-O2` flavor and no per-command recipe for work commands (`outdated`, `update`, and the others are arguments to `just run`).
 
+### Cleaning build outputs
+
+`just clean` defaults to `dev`. Pass `dev`, `release`, `coverage-dev`, or `coverage-release` to remove only that flavor's `dist/<flavor>/` tree. Cleaning `release` also removes its collected HIE. Either coverage flavor can be cleaned independently while preserving the shared reports in `coverage/`.
+
+`just clean all` removes all four flavor trees and the shared `coverage/` reports. Direct Cabal builds in `dist-newstyle/` are outside the scope of every `just clean` invocation.
+
 ### Build identity
 
 Binaries embed a build identity that run metrics write into each run header (`build` in `run_start`):
@@ -249,7 +255,7 @@ Generated coverage output is **gitignored** — do not commit HTML, `.tix`, or s
 | stan observations | Fix code; update `.stan.toml` only with intent (baseline excludes are deliberate) |
 | weeder weeds (exit 228) | Remove dead code or adjust `weeder.toml` `roots` / `root-modules` with justification |
 | weeder GHC/HIE mismatch | Rebuild with project GHC: `just build-release`; reinstall weeder via `./scripts/install-dev-tools` if the tool was built with the wrong GHC |
-| Stale HIE after deleting modules | `rm -rf dist/release && just build-release` |
+| Stale HIE after deleting modules | `just clean release && just build-release` |
 
 ### OpenSpec
 
