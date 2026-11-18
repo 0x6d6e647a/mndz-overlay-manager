@@ -125,7 +125,7 @@ Dev, release, coverage-dev, and coverage-release SHALL use separate build direct
 
 ### Requirement: Clean Just build outputs
 
-The task runner SHALL provide `just clean [flavor]`. It SHALL accept `dev`, `release`, `coverage-dev`, `coverage-release`, or `all`, and SHALL default to `dev`. A named flavor SHALL remove only its corresponding `dist/<flavor>/` tree. The `all` selection SHALL remove only the four named flavor trees and `coverage/`.
+The task runner SHALL provide `just clean [flavor]`. It SHALL accept `dev`, `release`, `coverage-dev`, `coverage-release`, or `all`, and SHALL default to `dev`. A named flavor SHALL remove only its corresponding `dist/<flavor>/` tree, and the parent `dist/` directory can remain empty. The `all` selection SHALL recursively remove `dist/` and `coverage/`. Every selection SHALL preserve `dist-newstyle/`.
 
 #### Scenario: Default cleanup targets dev
 
@@ -144,8 +144,8 @@ The task runner SHALL provide `just clean [flavor]`. It SHALL accept `dev`, `rel
 
 #### Scenario: All cleans Just workflow outputs
 
-- **WHEN** a contributor runs `just clean all`
-- **THEN** the four flavor trees and shared coverage reports are removed and `dist-newstyle/` and other repository outputs are preserved
+- **WHEN** a contributor runs `just clean all` with an extra entry under `dist/`
+- **THEN** the entire `dist/` tree, including the extra entry, and the entire `coverage/` tree are removed and `dist-newstyle/` and other repository outputs are preserved
 
 ### Requirement: Cleanup validates selection and tolerates absent outputs
 

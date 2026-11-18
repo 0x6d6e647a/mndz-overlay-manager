@@ -19,14 +19,14 @@ run *args:
 build:
     ./scripts/with-flavor dev -- build all
 
-# Remove build outputs for one flavor (default dev) or all flavors and reports.
+# Remove one flavor's build outputs (default dev) or all of dist/ and coverage/.
 [positional-arguments]
 clean flavor="dev":
     #!/usr/bin/env bash
     set -euo pipefail
     case "$1" in
         dev|release|coverage-dev|coverage-release) set -- "dist/$1" ;;
-        all) set -- dist/dev dist/release dist/coverage-dev dist/coverage-release coverage ;;
+        all) set -- dist coverage ;;
         *) printf 'Unsupported cleanup selector %q. Expected dev, release, coverage-dev, coverage-release, or all.\n' "$1" >&2; exit 1 ;;
     esac
     rm -rf -- "$@"

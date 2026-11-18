@@ -71,7 +71,7 @@ Stan and weeder read HIE collected from the release build into `dist/release/hie
 
 `just clean` defaults to `dev`. Pass `dev`, `release`, `coverage-dev`, or `coverage-release` to remove only that flavor's `dist/<flavor>/` tree. Cleaning `release` also removes its collected HIE. Either coverage flavor can be cleaned independently while preserving the shared reports in `coverage/`.
 
-`just clean all` removes all four flavor trees and the shared `coverage/` reports. Direct Cabal builds in `dist-newstyle/` are outside the scope of every `just clean` invocation.
+`just clean all` recursively removes the entire `dist/` and `coverage/` directories, including custom builds and stale entries. Treat `dist/` as disposable and move anything you want to keep outside the cleanup paths before running `just clean all`. Every `just clean` invocation preserves direct Cabal builds in `dist-newstyle/`.
 
 ### Build identity
 
