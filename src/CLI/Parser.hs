@@ -15,8 +15,6 @@ module CLI.Parser
   )
 where
 
-import Data.Char (isAscii, isSpace)
-import Data.List (dropWhileEnd)
 import GHC.Conc (getNumProcessors)
 import Options.Applicative
 import System.Environment (getProgName, lookupEnv)
@@ -218,9 +216,6 @@ refreshParser =
           \managed Gentoo tree regardless of its age"
     )
 
--- | Repeatable long-only @--exclude PACKAGE,...@.
--- Each value is split on commas and ASCII whitespace is trimmed.
--- An empty piece fails the reader before configuration is loaded.
 excludeTokens :: Parser [String]
 excludeTokens =
   concat
@@ -228,39 +223,22 @@ excludeTokens =
       ( option
           (eitherReader readExcludeList)
           ( long "exclude"
-              <> metavar "PACKAGE,..."
-              <> help
-                "Comma-separated, repeatable package tokens (same form as \
-                \PACKAGE) removed from the positional selection, or from the \
-                \whole inventory when no PACKAGE arguments are given. An empty \
-                \selection is an error"
+              <> metavar "PACKAGES"
+              <> help "Exclude package tokens (same form as PACKAGE, repeatable)"
           )
       )
 
 readExcludeList :: String -> Either String [String]
 readExcludeList raw =
-  let tokens = map trimAscii (splitOn ',' raw)
-   in if any null tokens
-        then Left "empty --exclude package token"
-        else Right tokens
-
-splitOn :: Char -> String -> [String]
-splitOn sep = go
-  where
-    go s = case break (== sep) s of
-      (piece, _ : rest) -> piece : go rest
-      (piece, []) -> [piece]
-
-trimAscii :: String -> String
-trimAscii = dropWhile isAsciiSpace . dropWhileEnd isAsciiSpace
-
-isAsciiSpace :: Char -> Bool
-isAsciiSpace c = isAscii c && isSpace c
+  case words raw of
+    [] -> Left "empty --exclude package list"
+    tokens -> Right tokens
 
 excludeFooter :: String
 excludeFooter =
-  "--exclude PACKAGE,... is a repeatable comma-separated list of package \
-  \tokens in the same form as PACKAGE. Those tokens are removed from the \
+  "Quote a whitespace-separated list, e.g. --exclude 'a b', or repeat \
+  \the option, e.g. --exclude a --exclude b. Replace comma-separated lists with either form. \
+  \These packages are removed from the \
   \positional selection, or from the whole inventory when no PACKAGE \
   \arguments are given. An empty selection is an error. "
 

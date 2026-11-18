@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the shared `--exclude` flag that removes packages from the `outdated`, `update`, and `gencache` selection.
+Define the shared `--exclude` flag that removes packages from the selection for `outdated`, `update`, `gencache`, and `smoke`.
 
 ## Requirements
 
@@ -36,13 +36,13 @@ Define the shared `--exclude` flag that removes packages from the `outdated`, `u
 - **WHEN** the user runs `--exclude dev-util/codex outdated`
 - **THEN** option parsing fails with exit status `1` before configuration is loaded
 
-### Requirement: Exclude values are comma-separated tokens
+### Requirement: Exclude values are whitespace-separated tokens
 
-Each `--exclude` value SHALL be split on commas into package tokens, and ASCII whitespace around each token SHALL be trimmed. An empty token SHALL fail option parsing with exit status `1` before configuration is loaded. Repeating `--exclude` SHALL union the tokens into one set. A comma inside a positional `PACKAGE` argument SHALL remain part of that single argument.
+Each `--exclude` value SHALL be split on whitespace into package tokens. An empty or whitespace-only value SHALL fail option parsing with exit status `1` before configuration is loaded. Commas SHALL NOT act as separators. Repeating `--exclude` SHALL union the tokens into one set. A comma inside a positional `PACKAGE` argument SHALL remain part of that single argument.
 
-#### Scenario: Comma list and surrounding spaces
+#### Scenario: Whitespace-separated list with surrounding spaces
 
-- **WHEN** the user runs `outdated --exclude "dev-util/codex, dev-util/crush"`
+- **WHEN** the user runs `outdated --exclude "  dev-util/codex  dev-util/crush  "`
 - **THEN** the exclude set contains `dev-util/codex` and `dev-util/crush`
 
 #### Scenario: Repeated flags union
@@ -50,10 +50,16 @@ Each `--exclude` value SHALL be split on commas into package tokens, and ASCII w
 - **WHEN** the user runs `gencache --exclude dev-util/codex --exclude dev-util/crush`
 - **THEN** the exclude set contains both packages
 
-#### Scenario: Empty segment fails before config load
+#### Scenario: Whitespace-only value fails before config load
 
-- **WHEN** the user runs `update --exclude "dev-util/codex,"`
+- **WHEN** the user runs `update --exclude "   "`
 - **THEN** option parsing fails with exit status `1` before configuration is loaded
+
+#### Scenario: Commas are not separators
+
+- **WHEN** the user runs `update --exclude dev-util/codex,dev-util/crush`
+- **THEN** the value is not interpreted as two packages
+- **AND** the command fails without performing package work
 
 #### Scenario: Positional comma is one argument
 
@@ -101,7 +107,7 @@ With no positional package arguments, the base SHALL be every discovered package
 
 #### Scenario: Duplicate tokens collapse
 
-- **WHEN** the user runs `gencache --exclude dev-util/codex,dev-util/codex`
+- **WHEN** the user runs `gencache --exclude "dev-util/codex dev-util/codex"`
 - **THEN** `dev-util/codex` is excluded once
 
 ### Requirement: Empty selection after exclusion is an error
@@ -131,7 +137,7 @@ When the selection is non-empty and at least one base package was removed, the p
 
 #### Scenario: Several removed packages
 
-- **WHEN** the user runs `gencache --exclude dev-util/crush,dev-util/codex` and both are in the inventory and other packages remain
+- **WHEN** the user runs `gencache --exclude "dev-util/crush dev-util/codex"` and both are in the inventory and other packages remain
 - **THEN** the program logs `excluding 2 packages: ` followed by those two keys in inventory order
 
 #### Scenario: Unused exclude adds no warning name

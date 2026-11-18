@@ -476,6 +476,9 @@ testExcludeSelection = do
       UnknownPackage "not-there"
     ]
     errs
+  let commaList = "bar/foo,baz/foo"
+  commaErrors <- assertLeft "comma-separated exclusion" $ selectExcluding sampleEntries [] [commaList]
+  assertEq "comma-separated exclusion is one unknown package" [UnknownPackage commaList] commaErrors
   -- A PV token is not a package key.
   pvErrs <-
     assertLeft "pv token" $

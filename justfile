@@ -12,7 +12,8 @@ default:
 run *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    exec ./scripts/with-flavor dev -- run mndz-overlay-manager -- {{ replace_regex(args, "^--( |$)", "") }}
+    if [[ "${1-}" == -- ]]; then shift; fi
+    exec ./scripts/with-flavor dev -- run mndz-overlay-manager -- "$@"
 
 # Build every component in the dev flavor.
 build:
@@ -35,7 +36,8 @@ test *pattern:
 run-release *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    exec ./scripts/with-flavor release -- run mndz-overlay-manager -- {{ replace_regex(args, "^--( |$)", "") }}
+    if [[ "${1-}" == -- ]]; then shift; fi
+    exec ./scripts/with-flavor release -- run mndz-overlay-manager -- "$@"
 
 # Build every component in the release flavor and collect its HIE.
 build-release:

@@ -190,7 +190,7 @@ Bun packages whose runtime ceiling comes from overlay `dev-lang/bun-bin` are pre
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name (same form as `update` / `gencache`). With no arguments, every discovered package is checked. With one or more targets, only the selected packages are checked.
 
-**Flags:** `--refresh` forces live check/plan work (ignores the check cache for reads) and a managed Gentoo tree sync. `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens in that same form. Those tokens are subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error.
+**Flags:** `--refresh` forces live check/plan work (ignores the check cache for reads) and a managed Gentoo tree sync. `--exclude 'PACKAGE ...'` accepts a whitespace-separated list of package tokens in that same form. Quote multiple tokens as one shell argument. An unquoted second word is a positional target. Replace `--exclude a,b` with `--exclude 'a b'` or `--exclude a --exclude b`. Those tokens are subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error.
 
 ```bash
 # All discovered packages
@@ -206,7 +206,7 @@ just run outdated caddy-analyzer
 just run outdated --refresh
 
 # Skip one package
-just run outdated --exclude dev-util/codex
+just run outdated --exclude 'dev-util/codex dev-util/crush'
 ```
 
 ### `update`
@@ -215,7 +215,7 @@ Apply updates for packages that need work: rename or rewrite ebuilds, regenerate
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every inventory package is planned; packages that need work are mutated and others soft-skipped. Explicit targets that do not need work are soft-skipped.
 
-**Flags:** `--refresh` forces live latest fetch / deps plan (ignores the check cache for reads) and a managed Gentoo tree sync. After a successful apply, the package’s cache entry is rewritten with the post-apply fingerprint when caching is enabled. `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens (`category/package` or an unambiguous package name), subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error. `update` does not pull an excluded package back into the selection. `--exclude dev-lang/bun-bin` leaves bun-bin an unselected ceiling provider and does not add bun-bin back. A dirty ensure-emerge atom is still checked when the materialize recipe will emerge it.
+**Flags:** `--refresh` forces live latest fetch / deps plan (ignores the check cache for reads) and a managed Gentoo tree sync. After a successful apply, the package’s cache entry is rewritten with the post-apply fingerprint when caching is enabled. `--exclude 'PACKAGE ...'` accepts a whitespace-separated list of package tokens (`category/package` or an unambiguous package name), subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error. `update` does not pull an excluded package back into the selection. `--exclude dev-lang/bun-bin` leaves bun-bin an unselected ceiling provider and does not add bun-bin back. A dirty ensure-emerge atom is still checked when the materialize recipe will emerge it.
 
 ```bash
 # All packages that need work
@@ -336,7 +336,7 @@ Held entries are **never removed** by the program, and `eclean` leaves them alon
 
 Generate or repair Portage **md5-dict** cache under `metadata/md5-cache/` via `egencache` in the [Portage tools container](#portage-tools-container) (eclass checksums come from the managed Gentoo tree), then create **one** GPG-signed overlay commit of changed cache paths (message `metadata: regenerate md5-cache`). No empty commit when nothing changes.
 
-**Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every package that has at least one ebuild is selected. `--exclude PACKAGE,...` is a repeatable comma-separated list of package tokens in that same form, subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error. `--force` regenerates only the packages that remain.
+**Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every package that has at least one ebuild is selected. `--exclude 'PACKAGE ...'` accepts a whitespace-separated list of package tokens in that same form, subtracted from the positional targets, or from the whole inventory when none are given. A non-empty removal logs one warning. An empty selection is an error. `--force` regenerates only the packages that remain.
 
 **Strict-strict policy:** without `--force`, missing cache is generated (bootstrap), matching packages are skipped, and `_md5_` mismatches hard-fail. With `--force`, every selected package is regenerated.
 
@@ -352,14 +352,14 @@ just run gencache --force
 just run gencache --force crush
 
 # Skip one package
-just run gencache --exclude dev-util/crush
+just run gencache --exclude dev-util/crush --exclude dev-util/codex
 ```
 
 ### `smoke`
 
 Install every on-disk (non-live) version of each selected package in a fresh Docker container, with Portage's sandboxes on, and run the package's checks. The worktree is tested as it is, including uncommitted changes; nothing in the overlay is written and nothing is committed or published. No GitHub token, GPG key, or SSH agent is needed.
 
-**Targets:** zero or more package arguments as `category/package` or an unambiguous package name; with none, every discovered package. `--exclude PACKAGE,...` works as for `outdated`. Every selected package must have a smoke definition in the program (all packages with an update policy do); a package without one hard-fails the command before any Docker work, naming it, and `--exclude` skips it.
+**Targets:** zero or more package arguments as `category/package` or an unambiguous package name; with none, every discovered package. `--exclude 'PACKAGE ...'` works as for `outdated`. Every selected package must have a smoke definition in the program (all packages with an update policy do); a package without one hard-fails the command before any Docker work, naming it, and `--exclude` skips it.
 
 ```bash
 # Every package

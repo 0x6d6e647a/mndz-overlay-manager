@@ -694,20 +694,13 @@ testExcludeParser = do
           CompletionInvoked _ -> do
             hPutStrLn stderr $ label <> ": expected failure, got completion"
             exitFailure
-  comma <- commandOf "comma" ["outdated", "--exclude", "dev-util/codex, dev-util/crush"]
+  comma <- commandOf "comma" ["gencache", "--exclude", "dev-util/codex,dev-util/crush"]
   assertEq
-    "comma split and trim"
-    ( Just
-        ( CLI.Outdated
-            { CLI.outdatedRefresh = False,
-              CLI.outdatedTargets = [],
-              CLI.outdatedExcludeTokens = ["dev-util/codex", "dev-util/crush"]
-            }
-        )
-    )
+    "comma list remains one token for target resolution"
+    (Just (CLI.Gencache [] False ["dev-util/codex,dev-util/crush"]))
     comma
   padded <-
-    commandOf "padded" ["outdated", "--exclude", "  dev-util/codex  ,  dev-util/crush  "]
+    commandOf "padded" ["outdated", "--exclude", "  dev-util/codex \t\n dev-util/crush  "]
   assertEq
     "padded tokens trimmed"
     ( Just
@@ -763,7 +756,7 @@ testExcludeParser = do
         )
     )
     excludeThenPos
-  assertFail "empty segment" ["update", "--exclude", "dev-util/codex,"]
+  assertFail "empty value" ["update", "--exclude", ""]
   assertFail "whitespace-only" ["update", "--exclude", "   "]
   assertFail "list rejects exclude" ["list", "--exclude", "dev-util/codex"]
   assertFail "eclean rejects exclude" ["eclean", "--exclude", "dev-util/codex"]
@@ -781,9 +774,11 @@ testExcludeHelp = do
           CompletionInvoked _ -> do
             hPutStrLn stderr $ label <> ": expected help, got completion"
             exitFailure
-      assertDocuments label msg = do
+      assertDocuments label rendered = do
+        let msg = unwords (words rendered)
         assertTrue (label <> " names --exclude") ("--exclude" `isInfixOf` msg)
-        assertTrue (label <> " comma-separated") ("comma-separated" `isInfixOf` msg)
+        assertTrue (label <> " whitespace-separated") ("whitespace-separated" `isInfixOf` msg)
+        assertTrue (label <> " quoted list") ("--exclude 'a b'" `isInfixOf` msg)
         assertTrue (label <> " repeatable") ("repeatable" `isInfixOf` msg)
         assertTrue (label <> " positional selection") ("positional selection" `isInfixOf` msg)
         assertTrue (label <> " whole inventory") ("whole inventory" `isInfixOf` msg)
@@ -798,6 +793,9 @@ testExcludeHelp = do
   assertEq "gencache help exits 0 without config" ExitSuccess gencacheCode
   assertDocuments "gencache" gencacheMsg
   assertTrue "gencache help still documents --force" ("--force" `isInfixOf` gencacheMsg)
+  (smokeMsg, smokeCode) <- helpOf "smoke" ["smoke", "--help"]
+  assertEq "smoke help exits 0 without config" ExitSuccess smokeCode
+  assertDocuments "smoke" smokeMsg
   (topMsg, topCode) <- helpOf "top" ["--help"]
   assertEq "top help exits 0 without config" ExitSuccess topCode
   assertTrue "top help does not document --exclude" (not ("--exclude" `isInfixOf` topMsg))
@@ -822,14 +820,14 @@ testParserSmoke = do
   assertEq
     "targets and exclude"
     (Just (CLI.Smoke ["crush", "deno-bin"] ["dev-util/codex", "dev-util/hk"] False False))
-    (cmdOf ["smoke", "crush", "deno-bin", "--exclude", "dev-util/codex,dev-util/hk"])
+    (cmdOf ["smoke", "crush", "deno-bin", "--exclude", "dev-util/codex dev-util/hk"])
   assertEq "refresh rejected" Nothing (cmdOf ["smoke", "--refresh"])
   assertEq "jobs is global" (Just (Just 8)) (optJobs <$> getParseResult (parse ["--jobs", "8", "smoke", "crush"]))
   (msg, code) <- helpOf ["smoke", "--help"]
   assertEq "smoke help exits 0 without config" ExitSuccess code
   mapM_
     (\needle -> assertTrue ("smoke help mentions " <> needle) (needle `isInfixOf` unwords (words msg)))
-    ["PACKAGE...", "test all discovered packages", "--exclude", "comma-separated", "--jobs", "build", "one at a time", "fresh", "containerd image store", "accepted before the subcommand", "--no-compile-cache", "--reset-compile-cache", "mndz-smoke-compile-cache"]
+    ["PACKAGE...", "test all discovered packages", "--exclude", "whitespace-separated", "--jobs", "build", "one at a time", "fresh", "containerd image store", "accepted before the subcommand", "--no-compile-cache", "--reset-compile-cache", "mndz-smoke-compile-cache"]
   assertTrue "smoke help has no --refresh" (not ("--refresh" `isInfixOf` msg))
   (topMsg, topCode) <- helpOf ["--help"]
   assertEq "top help exits 0" ExitSuccess topCode
