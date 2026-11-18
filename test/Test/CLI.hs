@@ -310,6 +310,7 @@ tests =
       testCase "ExcludeParser" testExcludeParser,
       testCase "ExcludeHelp" testExcludeHelp,
       testCase "Parser smoke" testParserSmoke,
+      testCase "Parser update gate flag and help" testParserUpdateGate,
       testCase "Help Catalogs Eclean And Distfiles" testHelpCatalogDistfiles,
       testCase "Show Top Level Help Exit 1" testShowTopLevelHelpExit1,
       testCase "Logger Hold And Filter" testLoggerHoldAndFilter
@@ -505,7 +506,7 @@ testParserPureCommands = do
       hPutStrLn stderr "parse outdated failed"
       exitFailure
   case parse ["update"] of
-    Just opts -> assertEq "update all" (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = [], CLI.updateExcludeTokens = []})) (optCommand opts)
+    Just opts -> assertEq "update all" (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = [], CLI.updateExcludeTokens = [], updateNoCompileCache = False})) (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update failed"
       exitFailure
@@ -513,7 +514,7 @@ testParserPureCommands = do
     Just opts ->
       assertEq
         "update one"
-        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["dev-util/hk"], CLI.updateExcludeTokens = []}))
+        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["dev-util/hk"], CLI.updateExcludeTokens = [], updateNoCompileCache = False}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update target failed"
@@ -646,7 +647,7 @@ testParserResidualEdges = do
     Just opts ->
       assertEq
         "update multi"
-        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["a/b", "c/d"], CLI.updateExcludeTokens = []}))
+        (Just (CLI.Update {CLI.updateRefresh = False, CLI.updateTargets = ["a/b", "c/d"], CLI.updateExcludeTokens = [], updateNoCompileCache = False}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update multi failed"
@@ -664,7 +665,7 @@ testParserResidualEdges = do
     Just opts ->
       assertEq
         "update refresh"
-        (Just (CLI.Update {CLI.updateRefresh = True, CLI.updateTargets = [], CLI.updateExcludeTokens = []}))
+        (Just (CLI.Update {CLI.updateRefresh = True, CLI.updateTargets = [], CLI.updateExcludeTokens = [], updateNoCompileCache = False}))
         (optCommand opts)
     Nothing -> do
       hPutStrLn stderr "parse update --refresh failed"
@@ -728,7 +729,8 @@ testExcludeParser = do
         ( CLI.Update
             { CLI.updateRefresh = False,
               CLI.updateTargets = [],
-              CLI.updateExcludeTokens = ["dev-util/codex", "dev-util/crush"]
+              CLI.updateExcludeTokens = ["dev-util/codex", "dev-util/crush"],
+              CLI.updateNoCompileCache = False
             }
         )
     )
@@ -833,6 +835,28 @@ testParserSmoke = do
   assertEq "top help exits 0" ExitSuccess topCode
   assertTrue "top help lists smoke" ("smoke" `isInfixOf` topMsg)
   assertTrue "top help describes smoke" ("in a clean container" `isInfixOf` unwords (words topMsg))
+
+testParserUpdateGate :: IO ()
+testParserUpdateGate = do
+  let parse = execParserPure defaultPrefs parserInfo
+      cmdOf args = optCommand =<< getParseResult (parse args)
+      helpOf args = case parse args of
+        Failure failure -> pure (renderFailure failure "mndz-overlay-manager")
+        _ -> do
+          hPutStrLn stderr ("expected help for " <> unwords args)
+          exitFailure
+  assertEq "default uses the cache" (Just (CLI.Update False [] [] False)) (cmdOf ["update"])
+  assertEq "opt-out" (Just (CLI.Update False ["hk"] [] True)) (cmdOf ["update", "--no-compile-cache", "hk"])
+  assertEq
+    "flag with exclude"
+    (Just (CLI.Update False [] ["dev-util/mise"] True))
+    (cmdOf ["update", "--no-compile-cache", "--exclude", "dev-util/mise"])
+  (msg, code) <- helpOf ["update", "--help"]
+  assertEq "update help exits 0" ExitSuccess code
+  let flat = unwords (words msg)
+  mapM_
+    (\needle -> assertTrue ("update help mentions " <> needle) (needle `isInfixOf` flat))
+    ["smoke-tested", "before anything about it is published or committed", "overlay is pushed", "--no-compile-cache", "without the per-package compile cache"]
 
 -- | Top-level and @eclean --help@ catalog manager distfiles surfaces.
 testHelpCatalogDistfiles :: IO ()

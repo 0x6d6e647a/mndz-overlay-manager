@@ -15,10 +15,13 @@ import Test.EbuildEdit qualified as EbuildEdit
 import Test.Ecosystems qualified as Ecosystems
 import Test.Ensure qualified as Ensure
 import Test.Gastown qualified as Gastown
+import Test.Gate qualified as Gate
+import Test.GatedPublish qualified as GatedPublish
 import Test.GentooTree qualified as GentooTree
 import Test.Git qualified as Git
 import Test.GitHubResilience qualified as GitHubResilience
 import Test.Gpg qualified as Gpg
+import Test.Held qualified as Held
 import Test.Lanes qualified as Lanes
 import Test.Materialize qualified as Materialize
 import Test.Md5Cache qualified as Md5Cache
@@ -128,6 +131,9 @@ main = do
               CaddyAnalyzer.integrationTests,
               GitHubResilience.integrationTests,
               Waves.integrationTests,
-              SmokeRun.tests
+              SmokeRun.tests,
+              Gate.tests,
+              GatedPublish.tests,
+              Held.tests
             ]
         ]

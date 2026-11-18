@@ -83,6 +83,7 @@ import Update.Apply
     EbuildRunner,
     applyPackagePhase1Tracked,
     foldExitHardFail,
+    newPublishControl,
   )
 import Update.Apply.Errors
   ( ApplyUnitError (..),
@@ -146,6 +147,7 @@ import Update.EbuildEdit
     writeVersionForPlannedPV,
   )
 import Update.Engines (parseEnginesMinimum)
+import Update.Gate (passThroughGate)
 import Update.Git (GitOps (..))
 import Update.GitHub (stripAndParse)
 import Update.Go.Lanes
@@ -311,6 +313,8 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
           }
   (cache, _) <- openCheckCache CacheDisabled False "/tmp"
   compressSlot <- newPackSlot
+  inFlight <- newIORef Map.empty
+  publish <- newPublishControl (\_ -> pure (Right ())) (\_ _ _ _ _ -> pure (Right ()))
   pure
     ApplyEnv
       { aeFetcher = \_ -> pure (Left "unused"),
@@ -325,6 +329,7 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeSbclDepsOps = productionSbclDepsOps compressSlot,
         aeUvDepsOps = productionUvDepsOps compressSlot,
         aePdmDepsOps = productionPdmDepsOps compressSlot,
+        aeSeedDistfiles = \_ -> pure (Right ()),
         aeReleaseOps = releaseOps,
         aeAssetsRoot = assetsRoot,
         aeGitHubToken = Just "tok",
@@ -343,7 +348,11 @@ mkTestApplyEnv gitOps planOps ebuildRun releaseOps vendorOps assetsRoot assetsLo
         aeMaterializeDocker = Nothing,
         aeAtomClosure = Nothing,
         aeGitOperationsHealth = pure (Right ()),
-        aeReleaseSigningSession = pure ()
+        aeReleaseSigningSession = pure (),
+        aeGate = passThroughGate,
+        aeHold = \_ -> pure (Right "/held/test-entry"),
+        aePublish = publish,
+        aeInFlight = inFlight
       }
 
 -- | Write a matching md5-dict cache file for one ebuild.

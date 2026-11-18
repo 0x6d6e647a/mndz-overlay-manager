@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 -- | Test-only Apply helpers.
 --
 -- Not part of the product CLI surface. The executable should depend on
@@ -14,6 +16,8 @@ module Update.Apply.TestSupport
     materializePlan,
     orderNeedPlannedUnits,
     overlayAfterAssets,
+    UnitTail (..),
+    reusedTail,
     fullPathMaterializeSteps,
     reusePathMaterializeSteps,
     materializeStepTotalUpper,
@@ -54,6 +58,7 @@ import Update.Apply.Materialize
     reviseMaterializeStepTotal,
   )
 import Update.Apply.OverlayWrite (overlayAfterAssets)
+import Update.Apply.Publish (UnitTail (..), noPublish)
 import Update.AtomClosure
   ( DepNeed (..),
     GitMvRenamePlan (..),
@@ -71,3 +76,8 @@ import Update.AtomClosure
     renameAwayUnsatisfied,
     waitCycleWithEdge,
   )
+
+-- | A reuse-path tail: assets already published, nothing to publish after
+-- the gate.
+reusedTail :: UnitTail
+reusedTail = (noPublish "DepsAndAssets Go" (Just "reuse")) {utPublishedBefore = True}

@@ -104,7 +104,7 @@ invocationFor :: Int -> Command -> Invocation
 invocationFor jobs cmd =
   case cmd of
     Outdated refresh targets excludes -> inv (Just refresh) targets excludes
-    Update refresh targets excludes -> inv (Just refresh) targets excludes
+    Update refresh targets excludes _ -> inv (Just refresh) targets excludes
     Gencache targets _ excludes -> inv Nothing targets excludes
     Smoke targets excludes _ _ -> inv Nothing targets excludes
     Eclean -> inv Nothing [] []

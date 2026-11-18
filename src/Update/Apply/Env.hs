@@ -6,12 +6,17 @@ module Update.Apply.Env
     productionEbuildRunner,
     mkEbuildRunner,
     ApplyEnv (..),
+    HoldRequest (..),
+    PublishControl (..),
+    newPublishControl,
   )
 where
 
 import CLI.Jobs (PackSlot)
 import CLI.Progress (MultiHandle)
 import Control.Concurrent.MVar (MVar)
+import Data.IORef (IORef, newIORef, readIORef)
+import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (makeAbsolute)
@@ -26,9 +31,11 @@ import Update.Distfiles
   ( ebuildManifestEnv,
     enrichEbuildManifestError,
   )
+import Update.Gate (GateHandle)
 import Update.Git (GitOps)
 import Update.Go.Plan (PlanOps)
 import Update.Go.Vendor (VendorOps)
+import Update.Held (AssetRecord, GateRunRecord, HeldReason)
 import Update.Http (HttpLbs)
 import Update.Md5Cache (EgencacheRunner)
 import Update.Npm.Cache (NpmCacheOps)
@@ -44,7 +51,7 @@ import Update.Process
 import Update.Process.Docker (MaterializeDockerCfg, ToolsSession, toolsSessionRunner)
 import Update.Sbcl.Deps (SbclDepsOps)
 import Update.TempWorkspace (RunRoot)
-import Update.Types (Fetcher)
+import Update.Types (ApplyOutcome, Fetcher, PackageKey)
 import Update.Uv.Deps (UvDepsOps)
 
 type EbuildRunner = FilePath -> FilePath -> IO (Either Text ())
@@ -83,6 +90,9 @@ data ApplyEnv = ApplyEnv
     aeHttpLbs :: HttpLbs,
     aeGitOps :: GitOps,
     aeEbuildRunner :: EbuildRunner,
+    -- | Copy a full-path unit's built distfiles into the manager @DISTDIR@
+    -- before its Manifest is generated.
+    aeSeedDistfiles :: [FilePath] -> IO (Either Text ()),
     aeEgencacheRunner :: EgencacheRunner,
     aeVendorOps :: VendorOps,
     aeNpmCacheOps :: NpmCacheOps,
@@ -121,5 +131,63 @@ data ApplyEnv = ApplyEnv
     -- | Git Operations Statuspage check immediately before assets @git push@.
     aeGitOperationsHealth :: IO (Either Text ()),
     -- | Kill the session agent before a successful run root is deleted.
-    aeReleaseSigningSession :: IO ()
+    aeReleaseSigningSession :: IO (),
+    -- | Smoke gate for each unit before it publishes or commits.
+    aeGate :: GateHandle,
+    -- | Save a unit's uncommitted work and roll it back; 'Right' is the held
+    -- entry. Takes the overlay critical section itself.
+    aeHold :: HoldRequest -> IO (Either Text FilePath),
+    aePublish :: PublishControl,
+    -- | Units past their gate's start and not yet finished, with the action
+    -- that holds each as interrupted.
+    aeInFlight :: IORef (Map PackageKey (IO ApplyOutcome))
   }
+
+-- | A unit to hold: what @held.json@ records beyond the run's own context.
+data HoldRequest = HoldRequest
+  { hrKey :: PackageKey,
+    hrPv :: Text,
+    hrTechnique :: Text,
+    -- | @full@ or @reuse@ for a DepsAndAssets unit.
+    hrPath :: Maybe Text,
+    hrRuns :: [GateRunRecord],
+    hrReason :: HeldReason,
+    hrDetail :: Text,
+    hrRelease :: Maybe Text,
+    hrAssets :: [AssetRecord],
+    -- | Overlay-relative paths the unit changed.
+    hrPaths :: [FilePath],
+    hrDistfiles :: [FilePath],
+    hrLogDirs :: [FilePath]
+  }
+  deriving (Eq, Show)
+
+-- | Overlay push and the run-wide stop on push failure.
+data PublishControl = PublishControl
+  { -- | The push failure that halted publishing, once one has.
+    pcHalted :: IORef (Maybe Text),
+    -- | Push the overlay's current branch to its upstream.
+    pcPushOverlay :: FilePath -> IO (Either Text ()),
+    -- | Verify a unit's published assets (download prefix, overlay root,
+    -- package, PVR, asset names) at the URLs its ebuild names; 'Left' is
+    -- the URL and mismatch.
+    pcVerify :: Text -> FilePath -> PackageKey -> Text -> [Text] -> IO (Either (Text, Text) ()),
+    -- | 'Just' the reason no further unit may start (gate prerequisites
+    -- failed). Halted publishing is checked separately.
+    pcStopStarting :: IO (Maybe Text)
+  }
+
+-- | Halt flag unset, the given push and verification, no other stop.
+newPublishControl ::
+  (FilePath -> IO (Either Text ())) ->
+  (Text -> FilePath -> PackageKey -> Text -> [Text] -> IO (Either (Text, Text) ())) ->
+  IO PublishControl
+newPublishControl push verify = do
+  halted <- newIORef Nothing
+  pure
+    PublishControl
+      { pcHalted = halted,
+        pcPushOverlay = push,
+        pcVerify = verify,
+        pcStopStarting = fmap (fmap ("publishing halted because " <>)) (readIORef halted)
+      }

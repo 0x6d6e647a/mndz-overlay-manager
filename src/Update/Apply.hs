@@ -15,6 +15,9 @@ module Update.Apply
     productionEbuildRunner,
     mkEbuildRunner,
     ApplyEnv (..),
+    HoldRequest (..),
+    PublishControl (..),
+    newPublishControl,
     -- | Exported for 'Update.Apply.TestSupport' and direct unit tests.
     applyPackagePhase1,
     -- | Exported for multi-progress terminal-handle unit tests.
@@ -34,7 +37,7 @@ import Control.Concurrent (newQSem, signalQSem, waitQSem)
 import Control.Concurrent.Async (mapConcurrently_, wait, withAsync)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
-import Control.Exception (IOException, try)
+import Control.Exception (IOException, SomeAsyncException, SomeException, catch, throwIO, try)
 import Control.Monad (replicateM_, unless, void, when)
 import Data.Either (partitionEithers)
 import Data.Foldable (for_)
@@ -46,18 +49,15 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Metrics.Core (captureSpanContext)
-import Update.Apply.Env
-  ( ApplyEnv (..),
-    EbuildRunner,
-    mkEbuildRunner,
-    productionEbuildRunner,
-  )
+import System.IO (hPutStrLn, stderr)
+import Update.Apply.Env (ApplyEnv (..), EbuildRunner, HoldRequest (..), PublishControl (..), mkEbuildRunner, newPublishControl, productionEbuildRunner)
 import Update.Apply.GitMv
-  ( PendingGitMvCommit (..),
+  ( PendingGitMvCommit,
     applyGitMv,
     applyGitMvFilesWithRemote,
     applyGitMvWithRemote,
     commitPendingGitMv,
+    gatePendingGitMv,
   )
 import Update.Apply.Materialize
   ( applyDepsAndAssets,
@@ -74,6 +74,7 @@ import Update.AtomClosure
     wireAtomClosureSlots,
   )
 import Update.Check (PackageEntry (..))
+import Update.Gate (GateHandle (..))
 import Update.Git (GitOps (..))
 import Update.Go.Lanes (RuntimeLanePlan (..))
 import Update.Hardcoded (lookupPolicy)
@@ -98,6 +99,13 @@ import Update.Types
 
 foldExitHardFail :: [ApplyOutcome] -> Bool
 foldExitHardFail = any outcomeIsHardFail
+
+-- | A package reached its outcome: atom-closure waiters and gate
+-- dependency waiters may proceed.
+markTerminal :: ApplyEnv -> PackageKey -> AtomClosureTerminal -> IO ()
+markTerminal env key term = do
+  recordAtomClosureTerminal (aeAtomClosure env) key term
+  ghTerminal (aeGate env) key
 
 terminalFromApplyOutcomes :: [ApplyOutcome] -> AtomClosureTerminal
 terminalFromApplyOutcomes os
@@ -286,11 +294,28 @@ applyOverlayFromPlan pcfg env overlayRoot entries planResults prepare mutate = d
                       withheldSet
                       byEntry
                       prepare
+                      `catch` \(e :: SomeAsyncException) -> do
+                        holdInterrupted env'
+                        throwIO e
           let outcomes = carried <> setupOutcomes <> cascadeFails <> nested
           unless (any outcomeIsHardFail outcomes) $ do
             aeReleaseSigningSession env
             cleanupRunSuccess (aeTempRun env)
           pure outcomes
+
+-- | After an interrupt: hold every unit still in flight (its gated
+-- container was removed when its worker was cancelled). A second
+-- interrupt stops the sweep; the dirty preflight names what is left.
+holdInterrupted :: ApplyEnv -> IO ()
+holdInterrupted env = do
+  inFlight <- Map.toList <$> readIORef (aeInFlight env)
+  for_ inFlight $ \(key, hold) -> do
+    r <- try @SomeException hold
+    hPutStrLn stderr $
+      T.unpack (packageKeyText key) <> ": " <> case r of
+        Right (ApplyHardFail _ msg _ _) -> T.unpack msg
+        Right _ -> "interrupted"
+        Left err -> "interrupted; could not hold: " <> show err
 
 partitionEnsure ::
   [PackageKey] ->
@@ -389,6 +414,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
         Just session ->
           wireAtomClosureSlots session (signalQSem sem) (waitQSem sem)
         Nothing -> pure ()
+      ghWireSlots (aeGate env) (signalQSem sem) (waitQSem sem)
       chan <- newChan
       remaining <- newIORef panelCount
       outcomesRef <- newIORef ([] :: [ApplyOutcome])
@@ -411,7 +437,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
             for_ consumers $ \c -> do
               mhFail mh c msg
               recordOutcomes [ApplyHardFail c msg False False]
-              recordAtomClosureTerminal (aeAtomClosure env) c TerminalOverlayFail
+              markTerminal env c TerminalOverlayFail
               finishOne
           admitResults provider consumers results = do
             let byPlan = Map.fromList [(planResultKey r, r) | r <- results]
@@ -423,20 +449,17 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                 Just (PlanSoftSkip _ reason) -> do
                   mhSkip mh c (shortApplyReason reason)
                   recordOutcomes [ApplySoftSkip c reason]
-                  recordAtomClosureTerminal (aeAtomClosure env) c TerminalOverlayOk
+                  markTerminal env c TerminalOverlayOk
                   finishOne
                 Just (PlanHardFail _ msg) -> do
                   mhFail mh c (shortApplyReason msg)
                   recordOutcomes [ApplyHardFail c msg False False]
-                  recordAtomClosureTerminal (aeAtomClosure env) c TerminalOverlayFail
+                  markTerminal env c TerminalOverlayFail
                   finishOne
                 _ -> cascade provider [c]
           handleDone key outs = do
             recordOutcomes outs
-            recordAtomClosureTerminal
-              (aeAtomClosure env)
-              key
-              (terminalFromApplyOutcomes outs)
+            markTerminal env key (terminalFromApplyOutcomes outs)
             waiting <-
               Map.keys . Map.filter (== key) <$> readIORef withheldRef
             if null waiting
@@ -456,7 +479,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
               let k = peKey e
               mhFail mh k (shortApplyReason err)
               recordOutcomes [ApplyHardFail k err False False]
-              recordAtomClosureTerminal (aeAtomClosure env) k TerminalOverlayFail
+              markTerminal env k TerminalOverlayFail
               finishOne
           delayedGitMv key work =
             delayKey == Just key && isGitMvWork work
@@ -467,52 +490,69 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
             Right () -> do
               n <- atomicModifyIORef' remainingGates (\x -> let x' = x - 1 in (x', x'))
               when (n == 0) $ signalFiles (Right ())
+          -- No unit starts once publishing halted or the gate's
+          -- prerequisites failed.
+          unlessStopped entry onStop k = do
+            stop <- pcStopStarting (aePublish env)
+            case stop of
+              Just reason -> do
+                let out = ApplyHardFail (peKey entry) reason False False
+                presentApplyChrome mh (peKey entry) [out]
+                onStop reason
+                handleDone (peKey entry) [out]
+              Nothing -> k
           worker = do
             item <- readChan chan
             case item of
               Nothing -> pure ()
               Just (entry, work)
                 | delayedGitMv (peKey entry) work -> do
-                    fileResult <-
-                      withMeasuredSlot
-                        (mhMetrics mh)
-                        "jobs"
-                        jobs
-                        sem
-                        (runDelayedGitMvFiles env overlayRoot entry work)
-                    case fileResult of
-                      Left outcome -> do
-                        presentApplyChrome mh (peKey entry) [outcome]
-                        signalGateDone (Left (outcomeMessage outcome))
-                        handleDone (peKey entry) [outcome]
-                        worker
-                      Right pending -> do
-                        putMVar pendingVar pending
-                        signalGateDone (Right ())
-                        worker
+                    unlessStopped entry (signalGateDone . Left) $ do
+                      -- The gate overlaps ensure; the commit waits for both.
+                      result <-
+                        withMeasuredSlot
+                          (mhMetrics mh)
+                          "jobs"
+                          jobs
+                          sem
+                          ( runDelayedGitMvFiles env overlayRoot entry work >>= \case
+                              Left outcome -> pure (Left outcome)
+                              Right pending -> do
+                                signalGateDone (Right ())
+                                Right <$> gatePendingGitMv env pending
+                          )
+                      case result of
+                        Left outcome -> do
+                          presentApplyChrome mh (peKey entry) [outcome]
+                          signalGateDone (Left (outcomeMessage outcome))
+                          handleDone (peKey entry) [outcome]
+                        Right gateResult -> putMVar pendingVar gateResult
+                    worker
                 | gatedFileWork (peKey entry) work -> do
-                    outs <-
-                      withMeasuredSlot
-                        (mhMetrics mh)
-                        "jobs"
-                        jobs
-                        sem
-                        (applyNeedsWorkTracked env overlayRoot entry work)
-                    signalGateDone $
-                      case [m | ApplyHardFail _ m _ _ <- outs] of
-                        (m : _) -> Left m
-                        [] -> Right ()
-                    handleDone (peKey entry) outs
+                    unlessStopped entry (signalGateDone . Left) $ do
+                      outs <-
+                        withMeasuredSlot
+                          (mhMetrics mh)
+                          "jobs"
+                          jobs
+                          sem
+                          (applyNeedsWorkTracked env overlayRoot entry work)
+                      signalGateDone $
+                        case [m | ApplyHardFail _ m _ _ <- outs] of
+                          (m : _) -> Left m
+                          [] -> Right ()
+                      handleDone (peKey entry) outs
                     worker
                 | otherwise -> do
-                    outs <-
-                      withMeasuredSlot
-                        (mhMetrics mh)
-                        "jobs"
-                        jobs
-                        sem
-                        (applyNeedsWorkTracked env overlayRoot entry work)
-                    handleDone (peKey entry) outs
+                    unlessStopped entry (const (pure ())) $ do
+                      outs <-
+                        withMeasuredSlot
+                          (mhMetrics mh)
+                          "jobs"
+                          jobs
+                          sem
+                          (applyNeedsWorkTracked env overlayRoot entry work)
+                      handleDone (peKey entry) outs
                     worker
           gated = not (null gateKeys)
           runEnsure = do
@@ -537,7 +577,7 @@ runAdmitPool env overlayRoot readyWork ensureWork mutate withheld0 byEntry prepa
                   (Just bunKey, Right ())
                     | delayInReady -> do
                         pending <- takeMVar pendingVar
-                        out <- commitPendingGitMv env overlayRoot pending
+                        out <- either pure (commitPendingGitMv env overlayRoot) pending
                         presentApplyChrome mh bunKey [out]
                         handleDone bunKey [out]
                   _ -> pure ()
@@ -690,10 +730,7 @@ applyPackagePhase1Tracked env overlayRoot entry = do
       mh = aeMulti env
   mhStart mh key
   outcomes <- applyPackagePhase1 env overlayRoot entry
-  recordAtomClosureTerminal
-    (aeAtomClosure env)
-    key
-    (terminalFromApplyOutcomes outcomes)
+  markTerminal env key (terminalFromApplyOutcomes outcomes)
   case outcomes of
     [] -> mhSuccess mh key
     _ ->

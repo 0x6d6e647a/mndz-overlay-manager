@@ -19,7 +19,7 @@ import Test.Assert (assertEq, assertTrue)
 import Test.Support (mkTestApplyEnv, unusedReleaseOps, unusedVendorOps)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase)
-import Update.Apply.TestSupport (overlayAfterAssets)
+import Update.Apply.TestSupport (overlayAfterAssets, reusedTail)
 import Update.Assets.Hash (hashBytes)
 import Update.Check (PackageEntry (..))
 import Update.Gastown.Gates (prepareGastownEbuild)
@@ -199,6 +199,7 @@ testNoWrite = do
       Nothing
       Nothing
       (Just (fixture "renamed"))
+      reusedTail
   case outcome of
     ApplyHardFail k msg half _ -> do
       assertEq "key" key k

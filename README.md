@@ -16,6 +16,7 @@ The documented build and run commands use [just](https://just.systems/) **1.55 o
 |------|------------------|
 | `outdated` | `git`, `gpg` (to sync and verify the [managed Gentoo tree](#managed-gentoo-tree)); no Portage and no Docker |
 | `update` (always) | `git`, `gpg`, `docker` (`ebuild … manifest` and `egencache` run in the [Portage tools container](#portage-tools-container)); no host `ebuild`, `egencache`, or `portageq` |
+| `update` when any package **needs work** | **Docker Engine 28.0 or newer with the containerd image store** for the [smoke gate](#gated-publishing) (the smoke image is built on first use), an SSH key named by `ssh-identity` for the overlay push, and overlay (and, for DepsAndAssets, assets) branches in sync with their upstreams |
 | `gencache` | `git`, `gpg`, `docker` (`egencache` runs in the Portage tools container); no host `egencache` |
 | `update` of packages that **need work** and use **full-path** DepsAndAssets materialize (new vendor/deps/crates tarballs) | a usable product Gentoo materialize image with the needed toolchains (host CPU architecture). The image provides `go`, `node`/`npm`, overlay `node-gyp` (`dev-build/node-gyp::mndz`), `bun`, `sbcl`, overlay `qlot` (`dev-lisp/qlot::mndz`), `cargo`, `pycargoebuild`, Python, uv, pdm, and Rust, plus `tar`, `xz`, `git`, and fetchers. Full-path Pdm packing runs in that image, which provides Python and pdm. Host `go` / `npm` / `bun` / `sbcl` / `pycargoebuild` / `xz` are **not** required for that path. |
 | `update` that only **reuses** existing GitHub release assets | no toolchains in the image and no host language toolchains (download + verify stay on the host) |
@@ -82,14 +83,14 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 | `github-token` | no | Encrypted (`mndz1.`) GitHub token envelope for authenticated fetch / release publish. A plaintext value hard-fails every command that loads config until you run `github-token --force`. |
 | `distfiles-path` | no | Private Portage `DISTDIR` for `ebuild … manifest` during `update` (default: XDG cache path below) |
 | `check-cache-ttl` | no | How long successful outdated-check / plan results are reused (human duration, default **5m**). Single unit: `s` / `m` / `h` / `d` (for example `30s`, `5m`, `1h`). **`0` or `0s` disables** the check cache (never read, never write) |
-| `ssh-identity` | no | One private-key path for an assets `git push`. A leading `~` is allowed. Required only when that push will run |
+| `ssh-identity` | no | One private-key path for `update`'s `git push` and sync fetch of the overlay and the assets repository. A leading `~` is allowed. Required whenever `update` has work, because it then pushes the overlay |
 | `gentoo-tree-max-age` | no | How long a [managed Gentoo tree](#managed-gentoo-tree) sync check stays fresh before `outdated`, `update`, or `gencache` syncs again (same duration syntax as `check-cache-ttl`, default **6h**; `0s` syncs on every run) |
 | `materialize-base-check-interval` | no | How often ensure asks the registry whether the pinned `gentoo/stage3` digest moved (same duration syntax, default **3d**) |
 | `smoke-compile-cache-max-size` | no | Size budget of the [smoke compile cache](#smoke-compile-cache): a byte count with an optional `KiB`, `MiB`, or `GiB` suffix (for example `512MiB`), default **3GiB**. An invalid or negative value is a configuration error |
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then the decrypted `github-token` envelope in the config. Using an environment token logs a warning (and an extra warning when that value is not a fine-grained PAT `github_pat_`). `outdated` and `update` use that token for live `api.github.com` version fetch when a token is available. If the winning source is the encrypted config envelope, they prompt for the wrap password on a controlling TTY when this run will call `api.github.com`. `outdated` does not prompt when every `api.github.com` read for the run is a valid check-cache hit, including when a cached plan still needs work. `update` still prompts when it will look up or publish an assets release. A cache miss or `--refresh` of a GitHub-source package also prompts. Unattended `outdated` / `update` **must** set `GITHUB_TOKEN` or `GH_TOKEN` rather than relying on TTY decrypt; without a controlling TTY the command exits `1` and does not fall back to unauthenticated fetch. Live unauthenticated fetch is still allowed when no token is configured, is limited to **60 requests per hour** per IP, and logs a warning. The program never logs the raw token, wrap password, or ciphertext.
 
-When `outdated` or `update` will call `api.github.com`, they first check GitHub Statuspage (**API Requests**; **Git Operations** only immediately before an assets `git push`) and `GET /rate_limit`. Remaining `0`, HTTP 401, a required component `partial_outage`/`major_outage`, or a `/rate_limit` fetch failure **hard-fails** the command with exit `1`. Rate-limit exhaustion and rejected tokens during package work also exit `1` (not per-package warnings). `gencache` does not use this GitHub health gate.
+When `outdated` or `update` will call `api.github.com`, they first check GitHub Statuspage (**API Requests**; **Git Operations** immediately before each assets or overlay `git push` and before the overlay and assets sync fetch, even when the run makes no `api.github.com` call) and `GET /rate_limit`. Remaining `0`, HTTP 401, a required component `partial_outage`/`major_outage`, or a `/rate_limit` fetch failure **hard-fails** the command with exit `1`. Rate-limit exhaustion and rejected tokens during package work also exit `1` (not per-package warnings). `gencache` does not use this GitHub health gate.
 
 The persisted token **must** be a fine-grained PAT (`github_pat_`) limited to the assets GitHub repository with **Contents: write** (Metadata: read comes with that grant). GitHub always includes read-only access to public repositories on a fine-grained PAT, so `github-token` still accepts a PAT when you own other public repositories. **Only select repositories** is operator guidance; the setter does not fail the probe because other owned repositories exist. Store it with `github-token` (see below); do not put a live PAT in the TOML.
 
@@ -210,7 +211,7 @@ just run outdated --exclude dev-util/codex
 
 ### `update`
 
-Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, regenerate package-scoped Portage `egencache` md5-cache, and create GPG-signed git commits in the overlay (ebuild/Manifest and `metadata/md5-cache/` paths together). For packages under the **DepsAndAssets** technique (Go vendor, npm/Bun deps, Cargo crates, Sbcl/Autolith deps, Uv deps, or Pdm deps), it may also materialize cache/vendor/crates/deps tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token). **Full-path** materialize runs in the Gentoo Docker image; reuse of an existing assets release stays on the host and needs no toolchains in the image and no host `go`/`npm`/`bun`/`sbcl`/`pycargoebuild`. Manifests and md5-cache are generated in the [Portage tools container](#portage-tools-container). During a full-path unit a named `mndz-mat-…` container is visible to `docker ps` / `docker stats` and is removed when that unit finishes.
+Apply updates for packages that need work: rename or rewrite ebuilds, regenerate Manifests with Portage `ebuild`, regenerate package-scoped Portage `egencache` md5-cache, and create GPG-signed git commits in the overlay (ebuild/Manifest and `metadata/md5-cache/` paths together). Each unit is [smoke-tested before it is published or committed](#gated-publishing), and each commit is [pushed](#overlay-push-and-sync-requirements). For packages under the **DepsAndAssets** technique (Go vendor, npm/Bun deps, Cargo crates, Sbcl/Autolith deps, Uv deps, or Pdm deps), it may also materialize cache/vendor/crates/deps tarballs and publish checksums/releases under `assets-path` (requires a resolvable GitHub token). **Full-path** materialize runs in the Gentoo Docker image; reuse of an existing assets release stays on the host and needs no toolchains in the image and no host `go`/`npm`/`bun`/`sbcl`/`pycargoebuild`. Manifests and md5-cache are generated in the [Portage tools container](#portage-tools-container). During a full-path unit a named `mndz-mat-…` container is visible to `docker ps` / `docker stats` and is removed when that unit finishes.
 
 **Targets:** zero or more package arguments as `category/package` or an unambiguous package name. With no arguments, every inventory package is planned; packages that need work are mutated and others soft-skipped. Explicit targets that do not need work are soft-skipped.
 
@@ -239,7 +240,7 @@ just run update --exclude dev-lang/bun-bin
 
 If the winning token is the encrypted config envelope, `update` prompts once on a controlling TTY for the wrap password when this run will call `api.github.com` (live latest fetch, `/rate_limit` health, or assets-repository release lookup/create/upload) and keeps the decrypted token for that run. A cached lane plan that still needs work still prompts, because that apply looks up or publishes an assets release. GitMv-only updates with a full check-cache hit and no assets GitHub access do not decrypt. Unattended `update` must set `GITHUB_TOKEN` or `GH_TOKEN`. GitHub rate-limit exhaustion and rejected tokens abort plan/mutate with exit `1`.
 
-Untargeted `update` plans Bun consumers against the selected bun-bin **remote** when bun-bin needs work (hypothetical overlay ceilings), and applies those consumers after bun-bin’s signed overlay commit **without** rediscovering ceilings from disk in the same run. Independent packages (mise, beads, grok-build-bin, …) may overlap bun-bin under `--jobs`; a withheld consumer does not occupy a job slot while waiting. When the run will sign, the operator is prompted once before that signed work, including before the image build; a commit that overlaps the build does not prompt again. The GPG passphrase prompt appears as soon as that unlock starts and does not time out while the operator is away. When ensure ran, bun-bin’s signed overlay commit is still created after that ensure attempt; GitMv-only bun-bin still commits immediately after `egencache`. `update ralph-tui` while bun-bin is unselected **does not** pull bun-bin into the selection: if a newer bun-bin would change ralph’s plan (or bun-bin’s latest cannot be fetched), ralph hard-fails naming `dev-lang/bun-bin` with recovery `update bun-bin` or untargeted `update`.
+Untargeted `update` plans Bun consumers against the selected bun-bin **remote** when bun-bin needs work (hypothetical overlay ceilings), and applies those consumers after bun-bin’s signed overlay commit **without** rediscovering ceilings from disk in the same run. Independent packages (mise, beads, grok-build-bin, …) may overlap bun-bin under `--jobs`; a withheld consumer does not occupy a job slot while waiting. When the run will sign, the operator is prompted once before that signed work, including before the image build; a commit that overlaps the build does not prompt again. The GPG passphrase prompt appears as soon as that unlock starts and does not time out while the operator is away. When ensure ran, bun-bin’s signed overlay commit is created after that ensure attempt and its smoke gate have both finished (a failed ensure does not skip the commit; a failed gate does); GitMv-only bun-bin commits right after its gate. Withheld consumers are admitted after that commit, without waiting for its push. `update ralph-tui` while bun-bin is unselected **does not** pull bun-bin into the selection: if a newer bun-bin would change ralph’s plan (or bun-bin’s latest cannot be fetched), ralph hard-fails naming `dev-lang/bun-bin` with recovery `update bun-bin` or untargeted `update`.
 
 After each signed overlay commit, retained overlay ebuilds’ dependencies on other overlay packages remain satisfiable (no consumer ebuild naming a provider PV the tree no longer has). DepsAndAssets prune of a provider will not drop a PV that a remaining consumer ebuild still requires. GitMv will not rename away the only PV that still satisfies a remaining consumer pin, except that overlay `dev-lang/bun-bin` **compile pins** (`~dev-lang/bun-bin-<PV>` from packages such as opencode; `=` also still add-keeps) are **added-and-kept**: latest is added as `SLOT="0"` (`/usr/bin/bun`) and the pin PV stays as `SLOT="${PV}"` (`/usr/bin/bun-<PV>` only). Other GitMv packages (for example usage exact pins required by hk) still hard-fail instead of copying the old ebuild aside. `update PACKAGE` of a consumer whose to-be-written ebuild is unsatisfied, while that overlay provider is unselected, hard-fails the consumer and names the provider; it does not pull the provider into the selection. This is distinct from overlay wait-edges: Bun consumers still wait on bun-bin for runtime-lane ceilings; Cargo packages such as hk and mise are not withheld on `dev-util/usage` as a runtime-lane wait-edge (they may still wait at overlay write if a usage atom would otherwise be unsatisfiable).
 
@@ -278,6 +279,58 @@ just run --jobs 1 update
 ```
 
 If md5-cache is **missing**, hard-fail recovery is `gencache category/package`. If `_md5_` **mismatches**, use `gencache --force category/package`, then retry `update`.
+
+#### Gated publishing
+
+Every unit that needs work (GitMv, and DepsAndAssets full and reuse path) is **smoke-tested before anything about it is published or committed**. There is no option to skip this gate. Per unit the order is:
+
+1. build (materialize) or rename;
+2. ebuild write, `ebuild … manifest` (from the locally built distfile), and package `egencache`;
+3. **smoke gate**: the runs [`smoke`](#smoke) would plan for the unit's new PV alone, one per distinct lane ceiling it serves, with the package's smoke checks;
+4. assets sidecars, assets commit, push, and GitHub release (full path only);
+5. download of each published asset at the exact URL in the ebuild, compared with the Manifest's size and hashes (full path only);
+6. signed overlay commit;
+7. overlay `git push`.
+
+Expect each `update` that does work to take noticeably longer: one smoke run per lane ceiling per unit. Gated runs go through one smoke lane, one at a time, in the order units reach their gates; a unit waiting for the lane, or for another selected package its new ebuild depends on (`DEPEND`/`BDEPEND`/`RDEPEND`/`IDEPEND`/`PDEPEND`), holds no `--jobs` slot. That dependency wait ends when the dependency commits, fails, or is held, and the gate then tests against whatever `HEAD` holds. Dependency cycles fail every unit in the cycle. A gate that fails (including a full container disk, or a PV not keyworded for the host) is not retried in the same run.
+
+Each gated run sees the overlay's `HEAD` plus only its own unit's package directory and md5-cache entries, mounted read-only, never other units' unfinished work. Distfiles the unit built but has not yet published are served to the gate by a **fetch shim**: Portage still computes the exact `SRC_URI` an end user would, and its `FETCHCOMMAND`/`RESUMECOMMAND` call a small script that copies the staged file for a URL under the assets repository's `releases/download/` prefix, fails on such a URL that is not staged, and hands every other URL to Portage's stock `wget` command. Portage verifies every file against the Manifest as usual. Reuse-path units stage nothing and fetch their published release.
+
+Whenever a package needs work, `update` needs **Docker Engine 28.0 or newer with the containerd image store**, builds or reuses the [smoke image](#smoke), takes one Gentoo tree snapshot, and runs the sandbox probe; this overlaps the first units' build work. If any of it fails, no further unit starts and units already in progress fail at their gate. Gated runs use the [smoke compile cache](#smoke-compile-cache); `update --no-compile-cache` runs them without it. Gate logs are under `smoke/logs/<run-id>/` like `smoke`'s.
+
+```bash
+# Gate without the per-package compile cache
+just run update --no-compile-cache hk
+```
+
+#### Overlay push and sync requirements
+
+`update` **pushes the overlay** after each unit's signed commit: only the current branch, to its configured upstream, without force, in commit order. Before any mutation in a run that has work, it fetches the overlay's upstream (and the assets worktree's, when a DepsAndAssets unit will run) and refuses to start, with exit `1`, when a branch is detached, has no upstream, or is ahead of, behind, or diverged from it. The error names the state and the commits involved. To recover, push or reconcile the branch (for example `git -C <overlay> push`, or `git pull --rebase` when behind), set an upstream with `git branch --set-upstream-to`, then run `update` again. The overlay's `origin` push URL must be a GitHub SSH or web URL; the overlay push and sync fetch use the same `ssh-identity` and session SSH agent as the assets push, so **`ssh-identity` is needed whenever there is work**, including GitMv-only runs.
+
+If an overlay push fails (or GitHub Git Operations reports an outage right before it), that unit's commit is **kept** locally and **all further publishing in the run stops**: no assets commits, pushes, or releases, no overlay commits or pushes, and no new units. Units already in progress run their gate and are then held. The error names the `git push` to run once the cause is fixed. The run exits `1`.
+
+#### Held units
+
+A unit is **held** when it changed overlay files without committing and its gate fails, its published assets fail verification, the run is interrupted (Ctrl-C or SIGTERM), publishing halted, or it is in a dependency cycle. Holding saves the unit's work first and only then rolls its overlay paths back to `HEAD` (other packages' files are untouched). If saving fails, nothing is rolled back and the error names the unit's paths. A held unit does not get the "may be left dirty" warning. Failures before the gate (rename, `ebuild … manifest`, `egencache`) are not held and keep that warning.
+
+Entries are written to `${XDG_CACHE_HOME:-$HOME/.cache}/mndz/overlay-manager/held/<run-id>/<category>/<pn>-<pv>/` and contain:
+
+- `overlay.patch`: the unit's overlay changes against `HEAD` (`git diff --binary -M`, including renames, deletions, and md5-cache entries);
+- `distfiles/`: every distfile the unit built for publishing;
+- `logs/`: copies of its gated runs' logs;
+- `held.json`: schema version, package, PV, technique, path (full or reuse), each gated run's lane and outcome, the reason (`gate`, `verify`, `interrupted`, `halted`, or `cycle`), the base `HEAD`, the planned release and whether each asset was published, run id, and time.
+
+The logged error names the entry. To inspect or re-apply a held unit by hand:
+
+```bash
+entry=~/.cache/mndz/overlay-manager/held/<run-id>/dev-util/hk-2.13.0
+jq . "$entry/held.json"
+cd /path/to/overlay
+git apply --check "$entry/overlay.patch" && git apply "$entry/overlay.patch"
+# If HEAD moved since, check out the recorded base_head or try: git apply --3way
+```
+
+Held entries are **never removed** by the program, and `eclean` leaves them alone; delete an entry directory yourself when you no longer need it.
 
 ### `gencache`
 
@@ -384,7 +437,7 @@ Create the PAT on GitHub: **Fine-grained**, resource owner matching the assets r
 
 ### `eclean`
 
-Delete the **manager private distfiles cache** used by `update` for Portage `ebuild … manifest` fetches (default under XDG cache `mndz/overlay-manager/distfiles`). This is **not** Gentoo `app-portage/eclean` and does **not** clean system Portage distfiles under `/var/cache/distfiles`. If the effective path is the system Portage DISTDIR (for example after `--distfiles-path /var/cache/distfiles`), the command refuses, logs an error, and exits `1`. A missing cache directory is a successful no-op.
+Delete the **manager private distfiles cache** used by `update` for Portage `ebuild … manifest` fetches (default under XDG cache `mndz/overlay-manager/distfiles`). This is **not** Gentoo `app-portage/eclean` and does **not** clean system Portage distfiles under `/var/cache/distfiles`. If the effective path is the system Portage DISTDIR (for example after `--distfiles-path /var/cache/distfiles`), the command refuses, logs an error, and exits `1`. A missing cache directory is a successful no-op. [Held entries](#held-units) are never touched, even when `distfiles-path` points at a directory that contains them.
 
 ```bash
 # Clean the default (or config) manager distfiles cache

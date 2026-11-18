@@ -39,15 +39,22 @@ import Smoke.CompileCache
 import Smoke.Container
   ( ExecUser (..),
     FailStage (..),
+    FetchShimPaths (..),
+    OverlayMount (..),
     RunOutcome (..),
     RunResult (..),
     SmokeContainerCfg (..),
     SmokeSession (..),
+    StagedFetch (..),
     dependenciesArgv,
+    fetchMakeConfLines,
+    fetchShimPaths,
+    fetchShimScript,
     packageArgv,
     performRun,
     portageConfigFiles,
     runSandboxProbe,
+    runSetupScript,
     setupScript,
     smokeContainerName,
     smokeCreateArgs,
@@ -63,9 +70,11 @@ import Smoke.Tree
     sweepStaleSnapshots,
     withSnapshot,
   )
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Process (readProcessWithExitCode)
 import Test.Assert (assertEq, assertLeft, assertTrue)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase)
@@ -88,6 +97,10 @@ tests =
       testGroup
         "container"
         [ testCase "create argv" testCreateArgs,
+          testCase "create argv: gated snapshot and staging mounts" testGatedCreateArgs,
+          testCase "setup: fetch shim only for gated runs with staged files" testShimOnlyWhenStaged,
+          testCase "fetch shim under sh: staged, unstaged assets, other URL" testShimUnderSh,
+          testCase "fetch make.conf lines call the shim" testShimMakeConf,
           testCase "container removed in every outcome" testRemovedAlways,
           testCase "portage files: plain-lane run" testConfigPlain,
           testCase "portage files: tilde-lane run" testConfigTilde,
@@ -246,7 +259,7 @@ cfg =
       sccCliPid = "4242",
       sccImage = "mndz-overlay-manager/smoke:local",
       sccSnapshot = "mndz-overlay-manager/smoke-tree:r1",
-      sccOverlay = "/ov",
+      sccOverlay = WorktreeMount "/ov",
       sccTimeDir = Nothing,
       sccOperatorUid = 1000,
       sccJobs = 8,
@@ -290,6 +303,95 @@ testCreateArgs = do
   let timed = smokeCreateArgs cfg {sccTimeDir = Just "/m/time"} crushTilde
   assertTrue "time bind" (isSub ["--mount", "type=bind,src=/m/time,dst=/m/time"] timed)
   assertEq "image last" ["mndz-overlay-manager/smoke:local", "sleep", "infinity"] (drop (length args - 3) args)
+
+assetsPrefix :: Text
+assetsPrefix = "https://github.com/o/mndz-overlay-assets/releases/download/"
+
+stagedCfg :: SmokeContainerCfg
+stagedCfg = cfg {sccOverlay = SnapshotMount "/run/u1/overlay" (Just (StagedFetch "/run/u1/staged" assetsPrefix))}
+
+testGatedCreateArgs :: IO ()
+testGatedCreateArgs = do
+  let standalone = smokeCreateArgs cfg crushTilde
+      gated = smokeCreateArgs stagedCfg crushTilde
+      unstaged = smokeCreateArgs cfg {sccOverlay = SnapshotMount "/run/u1/overlay" Nothing} crushTilde
+  assertTrue "standalone mounts the worktree" (isSub ["--mount", "type=bind,src=/ov,dst=/var/db/repos/mndz,readonly"] standalone)
+  assertTrue "gated mounts the snapshot read-only" (isSub ["--mount", "type=bind,src=/run/u1/overlay,dst=/var/db/repos/mndz,readonly"] gated)
+  assertTrue "gated does not mount the worktree" (not (any ("src=/ov," `isInfixOf`) gated))
+  assertTrue "staging read-only" (isSub ["--mount", "type=bind,src=/run/u1/staged,dst=/var/cache/mndz-staged,readonly"] gated)
+  assertTrue "no staging without staged files" (not (any ("mndz-staged" `isInfixOf`) unstaged))
+  assertTrue "no staging standalone" (not (any ("mndz-staged" `isInfixOf`) standalone))
+
+testShimOnlyWhenStaged :: IO ()
+testShimOnlyWhenStaged = do
+  let def = defOneCheck
+      has needle c = needle `T.isInfixOf` runSetupScript c def crushTilde
+  assertTrue "standalone: no FETCHCOMMAND" (not (has "FETCHCOMMAND" cfg))
+  assertTrue "standalone: no shim" (not (has "mndz-fetch" cfg))
+  assertTrue "gated without staged files: no shim" (not (has "mndz-fetch" cfg {sccOverlay = SnapshotMount "/s" Nothing}))
+  assertTrue "gated staged: FETCHCOMMAND" (has "FETCHCOMMAND" stagedCfg)
+  assertTrue "gated staged: RESUMECOMMAND" (has "RESUMECOMMAND" stagedCfg)
+  assertTrue "gated staged: stock command captured" (has "portageq envvar FETCHCOMMAND" stagedCfg)
+  assertTrue "gated staged: prefix in shim" (has assetsPrefix stagedCfg)
+  assertTrue "still the base setup" (has "useradd" stagedCfg)
+
+-- | Run the rendered shim with @sh@ against scratch paths. The stock
+-- command writes the URI into the file, standing in for @wget@.
+testShimUnderSh :: IO ()
+testShimUnderSh =
+  withSystemTempDirectory "om-shim" $ \tmp -> do
+    let paths =
+          FetchShimPaths
+            { fspShim = T.pack (tmp </> "mndz-fetch"),
+              fspStaged = T.pack (tmp </> "staged"),
+              fspStockFetch = T.pack (tmp </> "fetch"),
+              fspStockResume = T.pack (tmp </> "resume")
+            }
+        distdir = tmp </> "distdir"
+        shim args = readProcessWithExitCode "sh" (T.unpack (fspShim paths) : args) ""
+    createDirectoryIfMissing True (tmp </> "staged")
+    createDirectoryIfMissing True distdir
+    TIO.writeFile (tmp </> "staged" </> "hk-2.13.0-crates.tar.xz") "staged bytes"
+    TIO.writeFile (tmp </> "fetch") "printf 'fetched %s' \"${URI}\" > \"${DISTDIR}/${FILE}\""
+    TIO.writeFile (tmp </> "resume") "printf 'resumed %s' \"${URI}\" > \"${DISTDIR}/${FILE}\""
+    TIO.writeFile (T.unpack (fspShim paths)) (fetchShimScript paths assetsPrefix)
+    let staged = T.unpack assetsPrefix <> "hk-2.13.0/hk-2.13.0-crates.tar.xz"
+    (c1, _, _) <- shim [staged, distdir, "hk-2.13.0-crates.tar.xz.__download__"]
+    assertEq "staged exit" ExitSuccess c1
+    got1 <- TIO.readFile (distdir </> "hk-2.13.0-crates.tar.xz.__download__")
+    assertEq "staged copy" "staged bytes" got1
+    let missing = T.unpack assetsPrefix <> "hk-2.13.0/hk-2.13.0-crate.tar.xz"
+    (c2, _, err2) <- shim [missing, distdir, "hk-2.13.0-crate.tar.xz"]
+    assertTrue "unstaged fails" (c2 /= ExitSuccess)
+    assertEq "names the URL" ("mndz: unstaged assets URL " <> missing <> "\n") err2
+    gone <- doesFileExist (distdir </> "hk-2.13.0-crate.tar.xz")
+    assertTrue "nothing written" (not gone)
+    let upstream = "https://github.com/jdx/hk/archive/refs/tags/v2.13.0.tar.gz"
+    (c3, _, _) <- shim [upstream, distdir, "hk-2.13.0.tar.gz"]
+    assertEq "other URL exit" ExitSuccess c3
+    got3 <- TIO.readFile (distdir </> "hk-2.13.0.tar.gz")
+    assertEq "stock fetch" ("fetched " <> T.pack upstream) got3
+    (c4, _, _) <- shim [upstream, distdir, "hk-2.13.0.tar.gz", "resume"]
+    assertEq "resume exit" ExitSuccess c4
+    got4 <- TIO.readFile (distdir </> "hk-2.13.0.tar.gz")
+    assertEq "stock resume" ("resumed " <> T.pack upstream) got4
+
+-- | Portage reads @make.conf@ with shell quoting; the variables must hold
+-- the shim with Portage's own placeholders.
+testShimMakeConf :: IO ()
+testShimMakeConf = do
+  (code, out, _) <-
+    readProcessWithExitCode
+      "bash"
+      ["-c", T.unpack (T.unlines (fetchMakeConfLines fetchShimPaths)) <> "printf '%s\\n' \"$FETCHCOMMAND\" \"$RESUMECOMMAND\""]
+      ""
+  assertEq "parses" ExitSuccess code
+  assertEq
+    "values"
+    [ "/usr/local/libexec/mndz-fetch \"${URI}\" \"${DISTDIR}\" \"${FILE}\"",
+      "/usr/local/libexec/mndz-fetch \"${URI}\" \"${DISTDIR}\" \"${FILE}\" resume"
+    ]
+    (lines out)
 
 isSub :: (Eq a) => [a] -> [a] -> Bool
 isSub needle hay = any (needle `isPrefixOf`) (tailsOf hay)

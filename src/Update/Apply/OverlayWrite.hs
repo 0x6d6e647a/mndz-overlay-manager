@@ -18,14 +18,15 @@ import Data.Text.IO qualified as TIO
 import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Version (EbuildVersion, comparePV, parseEbuildVersion, renderPV)
 import System.Directory (doesFileExist)
-import System.FilePath (takeDirectory, takeFileName, (</>))
+import System.FilePath (dropExtension, takeDirectory, takeFileName, (</>))
 import System.IO (stdout)
-import Update.Apply.Commit (egencacheAndSignedCommit, unitCommitMessage)
+import Update.Apply.Commit (egencacheUnitPaths, unitCommitMessage)
 import Update.Apply.Env (ApplyEnv (..), EbuildRunner)
 import Update.Apply.Errors
   ( ApplyUnitError (..),
     applyUnitHardFail,
   )
+import Update.Apply.Publish (UnitCtx (..), UnitTail (..), finishUnit)
 import Update.Assets.Hash (FileDigests (..))
 import Update.AtomClosure
   ( AtomClosureObserve (..),
@@ -111,15 +112,18 @@ overlayAfterAssets ::
   Maybe CodexV8Overlay ->
   -- | Gas Town tag checkout. Required for @dev-util/gastown@; ignored otherwise.
   Maybe FilePath ->
+  -- | Gate, publish, and verification around the commit.
+  UnitTail ->
   IO ApplyOutcome
-overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDigests mReqVer mUvTag mEbuildBody mCodexV8 mGastownSrc = do
+overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDigests mReqVer mUvTag mEbuildBody mCodexV8 mGastownSrc unitTail = do
   let key = peKey entry
       oldPath = pePath entry
       pkgDir = takeDirectory oldPath
       pn = pePN entry
       gitOps = aeGitOps env
       ebuildRun = aeEbuildRunner env
-      orphan = True
+      -- Whether a failure leaves published assets without an overlay update.
+      orphan = utPublishedBefore unitTail
   eTemplate <-
     withOverlayTreeChecked (aeTreeLock env) $ \tree ->
       findTemplate tree pkgDir pn targetVer oldPath
@@ -176,6 +180,7 @@ overlayAfterAssets env overlayRoot entry eco keywords lines_ targetVer distDiges
                     templateContent
                     ebuildRun
                     gitOps
+                    unitTail
 
 -- | Align the donor body, then publish under the tree lock.
 publishPrepared ::
@@ -200,6 +205,7 @@ publishPrepared ::
   Text ->
   EbuildRunner ->
   GitOps ->
+  UnitTail ->
   IO ApplyOutcome
 publishPrepared
   env
@@ -222,7 +228,8 @@ publishPrepared
   mGastownSrc
   templateContent
   ebuildRun
-  _gitOps = do
+  _gitOps
+  unitTail = do
     let content = fromMaybe templateContent mEbuildBody
         -- Empty CRATES first so list-era detection does not treat
         -- pycargoebuild's multiline CRATES="\\n" as a crate list.
@@ -345,6 +352,7 @@ publishPrepared
                       body
                       mNotice
                       ebuildRun
+                      unitTail
                       Set.empty
 
 -- | Rewrite Gas Town's Dolt atom and Beads window before any overlay write.
@@ -380,6 +388,7 @@ publishOverlayBody ::
   -- | Beads window notice, printed only after the signed commit succeeds.
   Maybe Text ->
   EbuildRunner ->
+  UnitTail ->
   Set PackageKey ->
   IO ApplyOutcome
 publishOverlayBody
@@ -397,6 +406,7 @@ publishOverlayBody
   fixed
   mNotice
   ebuildRun
+  unitTail
   waited = do
     let newName = ebuildFileNameWithRev pn targetVer
         newPath = pkgDir </> newName
@@ -445,6 +455,7 @@ publishOverlayBody
               fixed
               mNotice
               ebuildRun
+              unitTail
               (Set.insert provider waited)
       Right (Right (Right removedTemplate)) -> do
         manResult <- ebuildRun pkgDir newName
@@ -462,18 +473,28 @@ publishOverlayBody
                         [newRel, manRel]
                           <> [ebuildRel | removedTemplate || templatePath /= newPath]
                     msg = unitCommitMessage key (renderPV targetVer)
-                committed <-
-                  egencacheAndSignedCommit
-                    env
-                    overlayRoot
-                    key
-                    unitPaths
-                    msg
-                case committed of
-                  Right paths -> do
-                    mapM_ (TIO.hPutStrLn stdout) mNotice
-                    pure (ApplySuccess key lines_ paths)
+                    pv = T.pack (drop (T.length pn + 1) (dropExtension newName))
+                ePaths <- egencacheUnitPaths env overlayRoot key unitPaths
+                case ePaths of
                   Left err -> pure (ApplyHardFail key err True orphan)
+                  Right paths -> do
+                    utStepDone unitTail "regenerating manifest"
+                    outcome <-
+                      finishUnit
+                        env
+                        overlayRoot
+                        UnitCtx
+                          { ucKey = key,
+                            ucPv = pv,
+                            ucPaths = paths,
+                            ucMessage = msg,
+                            ucLines = lines_,
+                            ucTail = unitTail
+                          }
+                    case outcome of
+                      ApplySuccess {} -> mapM_ (TIO.hPutStrLn stdout) mNotice
+                      _ -> pure ()
+                    pure outcome
 
 removeTemplateIfTarget ::
   InTree ->

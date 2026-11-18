@@ -1886,10 +1886,14 @@ testFullPathApplyProgressSequence =
         "status:cloning upstream",
         "status:go mod download",
         "status:compressing tarball",
+        "status:regenerating manifest",
+        "status:smoke testing",
         "status:committing assets",
         "status:pushing assets",
         "status:uploading release asset",
-        "status:regenerating manifest"
+        "status:verifying published asset",
+        "status:committing",
+        "status:pushing overlay"
       ]
       statuses
     assertEq
@@ -1897,10 +1901,12 @@ testFullPathApplyProgressSequence =
       [ "step:cloning upstream",
         "step:go mod download",
         "step:compressing tarball",
+        "step:regenerating manifest",
+        "step:smoke testing",
         "step:committing assets",
         "step:pushing assets",
         "step:uploading release asset",
-        "step:regenerating manifest"
+        "step:verifying published asset"
       ]
       steps
     assertTrue
@@ -2096,14 +2102,18 @@ testReusePathApplyProgressSequence =
       [ "status:probing release asset",
         "status:reusing release assets",
         "status:verifying vendor asset",
-        "status:regenerating manifest"
+        "status:regenerating manifest",
+        "status:smoke testing",
+        "status:committing",
+        "status:pushing overlay"
       ]
       statuses
     assertEq
       "reuse step sequence"
       [ "step:reusing release assets",
         "step:verifying vendor asset",
-        "step:regenerating manifest"
+        "step:regenerating manifest",
+        "step:smoke testing"
       ]
       steps
     assertTrue
@@ -2117,35 +2127,35 @@ testReusePathApplyProgressSequence =
 -- | Step-total upper bound and revise-after-probe math for full vs reuse.
 testMaterializeStepBudget :: IO ()
 testMaterializeStepBudget = do
-  assertEq "full path step count" 7 fullPathMaterializeSteps
-  assertEq "reuse path step count" 3 reusePathMaterializeSteps
+  assertEq "full path step count" 9 fullPathMaterializeSteps
+  assertEq "reuse path step count" 4 reusePathMaterializeSteps
   assertEq
     "upper bound planDone=3 n=2"
-    17
+    21
     (materializeStepTotalUpper 3 2)
   assertEq
     "single full path total"
-    7
+    9
     (reviseMaterializeStepTotal 0 fullPathMaterializeSteps 0)
   assertEq
     "single reuse path total"
-    3
+    4
     (reviseMaterializeStepTotal 0 reusePathMaterializeSteps 0)
-  -- Mixed: planDone=3, first PV reuses (3), one PV remains at full upper bound.
+  -- Mixed: planDone=3, first PV reuses (4), one PV remains at full upper bound.
   assertEq
     "reuse first of two"
-    (3 + 3 + 7)
+    (3 + 4 + 9)
     (reviseMaterializeStepTotal 3 reusePathMaterializeSteps 1)
-  -- After first full path (7), second reuses:
+  -- After first full path (9), second reuses:
   assertEq
     "reuse second after full"
-    (3 + 7 + 3)
-    (reviseMaterializeStepTotal (3 + 7) reusePathMaterializeSteps 0)
-  -- After first reuse (3), second full:
+    (3 + 9 + 4)
+    (reviseMaterializeStepTotal (3 + 9) reusePathMaterializeSteps 0)
+  -- After first reuse (4), second full:
   assertEq
     "full second after reuse"
-    (3 + 3 + 7)
-    (reviseMaterializeStepTotal (3 + 3) fullPathMaterializeSteps 0)
+    (3 + 4 + 9)
+    (reviseMaterializeStepTotal (3 + 4) fullPathMaterializeSteps 0)
 
 -- | Concurrent overlay commits serialize under aeOverlayLock.
 

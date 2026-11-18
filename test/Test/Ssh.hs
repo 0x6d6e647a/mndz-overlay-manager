@@ -78,7 +78,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (setFileMode)
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase)
+import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Apply
   ( ApplyEnv (..),
     EbuildRunner,
@@ -261,6 +261,7 @@ import Update.SshAgent
     SshSession (..),
     ensureSshAgent,
     guardSshIdentityOffered,
+    guardSshIdentityOfferedFor,
     mkSshAgentOps,
     prepareSshIdentity,
     resolveSshIdentity,
@@ -872,7 +873,8 @@ guardSshIdentityOfferedTests =
       testCase "https ignores GIT_SSH_COMMAND" testOfferHttpsIgnoresOverride,
       testCase "non-github host" testOfferNonGithub,
       testCase "ssh -G failure" testOfferSshGFails,
-      testCase "unreadable offered path" testOfferUnreadable
+      testCase "unreadable offered path" testOfferUnreadable,
+      testCase "overlay push URL is named as overlay" testOfferOverlayLabel
     ]
 
 data OfferScript = OfferScript
@@ -1153,3 +1155,15 @@ testOfferUnreadable = do
   err <- assertLeft "unreadable" result
   assertTrue "offered path" (T.pack offered `T.isInfixOf` err)
   assertTrue "fingerprint failure" ("No such file or directory" `T.isInfixOf` err)
+
+testOfferOverlayLabel :: IO ()
+testOfferOverlayLabel = do
+  let run _ = pure (failResult 1 "no process expected")
+  result <- guardSshIdentityOfferedFor "overlay" run baseSshOps "/work/overlay" "/home/mndz/.ssh/id" "file:///srv/overlay.git"
+  case result of
+    Left err -> do
+      assertTrue "names the overlay" ("overlay push URL" `T.isInfixOf` err)
+      assertTrue "names the URL" ("file:///srv/overlay.git" `T.isInfixOf` err)
+    Right () -> assertFailure "a non-GitHub overlay push URL must fail"
+  web <- guardSshIdentityOfferedFor "overlay" run baseSshOps "/work/overlay" "/home/mndz/.ssh/id" "https://github.com/o/mndz-overlay.git"
+  assertEq "web URL passes" (Right ()) web

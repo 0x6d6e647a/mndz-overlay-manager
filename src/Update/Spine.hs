@@ -16,8 +16,9 @@ import CLI.Progress
     noopMultiHandle,
     withStepProgress,
   )
+import Control.Concurrent (myThreadId, throwTo)
 import Control.Concurrent.MVar (newMVar)
-import Control.Exception (bracket)
+import Control.Exception (AsyncException (..), bracket)
 import Control.Monad (unless, void)
 import Data.Aeson (Value (..))
 import Data.Containers.ListUtils (nubOrd)
@@ -26,16 +27,19 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Metrics.Core (Metrics (..), setCount)
 import Overlay.Types (Ebuild)
 import Overlay.Version (renderPV)
 import System.Exit (ExitCode (..))
+import System.Posix.Signals (Handler (..), installHandler, sigTERM)
 import Update.Apply
   ( ApplyEnv (..),
     EbuildRunner,
     MutateEnsure (..),
     applyOverlayFromPlan,
   )
+import Update.Apply.Env (PublishControl (..), newPublishControl)
 import Update.Apply.Plan
   ( ClassifyPackageResult (..),
     PackagePlanResult (..),
@@ -46,6 +50,7 @@ import Update.Apply.Plan
     planResultKey,
     unitPlansFromClassifyResults,
   )
+import Update.Apply.Publish (mkHold)
 import Update.Assets.Release (ReleaseOps (..))
 import Update.Bun.Cache (mkBunCacheOps)
 import Update.Cargo.Crates (mkCargoOps)
@@ -66,7 +71,9 @@ import Update.DiskSpace
     resolveTempRoot,
     runDiskSpaceGate,
   )
-import Update.Git (GitOps (..))
+import Update.Distfiles (seedManagerDistfiles)
+import Update.Gate (GateHandle, passThroughGate)
+import Update.Git (GitOps (..), UpstreamSync, upstreamSyncError)
 import Update.GitHub (GitHubLatch, gitHubAbortLog, parseGitHubOrigin, peekGitHubLatch)
 import Update.Go.Vendor (mkVendorOps)
 import Update.Hardcoded (lookupPolicy)
@@ -117,7 +124,7 @@ import Update.SshAgent
   ( SshAgentOps,
     SshSession,
     ensureSshAgent,
-    guardSshIdentityOffered,
+    guardSshIdentityOfferedFor,
     prepareSshIdentity,
     teardownSshSession,
   )
@@ -177,6 +184,23 @@ data UpdateSpineDeps = UpdateSpineDeps
     usdGitHubLatch :: GitHubLatch,
     -- | Git Operations Statuspage check before assets @git push@ (no-op when unused).
     usdGitOperationsHealth :: IO (Either Text ()),
+    -- | Fetch a worktree's upstream (after the Git Operations check) and
+    -- compare its current branch with it.
+    usdUpstreamSync :: FilePath -> IO (Either Text UpstreamSync),
+    -- | Push the overlay's current branch to its upstream.
+    usdPushOverlay :: FilePath -> IO (Either Text ()),
+    -- | Verify a unit's published assets at the URLs its ebuild names.
+    usdVerifyAsset :: Text -> FilePath -> PackageKey -> Text -> [Text] -> IO (Either (Text, Text) ()),
+    -- | Run mutate with the smoke gate for these packages with work, and a
+    -- check that returns why no further unit may start.
+    usdWithGate :: forall a. [PackageKey] -> (GateHandle -> IO (Maybe Text) -> IO a) -> IO a,
+    -- | Smoke prerequisites (Docker 28, containerd store), checked before
+    -- mutation when a unit has work.
+    usdGatePrereqs :: IO (Either Text ()),
+    -- | Root of held entries.
+    usdHeldRoot :: FilePath,
+    -- | Runs @git@ for held capture and rollback.
+    usdGitRunner :: CommandRunner,
     -- | Before workers and the image build, when a selected unit may sign.
     -- Arguments: run root, whether this run may publish assets, overlay root,
     -- assets worktree.
@@ -548,7 +572,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                               _ -> False
                           )
                           planResults'
-                      runMutate = do
+                      runMutate = termAsInterrupt $ do
                         assetsLock <- newMVar ()
                         overlayLock <- newMVar ()
                         tempRun <- openRunRootWith (usdRunId deps)
@@ -573,7 +597,15 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                               ]
                           Right () ->
                             mutateSigned assetsLock overlayLock tempRun
-                      mutateSigned assetsLock overlayLock tempRun = do
+                      -- The smoke session exists only when a unit has work.
+                      mutateSigned assetsLock overlayLock tempRun
+                        | maySign =
+                            usdWithGate
+                              deps
+                              [k | PlanNeedsWork k _ <- planResults']
+                              (mutateGated assetsLock overlayLock tempRun)
+                        | otherwise = mutateGated assetsLock overlayLock tempRun passThroughGate (pure Nothing)
+                      mutateGated assetsLock overlayLock tempRun gate gateStop = do
                         unless (null t0FullKeys) $
                           usdSweepMaterialize deps
                         mMatDocker <-
@@ -585,6 +617,15 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   cfg <- resolveMaterializeDockerCfg (rrRunId tempRun) (mTimeDir (pcMetrics pcfg)) (dpoGentooTree (usdDepsPlanOps deps))
                                   pure (Just (cfg, inner))
                         httpMgr <- newMetricsManager (pcMetrics pcfg)
+                        inFlight <- newIORef Map.empty
+                        publishControl0 <- newPublishControl (usdPushOverlay deps) (usdVerifyAsset deps)
+                        let publishControl =
+                              publishControl0
+                                { pcStopStarting =
+                                    pcStopStarting publishControl0 >>= \case
+                                      Just halted -> pure (Just halted)
+                                      Nothing -> gateStop
+                                }
                         compressSlot <- packSlotWithMetrics (pcMetrics pcfg) <$> newPackSlot
                         let closedRun _ =
                               pure
@@ -599,6 +640,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   aeHttpLbs = httpLbsEither httpMgr,
                                   aeGitOps = usdGitOps deps,
                                   aeEbuildRunner = usdEbuildRunner deps,
+                                  aeSeedDistfiles = seedManagerDistfiles distDir,
                                   aeEgencacheRunner = usdEgencacheRunner deps,
                                   aeVendorOps = mkVendorOps jobs compressSlot closedRun,
                                   aeNpmCacheOps = mkNpmCacheOps jobs compressSlot closedRun,
@@ -625,7 +667,11 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                                   aeMaterializeDocker = mMatDocker,
                                   aeAtomClosure = Nothing,
                                   aeGitOperationsHealth = usdGitOperationsHealth deps,
-                                  aeReleaseSigningSession = usdReleaseSigning deps
+                                  aeReleaseSigningSession = usdReleaseSigning deps,
+                                  aeGate = gate,
+                                  aeHold = mkHold (usdGitRunner deps) overlayLock treeLock overlayRoot (usdHeldRoot deps) (T.pack (rrRunId tempRun)),
+                                  aePublish = publishControl,
+                                  aeInFlight = inFlight
                                 }
                             overlapReady =
                               [ r
@@ -732,69 +778,109 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                       case eDirtyNodeGyp of
                         Left err -> pure (Left err)
                         Right () -> do
-                          outcomes <-
-                            if needDeps
+                          -- Any unit with work publishes: SSH for the
+                          -- overlay (and assets) push, then both sync checks,
+                          -- all before the first mutation.
+                          eOutcomes <-
+                            if maySign
                               then
                                 bracket
-                                  (openAssetsSsh deps mAssetsRoot)
+                                  (openPublishSsh deps overlayRoot mAssetsRoot)
                                   ( \case
                                       Left _ -> pure ()
                                       Right sess -> teardownSshSession (usdSshOps deps) sess
                                   )
                                   ( \case
                                       Left err ->
-                                        pure
+                                        pure . Right $
                                           [ ApplyHardFail
                                               (PackageKey "")
                                               ("SSH agent setup failed: " <> err)
                                               False
                                               False
                                           ]
-                                      Right _sess -> runMutate
+                                      Right _sess ->
+                                        syncPreflight deps overlayRoot mAssetsRoot >>= \case
+                                          Left err -> pure (Left err)
+                                          Right () ->
+                                            usdGatePrereqs deps >>= \case
+                                              Left err -> pure (Left err)
+                                              Right () -> Right <$> runMutate
                                   )
-                              else runMutate
-                          usdPruneMaterialize deps
-                          flushCheckCache cache
-                          recordCacheCounters (pcMetrics pcfg) cache
-                          mSummary <- cacheSummaryLine cache
-                          pure $
-                            Right
-                              UpdateSpineResult
-                                { usrOutcomes = outcomes,
-                                  usrWarnings = warns,
-                                  usrCacheSummary = mSummary
-                                }
+                              else Right <$> runMutate
+                          case eOutcomes of
+                            Left err -> pure (Left err)
+                            Right outcomes -> do
+                              usdPruneMaterialize deps
+                              flushCheckCache cache
+                              recordCacheCounters (pcMetrics pcfg) cache
+                              mSummary <- cacheSummaryLine cache
+                              pure $
+                                Right
+                                  UpdateSpineResult
+                                    { usrOutcomes = outcomes,
+                                      usrWarnings = warns,
+                                      usrCacheSummary = mSummary
+                                    }
 
--- | Resolve the key, reject an offer mismatch, then start or reuse the agent.
+-- | Resolve the key, reject an offer mismatch for the overlay push URL and,
+-- when this run publishes assets, the assets push URL, then start or reuse
+-- the agent.
 --
 -- 'Left' is the pre-prompt SSH failure. It does not start an agent.
-openAssetsSsh ::
+openPublishSsh ::
   UpdateSpineDeps ->
+  FilePath ->
   Maybe FilePath ->
   IO (Either Text SshSession)
-openAssetsSsh deps mRoot = do
+openPublishSsh deps overlayRoot mAssetsRoot = do
   prepared <- prepareSshIdentity (usdSshOps deps) (usdSshIdentity deps)
   case prepared of
     Left err -> pure (Left err)
-    Right path ->
-      case mRoot of
-        Nothing ->
-          pure (Left "assets worktree is missing for the SSH offer check")
-        Just root -> do
-          eUrl <- usdGitPushUrl deps root
-          case eUrl of
-            Left err -> pure (Left err)
-            Right url -> do
-              offered <-
-                guardSshIdentityOffered
-                  (usdCommandRunner deps)
-                  (usdSshOps deps)
-                  root
-                  path
-                  url
-              case offered of
-                Left err -> pure (Left err)
-                Right () -> ensureSshAgent (usdSshOps deps) path
+    Right path -> do
+      checked <- checkAll path (("overlay", overlayRoot) : [("assets", root) | Just root <- [mAssetsRoot]])
+      case checked of
+        Left err -> pure (Left err)
+        Right () -> ensureSshAgent (usdSshOps deps) path
+  where
+    checkAll _ [] = pure (Right ())
+    checkAll path ((label, root) : rest) = do
+      eUrl <- usdGitPushUrl deps root
+      offered <- case eUrl of
+        Left err -> pure (Left err)
+        Right url ->
+          guardSshIdentityOfferedFor
+            label
+            (usdCommandRunner deps)
+            (usdSshOps deps)
+            root
+            path
+            url
+      either (pure . Left) (const (checkAll path rest)) offered
+
+-- | The overlay, and the assets worktree when this run publishes assets,
+-- must each be in sync with its upstream.
+syncPreflight :: UpdateSpineDeps -> FilePath -> Maybe FilePath -> IO (Either Text ())
+syncPreflight deps overlayRoot mAssetsRoot =
+  go (("overlay", overlayRoot) : [("assets worktree", root) | Just root <- [mAssetsRoot]])
+  where
+    go [] = pure (Right ())
+    go ((label, dir) : rest) =
+      usdUpstreamSync deps dir >>= \case
+        Left err -> pure (Left (label <> " sync check failed: " <> err))
+        Right state -> case upstreamSyncError label dir state of
+          Just err -> pure (Left err)
+          Nothing -> go rest
+
+-- | While mutating, SIGTERM interrupts this thread like Ctrl-C, so units in
+-- flight are held before the program exits.
+termAsInterrupt :: IO a -> IO a
+termAsInterrupt act = do
+  tid <- myThreadId
+  bracket
+    (installHandler sigTERM (Catch (throwTo tid UserInterrupt)) Nothing)
+    (\old -> installHandler sigTERM old Nothing)
+    (const act)
 
 -- | Promote classify hard-fails into plan results so mutate skips them.
 mergeClassifyHardFails ::

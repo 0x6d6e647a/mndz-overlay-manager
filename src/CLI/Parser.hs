@@ -45,7 +45,9 @@ data Command
   | Update
       { updateRefresh :: Bool,
         updateTargets :: [String],
-        updateExcludeTokens :: [String]
+        updateExcludeTokens :: [String],
+        -- | @--no-compile-cache@ for the gate's smoke runs.
+        updateNoCompileCache :: Bool
       }
   | Gencache
       { gencacheTargets :: [String],
@@ -275,6 +277,12 @@ updateParser =
           )
       )
     <*> excludeTokens
+    <*> switch
+      ( long "no-compile-cache"
+          <> help
+            "Run the smoke gate's runs without the per-package compile cache \
+            \(as smoke --no-compile-cache does)"
+      )
 
 gencacheParser :: Parser Command
 gencacheParser =
@@ -353,7 +361,16 @@ updateInfo =
             \unambiguous package name. With no PACKAGE arguments, update all \
             \packages that need work (outdated non-Go packages and Go packages \
             \with tree-lane gaps). Uses the shared check cache when valid; \
-            \--refresh forces live fetch/plan and a Gentoo tree sync. "
+            \--refresh forces live fetch/plan and a Gentoo tree sync. \
+            \Every update is smoke-tested in a clean container (one run per \
+            \lane ceiling, the checks of smoke) before anything about it is \
+            \published or committed; a unit that fails is held under the cache \
+            \and rolled back. Each successful update is committed and the \
+            \overlay is pushed to its upstream; the overlay and assets branches \
+            \must be in sync with their upstreams first. --no-compile-cache runs \
+            \the gate's smoke runs without the per-package compile cache. \
+            \Needs Docker Engine 28.0 or newer with the containerd image store \
+            \when any package needs work. "
               <> excludeFooter
               <> globalsFooter
           )

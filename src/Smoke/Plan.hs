@@ -13,6 +13,8 @@ module Smoke.Plan
     PlannedItem (..),
     PackageInput (..),
     planSmokeRuns,
+    planPvRuns,
+    readPackageInput,
     runLabel,
     runAtom,
     itemAtom,
@@ -20,16 +22,21 @@ module Smoke.Plan
   )
 where
 
-import Data.List (nubBy, sortBy)
+import Control.Exception (IOException, try)
+import Data.List (isSuffixOf, nubBy, sort, sortBy)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Ord (comparing)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
+import Overlay.Discovery (parseEbuildFileName)
 import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Version (EbuildVersion (..), comparePV, parseEbuildVersion, renderPVNoRev)
 import Smoke.Floors (ecosystemFloor, pythonSlot)
+import System.Directory (listDirectory)
+import System.FilePath ((</>))
 import Update.EbuildEdit (parseKeywordsLine)
 import Update.Go.Lanes (LaneId (..), laneLabelWith)
 import Update.Runtime.Ceilings
@@ -42,7 +49,7 @@ import Update.Runtime.Ceilings
     rustUnionRuntimeAtom,
     sbclRuntimeAtom,
   )
-import Update.Types (EcosystemSpec (..), PackageKey, UpdateTechnique (..))
+import Update.Types (EcosystemSpec (..), PackageKey, UpdateTechnique (..), packageKeyText, splitPackageKey)
 
 -- | Runtime a lane-gated ecosystem is capped on. One per ecosystem.
 data LaneRuntime
@@ -131,6 +138,40 @@ data PackageInput = PackageInput
 planSmokeRuns :: Text -> Map LaneRuntime HostCeilings -> [PackageInput] -> [PlannedItem]
 planSmokeRuns arch ceilings inputs =
   concatMap (planPackage arch ceilings) (sortBy (comparing piKey) inputs)
+
+-- | The items 'planSmokeRuns' gives one package's ebuild at version @pvr@,
+-- in plan order. Lanes are derived from every ebuild in the input, so the
+-- result is what @smoke@ would run for that version alone.
+planPvRuns :: Text -> Map LaneRuntime HostCeilings -> PackageInput -> Text -> [PlannedItem]
+planPvRuns arch ceilings pkg pvr =
+  filter ((== pvr) . ebuildVersion . itemEbuild) (planPackage arch ceilings pkg)
+  where
+    itemEbuild = \case
+      PlannedRun run -> srEbuild run
+      PlannedSkip e _ -> e
+      PlannedFail e _ -> e
+
+-- | One package's ebuilds and their texts under the overlay @root@.
+readPackageInput :: FilePath -> PackageKey -> UpdateTechnique -> IO (Either Text PackageInput)
+readPackageInput root key technique = case splitPackageKey key of
+  Nothing -> pure (Left ("invalid package key " <> packageKeyText key))
+  Just (cat, pn) -> do
+    let dir = root </> T.unpack cat </> T.unpack pn
+    listed <- try @IOException (listDirectory dir)
+    case listed of
+      Left err -> pure (Left ("could not list " <> T.pack dir <> ": " <> T.pack (show err)))
+      Right names -> do
+        let ebuilds =
+              [ Ebuild {ebuildCategory = cat, ebuildPackage = pn, ebuildVersion = T.pack ver, ebuildPath = dir </> name}
+              | name <- sort names,
+                ".ebuild" `isSuffixOf` name,
+                Just (n, ver) <- [parseEbuildFileName name],
+                n == T.unpack pn
+              ]
+        bodies <- try @IOException (traverse (TIO.readFile . ebuildPath) ebuilds)
+        pure $ case bodies of
+          Left err -> Left ("could not read the ebuilds of " <> packageKeyText key <> ": " <> T.pack (show err))
+          Right texts -> Right PackageInput {piKey = key, piTechnique = technique, piEbuilds = zip ebuilds texts}
 
 planPackage :: Text -> Map LaneRuntime HostCeilings -> PackageInput -> [PlannedItem]
 planPackage arch ceilings pkg =

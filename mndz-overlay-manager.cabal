@@ -104,6 +104,7 @@ library
       , Update.Assets.Hash
       , Update.Assets.Layout
       , Update.Assets.Release
+      , Update.Assets.Verify
       , Update.Auth
       , Update.Bun.Cache
       , Update.Cargo.Crates
@@ -115,6 +116,10 @@ library
       , Update.Distfiles
       , Update.EbuildEdit
       , Update.FileLock
+      , Update.Gate
+      , Update.Gate.Session
+      , Update.Gate.Snapshot
+      , Update.Gate.Staging
       , Update.Engines
       , Update.Gastown.Gates
       , Update.Git
@@ -129,6 +134,7 @@ library
       , Update.Go.Version
       , Update.GpgAgent
       , Update.Hardcoded
+      , Update.Held
       , Update.Http
       , Update.Materialize
       , Update.Md5Cache
@@ -169,6 +175,7 @@ library
       , Update.Apply.Materialize
       , Update.Apply.OverlayWrite
       , Update.Apply.Plan
+      , Update.Apply.Publish
       , Update.Cargo.Lock
       , Update.Cargo.V8Deps
       , Update.DiskSpace.StatVfs
@@ -212,6 +219,7 @@ library
         process ^>=1.6,
         template-haskell ^>=2.22,
         temporary ^>=1.3,
+        stm ^>=2.5,
         text ^>=2.1,
         time ^>=1.12,
         toml-parser ^>=2.0,
@@ -292,6 +300,9 @@ test-suite mndz-overlay-manager-test
         Test.Ensure
         Test.Ecosystems
         Test.Gastown
+        Test.Gate
+        Test.GatedPublish
+        Test.Held
         Test.Git
         Test.GitHubResilience
         Test.GentooTree

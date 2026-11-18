@@ -21,14 +21,17 @@ import Smoke.Container (FailStage (..), RunOutcome (..), RunResult (..))
 import Smoke.Definitions (lookupSmokeDef, smokeDefinitions)
 import Smoke.Plan (HostCeilings (..), LaneRuntime (..), PackageInput (..), PlannedItem (..), RuntimeCap (..), SmokeRun (..), planSmokeRuns)
 import Smoke.Run
-  ( SmokeOps (..),
+  ( ItemOutcome (..),
+    SmokeOps (..),
     SmokeSummary (..),
     keptRunLogs,
     missingDefinitions,
     pruneRunLogs,
+    runItem,
     runSmoke,
     summaryLines,
     uncommittedPackages,
+    withSmokeSession,
   )
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, listDirectory, setModificationTime)
 import System.FilePath ((</>))
@@ -51,6 +54,7 @@ tests =
       testCase "tree lock is released before the first run" testLockRelease,
       testCase "compile cache report is logged, stdout unchanged" testCacheReportLogged,
       testCase "probe failure stops before any run" testProbeFails,
+      testCase "one session runs two items through the executor" testSessionExecutor,
       testCase "missing definitions are named" testMissingDefinitions,
       testCase "eleventh earlier log directory is pruned" testPrune,
       testCase "modified, staged, and untracked files are reported" testUncommitted
@@ -212,6 +216,28 @@ testProbeFails = do
   events <- readIORef (tEvents t)
   assertTrue "no run" (not (any ("run " `T.isPrefixOf`) events))
   assertTrue "snapshot still removed" ("snapshot removed" `elem` events)
+
+testSessionExecutor :: IO ()
+testSessionExecutor = withSystemTempDirectory "om-smoke-session" $ \tmp -> do
+  t <- newTrace
+  let runOne run
+        | isJust (srCap run) = pure (RunFail FailBuild "Fetch failed" "/logs/beads/build.log")
+        | otherwise = pure RunPass
+      runs = [i | i@(PlannedRun _) <- items]
+  got <- withSmokeSession (fakeOps t runOne) $ \cache -> do
+    note t "session open"
+    mapM (runItem (fakeOps t runOne) defFor tmp cache) (take 2 runs)
+  assertEq
+    "outcomes"
+    (Right [Passed, Failed "build" "Fetch failed" (Just "/logs/beads/build.log")])
+    got
+  events <- readIORef (tEvents t)
+  assertEq
+    "one session around both runs"
+    ["sweep", "image", "snapshot", "release", "probe", "compile cache", "session open", "run 2.9.8", "run 1.3.4", "snapshot removed"]
+    events
+  outLines <- readIORef (tLines t)
+  assertEq "the executor prints no result line" [] outLines
 
 testMissingDefinitions :: IO ()
 testMissingDefinitions = do

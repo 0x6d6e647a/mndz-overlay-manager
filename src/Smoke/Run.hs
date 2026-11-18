@@ -1,11 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 
--- | Orchestration of a @smoke@ command after planning: leftover sweep, smoke
--- image, tree snapshot (then the tree lock is released), sandbox probe,
--- compile cache preparation, the runs one at a time, result lines, and the
--- summary. Every effect is a field
--- of 'SmokeOps', so the pipeline runs over fakes in tests.
+-- | Orchestration of smoke runs after planning. A session owns the
+-- command-scoped resources: leftover sweep, smoke image, tree snapshot (then
+-- the tree lock is released), sandbox probe, and compile cache preparation.
+-- The run executor performs one planned item inside an open session. The
+-- @smoke@ command folds the executor over its plan and prints result lines
+-- and the summary; @update@ gates call the executor per unit. Every effect is
+-- a field of 'SmokeOps', so the pipeline runs over fakes in tests.
 module Smoke.Run
   ( -- * Selection
     missingDefinitions,
@@ -13,6 +15,9 @@ module Smoke.Run
     -- * Pipeline
     SmokeOps (..),
     SmokeSummary (..),
+    withSmokeSession,
+    ItemOutcome (..),
+    runItem,
     runSmoke,
     resultLine,
     summaryLines,
@@ -90,15 +95,12 @@ data SmokeSummary = SmokeSummary
   }
   deriving (Eq, Show)
 
--- | The pipeline from the sweep to the last run. 'Left' is a hard failure
--- before the first run. @logsDir@ is this command's log directory.
-runSmoke ::
-  SmokeOps ->
-  (PackageKey -> SmokeDef) ->
-  FilePath ->
-  [PlannedItem] ->
-  IO (Either Text SmokeSummary)
-runSmoke ops defFor logsDir items = do
+-- | Open a session: sweep, image, snapshot, tree release, probe, and cache
+-- preparation, then run the continuation with the prepared cache use. The
+-- snapshot is removed when the continuation returns or throws. 'Left' is a
+-- failure before the continuation ran.
+withSmokeSession :: SmokeOps -> (CacheUse -> IO a) -> IO (Either Text a)
+withSmokeSession ops k = do
   soSweep ops
   image <- soEnsureImage ops
   case image of
@@ -109,48 +111,64 @@ runSmoke ops defFor logsDir items = do
         probe <- soProbe ops
         case probe of
           Left err -> pure (Left err)
-          Right () -> Right <$> runAll
+          Right () -> Right <$> (soPrepareCache ops >>= k)
       pure (join result)
+
+-- | Perform one planned item in an open session, logging its compile cache
+-- report. A run's logs go under @logsDir@.
+runItem :: SmokeOps -> (PackageKey -> SmokeDef) -> FilePath -> CacheUse -> PlannedItem -> IO ItemOutcome
+runItem ops defFor logsDir cache item = case item of
+  PlannedSkip _ reason -> pure (Skipped reason)
+  PlannedFail _ reason -> pure (Failed "plan" reason Nothing)
+  PlannedRun run -> do
+    r <- soRun ops cache run (defFor (srKey run)) (runLogDir logsDir run)
+    forM_ (roCache r) $ \report -> do
+      soLogInfo ops (itemAtom item <> ": " <> reportLine report)
+      forM_ (reportWarning report) (soLogWarning ops)
+    pure $ case roResult r of
+      RunPass -> Passed
+      RunFail stage why file -> Failed (renderFailStage stage) why (Just file)
+
+-- | The pipeline from the sweep to the last run. 'Left' is a hard failure
+-- before the first run. @logsDir@ is this command's log directory.
+runSmoke ::
+  SmokeOps ->
+  (PackageKey -> SmokeDef) ->
+  FilePath ->
+  [PlannedItem] ->
+  IO (Either Text SmokeSummary)
+runSmoke ops defFor logsDir items =
+  withSmokeSession ops $ \cache -> do
+    createDirectoryIfMissing True logsDir
+    results <- forM (zip [1 ..] items) $ \(i, item) -> do
+      soProgress ops i total (itemAtom item)
+      outcome <- runItem ops defFor logsDir cache item
+      soEmit ops (resultLine item outcome)
+      case outcome of
+        Failed _ why mFile ->
+          soLogFailure ops $
+            itemAtom item
+              <> ": "
+              <> why
+              <> maybe "" (\f -> " (log: " <> T.pack f <> ")") mFile
+        _ -> pure ()
+      pure outcome
+    pure
+      SmokeSummary
+        { ssPassed = length [() | Passed <- results],
+          ssFailed = length [() | Failed {} <- results],
+          ssSkipped = length [() | Skipped _ <- results]
+        }
   where
     total = length items
-    runAll = do
-      createDirectoryIfMissing True logsDir
-      cache <- soPrepareCache ops
-      results <- forM (zip [1 ..] items) $ \(i, item) -> do
-        soProgress ops i total (itemAtom item)
-        outcome <- case item of
-          PlannedSkip _ reason -> pure (Skipped reason)
-          PlannedFail _ reason -> pure (Failed "plan" reason Nothing)
-          PlannedRun run -> do
-            r <- soRun ops cache run (defFor (srKey run)) (runLogDir logsDir run)
-            forM_ (roCache r) $ \report -> do
-              soLogInfo ops (itemAtom item <> ": " <> reportLine report)
-              forM_ (reportWarning report) (soLogWarning ops)
-            pure $ case roResult r of
-              RunPass -> Passed
-              RunFail stage why file -> Failed (renderFailStage stage) why (Just file)
-        soEmit ops (resultLine item outcome)
-        case outcome of
-          Failed _ why mFile ->
-            soLogFailure ops $
-              itemAtom item
-                <> ": "
-                <> why
-                <> maybe "" (\f -> " (log: " <> T.pack f <> ")") mFile
-          _ -> pure ()
-        pure outcome
-      pure
-        SmokeSummary
-          { ssPassed = length [() | Passed <- results],
-            ssFailed = length [() | Failed {} <- results],
-            ssSkipped = length [() | Skipped _ <- results]
-          }
 
+-- | One item's outcome.
 data ItemOutcome
   = Passed
   | Skipped Text
   | -- | Stage, reason, log file.
     Failed Text Text (Maybe FilePath)
+  deriving (Eq, Show)
 
 -- | @\<atom\> [(\<lane\>)]: pass@, @: skip: \<reason\>@, or @: fail: \<stage\>@.
 resultLine :: PlannedItem -> ItemOutcome -> Text

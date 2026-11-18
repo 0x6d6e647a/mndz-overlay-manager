@@ -54,8 +54,8 @@ import Update.Adequacy
     plannedRuntimeReq,
     requiredAssetBasenames,
   )
-import Update.Apply.Commit (egencacheAndSignedCommit, pruneCommitMessage)
-import Update.Apply.Env (ApplyEnv (..))
+import Update.Apply.Commit (CommitOutcome (..), commitAndPushOverlay, egencacheUnitPaths, pruneCommitMessage)
+import Update.Apply.Env (ApplyEnv (..), PublishControl (..))
 import Update.Apply.Errors
   ( ApplyUnitError (..),
     applyUnitErrorMessage,
@@ -63,6 +63,7 @@ import Update.Apply.Errors
   )
 import Update.Apply.GitMv (requirePackageMd5Cache)
 import Update.Apply.OverlayWrite (CodexV8Overlay (..), findTemplate, overlayAfterAssets)
+import Update.Apply.Publish (AfterGateStop (..), UnitTail (..))
 import Update.Assets.Hash (FileDigests (..), hashFile, writeSidecars)
 import Update.Assets.Layout
   ( SidecarPaths (..),
@@ -84,6 +85,7 @@ import Update.Assets.Release
     findAssetByName,
     lookupNamedAssets,
   )
+import Update.Assets.Verify (assetsDownloadPrefix)
 import Update.AtomClosure (keepPVsForProvider)
 import Update.Bun.Cache (BunCacheProgress (..), BunProbe (..), buildBunDepsTarball, bunPackagingModeFor, isBunCompilePinPackage, mkBunCacheOps)
 import Update.Cargo.Crates
@@ -710,16 +712,19 @@ materializeDepsPlan env overlayRoot entry src eco plan localPVs contentFix force
                   then [ApplySoftSkip key "already matches runtime-lane plan"]
                   else successes
           | otherwise -> do
-              committed <-
-                egencacheAndSignedCommit
-                  env
-                  overlayRoot
-                  key
-                  extraPaths
-                  (pruneCommitMessage key)
+              ePaths <- egencacheUnitPaths env overlayRoot key extraPaths
+              committed <- case ePaths of
+                Left err -> pure (Left (ApplyHardFail key err True False))
+                Right paths ->
+                  commitAndPushOverlay env overlayRoot key paths (pruneCommitMessage key) >>= \case
+                    Committed -> pure (Right paths)
+                    CommitHalted cause ->
+                      pure (Left (applyUnitHardFail key (ApplyPublishingHalted cause) True False))
+                    CommitFailed err -> pure (Left (ApplyHardFail key err True False))
+                    PushFailed err ->
+                      pure (Left (applyUnitHardFail key (ApplyOverlayPushFailed overlayRoot err) False False))
               pure $ case committed of
-                Left err ->
-                  successes <> [ApplyHardFail key err True False]
+                Left failed -> successes <> [failed]
                 Right paths
                   | null successes ->
                       let lines_ = gapSuccessLines localPVs needPVs plan
@@ -948,20 +953,21 @@ readDonorEbuild env pkgDir pn ver fallback =
         body <- readEbuild tree path
         pure (Right (path, body))
 
--- | Full materialize path: 7 discrete multi-progress steps.
+-- | Full materialize path: 9 discrete multi-progress steps (build three,
+-- manifest, gate, assets commit, push, release, verification).
 fullPathMaterializeSteps :: Int
-fullPathMaterializeSteps = 7
+fullPathMaterializeSteps = 9
 
--- | Reuse materialize path: 3 discrete multi-progress steps.
+-- | Reuse materialize path: 4 discrete multi-progress steps.
 reusePathMaterializeSteps :: Int
-reusePathMaterializeSteps = 3
+reusePathMaterializeSteps = 4
 
--- | Upper-bound package step total after planning: @planDone + nPVs × 7@.
+-- | Upper-bound package step total after planning: @planDone + nPVs × 9@.
 materializeStepTotalUpper :: Int -> Int -> Int
 materializeStepTotalUpper planDone nPVs =
   planDone + nPVs * fullPathMaterializeSteps
 
--- | After path selection: @stepsDone + thisPath + remainingUnstarted × 7@.
+-- | After path selection: @stepsDone + thisPath + remainingUnstarted × 9@.
 reviseMaterializeStepTotal :: Int -> Int -> Int -> Int
 reviseMaterializeStepTotal stepsDone thisPathSteps remainingUnstartedPVs =
   stepsDone + thisPathSteps + remainingUnstartedPVs * fullPathMaterializeSteps
@@ -1233,101 +1239,147 @@ fullDepsPublishAndOverlay
                           rmBody = cratesMsg,
                           rmTargetCommitish = sha
                         }
-                pubResult <-
-                  publishAssetCycle
-                    env
-                    key
-                    assetsRoot
-                    paths
-                    (sidecarPaths assetsRoot category pn)
-                    cratesRel
-                    cratesMsg
-                    cratesMeta
-                    stepsDoneRef
-                    mh
-                case pubResult of
-                  Left err ->
+                    staged = paths <> maybe [] pure mHarvestPath
+                    publishRusty = case (mHarvestPath, mCodexV8) of
+                      (Nothing, _) -> pure (Right ())
+                      (Just harvestPath, Just ov) ->
+                        let ver = cvoVer ov
+                            base = takeFileName harvestPath
+                            rel =
+                              [ rustyV8DirName </> base <> ext
+                              | ext <- [".sha256", ".sha512", ".b3"]
+                              ]
+                            msg = rustyV8CommitMessage ver
+                            meta sha =
+                              ReleaseMeta
+                                { rmOwner = aeAssetsOwner env,
+                                  rmRepo = aeAssetsRepo env,
+                                  rmTag = rustyV8ReleaseTag ver,
+                                  rmName = rustyV8ReleaseName ver,
+                                  rmBody = msg,
+                                  rmTargetCommitish = sha
+                                }
+                         in void
+                              <$> publishAssetCycle
+                                env
+                                key
+                                assetsRoot
+                                [harvestPath]
+                                (rustyV8SidecarPaths assetsRoot)
+                                rel
+                                msg
+                                meta
+                                stepsDoneRef
+                                mh
+                      (Just _, Nothing) ->
+                        pure (Left (StopPublishFailed "internal: harvested rusty_v8 without pin"))
+                    -- Neither publish cycle starts before the gate passes.
+                    afterGate = do
+                      crates <-
+                        publishAssetCycle
+                          env
+                          key
+                          assetsRoot
+                          paths
+                          (sidecarPaths assetsRoot category pn)
+                          cratesRel
+                          cratesMsg
+                          cratesMeta
+                          stepsDoneRef
+                          mh
+                      case crates of
+                        Left stop -> pure (Left stop)
+                        Right _ -> do
+                          rustyPub <- publishRusty
+                          case rustyPub of
+                            Left stop -> pure (Left stop)
+                            Right () ->
+                              verifyPublishedAssets
+                                env
+                                overlayRoot
+                                key
+                                (renderPV targetVer)
+                                (map takeFileName staged)
+                                stepsDoneRef
+                                mh
+                    unitTail =
+                      UnitTail
+                        { utTechnique = depsTechniqueText eco,
+                          utPath = Just "full",
+                          utStaged = staged,
+                          utRelease = Just (releaseTag pn pvNoRev),
+                          utAssetNames = map (T.pack . takeFileName) staged,
+                          utPublishedBefore = False,
+                          utAfterGate = afterGate,
+                          utStepDone = markMaterializeStep stepsDoneRef mh key
+                        }
+                -- The Manifest is made from the locally built distfiles,
+                -- seeded into DISTDIR since nothing is published yet.
+                distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
+                mhStatus mh key "regenerating manifest"
+                seeded <- aeSeedDistfiles env staged
+                outcome <- case seeded of
+                  Left err -> pure (ApplyHardFail key err False False)
+                  Right () ->
+                    overlayAfterAssets
+                      env
+                      overlayRoot
+                      entry
+                      eco
+                      keywords
+                      lines_
+                      targetVer
+                      distDigests
+                      mReqVer
+                      (lookupUvRawTag plan targetVer)
+                      mEbuildBody
+                      mCodexV8
+                      (gastownCheckout key (udWork unit </> "src"))
+                      unitTail
+                case outcome of
+                  ApplySuccess {} -> do
+                    deleteUnit unit
+                    pure outcome
+                  ApplySoftSkip {} -> do
+                    deleteUnit unit
+                    pure outcome
+                  ApplyHardFail k failMsg half assetsPub ->
                     pure $
                       ApplyHardFail
-                        key
-                        (retainUnitError unit ("assets publish failed: " <> err))
-                        False
-                        False
-                  Right distDigests -> do
-                    rustyPub <-
-                      case (mHarvestPath, mCodexV8) of
-                        (Nothing, _) -> pure (Right ())
-                        (Just harvestPath, Just ov) ->
-                          let ver = cvoVer ov
-                              base = takeFileName harvestPath
-                              rel =
-                                [ rustyV8DirName </> base <> ext
-                                | ext <- [".sha256", ".sha512", ".b3"]
-                                ]
-                              msg = rustyV8CommitMessage ver
-                              meta sha =
-                                ReleaseMeta
-                                  { rmOwner = aeAssetsOwner env,
-                                    rmRepo = aeAssetsRepo env,
-                                    rmTag = rustyV8ReleaseTag ver,
-                                    rmName = rustyV8ReleaseName ver,
-                                    rmBody = msg,
-                                    rmTargetCommitish = sha
-                                  }
-                           in void
-                                <$> publishAssetCycle
-                                  env
-                                  key
-                                  assetsRoot
-                                  [harvestPath]
-                                  (rustyV8SidecarPaths assetsRoot)
-                                  rel
-                                  msg
-                                  meta
-                                  stepsDoneRef
-                                  mh
-                        (Just _, Nothing) ->
-                          pure (Left "internal: harvested rusty_v8 without pin")
-                    case rustyPub of
-                      Left err ->
-                        pure $
-                          ApplyHardFail
-                            key
-                            (retainUnitError unit ("assets publish failed: " <> err))
-                            False
-                            False
-                      Right () -> do
-                        mhStatus mh key "regenerating manifest"
-                        outcome <-
-                          overlayAfterAssets
-                            env
-                            overlayRoot
-                            entry
-                            eco
-                            keywords
-                            lines_
-                            targetVer
-                            distDigests
-                            mReqVer
-                            (lookupUvRawTag plan targetVer)
-                            mEbuildBody
-                            mCodexV8
-                            (gastownCheckout key (udWork unit </> "src"))
-                        case outcome of
-                          ApplySuccess {} -> do
-                            markMaterializeStep stepsDoneRef mh key "regenerating manifest"
-                            deleteUnit unit
-                            pure outcome
-                          ApplySoftSkip {} -> do
-                            deleteUnit unit
-                            pure outcome
-                          ApplyHardFail k failMsg half assetsPub ->
-                            pure $
-                              ApplyHardFail
-                                k
-                                (retainUnitError unit failMsg)
-                                half
-                                assetsPub
+                        k
+                        (retainUnitError unit failMsg)
+                        half
+                        assetsPub
+
+-- | @DepsAndAssets \<ecosystem\>@ for a held entry.
+depsTechniqueText :: EcosystemSpec -> Text
+depsTechniqueText eco = "DepsAndAssets " <> T.pack (takeWhile (/= ' ') (show eco))
+
+-- | Verify every published asset at the URL the unit's ebuild names.
+verifyPublishedAssets ::
+  ApplyEnv ->
+  FilePath ->
+  PackageKey ->
+  Text ->
+  [FilePath] ->
+  IORef Int ->
+  MultiHandle ->
+  IO (Either AfterGateStop ())
+verifyPublishedAssets env overlayRoot key pv names stepsDoneRef mh = do
+  mhStatus mh key "verifying published asset"
+  verified <-
+    pcVerify
+      (aePublish env)
+      (assetsDownloadPrefix (aeAssetsOwner env) (aeAssetsRepo env))
+      overlayRoot
+      key
+      pv
+      (map T.pack names)
+  case verified of
+    Left (url, why) -> pure (Left (StopVerifyFailed url why))
+    Right () -> do
+      markMaterializeStep stepsDoneRef mh key "verifying published asset"
+      pure (Right ())
 
 -- | Build all required distfiles (primary + companions); paths in asset order.
 materializeDistfiles ::
@@ -2012,9 +2064,18 @@ reuseDepsReleaseAsset
                         Nothing
                         Nothing
                         mCheckout
+                        UnitTail
+                          { utTechnique = depsTechniqueText eco,
+                            utPath = Just "reuse",
+                            utStaged = [],
+                            utRelease = Just (releaseTag pn pvNoRev),
+                            utAssetNames = map (T.pack . fst) namedUrls,
+                            utPublishedBefore = True,
+                            utAfterGate = pure (Right ()),
+                            utStepDone = markMaterializeStep stepsDoneRef mh key
+                          }
                     case outcome of
                       ApplySuccess k sls paths -> do
-                        markMaterializeStep stepsDoneRef mh key "regenerating manifest"
                         deleteUnit unit
                         pure (ApplySuccess k sls paths)
                       ApplySoftSkip k reason -> do
@@ -2389,45 +2450,58 @@ publishAssetCycle ::
   (Text -> ReleaseMeta) ->
   IORef Int ->
   MultiHandle ->
-  IO (Either Text [(FilePath, FileDigests)])
+  IO (Either AfterGateStop [(FilePath, FileDigests)])
 publishAssetCycle env key assetsRoot paths sidecarFn relSidecars msg mkMeta stepsDoneRef mh = do
-  mhStatus mh key "committing assets"
-  distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
-  mapM_
-    ( \(p, digests) -> do
-        let sp = sidecarFn (takeFileName p)
-        createDirectoryIfMissing True (takeDirectory (spSha256 sp))
-        writeSidecars p digests (spSha256 sp) (spSha512 sp) (spB3 sp)
-    )
-    distDigests
-  withMVar (aeAssetsLock env) $ \() -> do
-    committed <- goAddAndCommit (aeGitOps env) assetsRoot relSidecars msg
-    case committed of
-      Left err -> pure (Left err)
-      Right () -> do
-        sha <- goRevParseHead (aeGitOps env) assetsRoot
-        case sha of
-          Left err -> pure (Left err)
-          Right commitSha -> do
-            markMaterializeStep stepsDoneRef mh key "committing assets"
-            mhStatus mh key "pushing assets"
-            gitOpsOk <- aeGitOperationsHealth env
-            pushed <-
-              case gitOpsOk of
-                Left err -> pure (Left err)
-                Right () -> goPush (aeGitOps env) assetsRoot
-            case pushed of
-              Left err -> pure (Left err)
-              Right () -> do
-                markMaterializeStep stepsDoneRef mh key "pushing assets"
-                mhStatus mh key "uploading release asset"
-                uploaded <-
-                  roCreateReleaseWithAssets
-                    (aeReleaseOps env)
-                    (mkMeta commitSha)
-                    paths
-                case uploaded of
+  haltedBefore <- readIORef (pcHalted (aePublish env))
+  case haltedBefore of
+    Just cause -> pure (Left (StopHalted cause))
+    Nothing -> do
+      mhStatus mh key "committing assets"
+      distDigests <- mapM (\p -> (takeFileName p,) <$> hashFile p) paths
+      mapM_
+        ( \(p, digests) -> do
+            let sp = sidecarFn (takeFileName p)
+            createDirectoryIfMissing True (takeDirectory (spSha256 sp))
+            writeSidecars p digests (spSha256 sp) (spSha512 sp) (spB3 sp)
+        )
+        distDigests
+      withMVar (aeAssetsLock env) $ \() -> do
+        -- Publishing may have halted while the sidecars were written.
+        halted <- readIORef (pcHalted (aePublish env))
+        case halted of
+          Just cause -> pure (Left (StopHalted cause))
+          Nothing ->
+            either (Left . StopPublishFailed) Right
+              <$> commitPushRelease distDigests
+  where
+    commitPushRelease distDigests = do
+      committed <- goAddAndCommit (aeGitOps env) assetsRoot relSidecars msg
+      case committed of
+        Left err -> pure (Left err)
+        Right () -> do
+          sha <- goRevParseHead (aeGitOps env) assetsRoot
+          case sha of
+            Left err -> pure (Left err)
+            Right commitSha -> do
+              markMaterializeStep stepsDoneRef mh key "committing assets"
+              mhStatus mh key "pushing assets"
+              gitOpsOk <- aeGitOperationsHealth env
+              pushed <-
+                case gitOpsOk of
                   Left err -> pure (Left err)
-                  Right () -> do
-                    markMaterializeStep stepsDoneRef mh key "uploading release asset"
-                    pure (Right distDigests)
+                  Right () -> goPush (aeGitOps env) assetsRoot
+              case pushed of
+                Left err -> pure (Left err)
+                Right () -> do
+                  markMaterializeStep stepsDoneRef mh key "pushing assets"
+                  mhStatus mh key "uploading release asset"
+                  uploaded <-
+                    roCreateReleaseWithAssets
+                      (aeReleaseOps env)
+                      (mkMeta commitSha)
+                      paths
+                  case uploaded of
+                    Left err -> pure (Left err)
+                    Right () -> do
+                      markMaterializeStep stepsDoneRef mh key "uploading release asset"
+                      pure (Right distDigests)

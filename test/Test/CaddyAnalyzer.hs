@@ -922,7 +922,8 @@ testFailures = do
           }
   expectFail "image go" ["materialize image Go", "1.25.13", "retained temp unit"] False $
     \_ -> absentRelease (error "old-go release probe is per call")
-  expectFail "manifest" ["Manifest SHA512 does not match", "retained temp unit"] True $
+  -- The Manifest is checked before anything is published.
+  expectFail "manifest" ["Manifest SHA512 does not match", "retained temp unit"] False $
     \probe -> absentRelease probe
   expectFail "overlay commit" ["gpg failed", "retained temp unit"] True $
     \probe -> absentRelease probe
@@ -971,7 +972,5 @@ testFailures = do
               assertTrue (label <> " stops before a success commit") half
           other -> assertFailure (label <> ": " <> show other)
         created <- readIORef (prCreate probe)
-        when (label `elem` ["download", "sidecar", "route", "image go"]) $
+        when (label `elem` ["download", "sidecar", "route", "image go", "manifest"]) $
           assertEq (label <> " does not upload") [] created
-        when (label == "manifest") $
-          assertEq (label <> " uploads once") 1 (length created)

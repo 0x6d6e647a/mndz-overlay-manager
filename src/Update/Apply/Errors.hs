@@ -47,6 +47,15 @@ data ApplyUnitError
     ApplyOverlayProviderCascade PackageKey
   | -- | Overlay-internal atom-closure refuse, parse fail, cycle, or rename-away.
     ApplyAtomClosure Text
+  | -- | Smoke gate failure: the failed run's description (atom, lane,
+    -- @fail: \<stage\>@ or skip reason, and log).
+    ApplyGateFailed Text
+  | -- | Published asset verification: the URL and the mismatch.
+    ApplyVerifyFailed Text Text
+  | -- | Overlay push failed after the commit: overlay root and git's error.
+    ApplyOverlayPushFailed FilePath Text
+  | -- | Publishing halted before this unit; names the failed push.
+    ApplyPublishingHalted Text
   deriving (Eq, Show)
 
 applyUnitErrorMessage :: ApplyUnitError -> Text
@@ -72,6 +81,17 @@ applyUnitErrorMessage = \case
   ApplyOverlayFailClosed provider -> overlayFailClosedMessage provider
   ApplyOverlayProviderCascade provider -> overlayProviderCascadeMessage provider
   ApplyAtomClosure msg -> msg
+  ApplyGateFailed detail -> "smoke gate failed: " <> detail
+  ApplyVerifyFailed url why ->
+    "published asset verification failed for " <> url <> ": " <> why
+  ApplyOverlayPushFailed overlay err ->
+    "overlay push failed (the commit is kept; publishing halted for this run): "
+      <> err
+      <> "; push it with: git -C "
+      <> T.pack overlay
+      <> " push"
+  ApplyPublishingHalted cause ->
+    "publishing halted because " <> cause <> "; this unit was not published or committed"
 
 -- | Build 'ApplyHardFail' with stable operator wording for a known unit error.
 -- Remaining args are half-applied (overlay mutated) and assets-published flags.

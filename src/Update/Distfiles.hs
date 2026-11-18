@@ -13,7 +13,9 @@ module Update.Distfiles
     probeDistfilesDir,
     cleanManagerDistfiles,
     cleanManagerDistfilesWith,
+    cleanManagerDistfilesKeeping,
     ebuildManifestEnv,
+    seedManagerDistfiles,
     looksLikeStickyDistfilesError,
     stickyDistfilesGuidance,
     enrichEbuildManifestError,
@@ -22,12 +24,14 @@ module Update.Distfiles
 where
 
 import Control.Exception (try)
+import Data.List (isPrefixOf)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Metrics.Core (Metrics)
 import Metrics.Process (wallClockProc)
 import System.Directory
-  ( createDirectoryIfMissing,
+  ( copyFile,
+    createDirectoryIfMissing,
     doesDirectoryExist,
     getHomeDirectory,
     listDirectory,
@@ -38,9 +42,10 @@ import System.Directory
   )
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (addTrailingPathSeparator, normalise, splitDirectories, takeFileName, (</>))
 import System.Posix.Files (setFileMode)
 import System.Process (readProcessWithExitCode)
+import Update.Held (defaultHeldRoot)
 
 -- | Canonical system Portage DISTDIR when Portage is not queryable.
 systemDistfilesFallback :: FilePath
@@ -176,7 +181,23 @@ cleanManagerDistfilesWith ::
   FilePath ->
   IO (Either Text ())
 cleanManagerDistfilesWith m readProc path = do
+  held <- defaultHeldRoot
+  cleanManagerDistfilesKeeping m readProc [held] path
+
+-- | 'cleanManagerDistfilesWith' that never removes anything under the
+-- @keep@ paths (held entries): a top-level entry leading to one is left in
+-- place, and a distfiles path inside one is refused.
+cleanManagerDistfilesKeeping ::
+  Metrics ->
+  (FilePath -> [String] -> String -> IO (ExitCode, String, String)) ->
+  [FilePath] ->
+  FilePath ->
+  IO (Either Text ())
+cleanManagerDistfilesKeeping m readProc keepPaths path = do
   system <- isSystemDistfilesPath m readProc path
+  absPath <- normalise <$> makeAbsolute path
+  keeps <- mapM (fmap normalise . makeAbsolute) keepPaths
+  let within a b = a == b || addTrailingPathSeparator b `isPrefixOf` a
   if system
     then
       pure $
@@ -185,22 +206,43 @@ cleanManagerDistfilesWith m readProc path = do
             <> T.pack path
             <> ". Use the manager private cache (default under XDG cache "
             <> "mndz/overlay-manager/distfiles) or a non-system distfiles-path."
-    else do
-      exists <- doesDirectoryExist path
-      if not exists
-        then pure (Right ())
-        else do
-          -- Remove contents then leave an empty 0700 directory.
-          entries <- listDirectory path
-          mapM_ (\name -> removePathForcibly (path </> name)) entries
-          setFileMode path 0o700
-          pure (Right ())
+    else case [k | k <- keeps, absPath `within` k] of
+      k : _ ->
+        pure . Left $
+          "eclean refuses to clean "
+            <> T.pack path
+            <> ": it is inside the held entries at "
+            <> T.pack k
+      [] -> do
+        exists <- doesDirectoryExist path
+        if not exists
+          then pure (Right ())
+          else do
+            -- Remove contents then leave an empty 0700 directory, keeping
+            -- any entry that leads to a held root.
+            entries <- listDirectory path
+            let leadsToKeep name = any (\k -> (absPath </> name) `isAncestorOrSelf` k) keeps
+                isAncestorOrSelf a b = splitDirectories a `isPrefixOf` splitDirectories b
+            mapM_ (\name -> removePathForcibly (path </> name)) (filter (not . leadsToKeep) entries)
+            setFileMode path 0o700
+            pure (Right ())
 
 -- | @DISTDIR@ and empty @GENTOO_MIRRORS@ for ebuild manifest, set on top of
 -- the tools container's own environment.
 ebuildManifestEnv :: FilePath -> [(String, String)]
 ebuildManifestEnv distDir =
   [("DISTDIR", distDir), ("GENTOO_MIRRORS", "")]
+
+-- | Copy a unit's locally built distfiles into the manager @DISTDIR@ by
+-- basename, so @ebuild … manifest@ hashes them instead of fetching URLs
+-- that are not published yet. Each copy replaces any older file of that
+-- name in one rename.
+seedManagerDistfiles :: FilePath -> [FilePath] -> IO (Either Text ())
+seedManagerDistfiles distDir files = do
+  r <- try @IOError (mapM_ (\src -> copyFile src (distDir </> takeFileName src)) files)
+  pure $ case r of
+    Right () -> Right ()
+    Left err -> Left ("could not copy built distfiles into " <> T.pack distDir <> ": " <> T.pack (show err))
 
 -- | Detect sticky/EPERM/distfiles rename failure signatures in ebuild stderr.
 looksLikeStickyDistfilesError :: Text -> Bool

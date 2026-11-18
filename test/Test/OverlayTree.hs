@@ -177,14 +177,23 @@ nonEbuildAllowlist =
     "src/Overlay/Validation.hs",
     "src/Smoke/Container.hs",
     "src/Smoke/Image.hs",
+    -- Reads ebuilds from a gate's private overlay snapshot.
+    "src/Smoke/Plan.hs",
     "src/Update/Assets/Hash.hs",
     "src/Update/Assets/Release.hs",
+    -- Reads the unit's Manifest and md5-cache entry.
+    "src/Update/Assets/Verify.hs",
     "src/Update/Bun/Cache.hs",
     "src/Update/Cargo/Crates.hs",
     "src/Update/Cargo/Msrv.hs",
     "src/Update/DiskSpace.hs",
     "src/Update/Distfiles.hs",
     "src/Update/Gastown/Gates.hs",
+    -- Private snapshot and staging directories.
+    "src/Update/Gate/Snapshot.hs",
+    "src/Update/Gate/Staging.hs",
+    -- Held entries under the cache; rollback runs under the tree lock.
+    "src/Update/Held.hs",
     "src/Update/GentooTree.hs",
     "src/Update/GitHubToken.hs",
     "src/Update/GpgAgent.hs",

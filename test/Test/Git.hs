@@ -29,13 +29,16 @@ import Test.Metrics (spanStarts, withRecorded)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
 import Update.Git
-  ( gitAddAndSignedCommit,
+  ( UpstreamSync (..),
+    checkUpstreamSync,
+    gitAddAndSignedCommit,
     gitPush,
     gitRevParseHead,
     isGitWorkTree,
     pathsDirty,
     productionGitOps,
     relativeOverlayPath,
+    upstreamSyncError,
   )
 import Update.Git qualified as Git
 import Update.GitHub (gitRemoteOriginUrl, gitRemotePushUrl)
@@ -86,6 +89,16 @@ tests =
           testCase "remote URL argv and mapping" testFakeRemoteUrl,
           testCase "missing git raises the same IOException with metrics" testMissingGit,
           testCase "signing environment is not recorded" testSigningEnvNotRecorded
+        ],
+      testGroup
+        "Upstream sync"
+        [ testCase "detached HEAD fails before health and fetch" testSyncDetached,
+          testCase "no upstream fails before health and fetch" testSyncNoUpstream,
+          testCase "in sync after health and fetch" testSyncInSync,
+          testCase "ahead names the local commit" testSyncAhead,
+          testCase "behind names the branch" testSyncBehind,
+          testCase "diverged names both sides" testSyncDiverged,
+          testCase "Git Operations failure stops before fetch" testSyncHealthFails
         ]
     ]
 
@@ -555,3 +568,106 @@ testSigningEnvNotRecorded = withReadyHandle $ \root h -> do
     "git commit span recorded"
     (length [() | (_, _, "proc", _) <- spanStarts evs] == 2)
   assertTrue "tty value absent from every event" (not ("mndz-test-tty" `T.isInfixOf` T.pack (show evs)))
+
+-- | Scripted answers for the sync check: branch (empty for detached),
+-- upstream (empty for none), and the @behind ahead@ counts.
+syncRunner :: String -> String -> (Int, Int) -> IO (CommandRunner, IO [ProcessRequest])
+syncRunner branch upstream (behind, ahead) =
+  recordingRunner $ \req -> case drop 2 (gitArgs req) of
+    "symbolic-ref" : _ -> if null branch then failErr "fatal: ref HEAD is not a symbolic ref" else okOut (branch <> "\n")
+    "rev-parse" : _ -> if null upstream then failErr "fatal: no upstream configured" else okOut (upstream <> "\n")
+    "config" : _ -> okOut "origin\n"
+    "fetch" : _ -> okOut ""
+    "rev-list" : _ -> okOut (show behind <> "\t" <> show ahead <> "\n")
+    ["log", _, _, "@{u}..HEAD"] -> okOut "abc1234 local change\n"
+    ["log", _, _, "HEAD..@{u}"] -> okOut "def5678 upstream change\n"
+    other -> failErr ("unexpected " <> unwords other)
+
+subcommands :: [ProcessRequest] -> [String]
+subcommands = map (\r -> case drop 2 (gitArgs r) of c : _ -> c; [] -> "")
+
+healthOk :: IO (IO (Either T.Text ()), IO Int)
+healthOk = do
+  n <- newIORef (0 :: Int)
+  pure (modifyIORef' n (+ 1) >> pure (Right ()), readIORef n)
+
+testSyncDetached :: IO ()
+testSyncDetached = do
+  (run, seen) <- syncRunner "" "" (0, 0)
+  (health, calls) <- healthOk
+  got <- assertRight "sync" =<< checkUpstreamSync run health "/ov"
+  assertEq "state" SyncDetached got
+  assertEq "no fetch" ["symbolic-ref"] . subcommands =<< seen
+  assertEq "no health" 0 =<< calls
+  case upstreamSyncError "overlay" "/ov" got of
+    Just e -> assertTrue "names detached" ("detached" `T.isInfixOf` e)
+    Nothing -> assertTrue "refused" False
+
+testSyncNoUpstream :: IO ()
+testSyncNoUpstream = do
+  (run, seen) <- syncRunner "main" "" (0, 0)
+  (health, calls) <- healthOk
+  got <- assertRight "sync" =<< checkUpstreamSync run health "/ov"
+  assertEq "state" (SyncNoUpstream "main") got
+  assertEq "no fetch" ["symbolic-ref", "rev-parse"] . subcommands =<< seen
+  assertEq "no health" 0 =<< calls
+  case upstreamSyncError "overlay" "/ov" got of
+    Just e -> assertTrue "names missing upstream" ("no upstream" `T.isInfixOf` e && "main" `T.isInfixOf` e)
+    Nothing -> assertTrue "refused" False
+
+testSyncInSync :: IO ()
+testSyncInSync = do
+  (run, seen) <- syncRunner "main" "origin/main" (0, 0)
+  (health, calls) <- healthOk
+  got <- assertRight "sync" =<< checkUpstreamSync run health "/ov"
+  assertEq "state" SyncInSync got
+  reqs <- seen
+  assertEq "order" ["symbolic-ref", "rev-parse", "config", "fetch", "rev-list"] (subcommands reqs)
+  assertEq "fetches the branch's remote" ["-C", "/ov", "fetch", "--quiet", "origin"] (gitArgs (reqs !! 3))
+  assertEq "fetch may prompt" TimedInteractive (prMeasure (reqs !! 3))
+  assertEq "health once" 1 =<< calls
+  assertEq "no refusal" Nothing (upstreamSyncError "overlay" "/ov" got)
+
+testSyncAhead :: IO ()
+testSyncAhead = do
+  (run, _) <- syncRunner "main" "origin/main" (0, 1)
+  (health, _) <- healthOk
+  got <- assertRight "sync" =<< checkUpstreamSync run health "/ov"
+  assertEq "state" (SyncAhead "main" "origin/main" (1, ["abc1234 local change"])) got
+  case upstreamSyncError "overlay" "/ov" got of
+    Just e -> do
+      assertTrue "says ahead" ("ahead of origin/main" `T.isInfixOf` e)
+      assertTrue "names the commit" ("abc1234 local change" `T.isInfixOf` e)
+      assertTrue "says push" ("push" `T.isInfixOf` e)
+    Nothing -> assertTrue "refused" False
+
+testSyncBehind :: IO ()
+testSyncBehind = do
+  (run, _) <- syncRunner "main" "origin/main" (2, 0)
+  (health, _) <- healthOk
+  got <- assertRight "sync" =<< checkUpstreamSync run health "/assets"
+  assertEq "state" (SyncBehind "main" "origin/main" (2, ["def5678 upstream change"])) got
+  case upstreamSyncError "assets worktree" "/assets" got of
+    Just e -> assertTrue "says behind" ("assets worktree branch main is behind origin/main by 2 commits" `T.isInfixOf` e)
+    Nothing -> assertTrue "refused" False
+
+testSyncDiverged :: IO ()
+testSyncDiverged = do
+  (run, _) <- syncRunner "main" "origin/main" (1, 1)
+  (health, _) <- healthOk
+  got <- assertRight "sync" =<< checkUpstreamSync run health "/ov"
+  assertEq "state" (SyncDiverged "main" "origin/main" (1, ["abc1234 local change"]) (1, ["def5678 upstream change"])) got
+  case upstreamSyncError "overlay" "/ov" got of
+    Just e -> do
+      assertTrue "says diverged" ("diverged" `T.isInfixOf` e)
+      assertTrue "local side" ("abc1234" `T.isInfixOf` e)
+      assertTrue "upstream side" ("def5678" `T.isInfixOf` e)
+    Nothing -> assertTrue "refused" False
+
+testSyncHealthFails :: IO ()
+testSyncHealthFails = do
+  (run, seen) <- syncRunner "main" "origin/main" (0, 0)
+  err <- assertLeft "health" =<< checkUpstreamSync run (pure (Left "GitHub Git Operations: major_outage")) "/ov"
+  assertTrue "health error" ("major_outage" `T.isInfixOf` err)
+  reqs <- seen
+  assertTrue "no fetch" ("fetch" `notElem` subcommands reqs)

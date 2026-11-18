@@ -6,6 +6,7 @@ module Update.Apply.GitMv
     applyGitMvWithRemote,
     applyGitMvFilesWithRemote,
     commitPendingGitMv,
+    gatePendingGitMv,
     PendingGitMvCommit (..),
     requirePackageMd5Cache,
     newEbuildFileName,
@@ -23,13 +24,19 @@ import System.Directory (doesFileExist)
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import Update.Apply.Commit
   ( egencacheUnitPaths,
-    signedOverlayCommit,
     unitCommitMessage,
   )
 import Update.Apply.Env (ApplyEnv (..))
 import Update.Apply.Errors
   ( ApplyUnitError (..),
     applyUnitHardFail,
+  )
+import Update.Apply.Publish
+  ( GatedUnit,
+    UnitCtx (..),
+    gateUnitStep,
+    noPublish,
+    publishAndCommitStep,
   )
 import Update.AtomClosure
   ( AtomClosureObserve (..),
@@ -57,10 +64,7 @@ import Update.OverlayTree
     withOverlayTreeChecked,
     writeEbuild,
   )
-import Update.OverlayWaves
-  ( committingOverlayStatus,
-    regeneratingManifestStatus,
-  )
+import Update.OverlayWaves (regeneratingManifestStatus)
 import Update.Types
   ( ApplyOutcome (..),
     PackageKey (..),
@@ -73,11 +77,24 @@ import Update.Types
 -- | GitMv file work finished; signed overlay commit not yet created.
 data PendingGitMvCommit = PendingGitMvCommit
   { pgcKey :: PackageKey,
+    -- | Version of the new ebuild.
+    pgcPv :: Text,
     pgcLines :: [SuccessLine],
     pgcPaths :: [FilePath],
     pgcMessage :: Text
   }
   deriving (Eq, Show)
+
+pendingCtx :: PendingGitMvCommit -> UnitCtx
+pendingCtx pending =
+  UnitCtx
+    { ucKey = pgcKey pending,
+      ucPv = pgcPv pending,
+      ucPaths = pgcPaths pending,
+      ucMessage = pgcMessage pending,
+      ucLines = pgcLines pending,
+      ucTail = noPublish "GitMvAndManifest" Nothing
+    }
 
 -- | Hard-fail without mutation when package md5-cache is incomplete or mismatched.
 requirePackageMd5Cache ::
@@ -150,7 +167,9 @@ applyGitMvWithRemote env overlayRoot entry src remote = do
   result <- applyGitMvFilesWithRemote env overlayRoot entry src remote
   case result of
     Left outcome -> pure outcome
-    Right pending -> commitPendingGitMv env overlayRoot pending
+    Right pending ->
+      gatePendingGitMv env pending
+        >>= either pure (commitPendingGitMv env overlayRoot)
 
 -- | Rename, @ebuild … manifest@, and package @egencache@ without committing.
 --
@@ -213,21 +232,22 @@ applyGitMvFilesWithRemote env overlayRoot entry src remote = do
             False
             False
 
--- | Create the signed overlay commit for previously finished GitMv file work.
+-- | Smoke-gate finished GitMv file work. A failure holds the unit.
+gatePendingGitMv ::
+  ApplyEnv ->
+  PendingGitMvCommit ->
+  IO (Either ApplyOutcome (PendingGitMvCommit, GatedUnit))
+gatePendingGitMv env pending =
+  fmap (pending,) <$> gateUnitStep env (pendingCtx pending)
+
+-- | Create and push the signed overlay commit for gated GitMv file work.
 commitPendingGitMv ::
   ApplyEnv ->
   FilePath ->
-  PendingGitMvCommit ->
+  (PendingGitMvCommit, GatedUnit) ->
   IO ApplyOutcome
-commitPendingGitMv env overlayRoot pending = do
-  let key = pgcKey pending
-      mh = aeMulti env
-  mhStatus mh key committingOverlayStatus
-  committed <-
-    signedOverlayCommit env overlayRoot (pgcPaths pending) (pgcMessage pending)
-  pure $ case committed of
-    Right () -> ApplySuccess key (pgcLines pending) (pgcPaths pending)
-    Left err -> ApplyHardFail key err True False
+commitPendingGitMv env overlayRoot (pending, gated) =
+  publishAndCommitStep env overlayRoot (pendingCtx pending) gated
 
 gitMvFiles ::
   ApplyEnv ->
@@ -454,6 +474,7 @@ finishGitMvManifest env key local remote pkgDir overlayRoot ebuildRel wrote = do
             Right
               PendingGitMvCommit
                 { pgcKey = key,
+                  pgcPv = renderPVNoRev remote,
                   pgcLines = lines_,
                   pgcPaths = paths,
                   pgcMessage = msg

@@ -11,6 +11,7 @@ module Update.SshAgent
     resolveSshIdentity,
     prepareSshIdentity,
     guardSshIdentityOffered,
+    guardSshIdentityOfferedFor,
     takeSshSessionSupervisor,
     spawnSshSessionSupervisorIn,
   )
@@ -240,13 +241,25 @@ guardSshIdentityOffered ::
   FilePath ->
   Text ->
   IO (Either Text ())
-guardSshIdentityOffered run ops root keyPath pushUrl =
+guardSshIdentityOffered = guardSshIdentityOfferedFor "assets"
+
+-- | 'guardSshIdentityOffered' for the repository named by @label@
+-- (@assets@ or @overlay@) in its errors.
+guardSshIdentityOfferedFor ::
+  Text ->
+  CommandRunner ->
+  SshAgentOps ->
+  FilePath ->
+  FilePath ->
+  Text ->
+  IO (Either Text ())
+guardSshIdentityOfferedFor label run ops root keyPath pushUrl =
   case classifyAssetsPushUrl pushUrl of
     PushWeb -> pure (Right ())
     PushUnsupported url ->
       pure
         ( Left
-            ("assets push URL is not a github.com SSH or web URL: " <> url)
+            (label <> " push URL is not a github.com SSH or web URL: " <> url)
         )
     PushSshGitHub mUser -> do
       override <- saoLookupEnv ops "GIT_SSH_COMMAND"

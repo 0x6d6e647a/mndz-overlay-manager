@@ -8,6 +8,9 @@
 module Smoke.Container
   ( -- * Configuration
     SmokeContainerCfg (..),
+    OverlayMount (..),
+    StagedFetch (..),
+    overlayMountArgs,
     smokeBinpkgsVolume,
     smokeDistfilesVolume,
     smokeDistDir,
@@ -21,6 +24,22 @@ module Smoke.Container
     portageConfigFiles,
     makeConfLines,
     setupScript,
+    runSetupScript,
+
+    -- * Disk measurements
+    diskHookSetupLines,
+    diskReportScript,
+    DiskReport (..),
+    parseDiskReport,
+    diskReportAttrs,
+
+    -- * Fetch shim
+    FetchShimPaths (..),
+    fetchShimPaths,
+    stagedMountTarget,
+    fetchShimScript,
+    fetchMakeConfLines,
+    fetchShimSetupLines,
 
     -- * Sandbox probe
     sandboxProbeArgs,
@@ -50,14 +69,15 @@ where
 
 import Control.Exception (finally)
 import Control.Monad (void, when)
-import Data.Aeson ((.=))
+import Data.Aeson (object, (.=))
+import Data.Aeson.Types (Pair)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Metrics.Container (CgroupRoots)
-import Metrics.Core (Metrics (..), withSpan)
+import Metrics.Core (Metrics (..), trySync, withSpan)
 import Metrics.Process (timeWrapArgs)
 import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Version (renderPVNoRev)
@@ -126,8 +146,8 @@ data SmokeContainerCfg = SmokeContainerCfg
     sccImage :: String,
     -- | Tree snapshot image tag.
     sccSnapshot :: String,
-    -- | Absolute effective overlay path.
-    sccOverlay :: FilePath,
+    -- | What is mounted read-only at @/var/db/repos/mndz@.
+    sccOverlay :: OverlayMount,
     -- | Run metrics @time/@ directory when recording.
     sccTimeDir :: Maybe FilePath,
     -- | Operator uid (the check user's uid, unless 0).
@@ -140,6 +160,40 @@ data SmokeContainerCfg = SmokeContainerCfg
     sccCache :: CacheUse
   }
   deriving (Eq, Show)
+
+-- | The overlay of a run's container, always mounted read-only.
+data OverlayMount
+  = -- | The effective overlay worktree (absolute), for standalone @smoke@.
+    WorktreeMount FilePath
+  | -- | A gated unit's overlay snapshot (absolute) and, when the unit has
+    -- unpublished distfiles, how they are served.
+    SnapshotMount FilePath (Maybe StagedFetch)
+  deriving (Eq, Show)
+
+-- | Distfiles staged for a gated run.
+data StagedFetch = StagedFetch
+  { -- | Host directory holding exactly the unit's distfiles.
+    sfDir :: FilePath,
+    -- | @https://github.com/\<owner\>/\<assets-repo\>/releases/download/@.
+    sfPrefix :: Text
+  }
+  deriving (Eq, Show)
+
+-- | @--mount@ arguments for the overlay and, when staged, the staging
+-- directory (both read-only).
+overlayMountArgs :: OverlayMount -> [String]
+overlayMountArgs = \case
+  WorktreeMount dir -> bindRO dir
+  SnapshotMount dir staged ->
+    bindRO dir
+      <> concat [["--mount", "type=bind,src=" <> sfDir sf <> ",dst=" <> stagedMountTarget <> ",readonly"] | Just sf <- [staged]]
+  where
+    bindRO dir = ["--mount", "type=bind,src=" <> dir <> ",dst=/var/db/repos/mndz,readonly"]
+
+stagedFetchOf :: SmokeContainerCfg -> Maybe StagedFetch
+stagedFetchOf cfg = case sccOverlay cfg of
+  SnapshotMount _ staged -> staged
+  WorktreeMount _ -> Nothing
 
 smokeBinpkgsVolume :: String
 smokeBinpkgsVolume = "mndz-smoke-binpkgs"
@@ -195,14 +249,14 @@ smokeCreateArgs cfg run =
     "--cap-add",
     "SYS_ADMIN",
     "--mount",
-    "type=image,source=" <> sccSnapshot cfg <> ",target=/var/db/repos/gentoo",
-    "--mount",
-    "type=bind,src=" <> sccOverlay cfg <> ",dst=/var/db/repos/mndz,readonly",
-    "--mount",
-    "type=volume,src=" <> smokeBinpkgsVolume <> ",dst=/var/cache/binpkgs",
-    "--mount",
-    "type=volume,src=" <> smokeDistfilesVolume <> ",dst=/var/cache/distfiles"
+    "type=image,source=" <> sccSnapshot cfg <> ",target=/var/db/repos/gentoo"
   ]
+    <> overlayMountArgs (sccOverlay cfg)
+    <> [ "--mount",
+         "type=volume,src=" <> smokeBinpkgsVolume <> ",dst=/var/cache/binpkgs",
+         "--mount",
+         "type=volume,src=" <> smokeDistfilesVolume <> ",dst=/var/cache/distfiles"
+       ]
     <> concat [["--mount", compileCacheMount (srKey run)] | CacheOn _ <- [sccCache cfg]]
     <> concat [["--mount", "type=bind,src=" <> d <> ",dst=" <> d] | Just d <- [sccTimeDir cfg]]
     <> [sccImage cfg, "sleep", "infinity"]
@@ -270,6 +324,158 @@ setupScript uid jobs cache run extraAccepts uses =
     cacheFiles = case cache of
       CacheOn size -> [(T.unpack ccacheConfPath, ccacheConf size), ("/etc/portage/bashrc", portageBashrc)]
       CacheOff -> []
+
+-- | The setup script of one run: 'setupScript', then the fetch shim when
+-- the run has staged distfiles.
+runSetupScript :: SmokeContainerCfg -> SmokeDef -> SmokeRun -> Text
+runSetupScript cfg def run =
+  setupScript (checkUidFor (sccOperatorUid cfg)) (sccJobs cfg) (sccCache cfg) run (sdAcceptKeywords def) (sdPackageUse def)
+    <> T.unlines (maybe [] (fetchShimSetupLines fetchShimPaths) (stagedFetchOf cfg))
+    -- The time directory is set only while metrics are recording.
+    <> T.unlines (if isJust (sccTimeDir cfg) then diskHookSetupLines else [])
+
+------------------------------------------------------------------------
+-- Disk measurements
+
+diskMarkerDir :: Text
+diskMarkerDir = "/var/tmp/mndz-builddir-sizes"
+
+-- | Root setup lines: a @post_src_install@ hook that appends
+-- @\<category\>/\<pf\> \<kb\>@ of the Portage build directory to a marker
+-- file the sandbox may write.
+diskHookSetupLines :: [Text]
+diskHookSetupLines =
+  [ "install -d -m 2775 -o root -g portage " <> diskMarkerDir,
+    "cat >> /etc/portage/bashrc <<'MNDZ_DISK'",
+    "post_src_install() {",
+    "\taddwrite " <> diskMarkerDir,
+    "\tlocal kb",
+    "\tkb=$(du -sk \"${PORTAGE_BUILDDIR}\" 2>/dev/null | cut -f1)",
+    "\techo \"${CATEGORY}/${PF} ${kb:-?}\" >> " <> diskMarkerDir <> "/sizes",
+    "}",
+    "MNDZ_DISK"
+  ]
+
+-- | Root script: the hook's lines, a separator, then the package step's
+-- distfiles size in KiB.
+diskReportScript :: Text
+diskReportScript =
+  "cat " <> diskMarkerDir <> "/sizes 2>/dev/null; echo ---; du -sk " <> T.pack smokeDistDir <> " 2>/dev/null | cut -f1"
+
+data DiskReport = DiskReport
+  { -- | Build directory size per package built, in KiB.
+    drBuildDirs :: [(Text, Integer)],
+    drDistfilesKb :: Either Text Integer,
+    drWritableLayer :: Either Text Integer
+  }
+  deriving (Eq, Show)
+
+-- | Parse 'diskReportScript' output and @docker inspect --size@'s
+-- @SizeRw@ (each as read, or the reason it could not be).
+parseDiskReport :: Either Text Text -> Either Text Text -> DiskReport
+parseDiskReport script sizeRw =
+  DiskReport
+    { drBuildDirs = either (const []) builds script,
+      drDistfilesKb = script >>= distfiles,
+      drWritableLayer = sizeRw >>= number "writable layer size"
+    }
+  where
+    split = T.breakOn "---"
+    builds out =
+      [ (pkg, kb)
+      | l <- T.lines (fst (split out)),
+        [pkg, n] <- [T.words l],
+        Right kb <- [number "" n]
+      ]
+    distfiles out = case T.words (T.drop 3 (snd (split out))) of
+      n : _ -> number "distfiles size" n
+      [] -> Left "the package step's distfiles size could not be read"
+    number what raw = case reads (T.unpack (T.strip raw)) of
+      [(n, "")] -> Right n
+      _ -> Left ("unreadable " <> what <> ": " <> T.strip raw)
+
+diskReportAttrs :: DiskReport -> [Pair]
+diskReportAttrs r =
+  [ "build_dirs" .= [object ["package" .= p, "kb" .= kb] | (p, kb) <- drBuildDirs r],
+    either ("distfiles_error" .=) ("distfiles_kb" .=) (drDistfilesKb r),
+    either ("writable_layer_error" .=) ("writable_layer_bytes" .=) (drWritableLayer r)
+  ]
+
+------------------------------------------------------------------------
+-- Fetch shim
+
+-- | Where the shim and its inputs live. Tests point these at a scratch
+-- directory.
+data FetchShimPaths = FetchShimPaths
+  { fspShim :: Text,
+    -- | Directory of the staged distfiles.
+    fspStaged :: Text,
+    -- | Files holding Portage's stock @FETCHCOMMAND@ and @RESUMECOMMAND@.
+    fspStockFetch :: Text,
+    fspStockResume :: Text
+  }
+  deriving (Eq, Show)
+
+fetchShimPaths :: FetchShimPaths
+fetchShimPaths =
+  FetchShimPaths
+    { fspShim = "/usr/local/libexec/mndz-fetch",
+      fspStaged = T.pack stagedMountTarget,
+      fspStockFetch = "/usr/local/libexec/mndz-fetch.d/fetch",
+      fspStockResume = "/usr/local/libexec/mndz-fetch.d/resume"
+    }
+
+stagedMountTarget :: FilePath
+stagedMountTarget = "/var/cache/mndz-staged"
+
+-- | POSIX @sh@ fetch command: @mndz-fetch URI DISTDIR FILE [resume]@. A URI
+-- under the assets download @prefix@ is copied from the staged directory by
+-- its basename, or fails naming the URI when not staged. Any other URI runs
+-- Portage's stock command. Portage verifies the result against the
+-- Manifest either way.
+fetchShimScript :: FetchShimPaths -> Text -> Text
+fetchShimScript paths prefix =
+  T.unlines
+    [ "#!/bin/sh",
+      "# Generated by mndz-overlay-manager: serves staged distfiles to a gated smoke run.",
+      "URI=$1 DISTDIR=$2 FILE=$3",
+      "export URI DISTDIR FILE",
+      "case $URI in",
+      q prefix <> "*)",
+      "\tbase=${URI##*/}",
+      "\tif [ -f " <> q (fspStaged paths) <> "/\"$base\" ]; then",
+      "\t\texec cp -f " <> q (fspStaged paths) <> "/\"$base\" \"$DISTDIR/$FILE\"",
+      "\tfi",
+      "\techo \"mndz: unstaged assets URL $URI\" >&2",
+      "\texit 1",
+      "\t;;",
+      "esac",
+      "if [ \"${4:-}\" = resume ]; then stock=" <> q (fspStockResume paths) <> "; else stock=" <> q (fspStockFetch paths) <> "; fi",
+      "eval \"exec $(cat \"$stock\")\""
+    ]
+  where
+    q = T.pack . shellQuote . T.unpack
+
+-- | @make.conf@ lines routing Portage's fetches through the shim.
+fetchMakeConfLines :: FetchShimPaths -> [Text]
+fetchMakeConfLines paths =
+  [ "FETCHCOMMAND=\"" <> fspShim paths <> " \\\"\\${URI}\\\" \\\"\\${DISTDIR}\\\" \\\"\\${FILE}\\\"\"",
+    "RESUMECOMMAND=\"" <> fspShim paths <> " \\\"\\${URI}\\\" \\\"\\${DISTDIR}\\\" \\\"\\${FILE}\\\" resume\""
+  ]
+
+-- | Root setup lines: capture Portage's stock commands before overriding
+-- them, write the shim, and append 'fetchMakeConfLines'.
+fetchShimSetupLines :: FetchShimPaths -> StagedFetch -> [Text]
+fetchShimSetupLines paths sf =
+  [ "mkdir -p " <> q (T.pack (takeDirectory (T.unpack (fspStockFetch paths)))) <> " " <> q (T.pack (takeDirectory (T.unpack (fspShim paths)))),
+    "portageq envvar FETCHCOMMAND > " <> q (fspStockFetch paths),
+    "portageq envvar RESUMECOMMAND > " <> q (fspStockResume paths),
+    "printf '%s' " <> q (fetchShimScript paths (sfPrefix sf)) <> " > " <> q (fspShim paths),
+    "chmod 0755 " <> q (fspShim paths),
+    "printf '%s\\n' " <> T.unwords (map q (fetchMakeConfLines paths)) <> " >> /etc/portage/make.conf"
+  ]
+  where
+    q = T.pack . shellQuote . T.unpack
 
 ------------------------------------------------------------------------
 -- Sandbox probe
@@ -414,7 +620,10 @@ withSmokeContainer m roots run cfg smokeRun k = do
                           ssExec = execIn name,
                           ssNetwork = network name
                         }
-                (Right <$> k session) `finally` snapshotContainer m roots name mCgroup
+                (Right <$> k session)
+                  `finally` do
+                    when recording (recordDisk name)
+                    snapshotContainer m roots name mCgroup
         )
           `finally` dockerE Timed run ["rm", "-f", name]
   where
@@ -433,6 +642,13 @@ withSmokeContainer m roots run cfg smokeRun k = do
         }
     network name up =
       void <$> dockerE Timed run ["network", if up then "connect" else "disconnect", "bridge", name]
+    -- Best effort: never changes the run's outcome.
+    recordDisk name = do
+      script <- trySync (dockerE Timed run ["exec", name, "sh", "-c", T.unpack diskReportScript])
+      sizeRw <- trySync (dockerE Timed run ["container", "inspect", "--size", "--format", "{{.SizeRw}}", name])
+      let flat = either (Left . T.pack . show) (fmap T.pack)
+      void . trySync $
+        mEvent m "smoke.disk" (("container" .= name) : diskReportAttrs (parseDiskReport (flat script) (flat sizeRw)))
 
 ------------------------------------------------------------------------
 -- One run
@@ -496,7 +712,7 @@ performRun session cfg goChecks key def run logDir progress = do
       AsRoot
       (ExecCmd "sh" ["-s"])
       Nothing
-      (T.unpack (setupScript (checkUidFor (sccOperatorUid cfg)) (sccJobs cfg) (sccCache cfg) run (sdAcceptKeywords def) (sdPackageUse def)))
+      (T.unpack (runSetupScript cfg def run))
   case setup of
     Left (why, file) -> pure (RunOutcome (RunFail FailDependencies ("container setup failed: " <> why) file) Nothing)
     Right () -> do

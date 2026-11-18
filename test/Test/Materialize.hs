@@ -8,7 +8,8 @@ import CLI.Jobs (newWorkBudget)
 import CLI.Progress (MultiHandle (..))
 import Control.Concurrent.MVar (modifyMVar_, newMVar)
 import Data.ByteString qualified as BS
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -19,7 +20,7 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Version (EbuildVersion, parseEbuildVersion, renderPV)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (exitFailure)
-import System.FilePath (takeBaseName, takeDirectory, (</>))
+import System.FilePath (takeBaseName, takeDirectory, takeFileName, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Assert (assertEq, assertTrue)
@@ -31,7 +32,7 @@ import Test.Support
     writeMatchingCachesForPackage,
   )
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase)
+import Test.Tasty.HUnit (assertFailure, testCase)
 import Update.Apply
   ( ApplyEnv (..),
     applyPackagePhase1,
@@ -44,6 +45,7 @@ import Update.Apply.TestSupport
   ( fullPathMaterializeSteps,
     orderNeedPlannedUnits,
     overlayAfterAssets,
+    reusedTail,
   )
 import Update.Assets.Hash (digestSHA512, hashBytes, writeSidecars)
 import Update.Assets.Layout
@@ -64,6 +66,7 @@ import Update.Cargo.Crates (CargoOps (..))
 import Update.Cargo.Msrv (CargoTomlFetch (..))
 import Update.Check (PackageEntry (..))
 import Update.Deps.Plan (BunProbe (..), DepsPlanOps (..), minimumBunProbe)
+import Update.Gate (GateHandle (..), GateRequest (..), GateResult (..), passThroughGate)
 import Update.Git (GitOps (..))
 import Update.Go.Lanes (PlannedEbuild (..))
 import Update.Go.ModFetch (GoModKey (..))
@@ -111,6 +114,7 @@ integrationTests =
       testCase "assets target_commitish is sidecar SHA not later HEAD" testTargetCommitishSidecarSha,
       testCase "codex same-pin reuses rusty-v8 and publishes crates" testCodexSamePinReusesRustyV8,
       testCase "codex missing pin harvests rusty-v8 release" testCodexPinChangeHarvestsRustyV8,
+      testCase "codex harvest stages both distfiles and publishes after the gate" testCodexHarvestGated,
       testCase "hk full-path does not harvest rusty-v8" testHkDoesNotHarvestRustyV8,
       testCase "codex crates tag without rusty-v8 is not partial" testCodexCratesTagWithoutRustyV8NotPartial,
       testCase "cargo full-path staging crates then crates pack" testCargoFullPathStagingStatus,
@@ -547,6 +551,7 @@ testMissingTemplateHardFail =
         Nothing
         Nothing
         Nothing
+        reusedTail
     case outcome of
       ApplyHardFail k msg _ _ -> do
         assertEq "hard-fail key" key k
@@ -913,10 +918,12 @@ testNpmFullPathProgressSequence =
           [ "step:npm pack",
             "step:npm cache install",
             "step:compressing tarball",
+            "step:regenerating manifest",
+            "step:smoke testing",
             "step:committing assets",
             "step:pushing assets",
             "step:uploading release asset",
-            "step:regenerating manifest"
+            "step:verifying published asset"
           ]
         matSteps = filter (`elem` expectedMat) steps
     assertTrue
@@ -933,7 +940,7 @@ testNpmFullPathProgressSequence =
       "probe release"
       (any ("probing release asset" `T.isInfixOf`) statuses)
     assertEq "npm full-path materialize steps" expectedMat matSteps
-    assertEq "seven materialize steps" fullPathMaterializeSteps (length matSteps)
+    assertEq "nine materialize steps" fullPathMaterializeSteps (length matSteps)
 
 ------------------------------------------------------------------------
 -- bun
@@ -1496,10 +1503,12 @@ testCargoFullPathStagingStatus =
           [ "step:cloning upstream",
             "step:pycargoebuild",
             "step:crates pack",
+            "step:regenerating manifest",
+            "step:smoke testing",
             "step:committing assets",
             "step:pushing assets",
             "step:uploading release asset",
-            "step:regenerating manifest"
+            "step:verifying published asset"
           ]
         matSteps = filter (`elem` expectedMat) steps
     assertTrue
@@ -1508,7 +1517,7 @@ testCargoFullPathStagingStatus =
     assertTrue
       "crates pack status after staging"
       ("status:crates pack" `elem` statuses)
-    assertEq "seven materialize steps" fullPathMaterializeSteps (length matSteps)
+    assertEq "nine materialize steps" fullPathMaterializeSteps (length matSteps)
 
 testCargoReusePathSuccess :: IO ()
 testCargoReusePathSuccess =
@@ -2538,3 +2547,75 @@ testCodexCratesTagWithoutRustyV8NotPartial =
     assertEq "reuse does not clone rusty_v8" 0 n
     p <- readIORef pycargo
     assertEq "reuse does not pycargo" 0 p
+
+-- | Both the crates tarball and the harvested rusty_v8 snapshot are staged
+-- for one gate, and no release exists while the gate runs.
+testCodexHarvestGated :: IO ()
+testCodexHarvestGated =
+  withSystemTempDirectory "mndz-mat-codex-gated-" $ \tmp -> do
+    let overlayRoot = tmp </> "overlay"
+        assetsRoot = tmp </> "assets"
+        pkgDir = overlayRoot </> "dev-util" </> "codex"
+        pn = "codex" :: T.Text
+        entry =
+          PackageEntry
+            { peKey = mkPackageKey "dev-util" "codex",
+              pePN = pn,
+              peLocal = parseEbuildVersion "0.153.3",
+              pePath = pkgDir </> "codex-0.153.3.ebuild"
+            }
+    metas <- newIORef ([] :: [ReleaseMeta])
+    gated <- newIORef ([] :: [([FilePath], Int)])
+    createDirectoryIfMissing True assetsRoot
+    seedCodexLocalOk overlayRoot pkgDir pn
+    depsOps <-
+      mkDepsPlanOps
+        (listFixed ["0.153.4", "0.153.3"])
+        unusedGoMod
+        unusedNpm
+        unusedBun
+        codexTomls
+        (Just overlayRoot)
+    let cargoOps =
+          fakeCargoSuccessOps
+            { coClone = \_ _ dest -> codexCloneWithPin "150.5.0" dest,
+              coCloneRecursiveSubmodules = \_url _tag dest -> do
+                createDirectoryIfMissing True (dest </> "v8")
+                TIO.writeFile (dest </> "v8" </> "DEPS") v8DepsExcerpt
+                pure (Right ()),
+              coPackTree = \_src dest -> do
+                createDirectoryIfMissing True (takeDirectory dest)
+                BS.writeFile dest rustyV8Bytes
+                pure (Right ())
+            }
+    env0 <-
+      mkMatEnv
+        cleanGitOps
+        assetsRoot
+        overlayRoot
+        (manifestRunner pkgDir cratesKind cargoAssetBytes)
+        (rustyV8ReleaseOps False rustyV8Bytes metas)
+        depsOps
+        fakeNpmSuccessOps
+        fakeBunSuccessOps
+        cargoOps
+        unusedVendorOps
+        Nothing
+    let gate =
+          passThroughGate
+            { ghGate = \req -> do
+                published <- length <$> readIORef metas
+                modifyIORef' gated (++ [(map takeFileName (grStaged req), published)])
+                pure (GatePassed [] [])
+            }
+    outcomes <- applyPackagePhase1 env0 {aeGate = gate} overlayRoot entry
+    expectSuccess "codex gated harvest" outcomes
+    seen <- readIORef gated
+    case seen of
+      [(staged, publishedAtGate)] -> do
+        assertTrue "crates staged" ("codex-0.153.4-crates.tar.xz" `elem` staged)
+        assertTrue "rusty_v8 staged" (any ("rusty-v8-150.5.0" `isPrefixOf`) staged)
+        assertEq "nothing published at the gate" 0 publishedAtGate
+      other -> assertFailure ("expected one gate, got " <> show other)
+    recorded <- readIORef metas
+    assertEq "both releases after the gate" 2 (length recorded)

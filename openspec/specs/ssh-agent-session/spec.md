@@ -8,7 +8,7 @@ SSH agent lifecycle for assets git push: configured identity, offer check before
 
 ### Requirement: Assets push unlocks only ssh-identity
 
-When `update` will attempt an assets-repository `git push`, the program SHALL unlock only the private key named by config key `ssh-identity`. That value SHALL be one path. After a leading `~` expands to the operator's home, the path SHALL be absolute, SHALL name an existing file, and SHALL NOT end in `.pub`. Any other value SHALL hard-fail before a passphrase prompt. An omitted or empty value SHALL name `ssh-identity` in the error. A non-empty path SHALL appear in the error.
+When `update` will attempt an assets-repository `git push`, an overlay `git push`, or the sync fetch of either repository, the program SHALL unlock only the private key named by config key `ssh-identity`. That value SHALL be one path. After a leading `~` expands to the operator's home, the path SHALL be absolute, SHALL name an existing file, and SHALL NOT end in `.pub`. Any other value SHALL hard-fail before a passphrase prompt. An omitted or empty value SHALL name `ssh-identity` in the error. A non-empty path SHALL appear in the error.
 
 #### Scenario: Tilde path is the only key added
 
@@ -33,9 +33,14 @@ When `update` will attempt an assets-repository `git push`, the program SHALL un
 - **THEN** the program hard-fails before a passphrase prompt
 - **AND** the error names `ssh-identity`
 
+#### Scenario: Overlay push uses the same key
+
+- **WHEN** only `GitMvAndManifest` packages need work, so only the overlay will be fetched and pushed
+- **THEN** the program unlocks only the key named by `ssh-identity`
+
 ### Requirement: Omitted ssh-identity is valid without an assets push
 
-A command that will not `git push` the assets repository SHALL load a config that omits `ssh-identity`. It SHALL NOT prompt for an SSH passphrase because that key is omitted.
+A command that will not `git push` or sync-fetch the assets repository or the overlay SHALL load a config that omits `ssh-identity`. It SHALL NOT prompt for an SSH passphrase because that key is omitted.
 
 #### Scenario: List loads without ssh-identity
 
@@ -44,7 +49,7 @@ A command that will not `git push` the assets repository SHALL load a config tha
 
 #### Scenario: Update without an assets push does not prompt
 
-- **WHEN** the operator runs `update` for packages that will not `git push` the assets repository and the config omits `ssh-identity`
+- **WHEN** the operator runs `update`, no selected package needs work, and the config omits `ssh-identity`
 - **THEN** the program does not prompt for an SSH passphrase and does not start an `ssh-agent`
 
 ### Requirement: Early SSH readiness for the configured key
@@ -133,12 +138,17 @@ If the program started an `ssh-agent` for the run, it SHALL terminate that agent
 
 ### Requirement: No SSH setup when assets push not needed
 
-When no selected package will perform assets `git push` (for example only `GitMvAndManifest` packages), the program SHALL NOT require `ssh-add` or spawn an SSH agent for that run.
+When no unit needs work in an `update` run, so no assets or overlay `git push` or sync fetch will happen, the program SHALL NOT require `ssh-add` or spawn an SSH agent for that run.
 
 #### Scenario: Binary-only update skips ssh-add
 
-- **WHEN** the user runs `update` only for packages that use `GitMvAndManifest`
-- **THEN** the program does not spawn an SSH agent solely for assets push
+- **WHEN** the user runs `update` only for packages that use `GitMvAndManifest` and none of them needs work
+- **THEN** the program does not spawn an SSH agent
+
+#### Scenario: GitMv-only update sets up SSH
+
+- **WHEN** the user runs `update` and only `GitMvAndManifest` packages need work
+- **THEN** the program prepares SSH for the overlay fetch and push
 
 ### Requirement: Prefer configured git remote transport
 

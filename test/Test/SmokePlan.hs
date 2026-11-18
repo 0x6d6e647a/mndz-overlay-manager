@@ -28,7 +28,9 @@ import Smoke.Plan
     RuntimeCap (..),
     SmokeRun (..),
     itemAtom,
+    planPvRuns,
     planSmokeRuns,
+    readPackageInput,
   )
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
@@ -99,6 +101,14 @@ tests =
           testCase "Cargo lane label names the rust union" testCargoLabel
         ],
       testGroup
+        "one PV"
+        [ testCase "PV serving two ceilings gets two runs" testPvTwoCeilings,
+          testCase "equal ceilings give one run" testPvEqualCeilings,
+          testCase "PV serving no lane gets one run" testPvNoLane,
+          testCase "PV not keyworded for the host is a skip" testPvArchSkip,
+          testCase "package input is read from an overlay root" testReadPackageInput
+        ],
+      testGroup
         "ceilings"
         [ testCase "loader reads host-arch ceilings from local trees only" testLoaderLocal
         ]
@@ -138,6 +148,79 @@ lines' = map describe
       PlannedRun _ -> itemAtom item <> ": run"
       PlannedSkip _ r -> itemAtom item <> ": skip: " <> r
       PlannedFail _ r -> itemAtom item <> ": fail: plan (" <> r <> ")"
+
+testPvTwoCeilings :: IO ()
+testPvTwoCeilings =
+  assertEq
+    "beads 1.3.5 only"
+    [ "dev-util/beads-1.3.5 (dev-lang/go amd64): run",
+      "dev-util/beads-1.3.5 (dev-lang/go ~amd64): run"
+    ]
+    ( lines' $
+        planPvRuns
+          "amd64"
+          (goCeilings (Just "1.26.11") (Just "1.27.4"))
+          (goPkg "beads" [("1.0.4", "1.26.2"), ("1.3.5", "1.26.5")])
+          "1.3.5"
+    )
+
+testPvEqualCeilings :: IO ()
+testPvEqualCeilings =
+  assertEq
+    "one run"
+    ["dev-util/crush-0.102.0 (dev-lang/go amd64): run"]
+    ( lines' $
+        planPvRuns
+          "amd64"
+          (goCeilings (Just "1.27.4") (Just "1.27.4"))
+          (goPkg "crush" [("0.101.0", "1.27.3"), ("0.102.0", "1.27.3")])
+          "0.102.0"
+    )
+
+-- | 1.3.5 serves both lanes, so the older 1.0.4 serves none and gets the
+-- one fallback run.
+testPvNoLane :: IO ()
+testPvNoLane =
+  assertEq
+    "one run"
+    ["dev-util/beads-1.0.4 (dev-lang/go amd64): run"]
+    ( lines' $
+        planPvRuns
+          "amd64"
+          (goCeilings (Just "1.26.11") (Just "1.27.4"))
+          (goPkg "beads" [("1.0.4", "1.26.2"), ("1.3.5", "1.26.5")])
+          "1.0.4"
+    )
+
+testPvArchSkip :: IO ()
+testPvArchSkip = do
+  let pkg =
+        PackageInput
+          { piKey = mkPackageKey "dev-util" "codex",
+            piTechnique = GitMvAndManifest,
+            piEbuilds =
+              [ (eb "dev-util" "codex" "0.163.0", "KEYWORDS=\"-* ~amd64 ~arm64\"\n"),
+                (eb "dev-util" "codex" "0.164.0", "KEYWORDS=\"-* ~amd64\"\n")
+              ]
+          }
+  case planPvRuns "arm64" Map.empty pkg "0.164.0" of
+    [PlannedSkip e reason] -> do
+      assertEq "the PV" "0.164.0" (ebuildVersion e)
+      assertTrue "names arm64" ("arm64" `T.isInfixOf` reason)
+    other -> assertFailure ("expected one skip, got " <> show other)
+
+testReadPackageInput :: IO ()
+testReadPackageInput =
+  withSystemTempDirectory "om-plan-root" $ \root -> do
+    let dir = root </> "dev-util" </> "beads"
+    createDirectoryIfMissing True (dir </> "files")
+    TIO.writeFile (dir </> "beads-1.3.5.ebuild") (goBody "1.26.5")
+    TIO.writeFile (dir </> "beads-1.0.4.ebuild") (goBody "1.26.2")
+    TIO.writeFile (dir </> "Manifest") "DIST x 1 BLAKE2B 0\n"
+    got <- assertRight "read" =<< readPackageInput root (mkPackageKey "dev-util" "beads") (DepsAndAssets (Go Nothing))
+    assertEq "versions" ["1.0.4", "1.3.5"] (map (ebuildVersion . fst) (piEbuilds got))
+    assertEq "texts" [goBody "1.26.2", goBody "1.26.5"] (map snd (piEbuilds got))
+    assertEq "paths under the root" (dir </> "beads-1.3.5.ebuild") (ebuildPath (fst (last (piEbuilds got))))
 
 testKeywordSkip :: IO ()
 testKeywordSkip = do

@@ -10,6 +10,7 @@ module Test.Metrics
     spanStarts,
     spanEndOutcome,
     field,
+    firstId,
   )
 where
 
@@ -37,7 +38,7 @@ import Control.Concurrent (forkIO, threadDelay, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Exception (AsyncException (..), IOException, SomeException, fromException, throwIO, try)
 import Control.Monad (join, void, when)
-import Data.Aeson (Value (..), decodeStrict)
+import Data.Aeson (Value (..), decodeStrict, (.=))
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
@@ -131,11 +132,15 @@ import Smoke.CompileCache
     recordCleanup,
   )
 import Smoke.Container
-  ( ExecUser (..),
+  ( DiskReport (..),
+    ExecUser (..),
+    OverlayMount (..),
     RunOutcome (..),
     SmokeContainerCfg (..),
     SmokeSession (..),
+    parseDiskReport,
     performRun,
+    runSetupScript,
     withSmokeContainer,
   )
 import Smoke.Plan (SmokeRun (..))
@@ -152,6 +157,8 @@ import Update.Check (PackageEntry (..), checkPackage)
 import Update.CheckCache (flushCheckCache, openCheckCacheAt, recordCacheCounters)
 import Update.DiskSpace (DiskSpaceProbe (..))
 import Update.Distfiles (lookupPortageDistDirWith)
+import Update.Gate (GateWait (..))
+import Update.Gate.Session (gateWaitSpan)
 import Update.GentooTree
   ( GentooTreePaths (..),
     TreeEnv (..),
@@ -258,6 +265,10 @@ unitTests =
           testCase "--no-metrics skips the in-container time check" testSessionNoMetricsSkipsCheck,
           testCase "smoke container: inner/outer pair and container event" testSmokeSessionRecorded,
           testCase "smoke container: --no-metrics wraps nothing" testSmokeSessionNoMetrics,
+          testCase "smoke disk: report parsing" testDiskReportParse,
+          testCase "smoke disk: recorded under the run with fake container output" testDiskRecorded,
+          testCase "smoke disk: --no-metrics installs no hook" testDiskNoHook,
+          testCase "gate: waits are slot.wait smoke and gate-dependency" testGateWaitSpans,
           testCase "smoke compile cache: run statistics" testCompileCacheRunStats,
           testCase "smoke compile cache: failed trim check is recorded" testCompileCacheTrimFail,
           testCase "smoke compile cache: cleanup sizes and removals" testCompileCacheCleanup,
@@ -471,7 +482,7 @@ testStateHome = do
 testGateMissingTime :: IO ()
 testGateMissingTime = do
   (ops, calls) <- fakeOps (Left "/usr/bin/time: does not exist") (Right ())
-  (r, _) <- runGate ops False (Cmd.Update False [] [])
+  (r, _) <- runGate ops False (Cmd.Update False [] [] False)
   case r of
     Left err -> do
       assertTrue "names /usr/bin/time" ("/usr/bin/time" `T.isInfixOf` err)
@@ -513,7 +524,7 @@ testGateNoMetricsBypass = do
   cs <- calls
   assertEq "no startup effect ran" [] cs
   assertEq "one warning" ["metrics disabled by --no-metrics"] ws
-  (rU, wsU) <- runGate ops True (Cmd.Update False [] [])
+  (rU, wsU) <- runGate ops True (Cmd.Update False [] [] False)
   assertEq "update off" (Right MetricsOff) rU
   assertEq "update warns" ["metrics disabled by --no-metrics"] wsU
   (rE, wsE) <- runGate ops True Cmd.Eclean
@@ -721,7 +732,7 @@ testInvocationFor = do
   assertEq
     "update --jobs 4 --refresh dev-util/foo"
     Invocation {invJobs = 4, invRefresh = Just True, invTargets = ["dev-util/foo"], invExcludes = []}
-    (invocationFor 4 (Cmd.Update True ["dev-util/foo"] []))
+    (invocationFor 4 (Cmd.Update True ["dev-util/foo"] [] False))
   assertEq
     "eclean has no refresh"
     Nothing
@@ -743,7 +754,7 @@ runRecordedWith sampler body =
               rsRunId = sampleRunId,
               rsCommand = "update",
               rsTimeVersion = "time (GNU Time) 1.9",
-              rsInvocation = invocationFor 1 (Cmd.Update False ["nope"] []),
+              rsInvocation = invocationFor 1 (Cmd.Update False ["nope"] [] False),
               rsWarn = \_ -> pure (),
               rsStartSampler = sampler
             }
@@ -1420,7 +1431,7 @@ smokeCfg timeDir =
       sccCliPid = "4242",
       sccImage = "mndz-overlay-manager/smoke:local",
       sccSnapshot = "mndz-overlay-manager/smoke-tree:r1",
-      sccOverlay = "/ov",
+      sccOverlay = WorktreeMount "/ov",
       sccTimeDir = timeDir,
       sccOperatorUid = 1000,
       sccJobs = 4,
@@ -1462,6 +1473,60 @@ testSmokeSessionRecorded =
     case filter ((== "container") . evKind) evs of
       [e] -> assertEq "memory peak" (Just (Number 4194304)) (field "memory_peak_bytes" e)
       other -> assertFailure ("expected one container event, got " <> show (length other))
+
+testGateWaitSpans :: IO ()
+testGateWaitSpans = do
+  let key = mkPackageKey "dev-util" "codex-acp"
+  (_, evs) <- withRecorded $ \m ->
+    withSpan m "package" ["package" .= ("dev-util/codex-acp" :: T.Text)] $ do
+      gateWaitSpan m key (WaitDependency (mkPackageKey "dev-util" "codex")) (pure ())
+      gateWaitSpan m key WaitLane (pure ())
+  pkg <- firstId "package" evs
+  let waits = [a | (_, Just p, "slot.wait", a) <- spanStarts evs, p == pkg]
+  assertEq "two waits under the package" 2 (length waits)
+  assertTrue
+    "dependency wait names codex"
+    (any (\a -> KM.lookup "kind" a == Just (String "gate-dependency") && KM.lookup "dependency" a == Just (String "dev-util/codex")) waits)
+  assertTrue "smoke lane wait" (any (\a -> KM.lookup "kind" a == Just (String "smoke")) waits)
+
+testDiskReportParse :: IO ()
+testDiskReportParse = do
+  let r = parseDiskReport (Right "dev-libs/foo-1.0 8608\ndev-util/hk-2.13.0 14444\n---\n2512\n") (Right "262967296\n")
+  assertEq "build dirs" [("dev-libs/foo-1.0", 8608), ("dev-util/hk-2.13.0", 14444)] (drBuildDirs r)
+  assertEq "distfiles" (Right 2512) (drDistfilesKb r)
+  assertEq "layer" (Right 262967296) (drWritableLayer r)
+  let bad = parseDiskReport (Right "---\n\n") (Left "no such container")
+  assertTrue "distfiles reason" (either (const True) (const False) (drDistfilesKb bad))
+  assertEq "layer reason" (Left "no such container") (drWritableLayer bad)
+
+testDiskRecorded :: IO ()
+testDiskRecorded =
+  withCgroupFixture $ \roots -> do
+    (base, _) <- fakeDocker "time (GNU Time) 1.9\n"
+    let ok out = pure ProcessResult {prExitCode = ExitSuccess, prStdout = out, prStderr = ""}
+        run req = case prMode req of
+          ExecCmd "docker" ("exec" : _ : "sh" : "-c" : script : _)
+            | "mndz-builddir-sizes" `T.isInfixOf` T.pack script -> ok "dev-util/crush-0.101.0 14444\n---\n2512\n"
+          ExecCmd "docker" ("container" : "inspect" : "--size" : _) -> ok "262967296\n"
+          _ -> base req
+    (_, evs) <- withRecorded $ \m ->
+      withSmokeContainer m roots run (smokeCfg (mTimeDir m)) smokeRun $ \_ -> pure ()
+    case filter ((== "smoke.disk") . evKind) evs of
+      [e] -> do
+        assertEq "distfiles" (Just (Number 2512)) (field "distfiles_kb" e)
+        assertEq "writable layer" (Just (Number 262967296)) (field "writable_layer_bytes" e)
+        assertTrue "build dirs" (isJust (field "build_dirs" e))
+      other -> assertFailure ("expected one smoke.disk event, got " <> show (length other))
+
+testDiskNoHook :: IO ()
+testDiskNoHook = do
+  let def = smokeDef (check "v" (step (const (argv ["true"])) (exitsWith 0)) []) []
+  assertTrue "no hook without metrics" (not ("post_src_install" `T.isInfixOf` runSetupScript (smokeCfg Nothing) def smokeRun))
+  assertTrue "hook while recording" ("post_src_install" `T.isInfixOf` runSetupScript (smokeCfg (Just "/m/time")) def smokeRun)
+  (run, seen) <- fakeDocker "time (GNU Time) 1.9\n"
+  _ <- withSmokeContainer noopMetrics (CgroupRoots "/nonexistent" "/nonexistent") run (smokeCfg Nothing) smokeRun $ \_ -> pure ()
+  reqs <- seen
+  assertTrue "no size inspect" (null [() | ProcessRequest {prMode = ExecCmd "docker" ("container" : "inspect" : "--size" : _)} <- reqs])
 
 testSmokeSessionNoMetrics :: IO ()
 testSmokeSessionNoMetrics = do

@@ -9,7 +9,7 @@ import CLI.Progress (ProgressConfig, mkProgressConfig)
 import Colog (LogAction (..))
 import Config.Types (CheckCacheTtl (..))
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (race)
+import Control.Concurrent.Async (cancel, race, waitCatch, withAsync)
 import Control.Concurrent.MVar
   ( modifyMVar_,
     newEmptyMVar,
@@ -17,9 +17,9 @@ import Control.Concurrent.MVar
     putMVar,
     takeMVar,
   )
-import Control.Monad (when)
+import Control.Monad (forever, when)
 import Data.ByteString qualified as BS
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (elemIndex)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -29,6 +29,8 @@ import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion, parseEbuildVersion, prettyVersion)
+import Smoke.CompileCache (CacheUse (..))
+import Smoke.Run (SmokeOps (..))
 import System.Directory
   ( createDirectoryIfMissing,
     doesDirectoryExist,
@@ -63,7 +65,9 @@ import Update.CheckCache
   )
 import Update.Deps.Plan (BunProbe, DepsPlanOps (..), minimumBunProbe)
 import Update.DiskSpace (DiskSpaceProbe (..))
-import Update.Git (GitOps (..))
+import Update.Gate (GateFailure (..), GateHandle (..), GateRequest (..), GateResult (..), passThroughGate)
+import Update.Gate.Session (GateSessionCfg (..), withGateSession)
+import Update.Git (GitOps (..), UpstreamSync (..))
 import Update.GitHub (newGitHubLatch)
 import Update.GpgAgent
   ( GpgAgentOps (..),
@@ -74,6 +78,7 @@ import Update.GpgAgent
     prepareSigningSession,
     teardownGpgHandle,
   )
+import Update.Held (HeldReason (..))
 import Update.Materialize (EnsureOutcome (..), NeededFloors (..))
 import Update.OverlayTree (TreeLock, withNewTreeLock)
 import Update.Preflight (AssetsPreflight (..))
@@ -82,6 +87,7 @@ import Update.Process
     ProcessMode (..),
     ProcessRequest (..),
     ProcessResult (..),
+    productionCommandRunner,
   )
 import Update.Runtime.Ceilings (RuntimeCeilings (..))
 import Update.Spine
@@ -97,6 +103,7 @@ import Update.Types
     SuccessLine (..),
     UpdateSource (..),
     mkPackageKey,
+    packageKeyText,
   )
 
 waveSbclCeilings :: RuntimeCeilings
@@ -123,6 +130,36 @@ integrationTests =
       testCase
         "GitMv-only never calls image ensure"
         testGitMvOnlyNeverEnsure,
+      testCase
+        "bun-bin gate passes while ensure fails: commit after the gate"
+        testBunGatePassEnsureFails,
+      testCase
+        "bun-bin gate fails: no commit, consumer names bun-bin"
+        testBunGateFails,
+      testCase
+        "GitMv-only bun-bin commits after its gate"
+        testBunGitMvOnlyGate,
+      testCase
+        "probe fails after a GitMv rename: held, no commit"
+        testProbeFailsHeld,
+      testCase
+        "smoke prerequisites fail before any mutation"
+        testGatePrereqsFail,
+      testCase
+        "interrupt during a gated run holds the unit"
+        testInterruptHolds,
+      testCase
+        "GitMv-only work prepares SSH and syncs only the overlay"
+        testGitMvOnlyPreparesSsh,
+      testCase
+        "nothing to do: no SSH, no sync fetch"
+        testNothingToDoNoSshNoFetch,
+      testCase
+        "overlay ahead of upstream fails before any mutation"
+        testOverlayAheadFailsBeforeMutation,
+      testCase
+        "assets work syncs the overlay and the assets worktree"
+        testAssetsWorkSyncsBoth,
       testCase
         "reuse-only never calls image ensure"
         testReuseOnlyNeverEnsure,
@@ -460,6 +497,13 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
         usdMaterializeDockerRunner = Nothing,
         usdGitHubLatch = latch,
         usdGitOperationsHealth = pure (Right ()),
+        usdUpstreamSync = \_ -> pure (Right SyncInSync),
+        usdPushOverlay = \_ -> pure (Right ()),
+        usdVerifyAsset = \_ _ _ _ _ -> pure (Right ()),
+        usdWithGate = \_ k -> k passThroughGate (pure Nothing),
+        usdGatePrereqs = pure (Right ()),
+        usdHeldRoot = overlay </> ".." </> "held",
+        usdGitRunner = productionCommandRunner,
         usdPrepareSigning = \_ _ _ _ -> pure (Right ()),
         usdReleaseSigning = pure ()
       }
@@ -679,6 +723,357 @@ testGitMvOnlyNeverEnsure =
           )
         n <- readIORef nEnsure
         assertEq "GitMv-only never ensures" 0 n
+
+-- | A gate recording each request into @ev@; @fails@ names packages whose
+-- gate fails.
+recordingGate :: IORef [T.Text] -> [PackageKey] -> GateHandle
+recordingGate ev fails =
+  passThroughGate
+    { ghGate = \req -> do
+        modifyIORef' ev (++ ["gate " <> packageKeyText (grKey req)])
+        pure $
+          if grKey req `elem` fails
+            then GateFailed (GateFailure HeldGate (packageKeyText (grKey req) <> ": fail: build") [] [])
+            else GatePassed [] []
+    }
+
+commitRecorder :: IORef [T.Text] -> GitOps
+commitRecorder ev =
+  cleanGit
+    { goAddAndCommit = \_ _ msg -> do
+        modifyIORef' ev (++ ["commit " <> msg])
+        pure (Right ())
+    }
+
+testBunGatePassEnsureFails :: IO ()
+testBunGatePassEnsureFails =
+  withSystemTempDirectory "om-wave-bun-gate-ensure" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    ev <- newIORef []
+    let (entries, ebuilds) = mkEntries bunPath ralphPath
+    deps0 <- baseSpine overlay assets dist (commitRecorder ev) releaseMissing 2 preflightOk
+    let deps = deps0 {usdEnsureImage = failingEnsure, usdWithGate = \_ k -> k (recordingGate ev []) (pure Nothing)}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res -> do
+        let bunKey = mkPackageKey "dev-lang" "bun-bin"
+        assertTrue "bun-bin committed" (any (\case ApplySuccess k _ _ -> k == bunKey; _ -> False) (usrOutcomes res))
+        events <- readIORef ev
+        assertEq "gate before commit" ["gate dev-lang/bun-bin", "commit dev-lang/bun-bin: 1.2.0"] (take 2 events)
+
+testBunGateFails :: IO ()
+testBunGateFails =
+  withSystemTempDirectory "om-wave-bun-gate-fail" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+        bunKey = mkPackageKey "dev-lang" "bun-bin"
+        ralphKey = mkPackageKey "dev-util" "ralph-tui"
+    bunPath <- seedBunBin overlay "1.1.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    ev <- newIORef []
+    let (entries, ebuilds) = mkEntries bunPath ralphPath
+    deps0 <- baseSpine overlay assets dist (commitRecorder ev) releaseMissing 2 preflightOk
+    let deps = deps0 {usdWithGate = \_ k -> k (recordingGate ev [bunKey]) (pure Nothing)}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res -> do
+        events <- readIORef ev
+        assertTrue "no bun-bin commit" (not (any ("commit dev-lang/bun-bin" `T.isPrefixOf`) events))
+        assertTrue "bun-bin hard-fails" (any (\case ApplyHardFail k m _ _ -> k == bunKey && "smoke gate failed" `T.isInfixOf` m; _ -> False) (usrOutcomes res))
+        case [m | ApplyHardFail k m _ _ <- usrOutcomes res, k == ralphKey] of
+          msg : _ -> assertTrue "consumer names bun-bin" ("dev-lang/bun-bin" `T.isInfixOf` msg)
+          [] -> assertFailure "expected ralph-tui to hard-fail"
+
+testBunGitMvOnlyGate :: IO ()
+testBunGitMvOnlyGate =
+  withSystemTempDirectory "om-wave-bun-only-gate" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    ev <- newIORef []
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath]
+        entries = groupNewest ebuilds
+    nEnsure <- newIORef (0 :: Int)
+    deps0 <- baseSpine overlay assets dist (commitRecorder ev) releaseMissing 2 preflightOk
+    let deps = deps0 {usdEnsureImage = countingEnsure nEnsure, usdWithGate = \_ k -> k (recordingGate ev []) (pure Nothing)}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right _ -> do
+        events <- readIORef ev
+        assertEq "gate then commit" ["gate dev-lang/bun-bin", "commit dev-lang/bun-bin: 1.2.0"] events
+        assertEq "no ensure" 0 =<< readIORef nEnsure
+
+-- | Session ops whose probe fails; every other effect is a no-op.
+failingProbeOps :: SmokeOps
+failingProbeOps =
+  SmokeOps
+    { soSweep = pure (),
+      soEnsureImage = pure (Right ()),
+      soWithSnapshot = fmap Right,
+      soReleaseTree = pure (),
+      soProbe = pure (Left "Portage's sandboxes cannot be enforced on this host"),
+      soPrepareCache = pure CacheOff,
+      soRun = \_ _ _ _ -> error "no run after a failed probe",
+      soEmit = \_ -> pure (),
+      soLogFailure = \_ -> pure (),
+      soLogWarning = \_ -> pure (),
+      soLogInfo = \_ -> pure (),
+      soProgress = \_ _ _ -> pure ()
+    }
+
+testProbeFailsHeld :: IO ()
+testProbeFailsHeld =
+  withSystemTempDirectory "om-wave-probe-held" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+        held = tmp </> "held"
+        bunKey = mkPackageKey "dev-lang" "bun-bin"
+    bunPath <- seedBunBin overlay "1.1.0"
+    let git args = callProcess "git" (["-C", overlay, "-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false"] <> args)
+    git ["init", "-q"]
+    git ["add", "."]
+    git ["commit", "-q", "-m", "seed"]
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    ev <- newIORef []
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath]
+        entries = groupNewest ebuilds
+        session =
+          GateSessionCfg
+            { gscSmokeOps =
+                failingProbeOps
+                  { soProbe = do
+                      -- Fail only once the unit has renamed its ebuild.
+                      let renamed = overlay </> "dev-lang" </> "bun-bin" </> "bun-bin-1.2.0.ebuild"
+                          waitRename = doesFileExist renamed >>= \done -> if done then pure () else threadDelay 5000 >> waitRename
+                      waitRename
+                      soProbe failingProbeOps
+                  },
+              gscRunUnit = \_ _ -> pure (GatePassed [] []),
+              gscDependencies = \_ -> pure [],
+              gscAroundWait = \_ _ act -> act
+            }
+    deps0 <- baseSpine overlay assets dist (commitRecorder ev) releaseMissing 2 preflightOk
+    let deps = deps0 {usdWithGate = withGateSession session, usdHeldRoot = held}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res ->
+        case [m | ApplyHardFail k m _ _ <- usrOutcomes res, k == bunKey] of
+          msg : _ -> do
+            assertTrue "names the sandbox" ("sandboxes cannot be enforced" `T.isInfixOf` msg)
+            assertTrue ("names the held entry: " <> T.unpack msg) ("held in" `T.isInfixOf` msg)
+          [] -> assertFailure ("expected bun-bin to hard-fail, got " <> show (usrOutcomes res))
+    events <- readIORef ev
+    assertEq "no commit" [] events
+    oldBack <- doesFileExist bunPath
+    newGone <- not <$> doesFileExist (overlay </> "dev-lang" </> "bun-bin" </> "bun-bin-1.2.0.ebuild")
+    assertTrue "rolled back to HEAD" (oldBack && newGone)
+    runs <- doesDirectoryExist held
+    assertTrue "held entry written" runs
+
+testInterruptHolds :: IO ()
+testInterruptHolds =
+  withSystemTempDirectory "om-wave-interrupt" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+        held = tmp </> "held"
+    bunPath <- seedBunBin overlay "1.1.0"
+    let git args = callProcess "git" (["-C", overlay, "-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false"] <> args)
+    git ["init", "-q"]
+    git ["add", "."]
+    git ["commit", "-q", "-m", "seed"]
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    started <- newEmptyMVar
+    ev <- newIORef []
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath]
+        entries = groupNewest ebuilds
+        blocking =
+          passThroughGate
+            { ghGate = \_ -> do
+                putMVar started ()
+                forever (threadDelay 1000000)
+            }
+    deps0 <- baseSpine overlay assets dist (commitRecorder ev) releaseMissing 2 preflightOk
+    let deps = deps0 {usdWithGate = \_ k -> k blocking (pure Nothing), usdHeldRoot = held}
+    withAsync (runUpdatePhases deps entries ebuilds entries) $ \running -> do
+      takeMVar started
+      cancel running
+      _ <- waitCatch running
+      pure ()
+    assertEq "no commit" [] =<< readIORef ev
+    entriesHeld <- doesDirectoryExist (held </> "20260810T154207-0700-4242.a8f3" </> "dev-lang" </> "bun-bin-1.2.0")
+    assertTrue "held entry written" entriesHeld
+    meta <- TIO.readFile (held </> "20260810T154207-0700-4242.a8f3" </> "dev-lang" </> "bun-bin-1.2.0" </> "held.json")
+    assertTrue "reason interrupted" ("\"interrupted\"" `T.isInfixOf` meta)
+    oldBack <- doesFileExist bunPath
+    newGone <- not <$> doesFileExist (overlay </> "dev-lang" </> "bun-bin" </> "bun-bin-1.2.0.ebuild")
+    assertTrue "package directory clean" (oldBack && newGone)
+
+testGatePrereqsFail :: IO ()
+testGatePrereqsFail =
+  withSystemTempDirectory "om-wave-prereqs" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath]
+        entries = groupNewest ebuilds
+    deps0 <- baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    let deps = deps0 {usdGatePrereqs = pure (Left "smoke needs Docker Engine 28.0 or newer (image mounts); this engine is 27.5.1")}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertTrue "names 28.0" ("28.0" `T.isInfixOf` err)
+      Right res -> assertFailure ("expected a refusal, got " <> show (usrOutcomes res))
+    stillOld <- doesFileExist bunPath
+    assertTrue "not mutated" stillOld
+
+-- | Records SSH push-URL checks and sync calls.
+data PublishTrace = PublishTrace
+  { ptPushUrls :: IORef [FilePath],
+    ptSyncs :: IORef [FilePath],
+    ptFingerprints :: IORef Int
+  }
+
+tracedPublish :: PublishTrace -> (FilePath -> UpstreamSync) -> UpdateSpineDeps -> UpdateSpineDeps
+tracedPublish t state deps =
+  deps
+    { usdGitPushUrl = \root -> do
+        modifyIORef' (ptPushUrls t) (++ [root])
+        usdGitPushUrl deps root,
+      usdUpstreamSync = \dir -> do
+        modifyIORef' (ptSyncs t) (++ [dir])
+        pure (Right (state dir)),
+      usdSshOps =
+        (usdSshOps deps)
+          { saoFingerprint = \p -> do
+              modifyIORef' (ptFingerprints t) (+ 1)
+              saoFingerprint (usdSshOps deps) p
+          }
+    }
+
+newPublishTrace :: IO PublishTrace
+newPublishTrace = PublishTrace <$> newIORef [] <*> newIORef [] <*> newIORef 0
+
+testGitMvOnlyPreparesSsh :: IO ()
+testGitMvOnlyPreparesSsh =
+  withSystemTempDirectory "om-wave-gitmv-ssh" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath]
+        entries = groupNewest ebuilds
+    t <- newPublishTrace
+    deps0 <- baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    result <- runUpdatePhases (tracedPublish t (const SyncInSync) deps0) entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res -> do
+        assertTrue "bun-bin succeeded" (any (\case ApplySuccess k _ _ -> k == mkPackageKey "dev-lang" "bun-bin"; _ -> False) (usrOutcomes res))
+        urls <- readIORef (ptPushUrls t)
+        assertEq "only the overlay push URL checked" [overlay] urls
+        fps <- readIORef (ptFingerprints t)
+        assertTrue "SSH key prepared" (fps > 0)
+        syncs <- readIORef (ptSyncs t)
+        assertEq "only the overlay synced" [overlay] syncs
+
+testNothingToDoNoSshNoFetch :: IO ()
+testNothingToDoNoSshNoFetch =
+  withSystemTempDirectory "om-wave-nothing" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.2.0"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.2.0" bunPath]
+        entries = groupNewest ebuilds
+    t <- newPublishTrace
+    deps0 <- baseSpine overlay assets dist cleanGit releaseMissing 2 preflightOk
+    let deps = (tracedPublish t (const (SyncAhead "main" "origin/main" (1, ["x"]))) deps0) {usdSshIdentity = Nothing}
+    result <- runUpdatePhases deps entries ebuilds entries
+    case result of
+      Left err -> assertFailure $ "spine failed: " <> T.unpack err
+      Right res -> assertTrue "no hard fail" (null [() | ApplyHardFail {} <- usrOutcomes res])
+    assertEq "no push URL check" [] =<< readIORef (ptPushUrls t)
+    assertEq "no sync fetch" [] =<< readIORef (ptSyncs t)
+    assertEq "no SSH key work" 0 =<< readIORef (ptFingerprints t)
+
+testOverlayAheadFailsBeforeMutation :: IO ()
+testOverlayAheadFailsBeforeMutation =
+  withSystemTempDirectory "om-wave-ahead" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.1.0"
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds = [Ebuild "dev-lang" "bun-bin" "1.1.0" bunPath]
+        entries = groupNewest ebuilds
+    t <- newPublishTrace
+    commits <- newIORef (0 :: Int)
+    deps0 <-
+      baseSpine overlay assets dist cleanGit {goAddAndCommit = \_ _ _ -> modifyIORef' commits (+ 1) >> pure (Right ())} releaseMissing 2 preflightOk
+    let ahead = SyncAhead "main" "origin/main" (1, ["abc1234 hand-made change"])
+    result <- runUpdatePhases (tracedPublish t (const ahead) deps0) entries ebuilds entries
+    case result of
+      Left err -> do
+        assertTrue "says ahead" ("ahead of origin/main" `T.isInfixOf` err)
+        assertTrue "names the commit" ("abc1234 hand-made change" `T.isInfixOf` err)
+      Right res -> assertFailure ("expected a refusal, got " <> show (usrOutcomes res))
+    stillOld <- doesFileExist bunPath
+    assertTrue "ebuild not renamed" stillOld
+    assertEq "no commit" 0 =<< readIORef commits
+
+testAssetsWorkSyncsBoth :: IO ()
+testAssetsWorkSyncsBoth =
+  withSystemTempDirectory "om-wave-sync-both" $ \tmp -> do
+    let overlay = tmp </> "ov"
+        assets = tmp </> "assets"
+        dist = tmp </> "dist"
+    bunPath <- seedBunBin overlay "1.2.0"
+    ralphPath <- seedRalph overlay
+    initGitDir assets
+    createDirectoryIfMissing True dist
+    let ebuilds =
+          [ Ebuild "dev-lang" "bun-bin" "1.2.0" bunPath,
+            Ebuild "dev-util" "ralph-tui" "1.0.0" ralphPath
+          ]
+        entries = groupNewest ebuilds
+    t <- newPublishTrace
+    deps0 <- baseSpine overlay assets dist cleanGit releaseRalphReuse 2 preflightOk
+    let behindAssets dir = if dir == assets then SyncBehind "main" "origin/main" (1, ["def5678 upstream"]) else SyncInSync
+    result <- runUpdatePhases (tracedPublish t behindAssets deps0) entries ebuilds entries
+    syncs <- readIORef (ptSyncs t)
+    assertEq "overlay then assets" [overlay, assets] syncs
+    urls <- readIORef (ptPushUrls t)
+    assertEq "both push URLs checked" [overlay, assets] urls
+    case result of
+      Left err -> assertTrue "names the assets worktree" ("assets worktree branch main is behind" `T.isInfixOf` err)
+      Right res -> assertFailure ("expected a refusal, got " <> show (usrOutcomes res))
 
 testReuseOnlyNeverEnsure :: IO ()
 testReuseOnlyNeverEnsure =

@@ -30,7 +30,7 @@ import Config.Loader
   )
 import Config.Types (OverlayConfig (..))
 import Control.Concurrent.MVar (newMVar)
-import Control.Exception (bracket)
+import Control.Exception (IOException, bracket, finally, try)
 import Control.Monad (forM, unless, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson ((.=))
@@ -62,8 +62,10 @@ import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (EbuildVersion (..), prettyVersion)
 import Smoke.Ceilings (loadHostCeilings)
+import Smoke.Check (SmokeDef)
 import Smoke.CompileCache
   ( CacheUse (..),
+    GoChecks,
     HelperCfg (..),
     PrepareCfg (..),
     PrepareResult (..),
@@ -75,6 +77,7 @@ import Smoke.CompileCache
   )
 import Smoke.Container
   ( FailStage (..),
+    OverlayMount (..),
     RunOutcome (..),
     RunResult (..),
     SmokeContainerCfg (..),
@@ -102,7 +105,7 @@ import Smoke.Run
     uncommittedPackages,
   )
 import Smoke.Tree (SnapshotCfg (..), dockerSafe, snapshotTag, sweepStaleSnapshots, withSnapshot)
-import System.Directory (createDirectoryIfMissing, findExecutable, makeAbsolute)
+import System.Directory (createDirectoryIfMissing, findExecutable, makeAbsolute, removeDirectoryRecursive)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
@@ -111,6 +114,7 @@ import System.Posix.Process (getProcessID)
 import System.Posix.User (getRealUserID)
 import Update.Apply (foldExitHardFail, productionEbuildRunner)
 import Update.Assets.Release (ReleaseOps (..), productionReleaseOpsWithLatch)
+import Update.Assets.Verify (verifyPublishedAsset, verifyUnitAssets)
 import Update.Auth
   ( decryptConfigEnvelope,
     prepareGitHubToken,
@@ -140,8 +144,10 @@ import Update.Distfiles
     probeDistfilesDir,
     resolveDistfilesPath,
   )
+import Update.Gate (GateHandle, GateRequest (..), md5CacheDependencies, md5CacheEntryPath)
+import Update.Gate.Session (GateSessionCfg (..), UnitGateCfg (..), gateWaitSpan, runUnitGate, withGateSession)
 import Update.GentooTree (GentooTree, gentooTreeCommit, gentooTreePath, productionTreeEnv, releaseGentooTree, resolveGentooTree)
-import Update.Git (isGitWorkTree, productionGitOps)
+import Update.Git (checkUpstreamSync, gitPushCurrentBranch, isGitWorkTree, productionGitOps)
 import Update.GitHub
   ( GitHubLatch,
     gitRemoteOriginUrl,
@@ -167,6 +173,7 @@ import Update.GpgAgent
     teardownGpgHandle,
   )
 import Update.Hardcoded (lookupPolicy)
+import Update.Held (defaultHeldRoot)
 import Update.Http (httpLbsEither, newMetricsManager)
 import Update.Materialize (EnsureConfig (..), RecipeArch (..), defaultMaterializeSidecarDir, ensureMaterializeImage, ensureToolsImage, hostMachineArch, lookupRecipeArch, productionEnsureNow, prunePreviousMaterializeImage, stage3DigestWith)
 import Update.Md5Cache
@@ -287,8 +294,8 @@ runCommand rt cmd =
     Cmd.List -> runList rt
     Cmd.Outdated refresh pkgs excludeArgs ->
       runOutdated rt refresh pkgs excludeArgs
-    Cmd.Update refresh pkgs excludeArgs ->
-      runUpdate rt refresh pkgs excludeArgs
+    Cmd.Update refresh pkgs excludeArgs noCompileCache ->
+      runUpdate rt refresh pkgs excludeArgs noCompileCache
     Cmd.Gencache targets force excludeArgs ->
       runGencache rt targets force excludeArgs
     Cmd.Smoke pkgs excludeArgs noCache resetCache -> runSmokeCommand rt pkgs excludeArgs noCache resetCache
@@ -433,8 +440,10 @@ runUpdate ::
   Bool ->
   [String] ->
   [String] ->
+  -- | @--no-compile-cache@
+  Bool ->
   m ()
-runUpdate rt refresh pkgArgs excludeArgs = do
+runUpdate rt refresh pkgArgs excludeArgs noCompileCache = do
   enterPhase rt "config"
   (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
   let entries = groupNewest ebuilds
@@ -533,6 +542,11 @@ runUpdate rt refresh pkgArgs excludeArgs = do
             (pauseActivePanel pcfg)
             (resumeActivePanel pcfg)
     ensureCfg <- liftIO (productionEnsureConfig rt cfg run overlayPath tree)
+    heldRoot <- liftIO defaultHeldRoot
+    overlayAbs <- liftIO (makeAbsolute overlayPath)
+    senv <- liftIO (mkSmokeEnv rt cfg run overlayAbs tree ebuilds)
+    uname <- liftIO hostMachineArch
+    let hostArch = maybe "" raKeywords (lookupRecipeArch uname)
     spineResult <-
       liftIO $
         withRunToolsSession rt run ensureCfg tree (Just distDir) $ \tools ->
@@ -588,6 +602,27 @@ runUpdate rt refresh pkgArgs excludeArgs = do
                             Just run,
                           usdGitHubLatch = latch,
                           usdGitOperationsHealth = productionGitOperationsHealth (rtMetrics rt),
+                          usdUpstreamSync = checkUpstreamSync run (productionGitOperationsHealth (rtMetrics rt)),
+                          usdPushOverlay = gitPushCurrentBranch run,
+                          usdVerifyAsset = \prefix root key pv names -> do
+                            mgr <- newMetricsManager (rtMetrics rt)
+                            verifyUnitAssets
+                              (verifyPublishedAsset (httpLbsEither mgr))
+                              prefix
+                              root
+                              key
+                              pv
+                              names,
+                          usdWithGate = productionGateSession rt senv run overlayAbs tree hostArch noCompileCache,
+                          usdGatePrereqs = do
+                            pre <- smokePreflight findExecutable run overlayAbs
+                            pure $ case (pre, lookupRecipeArch uname) of
+                              (Left err, _) -> Left err
+                              (Right (), Nothing) ->
+                                Left ("no official gentoo/stage3 OpenRC flavor for host architecture " <> T.pack uname)
+                              (Right (), Just _) -> Right (),
+                          usdHeldRoot = heldRoot,
+                          usdGitRunner = run,
                           usdPrepareSigning =
                             \runRoot mayAssets overlay mAssets ->
                               prepareSigningSession
@@ -785,102 +820,30 @@ runSmokeCommand rt pkgArgs excludeArgs noCompileCache resetCompileCache = do
   let items = planSmokeRuns arch ceilings inputs
   liftIO (setCount m "packages.selected" (length keys))
   enterPhase rt "smoke"
-  cacheDir <- liftIO defaultSmokeCacheDir
-  let logsRoot = smokeLogsRoot cacheDir
-      logsDir = logsRoot </> dockerSafe (rtRunId rt)
-  liftIO (pruneRunLogs logsRoot)
-  mgr <- liftIO (newMetricsManager m)
-  uid <- liftIO getRealUserID
-  pid <- liftIO getProcessID
-  let say f = usingLoggerT (rtLogger rt) . f
-      ccfg =
-        SmokeContainerCfg
-          { sccRunId = rtRunId rt,
-            sccCliPid = show pid,
-            sccImage = smokeImageTag,
-            sccSnapshot = snapshotTag (rtRunId rt),
-            sccOverlay = overlay,
-            sccTimeDir = if mEnabled m then mTimeDir m else Nothing,
-            sccOperatorUid = fromIntegral uid,
-            sccJobs = rtJobs rt,
-            sccOverlayNames = nubOrd [ebuildCategory e <> "/" <> ebuildPackage e | e <- ebuilds],
-            sccCache = CacheOff
-          }
-      prepareCfg =
-        PrepareCfg
-          { pcRun = run,
-            pcHelper = HelperCfg {hcImage = smokeImageTag, hcRunId = rtRunId rt, hcCliPid = show pid},
-            pcLockPath = compileCacheLockPath cacheDir,
-            pcNow = floor <$> getPOSIXTime,
-            pcMaxSize = smokeCompileCacheMaxSize cfg,
-            pcInventory = sccOverlayNames ccfg,
-            pcSelected = nubOrd [packageKeyText (srKey r) | PlannedRun r <- items],
-            pcReset = if resetCompileCache then map packageKeyText keys else [],
-            pcEnabled = not noCompileCache
-          }
-      imageCfg =
-        SmokeImageConfig
-          { sicRun = run,
-            sicProbe = productionDiskSpaceProbe,
-            sicCacheDir = cacheDir,
-            sicUname = uname,
-            sicGentooTree = gentooTreePath tree,
-            sicGentooCommit = gentooTreeCommit tree,
-            sicNow = getCurrentTime,
-            sicStage3Digest = stage3DigestWith (httpLbsEither mgr),
-            sicBaseCheckInterval = materializeBaseCheckInterval cfg,
-            sicWarn = say logWarning
-          }
-      snapCfg =
-        SnapshotCfg
-          { scRunId = rtRunId rt,
-            scCliPid = show pid,
-            scImage = smokeImageTag,
-            scTree = gentooTreePath tree
-          }
+  senv <- liftIO (mkSmokeEnv rt cfg run overlay tree ebuilds)
+  let prepareCfg =
+        smokePrepareCfg
+          senv
+          (nubOrd [packageKeyText (srKey r) | PlannedRun r <- items])
+          (if resetCompileCache then map packageKeyText keys else [])
+          (not noCompileCache)
+      logsDir = seLogsDir senv
       defFor key = case lookupSmokeDef key of
         Just d -> d
         Nothing -> error "selected key without a definition"
-  goChecks <- liftIO newGoChecks
   result <-
     liftIO $
       withStepProgress (rtProgress rt) (length items) $ \step ->
         runSmoke
-          SmokeOps
-            { soSweep = do
-                sweepStaleMaterializeSessions run isLiveOverlayManagerPid
-                sweepStaleSnapshots run isLiveOverlayManagerPid,
-              soEnsureImage =
-                withSpan m "smoke.image" [] (void <$> ensureSmokeImage imageCfg),
-              soWithSnapshot = withSpan m "smoke.snapshot" [] . withSnapshot run snapCfg . const,
-              soReleaseTree = releaseGentooTree tree,
-              soProbe = withSpan m "smoke.probe" [] (runSandboxProbe run ccfg),
-              soPrepareCache = withSpan m "smoke.compile-cache" [] $ do
-                prepared <- prepareCompileCache prepareCfg
-                mapM_ (say logWarning) (prWarnings prepared)
-                for_ (prPlan prepared) (recordCleanup m)
-                pure (prUse prepared),
-              soRun = \cache smokeRun def dir ->
-                withSpan m "smoke.run" ["atom" .= runAtom smokeRun] $ do
-                  let runCfg = ccfg {sccCache = cache}
-                  r <-
-                    withSmokeContainer m productionCgroupRoots run runCfg smokeRun $ \session ->
-                      performRun session runCfg goChecks (srKey smokeRun) def smokeRun dir $ \stage ->
-                        shStep step (runAtom smokeRun <> ": " <> stage)
-                  case r of
-                    Right res -> do
-                      for_ (roCache res) (recordCacheReport m (runAtom smokeRun))
-                      pure res
-                    Left err -> do
-                      createDirectoryIfMissing True dir
-                      let file = dir </> "container.log"
-                      TIO.writeFile file err
-                      pure (RunOutcome (RunFail FailDependencies err file) Nothing),
-              soEmit = \line -> T.putStrLn line >> hFlush stdout,
-              soLogFailure = say logError,
-              soLogWarning = say logWarning,
-              soLogInfo = say logInfo,
-              soProgress = \i total atom ->
+          ( smokeOpsFor
+              rt
+              senv
+              prepareCfg
+              (releaseGentooTree tree)
+              (WorktreeMount overlay)
+              (\atom stage -> shStep step (atom <> ": " <> stage))
+          )
+            { soProgress = \i total atom ->
                 shStep step ("[" <> T.pack (show i) <> "/" <> T.pack (show total) <> "] " <> atom)
             }
           defFor
@@ -897,6 +860,201 @@ runSmokeCommand rt pkgArgs excludeArgs noCompileCache resetCompileCache = do
           report = if ssFailed summary > 0 || not (null dirty) then logWarning else logInfo
       mapM_ report lines_
       when (ssFailed summary > 0) $ liftIO (exitWith (ExitFailure 1))
+
+-- | Command-scoped smoke settings shared by @smoke@ and @update@'s gate.
+data SmokeEnv = SmokeEnv
+  { seContainer :: SmokeContainerCfg,
+    seImage :: SmokeImageConfig,
+    seSnapshot :: SnapshotCfg,
+    seLogsDir :: FilePath,
+    seCacheDir :: FilePath,
+    seHelper :: HelperCfg,
+    seMaxCacheSize :: Integer,
+    seGoChecks :: GoChecks
+  }
+
+mkSmokeEnv :: Runtime -> OverlayConfig -> CommandRunner -> FilePath -> GentooTree -> [Ebuild] -> IO SmokeEnv
+mkSmokeEnv rt cfg run overlay tree ebuilds = do
+  let m = rtMetrics rt
+  cacheDir <- defaultSmokeCacheDir
+  let logsRoot = smokeLogsRoot cacheDir
+  pruneRunLogs logsRoot
+  mgr <- newMetricsManager m
+  uid <- getRealUserID
+  pid <- getProcessID
+  uname <- hostMachineArch
+  goChecks <- newGoChecks
+  let say f = usingLoggerT (rtLogger rt) . f
+  pure
+    SmokeEnv
+      { seContainer =
+          SmokeContainerCfg
+            { sccRunId = rtRunId rt,
+              sccCliPid = show pid,
+              sccImage = smokeImageTag,
+              sccSnapshot = snapshotTag (rtRunId rt),
+              sccOverlay = WorktreeMount overlay,
+              sccTimeDir = if mEnabled m then mTimeDir m else Nothing,
+              sccOperatorUid = fromIntegral uid,
+              sccJobs = rtJobs rt,
+              sccOverlayNames = nubOrd [ebuildCategory e <> "/" <> ebuildPackage e | e <- ebuilds],
+              sccCache = CacheOff
+            },
+        seImage =
+          SmokeImageConfig
+            { sicRun = run,
+              sicProbe = productionDiskSpaceProbe,
+              sicCacheDir = cacheDir,
+              sicUname = uname,
+              sicGentooTree = gentooTreePath tree,
+              sicGentooCommit = gentooTreeCommit tree,
+              sicNow = getCurrentTime,
+              sicStage3Digest = stage3DigestWith (httpLbsEither mgr),
+              sicBaseCheckInterval = materializeBaseCheckInterval cfg,
+              sicWarn = say logWarning
+            },
+        seSnapshot =
+          SnapshotCfg
+            { scRunId = rtRunId rt,
+              scCliPid = show pid,
+              scImage = smokeImageTag,
+              scTree = gentooTreePath tree
+            },
+        seLogsDir = logsRoot </> dockerSafe (rtRunId rt),
+        seCacheDir = cacheDir,
+        seHelper = HelperCfg {hcImage = smokeImageTag, hcRunId = rtRunId rt, hcCliPid = show pid},
+        seMaxCacheSize = smokeCompileCacheMaxSize cfg,
+        seGoChecks = goChecks
+      }
+
+-- | Compile cache preparation for these selected packages.
+smokePrepareCfg :: SmokeEnv -> [T.Text] -> [T.Text] -> Bool -> PrepareCfg
+smokePrepareCfg senv selected reset enabled =
+  PrepareCfg
+    { pcRun = sicRun (seImage senv),
+      pcHelper = seHelper senv,
+      pcLockPath = compileCacheLockPath (seCacheDir senv),
+      pcNow = floor <$> getPOSIXTime,
+      pcMaxSize = seMaxCacheSize senv,
+      pcInventory = sccOverlayNames (seContainer senv),
+      pcSelected = selected,
+      pcReset = reset,
+      pcEnabled = enabled
+    }
+
+-- | Session and run effects of a smoke command or gate. @progress@ gets a
+-- run's atom and stage.
+smokeOpsFor ::
+  Runtime ->
+  SmokeEnv ->
+  PrepareCfg ->
+  IO () ->
+  OverlayMount ->
+  (T.Text -> T.Text -> IO ()) ->
+  SmokeOps
+smokeOpsFor rt senv prepareCfg releaseTree mount progress =
+  SmokeOps
+    { soSweep = do
+        sweepStaleMaterializeSessions run isLiveOverlayManagerPid
+        sweepStaleSnapshots run isLiveOverlayManagerPid,
+      soEnsureImage =
+        withSpan m "smoke.image" [] (void <$> ensureSmokeImage (seImage senv)),
+      soWithSnapshot = withSpan m "smoke.snapshot" [] . withSnapshot run (seSnapshot senv) . const,
+      soReleaseTree = releaseTree,
+      soProbe = withSpan m "smoke.probe" [] (runSandboxProbe run (seContainer senv)),
+      soPrepareCache = withSpan m "smoke.compile-cache" [] $ do
+        prepared <- prepareCompileCache prepareCfg
+        mapM_ (say logWarning) (prWarnings prepared)
+        for_ (prPlan prepared) (recordCleanup m)
+        pure (prUse prepared),
+      soRun = smokeRunIn rt senv mount progress,
+      soEmit = \line -> T.putStrLn line >> hFlush stdout,
+      soLogFailure = say logError,
+      soLogWarning = say logWarning,
+      soLogInfo = say logInfo,
+      soProgress = \_ _ _ -> pure ()
+    }
+  where
+    m = rtMetrics rt
+    run = sicRun (seImage senv)
+    say f = usingLoggerT (rtLogger rt) . f
+
+-- | One run in a fresh container with @mount@ as its overlay.
+smokeRunIn ::
+  Runtime ->
+  SmokeEnv ->
+  OverlayMount ->
+  (T.Text -> T.Text -> IO ()) ->
+  CacheUse ->
+  SmokeRun ->
+  SmokeDef ->
+  FilePath ->
+  IO RunOutcome
+smokeRunIn rt senv mount progress cache smokeRun def dir =
+  withSpan m "smoke.run" ["atom" .= runAtom smokeRun] $ do
+    let runCfg = (seContainer senv) {sccCache = cache, sccOverlay = mount}
+    r <-
+      withSmokeContainer m productionCgroupRoots run runCfg smokeRun $ \session ->
+        performRun session runCfg (seGoChecks senv) (srKey smokeRun) def smokeRun dir (progress (runAtom smokeRun))
+    case r of
+      Right res -> do
+        for_ (roCache res) (recordCacheReport m (runAtom smokeRun))
+        pure res
+      Left err -> do
+        createDirectoryIfMissing True dir
+        let file = dir </> "container.log"
+        TIO.writeFile file err
+        pure (RunOutcome (RunFail FailDependencies err file) Nothing)
+  where
+    m = rtMetrics rt
+    run = sicRun (seImage senv)
+
+-- | The smoke gate of an @update@ run: the session opens concurrently with
+-- the first units; each unit is run against its overlay snapshot.
+productionGateSession ::
+  Runtime ->
+  SmokeEnv ->
+  CommandRunner ->
+  FilePath ->
+  GentooTree ->
+  T.Text ->
+  -- | @--no-compile-cache@
+  Bool ->
+  [PackageKey] ->
+  (GateHandle -> IO (Maybe T.Text) -> IO a) ->
+  IO a
+productionGateSession rt senv run overlay tree arch noCompileCache keys k = do
+  gateRoot <- rrPath <$> openRunRootWith (rtRunId rt <> "-gate")
+  let workDir = gateRoot </> "gate"
+  let prepareCfg = smokePrepareCfg senv (map packageKeyText keys) [] (not noCompileCache)
+      ops = smokeOpsFor rt senv prepareCfg (pure ()) (WorktreeMount overlay) (\_ _ -> pure ())
+      unitCfg =
+        UnitGateCfg
+          { ugRunner = run,
+            ugOverlay = overlay,
+            ugWorkDir = workDir,
+            ugArch = arch,
+            ugCeilings = loadHostCeilings arch (gentooTreePath tree),
+            ugTechnique = fmap policyTechnique . lookupPolicy,
+            ugDefinition = lookupSmokeDef,
+            ugLogsDir = seLogsDir senv,
+            ugMetrics = rtMetrics rt,
+            ugRun = smokeRunIn rt senv
+          }
+  withGateSession
+    GateSessionCfg
+      { gscSmokeOps = ops,
+        gscRunUnit = runUnitGate unitCfg ops,
+        gscDependencies = \req -> case md5CacheEntryPath overlay (grKey req) (grPv req) of
+          Nothing -> pure []
+          Just path -> do
+            body <- try @IOException (TIO.readFile path)
+            pure (either (const []) md5CacheDependencies body),
+        gscAroundWait = gateWaitSpan (rtMetrics rt)
+      }
+    keys
+    k
+    `finally` try @IOException (removeDirectoryRecursive gateRoot)
 
 -- | Clean the manager private distfiles cache (never system Portage DISTDIR).
 runGitHubToken :: (WithLog env Message m, MonadIO m) => Runtime -> Bool -> m ()
