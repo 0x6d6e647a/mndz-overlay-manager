@@ -5,7 +5,7 @@
 -- through it. A scripted fake stands in for the @docker@ CLI.
 module Test.ToolsContainer (tests) where
 
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, isPrefixOf)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -52,6 +52,7 @@ cfg =
   ToolsContainerCfg
     { tccUser = "1000:1000",
       tccRunId = "run42",
+      tccJobs = 4,
       tccCliPid = "4242",
       tccGentooTree = "/home/op/.cache/mndz/overlay-manager/gentoo",
       tccOverlay = "/home/op/overlay",
@@ -170,9 +171,14 @@ testLazySharedRemoved = do
   assertTrue "all ran" (all ((== ExitSuccess) . prExitCode) outs)
   vs <- verbs fake
   assertEq "one create" 1 (length (filter (== "create") vs))
-  assertEq "three execs" 3 (length (filter (== "exec") vs))
+  assertEq "setup and three workloads" 4 (length (filter (== "exec") vs))
   assertEq "image resolved once" 1 =<< readIORef (fdImageCalls fake)
   calls <- readIORef (fdCalls fake)
+  case [c | c@("exec" : _) <- calls] of
+    (["exec", "--user", "0:0", "mndz-tools-run42", "sh", "-c", script] : workloads) -> do
+      assertTrue "setup uses four jobs" ("(jobs=4;" `isPrefixOf` script)
+      assertTrue "workloads use operator identity" (all (isPrefixOf ["exec", "--user", "1000:1000"]) workloads)
+    _ -> fail "expected privileged setup before the workloads"
   assertEq "removed at exit" ["rm", "-f", "mndz-tools-run42"] (last calls)
 
 testNoUseNoContainer :: IO ()
@@ -194,6 +200,19 @@ testStartFailure = do
   vs <- verbs fake
   assertEq "create attempted once" 1 (length (filter (== "create") vs))
   assertEq "no exec" 0 (length (filter (== "exec") vs))
+  let failSetup req = case prMode req of
+        ExecCmd "docker" ("exec" : "--user" : "0:0" : _) -> do
+          _ <- fakeRunner False fake req
+          pure (ProcessResult (ExitFailure 1) "" "read-only file system")
+        _ -> fakeRunner False fake req
+  writeIORef (fdCalls fake) []
+  withToolsSession failSetup cfg (pure (Right "example/override:local")) $ \session -> do
+    failed <- toolsSessionRunner session (dummyReq "egencache")
+    assertTrue "configuration error names file" ("/etc/portage/make.conf" `isInfixOf` prStderr failed)
+  setupCalls <- readIORef (fdCalls fake)
+  assertTrue "uses override image" (any (elem "example/override:local") setupCalls)
+  assertTrue "no workload exec" (not (any (isPrefixOf ["exec", "--user", "1000:1000"]) setupCalls))
+  assertEq "removes failed setup" ["rm", "-f", "mndz-tools-run42"] (last setupCalls)
   -- An image failure is a container failure too.
   fake2 <- newFake
   ts2 <- newToolsSession (fakeRunner False fake2) cfg (pure (Left "failed to ensure materialize image: boom"))
@@ -205,7 +224,7 @@ testStartFailure = do
 execOf :: FakeDocker -> IO [String]
 execOf fake = do
   calls <- readIORef (fdCalls fake)
-  case [c | c@("exec" : _) <- calls] of
+  case [c | c@("exec" : "--user" : "1000:1000" : _) <- calls] of
     (c : _) -> pure c
     [] -> pure []
 

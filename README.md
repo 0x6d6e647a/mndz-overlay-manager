@@ -48,7 +48,11 @@ Bun inside the image comes from overlay `dev-lang/bun-bin::mndz` (overlay bind-m
 
 Image Portage DISTDIR (`/var/cache/distfiles`), PKGDIR (`/var/cache/binpkgs`), and binhost fetch caches (`/var/cache/binhost`) live in Docker BuildKit, not as XDG binpkg trees under that overlay-manager cache path (except `image.json` and the last generated Dockerfile). A successful default-tag `docker build` runs Gentoo `eclean-pkg --deep` and `eclean-dist --deep` after toolchain install so those caches keep the exact installed versions. `docker builder prune` wipes them; ensure does not run it. Cache sizes appear in the ensure build log. Moving a warm cache to another machine means copying `image.json` together with the docker image, not copying a host directory of binpkgs.
 
+Both generated images set the baked Portage `MAKEOPTS` default before the first emerge. If `nproc` reports N processors inside the Docker build, the image retains `-jN -l(N+1)` for direct launches.
+
 Override with `MNDZ_MATERIALIZE_IMAGE` to an **existing** tag: the CLI inspects/satisfies that tag only and does not `docker build` or `docker rmi` it. The image must match the **host CPU architecture** (no qemu/foreign-arch materialize). While run metrics record, the image must also provide GNU time at `/usr/bin/time`; a full-path unit whose image lacks it hard-fails with an error naming the image and `--no-metrics`.
+
+The operator-supplied image must let root update `/etc/portage/make.conf` inside the workload container. Smoke, materialize, and Portage tools containers set `MAKEOPTS="-jN -l(N+1)"` from the resolved `--jobs N` value at startup, including when reusing an image. With the flag omitted, the value defaults to the host processor count. Changing it leaves the image eligible for reuse.
 
 The generated image installs `sys-process/time` so run metrics can measure commands inside the container. The recipe leaves Portage's `sandbox`, `usersandbox`, `userpriv`, `network-sandbox`, `ipc-sandbox`, and `pid-sandbox` features on; inside `docker build` Portage logs that it is unable to unshare the namespaces and continues. Images from an older recipe generator are rebuilt once on the next ensure.
 
@@ -162,7 +166,7 @@ Global options apply **before** the subcommand (for example `mndz-overlay-manage
 | `--config` / `-c FILE.toml` | Config path (overrides the XDG default) |
 | `--overlay-path DIR` | Use this overlay root instead of `overlay-path` from config |
 | `--distfiles-path DIR` | Use this directory as the manager private Portage DISTDIR (overrides `distfiles-path` / XDG default) |
-| `--jobs N` | Max concurrent package jobs (default: host CPU count); mainly affects `outdated` and `update` |
+| `--jobs N` | Package job limit and runtime Portage build parallelism (default: host CPU count) |
 | `-v` / `--verbose` | Increase log verbosity from warn (repeatable: `-v` → info, `-vv` → debug) |
 | `--log-level LEVEL` | Set log level (`error` \| `warn` \| `info` \| `debug`); overrides `-v` when set |
 | `--no-progress` | Disable interactive activity indicators (useful for CI or plain logs) |

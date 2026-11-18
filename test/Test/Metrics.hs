@@ -1283,6 +1283,7 @@ dockerCfg timeDir =
     { mdcImage = "example/no-time:1",
       mdcUser = "1000:1000",
       mdcRunId = sampleRunId,
+      mdcJobs = 4,
       mdcCliPid = "4242",
       mdcTimeDir = timeDir,
       mdcGentooTree = "/managed/gentoo"

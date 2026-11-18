@@ -1531,10 +1531,12 @@ testGeneratorMismatchRebuilds staleGen =
       Right side -> do
         assertEq "records current generator" materializeGeneratorId (isGenerator side)
         assertEq
-          "generator is materialize-11"
-          "mndz-overlay-manager-materialize-11"
+          "generator is materialize-12"
+          "mndz-overlay-manager-materialize-12"
           materializeGeneratorId
     df <- decodeUtf8 <$> BS.readFile (sidecar </> "Dockerfile")
+    let (beforeEmerge, _) = T.breakOn "emerge --oneshot" df
+    assertTrue "build-local jobs before emerge" ("RUN (jobs=$(nproc);" `T.isInfixOf` beforeEmerge)
     assertPruneRun "generator rebuild" df
 
 testNewerQlotRebuilds :: IO ()

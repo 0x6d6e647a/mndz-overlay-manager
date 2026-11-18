@@ -101,7 +101,7 @@ The executable SHOULD enable multi-capability RTS defaults (for example `-with-r
 
 ### Requirement: Jobs sets build parallelism for smoke
 
-For `smoke`, and for the gated runs of `update`, the resolved `--jobs` value `N` SHALL set the build parallelism inside each smoke container as `MAKEOPTS="-j<N> -l<N+1>"`, and each emerge SHALL run one package job at a time. `--jobs` SHALL NOT cause more than one smoke run or more than one smoke container to be active at once within one command.
+For `smoke` and the gated runs of `update`, the resolved jobs value SHALL configure build parallelism as specified by `portage-build-parallelism`. Each smoke emerge SHALL run one package job at a time. Within one command, smoke runs and their workload containers SHALL remain sequential regardless of the jobs value.
 
 #### Scenario: Explicit jobs
 

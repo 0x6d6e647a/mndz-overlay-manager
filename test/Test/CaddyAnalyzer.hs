@@ -661,6 +661,7 @@ publish overlayRoot assetsRoot ent probe releaseOps vendorOps dockerArmed manife
           { mdcImage = defaultMaterializeImage,
             mdcUser = "1000:1000",
             mdcRunId = "caddy-test",
+            mdcJobs = 4,
             mdcCliPid = "1",
             mdcTimeDir = Nothing,
             mdcGentooTree = "/managed/gentoo"

@@ -81,6 +81,7 @@ import Metrics.Core (Metrics (..), trySync, withSpan)
 import Metrics.Process (timeWrapArgs)
 import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Version (renderPVNoRev)
+import Portage.MakeOpts (configureMakeOpts)
 import Smoke.Check
   ( CheckCtx (..),
     CheckIO (..),
@@ -266,10 +267,9 @@ smokeCreateArgs cfg run =
 
 -- | Lines appended to @/etc/portage/make.conf@. With the compile cache on,
 -- @FEATURES@ gains @ccache@ and the cache settings follow.
-makeConfLines :: Int -> CacheUse -> SmokeRun -> [Text]
-makeConfLines jobs cache run =
-  [ "MAKEOPTS=\"-j" <> tshow jobs <> " -l" <> tshow (jobs + 1) <> "\"",
-    "FEATURES=\"getbinpkg buildpkg" <> (case cache of CacheOn _ -> " ccache"; CacheOff -> "") <> "\"",
+makeConfLines :: CacheUse -> SmokeRun -> [Text]
+makeConfLines cache run =
+  [ "FEATURES=\"getbinpkg buildpkg" <> (case cache of CacheOn _ -> " ccache"; CacheOff -> "") <> "\"",
     "ACCEPT_LICENSE=\"*\""
   ]
     <> case cache of
@@ -312,7 +312,8 @@ setupScript uid jobs cache run extraAccepts uses =
   T.unlines $
     ["set -eu"]
       <> concatMap writeFile' (portageConfigFiles run extraAccepts uses <> cacheFiles)
-      <> ["printf '%s\\n' " <> T.unwords (map q (makeConfLines jobs cache run)) <> " >> /etc/portage/make.conf"]
+      <> ["printf '%s\\n' '' " <> T.unwords (map q (makeConfLines cache run)) <> " >> /etc/portage/make.conf"]
+      <> [configureMakeOpts (tshow jobs)]
       <> (case cache of CacheOn _ -> cacheSetupLines; CacheOff -> [])
       <> ["useradd --create-home --uid " <> tshow uid <> " --user-group " <> T.pack checkUser]
   where

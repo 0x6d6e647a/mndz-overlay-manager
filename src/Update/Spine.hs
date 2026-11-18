@@ -614,7 +614,7 @@ runAfterPlan deps entries _allEbuilds selected planResults cache overlayRoot dis
                             Just inner
                               | null t0FullKeys -> pure Nothing
                               | otherwise -> do
-                                  cfg <- resolveMaterializeDockerCfg (rrRunId tempRun) (mTimeDir (pcMetrics pcfg)) (dpoGentooTree (usdDepsPlanOps deps))
+                                  cfg <- resolveMaterializeDockerCfg (usdJobs deps) (rrRunId tempRun) (mTimeDir (pcMetrics pcfg)) (dpoGentooTree (usdDepsPlanOps deps))
                                   pure (Just (cfg, inner))
                         httpMgr <- newMetricsManager (pcMetrics pcfg)
                         inFlight <- newIORef Map.empty

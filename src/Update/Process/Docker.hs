@@ -65,6 +65,7 @@ import Metrics.Container (CgroupRoots, cgroupOfPid, cgroupSnapshot)
 import Metrics.Core (Metrics (..), Outcome (..), withSpan)
 import Metrics.Process (ingestTimeFile, procEndAttrs, procStartAttrs, timeFileName, timeWrapArgs)
 import Metrics.Startup (gnuTimePath)
+import Portage.MakeOpts (configureMakeOpts)
 import System.Directory (doesDirectoryExist, getSymbolicLinkTarget, makeAbsolute)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..))
@@ -140,6 +141,7 @@ data MaterializeDockerCfg = MaterializeDockerCfg
     mdcUser :: String,
     -- | Run-id segment used in the container name and run label.
     mdcRunId :: String,
+    mdcJobs :: Int,
     -- | Host CLI pid recorded on the pid label (not parsed from run-id).
     mdcCliPid :: String,
     -- | Run metrics @time/@ directory, bind-mounted when recording.
@@ -168,8 +170,8 @@ resolveMaterializeImage = do
 
 -- | Resolve image, host uid:gid, and this CLI pid for a run. @timeDir@ is the
 -- run metrics @time/@ directory when recording; @gentooTree@ the managed tree.
-resolveMaterializeDockerCfg :: String -> Maybe FilePath -> FilePath -> IO MaterializeDockerCfg
-resolveMaterializeDockerCfg runId timeDir gentooTree = do
+resolveMaterializeDockerCfg :: Int -> String -> Maybe FilePath -> FilePath -> IO MaterializeDockerCfg
+resolveMaterializeDockerCfg jobs runId timeDir gentooTree = do
   image <- resolveMaterializeImage
   uid <- getRealUserID
   gid <- getRealGroupID
@@ -179,6 +181,7 @@ resolveMaterializeDockerCfg runId timeDir gentooTree = do
       { mdcImage = image,
         mdcUser = show uid <> ":" <> show gid,
         mdcRunId = runId,
+        mdcJobs = jobs,
         mdcCliPid = show pid,
         mdcTimeDir = timeDir,
         mdcGentooTree = gentooTree
@@ -337,7 +340,7 @@ withUnitMaterializeSession m roots inner cfg unit dirs k = do
                   case started of
                     Left err -> pure (Left err)
                     Right () -> do
-                      ready <- waitUntilRunning inner name
+                      ready <- configurePortageSession inner name (mdcJobs cfg)
                       case ready of
                         Left err -> pure (Left err)
                         Right () -> do
@@ -357,6 +360,18 @@ withUnitMaterializeSession m roots inner cfg unit dirs k = do
               )
                 `finally` dockerRm inner name
   session
+
+-- | Wait for the container and configure Portage before any workload exec.
+configurePortageSession :: CommandRunner -> String -> Int -> IO (Either Text ())
+configurePortageSession run name jobs = do
+  ready <- waitUntilRunning run name
+  case ready of
+    Left err -> pure (Left err)
+    Right () -> do
+      configured <- runDockerAs Lifecycle run ["exec", "--user", "0:0", name, "sh", "-c", T.unpack (configureMakeOpts (T.pack (show jobs)))] ""
+      pure $ case configured of
+        Left err -> Left ("container setup failed configuring /etc/portage/make.conf: " <> err)
+        Right _ -> Right ()
 
 -- | Once per recording session: @/usr/bin/time@ in the container must be GNU
 -- Time, or the unit hard-fails naming the image and @--no-metrics@.
@@ -698,6 +713,7 @@ data ToolsContainerCfg = ToolsContainerCfg
   { -- | @uid:gid@ for create and exec.
     tccUser :: String,
     tccRunId :: String,
+    tccJobs :: Int,
     tccCliPid :: String,
     -- | Host path of the managed Gentoo tree.
     tccGentooTree :: FilePath,
@@ -710,8 +726,8 @@ data ToolsContainerCfg = ToolsContainerCfg
 
 -- | Operator uid:gid and this CLI pid, with absolute overlay and distfiles
 -- paths.
-resolveToolsContainerCfg :: String -> FilePath -> FilePath -> Maybe FilePath -> IO ToolsContainerCfg
-resolveToolsContainerCfg runId gentooTree overlay mDistDir = do
+resolveToolsContainerCfg :: Int -> String -> FilePath -> FilePath -> Maybe FilePath -> IO ToolsContainerCfg
+resolveToolsContainerCfg jobs runId gentooTree overlay mDistDir = do
   uid <- getRealUserID
   gid <- getRealGroupID
   pid <- getProcessID
@@ -721,6 +737,7 @@ resolveToolsContainerCfg runId gentooTree overlay mDistDir = do
     ToolsContainerCfg
       { tccUser = show uid <> ":" <> show gid,
         tccRunId = runId,
+        tccJobs = jobs,
         tccCliPid = show pid,
         tccGentooTree = gentooTree,
         tccOverlay = overlayAbs,
@@ -872,7 +889,7 @@ startTools ts = do
         Left err -> pure (failed err)
         Right _ -> do
           started <- runDocker (tsInner ts) ["start", name] ""
-          ready <- either (pure . Left) (const (waitUntilRunning (tsInner ts) name)) started
+          ready <- either (pure . Left) (const (configurePortageSession (tsInner ts) name (tccJobs cfg))) started
           case ready of
             Left err -> failed err <$ dockerRm (tsInner ts) name
             Right () -> pure (Right name)

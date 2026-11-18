@@ -167,6 +167,7 @@ library
     other-modules:
         Build.GitRev
       , Paths_mndz_overlay_manager
+      , Portage.MakeOpts
       , Update.Adequacy
       , Update.AtomClosure
       , Update.Apply.Commit

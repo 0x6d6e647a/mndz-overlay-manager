@@ -275,6 +275,7 @@ unitTests =
           testCase "session name sanitizes slash and includes labels" testDockerSessionNameAndLabels,
           testCase "withUnitMaterializeSession create/start/exec/rm bracket" testDockerSessionBracket,
           testCase "session create failure is Left and does not exec" testDockerSessionCreateFail,
+          testCase "session configuration failure removes override container" testDockerSessionSetupFail,
           testCase "exec into a dead session hard-fails without a new create" testDockerSessionDeadExec,
           testCase "sequential unit sessions are two create/rm pairs" testDockerSequentialSessions,
           testCase "sweep removes dead pid, keeps live overlay-manager, ignores errors" testDockerSweep
@@ -3120,6 +3121,7 @@ sampleDockerCfg =
     { mdcImage = defaultMaterializeImage,
       mdcUser = "1000:1000",
       mdcRunId = "20260810T154207-0700-4242.a8f3",
+      mdcJobs = 4,
       mdcCliPid = "4242",
       mdcTimeDir = Nothing,
       mdcGentooTree = "/managed/gentoo"
@@ -3315,7 +3317,11 @@ testDockerSessionBracket =
     assertTrue "created once" (length (filter (== "create") heads) == 1)
     assertTrue "started" ("start" `elem` heads)
     assertTrue "inspected" ("inspect" `elem` heads)
-    assertTrue "exec once" (length (filter (== "exec") heads) == 1)
+    case [args | args@("exec" : _) <- subs] of
+      [["exec", "--user", "0:0", _, "sh", "-c", script], workload] -> do
+        assertTrue "setup uses four jobs" ("(jobs=4;" `isInfixOf` script)
+        assertTrue "workload uses operator identity" (["--user", "1000:1000"] `isInfixOf` workload)
+      _ -> fail "expected privileged setup before the workload"
     assertTrue "rm -f" (any (\a -> ["rm", "-f"] `isInfixOf` a) subs)
     assertTrue "no per-command run" ("run" `notElem` heads)
     -- Exception path also rm -f.
@@ -3370,6 +3376,29 @@ testDockerSessionCreateFail =
     assertTrue "no start after create fail" ("start" `notElem` heads)
     assertTrue "no exec after create fail" ("exec" `notElem` heads)
 
+testDockerSessionSetupFail :: IO ()
+testDockerSessionSetupFail =
+  withSystemTempDirectory "mndz-docker-setup-fail-" $ \tmp -> do
+    reqsRef <- newIORef []
+    let cfg = sampleDockerCfg {mdcImage = "example/override:local"}
+        run = scriptedDocker reqsRef $ \req -> case dockerArgv req of
+          Just ("exec" : "--user" : "0:0" : _) -> pure (failResult "read-only file system")
+          _ -> sessionOkHandler req
+    err <-
+      assertLeft "configuration fails"
+        =<< withUnitMaterializeSession
+          noopMetrics
+          productionCgroupRoots
+          run
+          cfg
+          sampleUnitRef
+          (sampleUnitDirs tmp)
+          (const (fail "workload started after configuration failure" :: IO (Either T.Text ())))
+    assertTrue "error names make.conf" ("/etc/portage/make.conf" `T.isInfixOf` err)
+    calls <- reverse . mapMaybe dockerArgv <$> readIORef reqsRef
+    assertTrue "uses override image" (any (elem "example/override:local") calls)
+    assertEq "removes failed setup" ["rm", "-f", materializeSessionName cfg sampleUnitRef] (last calls)
+
 testDockerSessionDeadExec :: IO ()
 testDockerSessionDeadExec =
   withSystemTempDirectory "mndz-docker-dead-exec-" $ \tmp -> do
@@ -3383,6 +3412,7 @@ testDockerSessionDeadExec =
             if n == 1
               then pure (okResult "true\n")
               else pure (okResult "false\n")
+          Just ("exec" : "--user" : "0:0" : _) -> pure (okResult "")
           Just ("exec" : _) -> pure (failResult "container is not running")
           Just ("rm" : _) -> pure (okResult "")
           _ -> pure (failResult ("unexpected: " <> show (prMode req)))

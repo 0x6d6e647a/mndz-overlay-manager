@@ -11,6 +11,7 @@ where
 import Data.List (sortOn)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Portage.MakeOpts (configureMakeOpts)
 import Update.Materialize.Resolve
   ( ResolvedInstall (..),
     ResolvedToolchain (..),
@@ -99,6 +100,8 @@ renderMaterializeDockerfile arch digest installs =
            "",
            "ENV FEATURES=\"getbinpkg buildpkg -news\"",
            "ENV EMERGE_DEFAULT_OPTS=\"--quiet-build=y --with-bdeps=n --usepkg\"",
+           "",
+           "RUN " <> configureMakeOpts "$(nproc)",
            ""
          ]
       <> [runCache baseCmds]

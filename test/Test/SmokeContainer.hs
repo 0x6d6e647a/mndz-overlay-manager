@@ -70,7 +70,7 @@ import Smoke.Tree
     sweepStaleSnapshots,
     withSnapshot,
   )
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesFileExist, getPermissions)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -501,13 +501,31 @@ testConfigUse = do
 
 testSetupScript :: IO ()
 testSetupScript = do
-  let script = setupScript 1000 8 CacheOff crushTilde [] []
-  assertTrue "MAKEOPTS" ("'MAKEOPTS=\"-j8 -l9\"'" `T.isInfixOf` script)
+  let script = setupScript 1000 4 CacheOff crushTilde [] []
+  assertTrue "MAKEOPTS uses resolved jobs" ("(jobs=4;" `T.isInfixOf` script)
   assertTrue "FEATURES" ("'FEATURES=\"getbinpkg buildpkg\"'" `T.isInfixOf` script)
   assertTrue "license" ("'ACCEPT_LICENSE=\"*\"'" `T.isInfixOf` script)
   assertTrue "appends make.conf" (">> /etc/portage/make.conf" `T.isInfixOf` script)
   assertTrue "check user" ("useradd --create-home --uid 1000 --user-group smoke" `T.isInfixOf` script)
   assertTrue "no sandbox opt-out" (not ("-sandbox" `T.isInfixOf` script))
+  withSystemTempDirectory "om-smoke-makeopts" $ \tmp -> do
+    let conf = tmp </> "make.conf"
+        inherited = "CHOST=example\nMAKEOPTS=\"-j8 -l9\"\n"
+        fragment = T.unlines (filter (T.isPrefixOf "(jobs=") (T.lines script))
+        apply path = readProcessWithExitCode "sh" ["-c", T.unpack (T.replace "/etc/portage/make.conf" (T.pack path) fragment)] ""
+    TIO.writeFile conf inherited
+    permissions <- getPermissions conf
+    (first, _, _) <- apply conf
+    assertEq "configuration succeeds" ExitSuccess first
+    assertEq "preserves permissions" permissions =<< getPermissions conf
+    updated <- TIO.readFile conf
+    assertTrue "preserves inherited settings" (inherited `T.isPrefixOf` updated)
+    assertEq "effective assignment" "MAKEOPTS=\"-j4 -l5\"" (last (T.lines updated))
+    (second, _, _) <- apply conf
+    assertEq "repeat succeeds" ExitSuccess second
+    assertEq "repeat is idempotent" updated =<< TIO.readFile conf
+    (failed, _, _) <- apply (tmp </> "missing" </> "make.conf")
+    assertTrue "unwritable path fails" (failed /= ExitSuccess)
 
 testProbeFails :: IO ()
 testProbeFails = do
@@ -536,9 +554,13 @@ testEmergeArgv = do
   assertTrue "from source" ("--usepkg=n" `elem` pkg && "--buildpkg=n" `elem` pkg)
   withSystemTempDirectory "om-smoke-run" $ \tmp -> do
     (session, seen) <- scriptedSession (const (Just okOutcome))
-    r <- runPlain session cfg (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
+    r <- runPlain session cfg {sccJobs = 4} (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
     assertEq "pass" RunPass r
     reqs <- seen
+    case reqs of
+      (AsRoot, ProcessRequest {prMode = ExecCmd "sh" ["-s"], prStdin = script}) : _ ->
+        assertTrue "privileged setup precedes emerge" ("(jobs=4;" `T.isInfixOf` T.pack script)
+      _ -> assertFailure "expected setup as the first container command"
     case [req | (AsRoot, req@ProcessRequest {prMode = ExecCmd "emerge" as}) <- reqs, "--usepkg=n" `elem` as] of
       [req] -> assertEq "empty DISTDIR" (Just [("DISTDIR", smokeDistDir)]) (prEnv req)
       other -> assertFailure ("expected one package step, got " <> show other)

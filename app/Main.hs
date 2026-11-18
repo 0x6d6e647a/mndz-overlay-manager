@@ -699,7 +699,7 @@ withRunToolsSession ::
   (ToolsSession -> IO a) ->
   IO a
 withRunToolsSession rt run ensureCfg tree mDist k = do
-  cfg <- resolveToolsContainerCfg (rtRunId rt) (gentooTreePath tree) (ecOverlayRoot ensureCfg) mDist
+  cfg <- resolveToolsContainerCfg (rtJobs rt) (rtRunId rt) (gentooTreePath tree) (ecOverlayRoot ensureCfg) mDist
   baseLock <- newTreeLock
   withToolsSession run cfg (ensureToolsImage baseLock ensureCfg) k
 

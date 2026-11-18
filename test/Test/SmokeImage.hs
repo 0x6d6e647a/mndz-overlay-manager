@@ -87,8 +87,8 @@ testRecipeFrom =
 
 testRecipeTreeBind :: IO ()
 testRecipeTreeBind = do
-  let runs = [l | l <- T.lines recipe, "RUN " `T.isPrefixOf` l]
-  assertEq "one RUN" 1 (length runs)
+  let runs = [l | l <- T.lines recipe, "RUN --mount=" `T.isPrefixOf` l]
+  assertEq "one emerge RUN" 1 (length runs)
   assertTrue
     "tree bind"
     (all ("--mount=type=bind,from=gentoo,target=/var/db/repos/gentoo" `T.isInfixOf`) runs)
@@ -96,6 +96,8 @@ testRecipeTreeBind = do
 
 testRecipeContents :: IO ()
 testRecipeContents = do
+  let (beforeEmerge, _) = T.breakOn "emerge --oneshot" recipe
+  assertTrue "build-local jobs before emerge" ("RUN (jobs=$(nproc);" `T.isInfixOf` beforeEmerge)
   assertTrue "@world" ("emerge --update --deep --newuse @world" `T.isInfixOf` recipe)
   assertTrue "portage" ("emerge --oneshot sys-apps/portage" `T.isInfixOf` recipe)
   assertTrue "time and ccache" ("emerge -n sys-process/time dev-util/ccache" `T.isInfixOf` recipe)
@@ -120,7 +122,7 @@ testRecipeBinpkgs = do
   assertTrue
     "binpkgs cache mount on the Portage RUN"
     ("--mount=type=cache,id=mndz-smoke-build-binpkgs,target=/var/cache/binpkgs" `T.isInfixOf` recipe)
-  assertEq "generator id" "mndz-overlay-manager-smoke-2" smokeGeneratorId
+  assertEq "generator id" "mndz-overlay-manager-smoke-3" smokeGeneratorId
 
 testRecipeSandboxes :: IO ()
 testRecipeSandboxes = do

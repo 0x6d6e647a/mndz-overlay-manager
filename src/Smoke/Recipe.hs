@@ -11,11 +11,12 @@ where
 
 import Data.Text (Text)
 import Data.Text qualified as T
+import Portage.MakeOpts (configureMakeOpts)
 import Update.Materialize.Recipe (RecipeArch (..))
 
 -- | Identity of the smoke Dockerfile generator recorded in the sidecar.
 smokeGeneratorId :: Text
-smokeGeneratorId = "mndz-overlay-manager-smoke-2"
+smokeGeneratorId = "mndz-overlay-manager-smoke-3"
 
 -- | Render the smoke recipe. @digest@ pins the stage3 tag (@sha256:…@). The
 -- single Portage @RUN@ binds the build context named @gentoo@ (the managed
@@ -32,6 +33,8 @@ renderSmokeDockerfile arch digest =
       "",
       "ENV FEATURES=\"getbinpkg buildpkg\"",
       "ENV EMERGE_DEFAULT_OPTS=\"--quiet-build=y --with-bdeps=n --usepkg\"",
+      "",
+      "RUN " <> configureMakeOpts "$(nproc)",
       "",
       "RUN --mount=type=bind,from=gentoo,target=/var/db/repos/gentoo \\",
       "    --mount=type=cache,id=mndz-smoke-build-binhost,target=/var/cache/binhost \\",
