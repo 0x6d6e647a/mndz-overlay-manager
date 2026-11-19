@@ -12,13 +12,25 @@ module CLI.Parser
     resolveColorMode,
     resolveJobs,
     commandTreeSync,
+    parseOptionsPure,
+    parseOptions,
   )
 where
 
 import GHC.Conc (getNumProcessors)
 import Options.Applicative
-import System.Environment (getProgName, lookupEnv)
+import Process.Priority
+  ( IoClass,
+    PriorityRequest,
+    SettingSource (..),
+    checkIoLevel,
+    checkNice,
+    parseIoClass,
+    priorityRequest,
+  )
+import System.Environment (getArgs, getProgName, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
+import Text.Read (readMaybe)
 
 data Verbosity
   = Error
@@ -76,6 +88,12 @@ data Options = Options
     optNoColor :: Bool,
     -- | Turn off run metrics recording for this invocation.
     optNoMetrics :: Bool,
+    -- | @--nice@ (validated range; combination checked by 'parseOptionsPure').
+    optNice :: Maybe Int,
+    -- | @--ionice-class@.
+    optIoniceClass :: Maybe IoClass,
+    -- | @--ionice-level@.
+    optIoniceLevel :: Maybe Int,
     -- | 'Nothing' when no subcommand was given (bare / globals-only).
     optCommand :: Maybe Command
   }
@@ -163,6 +181,62 @@ noMetricsParser =
           \update, gencache, and eclean otherwise record a run and require \
           \GNU /usr/bin/time)"
     )
+
+-- | Integer option reader validated by a shared priority checker.
+priorityIntReader :: (Integer -> Either String Int) -> ReadM Int
+priorityIntReader check = eitherReader $ \raw -> case readMaybe raw of
+  Nothing -> Left ("not an integer: " <> show raw)
+  Just n -> check n
+
+niceParser :: Parser (Maybe Int)
+niceParser =
+  optional $
+    option
+      (priorityIntReader (checkNice FromCommandLine))
+      ( long "nice"
+          <> metavar "N"
+          <> help
+            "Run at absolute nice value N (0-19) instead of the inherited one; \
+            \never raises an inherited lower priority (config: nice)"
+      )
+
+ioniceClassParser :: Parser (Maybe IoClass)
+ioniceClassParser =
+  optional $
+    option
+      (eitherReader (parseIoClass FromCommandLine))
+      ( long "ionice-class"
+          <> metavar "CLASS"
+          <> help
+            "Run in I/O scheduling class CLASS (idle|best-effort); best-effort \
+            \without --ionice-level takes its level from the nice value \
+            \(config: ionice-class)"
+      )
+
+ioniceLevelParser :: Parser (Maybe Int)
+ioniceLevelParser =
+  optional $
+    option
+      (priorityIntReader (checkIoLevel FromCommandLine))
+      ( long "ionice-level"
+          <> metavar "N"
+          <> help
+            "Run at best-effort I/O level N (0-7, 7 lowest); implies \
+            \--ionice-class best-effort (config: ionice-level)"
+      )
+
+-- | Top-level help note on the priority options.
+priorityFooter :: String
+priorityFooter =
+  "Priority: --nice, --ionice-class and --ionice-level are absolute targets, \
+  \not increments, and replace the config keys nice, ionice-class and \
+  \ionice-level (any I/O option replaces the whole config I/O setting). The \
+  \manager never raises the priority it inherited: a lower inherited priority \
+  \is kept with a warning, so --nice 0 leaves an inherited nice value alone. \
+  \Container workloads (smoke, materialize, Portage tools) run at the \
+  \manager's effective priority, including one inherited from nice or \
+  \ionice. I/O priority depends on the disk's I/O scheduler: bfq honours it, \
+  \while the none and kyber schedulers (common NVMe defaults) ignore it."
 
 configParser :: Parser (Maybe FilePath)
 configParser =
@@ -490,6 +564,9 @@ optionsParser = do
   optNoProgress <- noProgressParser
   optNoColor <- noColorParser
   optNoMetrics <- noMetricsParser
+  optNice <- niceParser
+  optIoniceClass <- ioniceClassParser
+  optIoniceLevel <- ioniceLevelParser
   optCommand <- commandParser
   pure Options {..}
 
@@ -500,7 +577,21 @@ parserInfo =
     ( fullDesc
         <> progDesc "mndz-overlay-manager - Gentoo overlay management tool"
         <> header "mndz-overlay-manager - manage your mndz Gentoo overlay"
+        <> footer priorityFooter
     )
+
+-- | Parse @args@ and the command-line priority request. Invalid option
+-- combinations (idle with a level) are usage errors.
+parseOptionsPure :: [String] -> ParserResult (Options, PriorityRequest)
+parseOptionsPure args =
+  execParserPure defaultPrefs parserInfo args >>= \opts ->
+    case priorityRequest FromCommandLine (optNice opts) (optIoniceClass opts) (optIoniceLevel opts) of
+      Right request -> pure (opts, request)
+      Left err -> Failure (parserFailure defaultPrefs parserInfo (ErrorMsg err) mempty)
+
+-- | 'parseOptionsPure' on the process arguments; usage errors exit non-zero.
+parseOptions :: IO (Options, PriorityRequest)
+parseOptions = getArgs >>= handleParseResult . parseOptionsPure
 
 -- | Print full top-level help (same body as @--help@) and exit with status 1.
 --

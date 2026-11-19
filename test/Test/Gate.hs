@@ -19,6 +19,7 @@ import Data.Text.IO qualified as TIO
 import Metrics.Core (noopMetrics, withSpan)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (parseEbuildVersion)
+import Process.Priority (defaultEffectivePriority)
 import Smoke.CompileCache (CacheUse (..))
 import Smoke.Container (OverlayMount (..), RunOutcome (..), RunResult (..), SmokeContainerCfg (..), StagedFetch (..), smokeCreateArgs)
 import Smoke.Definitions (lookupSmokeDef)
@@ -186,7 +187,8 @@ testStaging =
               sccOperatorUid = 1000,
               sccJobs = 4,
               sccOverlayNames = [],
-              sccCache = CacheOff
+              sccCache = CacheOff,
+              sccPriority = defaultEffectivePriority
             }
         args = smokeCreateArgs cfg run
     assertTrue "staging mounted" (any (("src=" <> staging <> ",") `isInfixOf`) args)

@@ -108,7 +108,7 @@ The program SHALL NOT delete or prune run metrics directories.
 
 ### Requirement: Event file is JSON Lines with a schema version
 
-`run.jsonl` SHALL contain one JSON object per line. Every object SHALL have an `ev` field naming the event kind (`run_start`, `span_start`, `span_end`, `sample`, `container`, `run_end`). Every object except `run_start` SHALL have `t_ns`, the monotonic nanoseconds since the run started. The `run_start` line SHALL be first and SHALL carry `schema`, an integer format version.
+`run.jsonl` SHALL contain one JSON object per line. Every object SHALL have an `ev` field naming the event kind (`run_start`, `span_start`, `span_end`, `sample`, `container`, `priority`, `run_end`). Every object except `run_start` SHALL have `t_ns`, the monotonic nanoseconds since the run started. The `run_start` line SHALL be first and SHALL carry `schema`, an integer format version.
 
 #### Scenario: First line is the header
 
@@ -120,6 +120,11 @@ The program SHALL NOT delete or prune run metrics directories.
 
 - **WHEN** a later build adds a new span name or a new attribute to an existing event
 - **THEN** `schema` does not change
+
+#### Scenario: Priority event is additive
+
+- **WHEN** a recorded run includes a `priority` event
+- **THEN** `schema` is the same as for runs without one
 
 ### Requirement: Run header records build identity
 
@@ -465,3 +470,17 @@ When recording, each gated run of `update` SHALL be recorded as a span under the
 
 - **WHEN** `update` gates `dev-util/hk-2.13.0` while recording
 - **THEN** the gated run's span has the `dev-util/hk` package span as an ancestor and records the gate outcome
+
+### Requirement: Applied process priority is recorded
+
+When the manager applies its effective priority, a recorded run SHALL contain one `priority` event. The event SHALL give the requested nice and I/O priority (absent when unset), the effective nice and I/O priority, and whether the floor kept an inherited value for each.
+
+#### Scenario: Floored nice is recorded
+
+- **WHEN** the operator runs `update --nice 10` from a shell at nice 15
+- **THEN** the `priority` event records requested nice 10, effective nice 15, and that the nice floor applied
+
+#### Scenario: Unset priority is recorded
+
+- **WHEN** the operator runs `update` with no priority options or keys from a shell at nice 0
+- **THEN** the `priority` event records no requested values and effective nice 0

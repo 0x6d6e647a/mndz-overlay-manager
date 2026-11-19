@@ -22,6 +22,7 @@ The documented build and run commands use [just](https://just.systems/) **1.55 o
 | `update` that only **reuses** existing GitHub release assets | no toolchains in the image and no host language toolchains (download + verify stay on the host) |
 | `smoke` | `git`, `gpg`, `docker`; **Docker Engine 28.0 or newer with the containerd image store** (image mounts need both). The first `smoke` builds its own [smoke image](#smoke) (minutes). No host Portage. |
 | `outdated`, `update`, `gencache`, `smoke`, `eclean` (unless `--no-metrics`) | GNU time at `/usr/bin/time` (`sys-process/time`) for [run metrics](#run-metrics) |
+| Container workloads when a [process priority](#process-priority) change applies | `nice` (nice above 0) and `ionice` (explicit I/O class) **inside** the container image; the bundled images have both, and an `MNDZ_MATERIALIZE_IMAGE` that lacks one fails session setup naming the tool |
 
 `list` only needs a readable overlay and a valid config; it does not require Portage, GPG, or Docker. `outdated` also needs `git` and `gpg` for the managed Gentoo tree (plus GNU `/usr/bin/time` unless `--no-metrics`), and does not require Portage or Docker. No command runs `portageq` or reads the host's Gentoo tree or `repos.conf`. Help (`--help`) does not load configuration and needs no overlay.
 
@@ -91,6 +92,9 @@ Override with `--config FILE.toml`. Work subcommands always load the config file
 | `gentoo-tree-max-age` | no | How long a [managed Gentoo tree](#managed-gentoo-tree) sync check stays fresh before `outdated`, `update`, or `gencache` syncs again (same duration syntax as `check-cache-ttl`, default **6h**; `0s` syncs on every run) |
 | `materialize-base-check-interval` | no | How often ensure asks the registry whether the pinned `gentoo/stage3` digest moved (same duration syntax, default **3d**) |
 | `smoke-compile-cache-max-size` | no | Size budget of the [smoke compile cache](#smoke-compile-cache): a byte count with an optional `KiB`, `MiB`, or `GiB` suffix (for example `512MiB`), default **3GiB**. An invalid or negative value is a configuration error |
+| `nice` | no | Absolute [process priority](#process-priority) nice value, an integer from **0** to **19** (same as `--nice`). Out of range is a configuration error naming the key |
+| `ionice-class` | no | I/O scheduling class, `"idle"` or `"best-effort"` (same as `--ionice-class`). `"idle"` together with `ionice-level` is a configuration error |
+| `ionice-level` | no | Best-effort I/O level, an integer from **0** to **7** (same as `--ionice-level`); alone it selects best-effort |
 
 **Token resolution order** (first non-empty wins): environment `GITHUB_TOKEN`, then `GH_TOKEN`, then the decrypted `github-token` envelope in the config. Using an environment token logs a warning (and an extra warning when that value is not a fine-grained PAT `github_pat_`). `outdated` and `update` use that token for live `api.github.com` version fetch when a token is available. If the winning source is the encrypted config envelope, they prompt for the wrap password on a controlling TTY when this run will call `api.github.com`. `outdated` does not prompt when every `api.github.com` read for the run is a valid check-cache hit, including when a cached plan still needs work. `update` still prompts when it will look up or publish an assets release. A cache miss or `--refresh` of a GitHub-source package also prompts. Unattended `outdated` / `update` **must** set `GITHUB_TOKEN` or `GH_TOKEN` rather than relying on TTY decrypt; without a controlling TTY the command exits `1` and does not fall back to unauthenticated fetch. Live unauthenticated fetch is still allowed when no token is configured, is limited to **60 requests per hour** per IP, and logs a warning. The program never logs the raw token, wrap password, or ciphertext.
 
@@ -122,6 +126,9 @@ assets-path = "/path/to/mndz-overlay-assets"
 # gentoo-tree-max-age = "6h"  # optional; default 6h
 # materialize-base-check-interval = "3d"  # optional; default 3d
 # smoke-compile-cache-max-size = "3GiB"  # optional; default 3GiB
+# nice = 10  # optional; absolute nice 0-19, never raises an inherited lower priority
+# ionice-class = "idle"  # optional; "idle" or "best-effort"
+# ionice-level = 7  # optional; best-effort level 0-7 (not with "idle")
 ssh-identity = "~/.ssh/keys/shanty_github_id"
 ```
 
@@ -172,6 +179,19 @@ Global options apply **before** the subcommand (for example `mndz-overlay-manage
 | `--no-progress` | Disable interactive activity indicators (useful for CI or plain logs) |
 | `--no-color` | Disable ANSI colors in logs and indicators (also honors non-empty `NO_COLOR`) |
 | `--no-metrics` | Do not record [run metrics](#run-metrics) for this invocation (logs a warning; also skips the GNU time requirement) |
+| `--nice N` | Run at absolute nice value N (0–19); replaces config `nice` (see [process priority](#process-priority)) |
+| `--ionice-class CLASS` | Run in I/O class `idle` or `best-effort`; best-effort without a level takes the level the kernel derives from the nice value |
+| `--ionice-level N` | Run at best-effort I/O level N (0–7); implies `--ionice-class best-effort`. Not allowed with `--ionice-class idle` |
+
+### Process priority
+
+`--nice`, `--ionice-class` and `--ionice-level` (or the config keys `nice`, `ionice-class` and `ionice-level`) lower the CPU and I/O scheduling priority of a whole run. Values are **absolute targets**, not increments: `--nice 10` from a shell at nice 5 runs at nice 10, not 15. A command-line `--nice` replaces the config `nice`; any command-line I/O option replaces the whole config I/O setting (`--ionice-level 4` over `ionice-class = "idle"` runs best-effort at level 4). Out-of-range values, `realtime`, and idle with a level are usage errors.
+
+The manager **never raises** the priority it inherited. When the inherited value is already lower than a target (for example `--nice 10` from a shell at nice 15, or `--ionice-level 4` under `ionice -c 3`), it keeps the inherited value, logs one warning per setting naming both values, and continues. So `--nice 0` leaves an inherited nice value alone, which also overrides a config `nice` back to the inherited value. An unset setting keeps the inherited value. Each command applies the effective priority to every manager thread right after it loads its config and before it starts any process, so `git`, `gpg`, the GPG and SSH session supervisors, and every other child inherit it; a failure to apply it exits `1` before any workload. With run metrics on, a `priority` event records the requested and effective values and whether each floor applied.
+
+**Containers follow the manager.** Container processes descend from the Docker daemon, not from the manager, so each workload command in a smoke, materialize or Portage tools container is started through a small `sh` prelude that applies the manager's effective nice and I/O priority and then `exec`s the command (outside GNU time, which still measures the command itself). This includes priority the manager only inherited: `nice -n 19 ionice -c 3 mndz-overlay-manager update` runs those workloads at nice 19 in the idle class with no options. When a container already starts at a lower priority (for example a niced Docker daemon), the command keeps it and writes one line to its standard error naming the kept and requested values. Container setup commands run by the manager are not reniced. At nice 0 with no explicit I/O class, commands run unchanged and images need no priority tools; otherwise session setup checks for `nice` and `ionice` in the image and fails naming a missing one. Negative nice values and the realtime class are never propagated into containers. Docker image builds are not affected and their recipes do not change.
+
+**I/O scheduler.** I/O priority only has an effect when the disk's I/O scheduler honours it (`bfq`). Under the `none` and `kyber` schedulers, the usual NVMe defaults, it is applied but ignored. Check `/sys/block/<dev>/queue/scheduler`.
 
 ### `list`
 
@@ -460,7 +480,7 @@ Each run writes one directory:
 - `$XDG_STATE_HOME/mndz/overlay-manager/metrics/<run-id>-<command>/` when `XDG_STATE_HOME` is set and non-empty
 - otherwise `~/.local/state/mndz/overlay-manager/metrics/<run-id>-<command>/`
 
-The run id is the same one used for the temp workspace run root and the materialize container names. The directory holds `run.jsonl`: one JSON object per line, starting with a `run_start` header (build identity, host, invocation) and ending with a `run_end` footer (outcome, resource use, counters such as check-cache hits). Between them are timed spans for phases, package steps, subprocesses, HTTP requests, and slot waits, plus machine `sample` lines every 5 seconds. Subprocesses are measured with GNU time. Command arguments are recorded with the GitHub token and other known secrets replaced by `<redacted>`; environment variables are never recorded. A `time/` subdirectory holds per-process GNU time files only while they are being read (a file that cannot be parsed is kept there).
+The run id is the same one used for the temp workspace run root and the materialize container names. The directory holds `run.jsonl`: one JSON object per line, starting with a `run_start` header (build identity, host, invocation) and ending with a `run_end` footer (outcome, resource use, counters such as check-cache hits). Between them are timed spans for phases, package steps, subprocesses, HTTP requests, and slot waits, plus machine `sample` lines every 5 seconds and one `priority` event with the requested and effective [process priority](#process-priority). Subprocesses are measured with GNU time. Command arguments are recorded with the GitHub token and other known secrets replaced by `<redacted>`; environment variables are never recorded. A `time/` subdirectory holds per-process GNU time files only while they are being read (a file that cannot be parsed is kept there).
 
 `smoke` measures each emerge step and check command in its containers like a materialize container command (an `.outer` result for the host `docker exec` and an `.inner` result for the command, under one span per container), records one span per run named by its atom and lane, and writes a `container` resource event before each container is removed. With the compile cache on, each run also writes a `compile-cache` event (its span and atom, ccache hits and misses, Go cache entries added, and the Go trim check result and Go version when that run checked), and each command writes one `compile-cache.cleanup` event (cache size before and after cleanup, the budget, and the packages removed). `--no-compile-cache` writes neither.
 

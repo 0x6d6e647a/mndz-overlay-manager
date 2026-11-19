@@ -115,6 +115,7 @@ import Network.HTTP.Client
 import Network.HTTP.Client.Internal (makeConnection)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (parseEbuildVersion)
+import Process.Priority (EffectivePriority (..), IoPriority (..), defaultEffectivePriority)
 import Smoke.Check (argv, check, exitsWith, smokeDef, step)
 import Smoke.CompileCache
   ( Apply (..),
@@ -260,6 +261,10 @@ unitTests =
         "Container"
         [ testCase "create mounts time dir only when recording" testCreateArgsMount,
           testCase "exec wraps the inner command only when recording" testExecArgsInnerWrap,
+          testCase "priority prelude runs outside GNU time" testExecArgsPriorityOutsideTime,
+          testCase "recorded exec at a priority: inner still names the command" testSessionRecordedPriority,
+          testCase "smoke container at a priority: workloads wrapped, setup not" testSmokeSessionPriority,
+          testCase "materialize image without ionice fails setup" testSessionMissingIonice,
           testCase "recorded exec: inner/outer under one parent, lifecycle create" testSessionRecorded,
           testCase "image without GNU time hard-fails naming image and --no-metrics" testSessionNoGnuTime,
           testCase "--no-metrics skips the in-container time check" testSessionNoMetricsSkipsCheck,
@@ -1286,7 +1291,8 @@ dockerCfg timeDir =
       mdcJobs = 4,
       mdcCliPid = "4242",
       mdcTimeDir = timeDir,
-      mdcGentooTree = "/managed/gentoo"
+      mdcGentooTree = "/managed/gentoo",
+      mdcPriority = defaultEffectivePriority
     }
 
 unitRef :: MaterializeUnitRef
@@ -1332,6 +1338,91 @@ testExecArgsInnerWrap = do
     ["sess", "/usr/bin/time", "-o", inner, "--quiet", "-f", timeFormat, "--", "go", "mod", "vendor"]
     (dropWhile (/= "sess") wrapped)
   assertEq "plain exec" ["sess", "go", "mod", "vendor"] (dropWhile (/= "sess") plain)
+
+-- | A priority that needs the container prelude.
+lowPriority :: EffectivePriority
+lowPriority = EffectivePriority 19 IoIdle
+
+-- | The argv after @name@ with the priority prelude replaced by @PRELUDE@.
+afterPrelude :: String -> [String] -> [String]
+afterPrelude name args = case dropWhile (/= name) args of
+  _ : "sh" : "-c" : _ : "mndz-priority" : rest -> "PRELUDE" : rest
+  _ : rest -> rest
+  [] -> []
+
+testExecArgsPriorityOutsideTime :: IO ()
+testExecArgsPriorityOutsideTime = do
+  let req = execReq "go" ["mod", "vendor"]
+      inner = "/state/time/7-dev-util_crush-go.inner.json"
+      cfgAt t = (dockerCfg t) {mdcPriority = lowPriority}
+  assertEq
+    "prelude, then GNU time, then the command"
+    ["PRELUDE", "/usr/bin/time", "-o", inner, "--quiet", "-f", timeFormat, "--", "go", "mod", "vendor"]
+    (afterPrelude "sess" (materializeExecArgs (cfgAt (Just "/state/time")) "sess" (Just inner) req))
+  assertEq "prelude without metrics" ["PRELUDE", "go", "mod", "vendor"] (afterPrelude "sess" (materializeExecArgs (cfgAt Nothing) "sess" Nothing req))
+
+testSessionRecordedPriority :: IO ()
+testSessionRecordedPriority =
+  withCgroupFixture $ \roots ->
+    withSystemTempDirectory "mndz-session-" $ \tmp -> do
+      (run, seen) <- fakeDocker "time (GNU Time) 1.9\n"
+      (result, evs) <- withRecorded $ \m ->
+        withUnitMaterializeSession m roots run (dockerCfg (mTimeDir m)) {mdcPriority = lowPriority} unitRef (unitDirsAt tmp) $ \runner ->
+          Right <$> runner (execReq "go" ["mod", "vendor"])
+      either (assertFailure . T.unpack) (assertEq "exec ok" ExitSuccess . prExitCode) result
+      reqs <- seen
+      let execs = [args | ProcessRequest {prMode = ExecCmd "docker" args@("exec" : _)} <- reqs]
+          wrapped = filter ("mndz-priority" `elem`) execs
+      assertEq "only the workload is wrapped" 1 (length wrapped)
+      assertTrue "setup execs unchanged" (all (\a -> "mndz-priority" `notElem` a) (filter (`notElem` wrapped) execs))
+      assertTrue "GNU time follows the prelude" (take 2 (dropWhile (/= "mndz-priority") (concat wrapped)) == ["mndz-priority", "/usr/bin/time"])
+      parent <- firstId "container.exec" evs
+      case [a | (_, Just p, "proc", a) <- spanStarts evs, p == parent] of
+        [attrs] -> assertEq "inner names go" (Just (String "go")) (KM.lookup "cmd" attrs)
+        other -> assertFailure ("expected the inner proc under container.exec, got " <> show (length other))
+
+testSmokeSessionPriority :: IO ()
+testSmokeSessionPriority =
+  withCgroupFixture $ \roots -> do
+    (run, seen) <- fakeDocker "time (GNU Time) 1.9\n"
+    (result, _) <- withRecorded $ \m ->
+      withSmokeContainer m roots run (smokeCfg (mTimeDir m)) {sccPriority = lowPriority} smokeRun $ \session -> do
+        _ <- ssSetup session (execReq "sh" ["-s"])
+        _ <- ssExec session AsCheckUser (execReq "timeout" ["5", "true"])
+        ssExec session AsRoot (execReq "emerge" ["--oneshot", "=dev-util/crush-0.101.0::mndz"])
+    either (assertFailure . T.unpack) (assertEq "exec ok" ExitSuccess . prExitCode) result
+    reqs <- seen
+    let execs = [args | ProcessRequest {prMode = ExecCmd "docker" args@("exec" : _), prMeasure = TimedContainerExec} <- reqs]
+        cmdAfter args = take 2 (dropWhile (/= "mndz-priority") args)
+    case execs of
+      [setup, checkExec, emerge] -> do
+        assertTrue "setup has no prelude" ("mndz-priority" `notElem` setup)
+        assertEq "check user exec wrapped before GNU time" ["mndz-priority", "/usr/bin/time"] (cmdAfter checkExec)
+        assertEq "root exec wrapped before GNU time" ["mndz-priority", "/usr/bin/time"] (cmdAfter emerge)
+        assertTrue "emerge still the measured command" ("emerge" `elem` emerge)
+      other -> assertFailure ("expected three outer execs, got " <> show (length other))
+
+testSessionMissingIonice :: IO ()
+testSessionMissingIonice =
+  withCgroupFixture $ \roots ->
+    withSystemTempDirectory "mndz-session-" $ \tmp -> do
+      (base, seen) <- fakeDocker "time (GNU Time) 1.9\n"
+      called <- newIORef False
+      let run req = case prMode req of
+            ExecCmd "docker" ["exec", _, "sh", "-c", script]
+              | "command -v ionice" `T.isInfixOf` T.pack script -> do
+                  _ <- base req
+                  pure ProcessResult {prExitCode = ExitFailure 1, prStdout = "", prStderr = "ionice not found (needed for process priority)\n"}
+            _ -> base req
+          cfg = (dockerCfg Nothing) {mdcPriority = EffectivePriority 0 IoIdle}
+      result <- withUnitMaterializeSession noopMetrics roots run cfg unitRef (unitDirsAt tmp) $ \_ -> do
+        atomicModifyIORef' called (const (True, ()))
+        pure (Right ())
+      assertEq "setup fails naming ionice" (Left "container setup failed: ionice not found (needed for process priority)") result
+      ran <- readIORef called
+      assertTrue "no workload" (not ran)
+      reqs <- seen
+      assertTrue "container removed" (not (null [() | ProcessRequest {prMode = ExecCmd "docker" ("rm" : _)} <- reqs]))
 
 -- | Fake docker CLI for a session. @timeVersion@ is what the in-container
 -- @/usr/bin/time --version@ prints. Inner GNU time files are written as if
@@ -1437,7 +1528,8 @@ smokeCfg timeDir =
       sccOperatorUid = 1000,
       sccJobs = 4,
       sccOverlayNames = ["dev-util/crush"],
-      sccCache = CacheOff
+      sccCache = CacheOff,
+      sccPriority = defaultEffectivePriority
     }
 
 smokeRun :: SmokeRun

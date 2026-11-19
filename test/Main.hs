@@ -32,6 +32,7 @@ import Test.OverlayWaves qualified as OverlayWaves
 import Test.Pdm qualified as Pdm
 import Test.Policy qualified as Policy
 import Test.Preflight qualified as Preflight
+import Test.Priority qualified as Priority
 import Test.Progress qualified as Progress
 import Test.Properties qualified as Properties
 import Test.SmokeCheck qualified as SmokeCheck
@@ -70,7 +71,8 @@ main = do
   tookGpg <- takeGpgSessionSupervisor
   tookSsh <- takeSshSessionSupervisor
   probed <- Gpg.takeGpgTtyProbe
-  unless (tookGpg || tookSsh || probed) $ do
+  priorityProbed <- Priority.takePriorityProbe
+  unless (tookGpg || tookSsh || probed || priorityProbed) $ do
     Git.clearGitLocalEnv
     defaultMain $
       testGroup
@@ -93,6 +95,7 @@ main = do
               Uv.tests,
               Targets.tests,
               Preflight.tests,
+              Priority.tests,
               Assets.tests,
               EbuildEdit.tests,
               Gastown.tests,

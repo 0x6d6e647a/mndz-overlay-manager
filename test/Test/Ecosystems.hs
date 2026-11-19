@@ -24,6 +24,7 @@ import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Metrics.Container (productionCgroupRoots)
 import Metrics.Core (noopMetrics)
+import Process.Priority (defaultEffectivePriority)
 import System.Directory
   ( Permissions (executable, readable, searchable, writable),
     copyFile,
@@ -3124,7 +3125,8 @@ sampleDockerCfg =
       mdcJobs = 4,
       mdcCliPid = "4242",
       mdcTimeDir = Nothing,
-      mdcGentooTree = "/managed/gentoo"
+      mdcGentooTree = "/managed/gentoo",
+      mdcPriority = defaultEffectivePriority
     }
 
 sampleUnitRef :: MaterializeUnitRef

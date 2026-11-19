@@ -16,6 +16,7 @@ import Metrics.Container (CgroupRoots (..))
 import Metrics.Core (noopMetrics)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (parseEbuildVersion)
+import Process.Priority (EffectivePriority (..), IoPriority (..), defaultEffectivePriority)
 import Smoke.Check
   ( Check (..),
     SmokeDef (..),
@@ -113,6 +114,8 @@ tests =
           testCase "sandbox probe failure names the requirement" testProbeFails,
           testCase "emerge steps: overlay names and empty DISTDIR" testEmergeArgv,
           testCase "dependency failure skips the package step" testDepsFailure,
+          testCase "Priority tool check leads the setup script" testSetupPriorityCheck,
+          testCase "Missing priority tool fails setup" testSetupPriorityToolMissing,
           testCase "build failure runs no check" testBuildFailure,
           testCase "build failure reason is Portage's ERROR line" testErrorNote,
           testCase "network detach after installs, attach around a network check" testNetworkOrder,
@@ -264,7 +267,8 @@ cfg =
       sccOperatorUid = 1000,
       sccJobs = 8,
       sccOverlayNames = ["dev-util/crush", "dev-lang/bun-bin"],
-      sccCache = CacheOff
+      sccCache = CacheOff,
+      sccPriority = defaultEffectivePriority
     }
 
 mkRun :: Text -> Text -> Text -> Maybe RuntimeCap -> Maybe Text -> SmokeRun
@@ -590,6 +594,7 @@ scriptedSession respond = do
         SmokeSession
           { ssName = "c",
             ssExec = exec,
+            ssSetup = exec AsRoot,
             ssNetwork = \_ -> pure (Right ())
           }
   pure (session, readIORef seen)
@@ -598,6 +603,31 @@ isEmerge :: ProcessRequest -> Bool
 isEmerge req = case prMode req of
   ExecCmd "emerge" _ -> True
   _ -> False
+
+testSetupPriorityCheck :: IO ()
+testSetupPriorityCheck = do
+  let low = cfg {sccPriority = EffectivePriority 10 IoIdle}
+      script = runSetupScript low defOneCheck crushTilde
+  case T.lines script of
+    first : _ -> assertTrue "checks run first" ("command -v nice" `T.isInfixOf` first && "command -v ionice" `T.isInfixOf` first)
+    [] -> assertFailure "empty setup script"
+  assertTrue "no check at the default priority" (not ("command -v" `T.isInfixOf` runSetupScript cfg defOneCheck crushTilde))
+
+testSetupPriorityToolMissing :: IO ()
+testSetupPriorityToolMissing =
+  withSystemTempDirectory "om-smoke-run" $ \tmp -> do
+    let low = cfg {sccPriority = EffectivePriority 0 IoIdle}
+    (session, seen) <- scriptedSession $ \(_, req) -> case prMode req of
+      ExecCmd "sh" ["-s"]
+        | "command -v ionice" `T.isInfixOf` T.pack (prStdin req) ->
+            Just (ProcessResult (ExitFailure 1) "" "ionice not found (needed for process priority)\n")
+      _ -> Nothing
+    r <- runPlain session low (srKey crushTilde) defOneCheck crushTilde tmp (\_ -> pure ())
+    case r of
+      RunFail FailDependencies why _ -> assertTrue "names the tool" ("container setup failed" `T.isInfixOf` why && "ionice not found" `T.isInfixOf` why)
+      other -> assertFailure ("expected a setup failure, got " <> show other)
+    reqs <- seen
+    assertEq "no workload" 0 (length (filter (isEmerge . snd) reqs))
 
 testDepsFailure :: IO ()
 testDepsFailure =

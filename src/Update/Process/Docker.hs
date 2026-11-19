@@ -66,6 +66,7 @@ import Metrics.Core (Metrics (..), Outcome (..), withSpan)
 import Metrics.Process (ingestTimeFile, procEndAttrs, procStartAttrs, timeFileName, timeWrapArgs)
 import Metrics.Startup (gnuTimePath)
 import Portage.MakeOpts (configureMakeOpts)
+import Process.Priority (EffectivePriority, priorityToolCheck, priorityWrap)
 import System.Directory (doesDirectoryExist, getSymbolicLinkTarget, makeAbsolute)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..))
@@ -148,7 +149,9 @@ data MaterializeDockerCfg = MaterializeDockerCfg
     mdcTimeDir :: Maybe FilePath,
     -- | Host path of the managed Gentoo tree, bound read-only at
     -- @/var/db/repos/gentoo@ (for example @pycargoebuild@'s license mapping).
-    mdcGentooTree :: FilePath
+    mdcGentooTree :: FilePath,
+    -- | The manager's effective priority, applied to every workload exec.
+    mdcPriority :: EffectivePriority
   }
   deriving (Eq, Show)
 
@@ -170,8 +173,8 @@ resolveMaterializeImage = do
 
 -- | Resolve image, host uid:gid, and this CLI pid for a run. @timeDir@ is the
 -- run metrics @time/@ directory when recording; @gentooTree@ the managed tree.
-resolveMaterializeDockerCfg :: Int -> String -> Maybe FilePath -> FilePath -> IO MaterializeDockerCfg
-resolveMaterializeDockerCfg jobs runId timeDir gentooTree = do
+resolveMaterializeDockerCfg :: Int -> String -> Maybe FilePath -> FilePath -> EffectivePriority -> IO MaterializeDockerCfg
+resolveMaterializeDockerCfg jobs runId timeDir gentooTree priority = do
   image <- resolveMaterializeImage
   uid <- getRealUserID
   gid <- getRealGroupID
@@ -184,7 +187,8 @@ resolveMaterializeDockerCfg jobs runId timeDir gentooTree = do
         mdcJobs = jobs,
         mdcCliPid = show pid,
         mdcTimeDir = timeDir,
-        mdcGentooTree = gentooTree
+        mdcGentooTree = gentooTree,
+        mdcPriority = priority
       }
 
 -- | @mndz-mat-\<runId\>-\<cat\>-\<pn\>-\<pv\>@ with @/@ replaced by @-@.
@@ -253,7 +257,8 @@ materializeCreateArgs cfg unit dirs =
     bindMount p = "type=bind,src=" <> p <> ",dst=" <> p
 
 -- | @docker exec@ argv for one builder request. With @innerTime@, the
--- in-container command runs under GNU time writing that @.inner@ file.
+-- in-container command runs under GNU time writing that @.inner@ file. The
+-- priority prelude runs outside GNU time, which still measures the command.
 materializeExecArgs :: MaterializeDockerCfg -> String -> Maybe FilePath -> ProcessRequest -> [String]
 materializeExecArgs cfg name innerTime req =
   ["exec"]
@@ -273,7 +278,7 @@ materializeExecArgs cfg name innerTime req =
     argv = case prMode req of
       ExecCmd cmd args -> cmd : args
       ShellCmd sh -> ["sh", "-c", sh]
-    innerCmd = case innerTime of
+    innerCmd = priorityWrap (mdcPriority cfg) $ case innerTime of
       Nothing -> argv
       Just file -> let (t, targs) = timeWrapArgs file argv in t : targs
 
@@ -340,7 +345,7 @@ withUnitMaterializeSession m roots inner cfg unit dirs k = do
                   case started of
                     Left err -> pure (Left err)
                     Right () -> do
-                      ready <- configurePortageSession inner name (mdcJobs cfg)
+                      ready <- configurePortageSession inner name (mdcJobs cfg) (mdcPriority cfg)
                       case ready of
                         Left err -> pure (Left err)
                         Right () -> do
@@ -361,17 +366,24 @@ withUnitMaterializeSession m roots inner cfg unit dirs k = do
                 `finally` dockerRm inner name
   session
 
--- | Wait for the container and configure Portage before any workload exec.
-configurePortageSession :: CommandRunner -> String -> Int -> IO (Either Text ())
-configurePortageSession run name jobs = do
+-- | Wait for the container, configure Portage, and check for the priority
+-- tools (only when a priority change applies) before any workload exec.
+configurePortageSession :: CommandRunner -> String -> Int -> EffectivePriority -> IO (Either Text ())
+configurePortageSession run name jobs priority = do
   ready <- waitUntilRunning run name
   case ready of
     Left err -> pure (Left err)
     Right () -> do
       configured <- runDockerAs Lifecycle run ["exec", "--user", "0:0", name, "sh", "-c", T.unpack (configureMakeOpts (T.pack (show jobs)))] ""
-      pure $ case configured of
-        Left err -> Left ("container setup failed configuring /etc/portage/make.conf: " <> err)
-        Right _ -> Right ()
+      case configured of
+        Left err -> pure (Left ("container setup failed configuring /etc/portage/make.conf: " <> err))
+        Right _ -> case priorityToolCheck priority of
+          Nothing -> pure (Right ())
+          Just check -> do
+            found <- runDockerAs Lifecycle run ["exec", name, "sh", "-c", T.unpack check] ""
+            pure $ case found of
+              Left err -> Left ("container setup failed: " <> err)
+              Right _ -> Right ()
 
 -- | Once per recording session: @/usr/bin/time@ in the container must be GNU
 -- Time, or the unit hard-fails naming the image and @--no-metrics@.
@@ -720,14 +732,16 @@ data ToolsContainerCfg = ToolsContainerCfg
     -- | Absolute effective overlay path.
     tccOverlay :: FilePath,
     -- | Absolute effective manager distfiles path, when the command uses one.
-    tccDistDir :: Maybe FilePath
+    tccDistDir :: Maybe FilePath,
+    -- | The manager's effective priority, applied to every tool exec.
+    tccPriority :: EffectivePriority
   }
   deriving (Eq, Show)
 
 -- | Operator uid:gid and this CLI pid, with absolute overlay and distfiles
 -- paths.
-resolveToolsContainerCfg :: Int -> String -> FilePath -> FilePath -> Maybe FilePath -> IO ToolsContainerCfg
-resolveToolsContainerCfg jobs runId gentooTree overlay mDistDir = do
+resolveToolsContainerCfg :: Int -> String -> FilePath -> FilePath -> Maybe FilePath -> EffectivePriority -> IO ToolsContainerCfg
+resolveToolsContainerCfg jobs runId gentooTree overlay mDistDir priority = do
   uid <- getRealUserID
   gid <- getRealGroupID
   pid <- getProcessID
@@ -741,7 +755,8 @@ resolveToolsContainerCfg jobs runId gentooTree overlay mDistDir = do
         tccCliPid = show pid,
         tccGentooTree = gentooTree,
         tccOverlay = overlayAbs,
-        tccDistDir = distAbs
+        tccDistDir = distAbs,
+        tccPriority = priority
       }
 
 -- | @mndz-tools-\<runId\>@.
@@ -802,7 +817,8 @@ toolsCreateArgs cfg image =
     bindSame p = "type=bind,src=" <> p <> ",dst=" <> p
 
 -- | @docker exec@ argv for one tool request: operator user, request cwd,
--- request environment (secrets dropped), then the command.
+-- request environment (secrets dropped), then the command at the effective
+-- priority.
 toolsExecArgs :: ToolsContainerCfg -> ProcessRequest -> [String]
 toolsExecArgs cfg req =
   ["exec", "--user", tccUser cfg]
@@ -810,7 +826,7 @@ toolsExecArgs cfg req =
     <> concatMap envFlag (toolsEnv req)
     <> ["-i" | not (null (prStdin req))]
     <> [toolsContainerName cfg]
-    <> argv
+    <> priorityWrap (tccPriority cfg) argv
   where
     argv = case prMode req of
       ExecCmd cmd args -> cmd : args
@@ -889,7 +905,7 @@ startTools ts = do
         Left err -> pure (failed err)
         Right _ -> do
           started <- runDocker (tsInner ts) ["start", name] ""
-          ready <- either (pure . Left) (const (configurePortageSession (tsInner ts) name (tccJobs cfg))) started
+          ready <- either (pure . Left) (const (configurePortageSession (tsInner ts) name (tccJobs cfg) (tccPriority cfg))) started
           case ready of
             Left err -> failed err <$ dockerRm (tsInner ts) name
             Right () -> pure (Right name)

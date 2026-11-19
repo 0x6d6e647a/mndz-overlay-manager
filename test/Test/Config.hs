@@ -74,6 +74,7 @@ import Overlay.Version
     parseEbuildVersion,
     prettyVersion,
   )
+import Process.Priority (IoRequest (..), PriorityRequest (..), noPriorityRequest)
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
 import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Exit (exitFailure)
@@ -293,6 +294,7 @@ tests =
       testCase "Config duration keys invalid" testConfigDurationKeysInvalid,
       testCase "Parse byte size" testParseByteSize,
       testCase "Config compile cache max size" testConfigCompileCacheMaxSize,
+      testCase "Config priority keys" testConfigPriorityKeys,
       testCase "Config mode 0644 hard-fails" testConfigModeWrong,
       testCase "Config mode 0600 loads" testConfigModeOk,
       testCase "Config unreadable mode hard-fails" testConfigModeUnreadable,
@@ -573,6 +575,32 @@ testConfigCompileCacheMaxSize =
         other -> do
           hPutStrLn stderr $ "expected DecodeError, got " <> show other
           exitFailure
+
+testConfigPriorityKeys :: IO ()
+testConfigPriorityKeys =
+  withSystemTempDirectory "om-priority" $ \tmp -> do
+    let load name body = do
+          let path = tmp </> name
+          TIO.writeFile path ("overlay-path = \"/tmp/ov\"\n" <> body)
+          chmodConfig600 path
+          loadConfig (Just path)
+        decodeErr label body expect = do
+          err <- assertLeft label =<< load (label <> ".toml") body
+          case err of
+            DecodeError msg -> assertTrue (label <> " names " <> T.unpack expect) (expect `T.isInfixOf` T.pack msg)
+            other -> do
+              hPutStrLn stderr $ "expected DecodeError, got " <> show other
+              exitFailure
+    dflt <- assertRight "omitted" =<< load "d.toml" ""
+    assertEq "unset" noPriorityRequest (configPriority dflt)
+    set <- assertRight "valid keys" =<< load "s.toml" "nice = 10\nionice-class = \"best-effort\"\nionice-level = 5\n"
+    assertEq "valid" (PriorityRequest (Just 10) (Just (IoBestEffortReq (Just 5)))) (configPriority set)
+    idle <- assertRight "idle" =<< load "i.toml" "ionice-class = \"idle\"\n"
+    assertEq "idle" (PriorityRequest Nothing (Just IoIdleReq)) (configPriority idle)
+    decodeErr "nice-range" "nice = 25\n" "nice must be between 0 and 19"
+    decodeErr "level-range" "ionice-level = 9\n" "ionice-level must be between 0 and 7"
+    decodeErr "realtime" "ionice-class = \"realtime\"\n" "ionice-class must be idle or best-effort"
+    decodeErr "idle-level" "ionice-class = \"idle\"\nionice-level = 3\n" "idle takes no ionice-level"
 
 testConfigModeWrong :: IO ()
 testConfigModeWrong =

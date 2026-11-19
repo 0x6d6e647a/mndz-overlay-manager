@@ -78,6 +78,7 @@ import Overlay.Version
     parseEbuildVersion,
     prettyVersion,
   )
+import Process.Priority (noPriorityRequest)
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
 import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Exit (exitFailure)
@@ -416,7 +417,8 @@ testTokenResolverIO = do
             sshIdentity = Nothing,
             gentooTreeMaxAge = defaultGentooTreeMaxAge,
             materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval,
-            smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize
+            smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize,
+            configPriority = noPriorityRequest
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "config envelope not decrypted" Nothing =<< resolveGitHubToken cfg
@@ -436,7 +438,8 @@ testTokenResolverIO = do
             sshIdentity = Nothing,
             gentooTreeMaxAge = defaultGentooTreeMaxAge,
             materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval,
-            smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize
+            smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize,
+            configPriority = noPriorityRequest
           }
   withAuthEnv Nothing Nothing $ do
     assertEq "none" Nothing =<< resolveGitHubToken cfgNoTok
@@ -1018,7 +1021,8 @@ testGitHubTokenExistingKey = do
             sshIdentity = Nothing,
             gentooTreeMaxAge = defaultGentooTreeMaxAge,
             materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval,
-            smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize
+            smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize,
+            configPriority = noPriorityRequest
           }
       boom = error "github-token should not prompt or probe without --force"
       ops =

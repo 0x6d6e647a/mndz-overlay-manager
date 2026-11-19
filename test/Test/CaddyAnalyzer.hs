@@ -17,6 +17,7 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
 import Network.HTTP.Client (path, requestHeaders)
 import Overlay.Version (EbuildVersion, parseEbuildVersion)
+import Process.Priority (defaultEffectivePriority)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
@@ -664,7 +665,8 @@ publish overlayRoot assetsRoot ent probe releaseOps vendorOps dockerArmed manife
             mdcJobs = 4,
             mdcCliPid = "1",
             mdcTimeDir = Nothing,
-            mdcGentooTree = "/managed/gentoo"
+            mdcGentooTree = "/managed/gentoo",
+            mdcPriority = defaultEffectivePriority
           }
       env =
         env0

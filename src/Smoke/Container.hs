@@ -82,6 +82,7 @@ import Metrics.Process (timeWrapArgs)
 import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Version (renderPVNoRev)
 import Portage.MakeOpts (configureMakeOpts)
+import Process.Priority (EffectivePriority, defaultEffectivePriority, priorityToolCheck, priorityWrap)
 import Smoke.Check
   ( CheckCtx (..),
     CheckIO (..),
@@ -158,7 +159,9 @@ data SmokeContainerCfg = SmokeContainerCfg
     -- | Every overlay @category/package@, excluded from binary packages.
     sccOverlayNames :: [Text],
     -- | Compile cache use for this command's runs.
-    sccCache :: CacheUse
+    sccCache :: CacheUse,
+    -- | The manager's effective priority, applied to every workload exec.
+    sccPriority :: EffectivePriority
   }
   deriving (Eq, Show)
 
@@ -326,11 +329,13 @@ setupScript uid jobs cache run extraAccepts uses =
       CacheOn size -> [(T.unpack ccacheConfPath, ccacheConf size), ("/etc/portage/bashrc", portageBashrc)]
       CacheOff -> []
 
--- | The setup script of one run: 'setupScript', then the fetch shim when
--- the run has staged distfiles.
+-- | The setup script of one run: the priority tool check (when a priority
+-- change applies), 'setupScript', then the fetch shim when the run has
+-- staged distfiles.
 runSetupScript :: SmokeContainerCfg -> SmokeDef -> SmokeRun -> Text
 runSetupScript cfg def run =
-  setupScript (checkUidFor (sccOperatorUid cfg)) (sccJobs cfg) (sccCache cfg) run (sdAcceptKeywords def) (sdPackageUse def)
+  T.unlines (maybe [] pure (priorityToolCheck (sccPriority cfg)))
+    <> setupScript (checkUidFor (sccOperatorUid cfg)) (sccJobs cfg) (sccCache cfg) run (sdAcceptKeywords def) (sdPackageUse def)
     <> T.unlines (maybe [] (fetchShimSetupLines fetchShimPaths) (stagedFetchOf cfg))
     -- The time directory is set only while metrics are recording.
     <> T.unlines (if isJust (sccTimeDir cfg) then diskHookSetupLines else [])
@@ -558,16 +563,21 @@ data ExecUser = AsRoot | AsCheckUser
 
 data SmokeSession = SmokeSession
   { ssName :: String,
-    -- | Run a request in the container.
+    -- | Run a workload request in the container at the effective priority.
     ssExec :: ExecUser -> ProcessRequest -> IO ProcessResult,
+    -- | Run the root setup script, without the priority prelude (the
+    -- script checks for the priority tools).
+    ssSetup :: ProcessRequest -> IO ProcessResult,
     -- | Attach ('True') to or detach from the default bridge.
     ssNetwork :: Bool -> IO (Either Text ())
   }
 
--- | @docker exec@ argv for an in-container request. With @innerTime@, the
--- command runs under GNU time writing that @.inner@ file.
-smokeExecArgs :: String -> ExecUser -> Maybe FilePath -> ProcessRequest -> [String]
-smokeExecArgs name user innerTime req =
+-- | @docker exec@ argv for an in-container request at @priority@. With
+-- @innerTime@, the command runs under GNU time writing that @.inner@ file;
+-- the priority prelude runs outside GNU time, which still measures the
+-- command.
+smokeExecArgs :: EffectivePriority -> String -> ExecUser -> Maybe FilePath -> ProcessRequest -> [String]
+smokeExecArgs priority name user innerTime req =
   ["exec"]
     <> userFlags
     <> concat [["--env", k <> "=" <> v] | (k, v) <- fromMaybe [] (prEnv req)]
@@ -581,7 +591,7 @@ smokeExecArgs name user innerTime req =
     cmdline = case prMode req of
       ExecCmd c as -> c : as
       ShellCmd s -> ["sh", "-c", s]
-    inner = case innerTime of
+    inner = priorityWrap priority $ case innerTime of
       Nothing -> cmdline
       Just file -> let (t, ts) = timeWrapArgs file cmdline in t : ts
 
@@ -618,7 +628,8 @@ withSmokeContainer m roots run cfg smokeRun k = do
                 let session =
                       SmokeSession
                         { ssName = name,
-                          ssExec = execIn name,
+                          ssExec = execIn (sccPriority cfg) name,
+                          ssSetup = execIn defaultEffectivePriority name AsRoot,
                           ssNetwork = network name
                         }
                 (Right <$> k session)
@@ -628,14 +639,14 @@ withSmokeContainer m roots run cfg smokeRun k = do
         )
           `finally` dockerE Timed run ["rm", "-f", name]
   where
-    execIn name user req =
+    execIn priority name user req =
       case (mEnabled m, sccTimeDir cfg) of
         (True, Just dir) ->
-          measuredContainerExec m run name dir (\f -> wrap name user f req) req
-        _ -> run (wrap name user Nothing req)
-    wrap name user innerTime req =
+          measuredContainerExec m run name dir (\f -> wrap priority name user f req) req
+        _ -> run (wrap priority name user Nothing req)
+    wrap priority name user innerTime req =
       ProcessRequest
-        { prMode = ExecCmd "docker" (smokeExecArgs name user innerTime req),
+        { prMode = ExecCmd "docker" (smokeExecArgs priority name user innerTime req),
           prCwd = Nothing,
           prEnv = Nothing,
           prStdin = prStdin req,
@@ -707,13 +718,7 @@ performRun ::
 performRun session cfg goChecks key def run logDir progress = do
   createDirectoryIfMissing True logDir
   progress "dependencies"
-  setup <-
-    step
-      "setup"
-      AsRoot
-      (ExecCmd "sh" ["-s"])
-      Nothing
-      (T.unpack (runSetupScript cfg def run))
+  setup <- logged "setup" . ssSetup session $ request (ExecCmd "sh" ["-s"]) Nothing (T.unpack (runSetupScript cfg def run))
   case setup of
     Left (why, file) -> pure (RunOutcome (RunFail FailDependencies ("container setup failed: " <> why) file) Nothing)
     Right () -> do
@@ -766,13 +771,12 @@ performRun session cfg goChecks key def run logDir progress = do
           ccVersion = srVersion run,
           ccPv = renderPVNoRev (srVersion run)
         }
-    step label user mode env stdin = do
+    request mode env stdin = ProcessRequest {prMode = mode, prCwd = Nothing, prEnv = env, prStdin = stdin, prMeasure = Timed}
+    step label user mode env stdin = logged label (ssExec session user (request mode env stdin))
+    -- Run, write the output to @label.log@, and classify the exit.
+    logged label exec = do
       let file = logDir </> (label <> ".log")
-      res <-
-        ssExec
-          session
-          user
-          ProcessRequest {prMode = mode, prCwd = Nothing, prEnv = env, prStdin = stdin, prMeasure = Timed}
+      res <- exec
       TIO.writeFile file (T.pack (prStdout res) <> T.pack (prStderr res))
       pure $
         if prExitCode res == ExitSuccess

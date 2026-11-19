@@ -19,7 +19,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (NominalDiffTime)
 import GHC.Generics (Generic)
-import Toml.Schema (FromValue (..), optKey, optKeyOf, parseTableFromValue, reqKey)
+import Process.Priority (PriorityRequest, SettingSource (..), checkIoLevel, checkNice, parseIoClass, priorityRequest)
+import Toml.Schema (FromValue (..), ParseTable, optKey, optKeyOf, parseTableFromValue, reqKey)
 
 -- | Effective check-cache TTL after config load.
 --
@@ -152,7 +153,9 @@ data OverlayConfig = OverlayConfig
     -- | Materialize stage3 base check interval (default 3d).
     materializeBaseCheckInterval :: NominalDiffTime,
     -- | Smoke compile cache size budget in bytes (default 3 GiB).
-    smokeCompileCacheMaxSize :: Integer
+    smokeCompileCacheMaxSize :: Integer,
+    -- | @nice@, @ionice-class@ and @ionice-level@ (each optional).
+    configPriority :: PriorityRequest
   }
   deriving (Eq, Show, Generic)
 
@@ -171,7 +174,16 @@ instance FromValue OverlayConfig where
         <*> ( fromMaybe defaultSmokeCompileCacheMaxSize
                 <$> optKeyOf "smoke-compile-cache-max-size" (fromValue >=> either fail pure . parseByteSizeFor "smoke-compile-cache-max-size")
             )
+        <*> priorityKeys
     where
       durationKey key def =
         fromMaybe def
           <$> optKeyOf key (fromValue >=> either fail pure . parseDurationFor (T.unpack key))
+
+-- | The priority keys, validated like the matching options.
+priorityKeys :: ParseTable l PriorityRequest
+priorityKeys = do
+  nice <- optKeyOf "nice" (fromValue >=> either fail pure . checkNice FromConfig)
+  cls <- optKeyOf "ionice-class" (fromValue >=> either fail pure . parseIoClass FromConfig)
+  level <- optKeyOf "ionice-level" (fromValue >=> either fail pure . checkIoLevel FromConfig)
+  either fail pure (priorityRequest FromConfig nice cls level)

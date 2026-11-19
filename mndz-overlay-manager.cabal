@@ -86,6 +86,8 @@ library
       , Overlay.Types
       , Overlay.Validation
       , Overlay.Version
+      , Process.Priority
+      , Process.Priority.Apply
       , Smoke.Ceilings
       , Smoke.CompileCache
       , Smoke.Check
@@ -229,8 +231,11 @@ library
     -- Directories containing source files.
     hs-source-dirs:   src
 
-    -- getrusage(2) and page-size shim for run metrics (Metrics.Recorder, Metrics.Sampler).
-    c-sources:        cbits/rusage.c
+    -- getrusage(2) and page-size shim for run metrics (Metrics.Recorder, Metrics.Sampler);
+    -- per-thread nice and I/O priority syscalls (Process.Priority.Apply).
+    c-sources:
+        cbits/rusage.c
+        cbits/ioprio.c
 
     -- Base language which the package is written in.
     default-language: GHC2024
@@ -319,6 +324,7 @@ test-suite mndz-overlay-manager-test
         Test.Pdm
         Test.Policy
         Test.Preflight
+        Test.Priority
         Test.Progress
         Test.Properties
         Test.SmokeCheck

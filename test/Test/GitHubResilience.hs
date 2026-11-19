@@ -20,6 +20,7 @@ import Network.HTTP.Client (getUri, parseRequest_, path)
 import Network.HTTP.Types (ResponseHeaders)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (parseEbuildVersion)
+import Process.Priority (noPriorityRequest)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -485,7 +486,8 @@ testCfg tok =
       sshIdentity = Nothing,
       gentooTreeMaxAge = defaultGentooTreeMaxAge,
       materializeBaseCheckInterval = defaultMaterializeBaseCheckInterval,
-      smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize
+      smokeCompileCacheMaxSize = defaultSmokeCompileCacheMaxSize,
+      configPriority = noPriorityRequest
     }
 
 countingPrompt :: IORef Int -> SecretPrompt

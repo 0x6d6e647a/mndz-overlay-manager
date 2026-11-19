@@ -5,10 +5,12 @@
 -- through it. A scripted fake stands in for the @docker@ CLI.
 module Test.ToolsContainer (tests) where
 
+import Control.Monad (void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, isPrefixOf)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Process.Priority (EffectivePriority (..), IoPriority (..), defaultEffectivePriority)
 import System.Exit (ExitCode (..))
 import Test.Assert (assertEq, assertLeft, assertRight, assertTrue)
 import Test.Tasty (TestTree, testGroup)
@@ -42,6 +44,8 @@ tests =
       testCase "Created lazily, shared, removed at exit" testLazySharedRemoved,
       testCase "No container when no tool runs" testNoUseNoContainer,
       testCase "Container cannot start" testStartFailure,
+      testCase "Exec argv at a priority" testExecArgsPriority,
+      testCase "Missing priority tool fails setup" testPriorityToolMissing,
       testCase "Manifest runs in the tools container" testEbuildInContainer,
       testCase "Eclass checksums come from the managed tree" testEgencacheInContainer,
       testCase "gencache preflight requires git gpg docker" testGencachePreflight
@@ -56,7 +60,8 @@ cfg =
       tccCliPid = "4242",
       tccGentooTree = "/home/op/.cache/mndz/overlay-manager/gentoo",
       tccOverlay = "/home/op/overlay",
-      tccDistDir = Just "/home/op/.cache/mndz/overlay-manager/distfiles"
+      tccDistDir = Just "/home/op/.cache/mndz/overlay-manager/distfiles",
+      tccPriority = defaultEffectivePriority
     }
 
 -- | Records every @docker@ argv. @create@ fails when @failCreate@.
@@ -220,6 +225,37 @@ testStartFailure = do
   assertTrue "image failure named" ("boom" `isInfixOf` prStderr r3)
   closeToolsSession ts
   closeToolsSession ts2
+
+testExecArgsPriority :: IO ()
+testExecArgsPriority = do
+  let req = (dummyReq "egencache") {prMode = ExecCmd "egencache" ["--update"]}
+  case dropWhile (/= "mndz-tools-run42") (toolsExecArgs cfg {tccPriority = EffectivePriority 10 IoIdle} req) of
+    [_, "sh", "-c", _, "mndz-priority", "egencache", "--update"] -> pure ()
+    other -> fail ("expected the prelude before the tool: " <> show other)
+  assertEq "default priority unchanged" ["mndz-tools-run42", "egencache", "--update"] (dropWhile (/= "mndz-tools-run42") (toolsExecArgs cfg req))
+
+-- | An image without @ionice@: the setup check fails, no workload runs, and
+-- the container is removed. At the default priority no check runs.
+testPriorityToolMissing :: IO ()
+testPriorityToolMissing = do
+  fake <- newFake
+  let noIonice req = case prMode req of
+        ExecCmd "docker" ["exec", _, "sh", "-c", script]
+          | "command -v ionice" `isInfixOf` script -> do
+              _ <- fakeRunner False fake req
+              pure (ProcessResult (ExitFailure 1) "" "ionice not found (needed for process priority)\n")
+        _ -> fakeRunner False fake req
+  withToolsSession noIonice cfg {tccPriority = EffectivePriority 0 IoIdle} (imageResolver fake) $ \ts -> do
+    failed <- toolsSessionRunner ts (dummyReq "egencache")
+    assertTrue "names the tool" ("container setup failed: ionice not found (needed for process priority)" `isInfixOf` prStderr failed)
+  calls <- readIORef (fdCalls fake)
+  assertTrue "no workload exec" (not (any (isPrefixOf ["exec", "--user", "1000:1000"]) calls))
+  assertEq "removed" ["rm", "-f", "mndz-tools-run42"] (last calls)
+  plain <- newFake
+  withToolsSession (fakeRunner False plain) cfg (imageResolver plain) $ \ts ->
+    void (toolsSessionRunner ts (dummyReq "egencache"))
+  plainCalls <- readIORef (fdCalls plain)
+  assertTrue "no tool check at the default priority" (not (any (any ("command -v" `isInfixOf`)) plainCalls))
 
 execOf :: FakeDocker -> IO [String]
 execOf fake = do

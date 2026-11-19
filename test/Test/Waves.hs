@@ -29,6 +29,7 @@ import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Overlay.Types (Ebuild (..))
 import Overlay.Version (EbuildVersion, parseEbuildVersion, prettyVersion)
+import Process.Priority (defaultEffectivePriority)
 import Smoke.CompileCache (CacheUse (..))
 import Smoke.Run (SmokeOps (..))
 import System.Directory
@@ -460,6 +461,7 @@ baseSpine overlay assets dist gitOps releaseOps jobs preflight = do
   pure
     UpdateSpineDeps
       { usdJobs = jobs,
+        usdPriority = defaultEffectivePriority,
         usdRunId = "20260810T154207-0700-4242.a8f3",
         usdProgress = pcfg,
         usdFetcher = fetchBunLatest,

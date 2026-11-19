@@ -73,6 +73,7 @@ import Overlay.Version
     parseEbuildVersion,
     prettyVersion,
   )
+import Process.Priority (defaultEffectivePriority)
 import System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute, removeFile)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, (</>))
@@ -789,7 +790,8 @@ testGitMvCommitsOnSuccess =
               mdcJobs = 4,
               mdcCliPid = "1",
               mdcTimeDir = Nothing,
-              mdcGentooTree = "/managed/gentoo"
+              mdcGentooTree = "/managed/gentoo",
+              mdcPriority = defaultEffectivePriority
             }
         env =
           env0
@@ -2057,7 +2059,8 @@ testReusePathApplyProgressSequence =
               mdcJobs = 4,
               mdcCliPid = "1",
               mdcTimeDir = Nothing,
-              mdcGentooTree = "/managed/gentoo"
+              mdcGentooTree = "/managed/gentoo",
+              mdcPriority = defaultEffectivePriority
             }
         env =
           env0

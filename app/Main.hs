@@ -5,7 +5,7 @@ module Main (main) where
 import CLI.Parser
   ( ColorMode,
     Options (..),
-    parserInfo,
+    parseOptions,
     resolveColorMode,
     resolveJobs,
     showTopLevelHelpExit1,
@@ -56,11 +56,12 @@ import Metrics.Startup
     metricsGate,
     productionMetricsStartupOps,
   )
-import Options.Applicative (execParser)
 import Overlay.Discovery (collectEbuilds, discoveryErrorMessage)
 import Overlay.Types (Ebuild (..), ebuildAtom)
 import Overlay.Validation (OverlayError (..), validateOverlay)
 import Overlay.Version (EbuildVersion (..), prettyVersion)
+import Process.Priority (EffectivePriority, PriorityRequest)
+import Process.Priority.Apply (applyCommandPriority, productionThreadOps)
 import Smoke.Ceilings (loadHostCeilings)
 import Smoke.Check (SmokeDef)
 import Smoke.CompileCache
@@ -225,7 +226,9 @@ data Runtime = Runtime
     rtRunId :: String,
     -- | 'commandTreeSync' of the command: whether it reads the managed Gentoo
     -- tree, and whether it forces a sync.
-    rtTreeSync :: Maybe Bool
+    rtTreeSync :: Maybe Bool,
+    -- | Command-line priority request (merged with the config's at load).
+    rtPriority :: PriorityRequest
   }
 
 main :: IO ()
@@ -236,7 +239,7 @@ main = do
 
 runProgram :: IO ()
 runProgram = do
-  opts <- execParser parserInfo
+  (opts, cliPriority) <- parseOptions
   color <- resolveColorMode (optNoColor opts)
   jobs <- resolveJobs (optJobs opts)
   hold <- mkLogHold
@@ -263,7 +266,8 @@ runProgram = do
                 rtHold = hold,
                 rtProgress = pcfg {pcMetrics = m},
                 rtRunId = runId,
-                rtTreeSync = Cmd.commandTreeSync cmd
+                rtTreeSync = Cmd.commandTreeSync cmd,
+                rtPriority = cliPriority
               }
           dispatch m = do
             registerEnvSecrets m
@@ -318,7 +322,7 @@ registerEnvSecrets m =
 
 runList :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runList rt = do
-  ebuilds <- loadValidatedEbuilds (rtOptions rt)
+  ebuilds <- loadValidatedEbuilds rt
   liftIO $ mapM_ (T.putStrLn . ebuildAtom) ebuilds
 
 -- | Resolve positionals minus exclusions. Target errors exit before the
@@ -351,7 +355,7 @@ runOutdated ::
   m ()
 runOutdated rt refresh pkgArgs excludeArgs = do
   enterPhase rt "config"
-  (cfg, overlayResolved, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
+  (cfg, overlayResolved, ebuilds, _priority) <- loadValidatedEbuildsFull rt
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
       excludes = map T.pack excludeArgs
@@ -445,7 +449,7 @@ runUpdate ::
   m ()
 runUpdate rt refresh pkgArgs excludeArgs noCompileCache = do
   enterPhase rt "config"
-  (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
+  (cfg, overlayPath, ebuilds, priority) <- loadValidatedEbuildsFull rt
   let entries = groupNewest ebuilds
       tokens = map T.pack pkgArgs
       excludes = map T.pack excludeArgs
@@ -544,12 +548,12 @@ runUpdate rt refresh pkgArgs excludeArgs noCompileCache = do
     ensureCfg <- liftIO (productionEnsureConfig rt cfg run overlayPath tree)
     heldRoot <- liftIO defaultHeldRoot
     overlayAbs <- liftIO (makeAbsolute overlayPath)
-    senv <- liftIO (mkSmokeEnv rt cfg run overlayAbs tree ebuilds)
+    senv <- liftIO (mkSmokeEnv rt cfg run overlayAbs tree ebuilds priority)
     uname <- liftIO hostMachineArch
     let hostArch = maybe "" raKeywords (lookupRecipeArch uname)
     spineResult <-
       liftIO $
-        withRunToolsSession rt run ensureCfg tree (Just distDir) $ \tools ->
+        withRunToolsSession rt run ensureCfg tree (Just distDir) priority $ \tools ->
           bracket
             (newGpgHandle gpgOps)
             teardownGpgHandle
@@ -567,6 +571,7 @@ runUpdate rt refresh pkgArgs excludeArgs noCompileCache = do
                     deps =
                       UpdateSpineDeps
                         { usdJobs = rtJobs rt,
+                          usdPriority = priority,
                           usdRunId = rtRunId rt,
                           usdProgress = pcfg,
                           usdFetcher = fetch,
@@ -696,10 +701,11 @@ withRunToolsSession ::
   EnsureConfig ->
   GentooTree ->
   Maybe FilePath ->
+  EffectivePriority ->
   (ToolsSession -> IO a) ->
   IO a
-withRunToolsSession rt run ensureCfg tree mDist k = do
-  cfg <- resolveToolsContainerCfg (rtJobs rt) (rtRunId rt) (gentooTreePath tree) (ecOverlayRoot ensureCfg) mDist
+withRunToolsSession rt run ensureCfg tree mDist priority k = do
+  cfg <- resolveToolsContainerCfg (rtJobs rt) (rtRunId rt) (gentooTreePath tree) (ecOverlayRoot ensureCfg) mDist priority
   baseLock <- newTreeLock
   withToolsSession run cfg (ensureToolsImage baseLock ensureCfg) k
 
@@ -783,7 +789,7 @@ runSmokeCommand ::
   m ()
 runSmokeCommand rt pkgArgs excludeArgs noCompileCache resetCompileCache = do
   enterPhase rt "config"
-  (cfg, overlayPath', ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
+  (cfg, overlayPath', ebuilds, priority) <- loadValidatedEbuildsFull rt
   let m = rtMetrics rt
       run = timedRunner m productionCommandRunner
   overlay <- liftIO (makeAbsolute overlayPath')
@@ -820,7 +826,7 @@ runSmokeCommand rt pkgArgs excludeArgs noCompileCache resetCompileCache = do
   let items = planSmokeRuns arch ceilings inputs
   liftIO (setCount m "packages.selected" (length keys))
   enterPhase rt "smoke"
-  senv <- liftIO (mkSmokeEnv rt cfg run overlay tree ebuilds)
+  senv <- liftIO (mkSmokeEnv rt cfg run overlay tree ebuilds priority)
   let prepareCfg =
         smokePrepareCfg
           senv
@@ -873,8 +879,8 @@ data SmokeEnv = SmokeEnv
     seGoChecks :: GoChecks
   }
 
-mkSmokeEnv :: Runtime -> OverlayConfig -> CommandRunner -> FilePath -> GentooTree -> [Ebuild] -> IO SmokeEnv
-mkSmokeEnv rt cfg run overlay tree ebuilds = do
+mkSmokeEnv :: Runtime -> OverlayConfig -> CommandRunner -> FilePath -> GentooTree -> [Ebuild] -> EffectivePriority -> IO SmokeEnv
+mkSmokeEnv rt cfg run overlay tree ebuilds priority = do
   let m = rtMetrics rt
   cacheDir <- defaultSmokeCacheDir
   let logsRoot = smokeLogsRoot cacheDir
@@ -898,7 +904,8 @@ mkSmokeEnv rt cfg run overlay tree ebuilds = do
               sccOperatorUid = fromIntegral uid,
               sccJobs = rtJobs rt,
               sccOverlayNames = nubOrd [ebuildCategory e <> "/" <> ebuildPackage e | e <- ebuilds],
-              sccCache = CacheOff
+              sccCache = CacheOff,
+              sccPriority = priority
             },
         seImage =
           SmokeImageConfig
@@ -1064,6 +1071,7 @@ runGitHubToken rt force = do
   cfg <- case result of
     Left err -> dieError (configErrorMessage err)
     Right c -> pure c
+  _ <- applyPriorityOrDie rt cfg
   configPath <- liftIO (maybe defaultConfigPath pure override)
   let pcfg = rtProgress rt
   ops <-
@@ -1111,6 +1119,7 @@ runEclean :: (WithLog env Message m, MonadIO m) => Runtime -> m ()
 runEclean rt = do
   enterPhase rt "config"
   cfg <- loadConfigOrDie (optConfig (rtOptions rt))
+  _ <- applyPriorityOrDie rt cfg
   distDir <-
     liftIO $
       resolveDistfilesPath
@@ -1132,7 +1141,7 @@ runGencache ::
   m ()
 runGencache rt pkgArgs force excludeArgs = do
   enterPhase rt "config"
-  (cfg, overlayPath, ebuilds) <- loadValidatedEbuildsFull (rtOptions rt)
+  (cfg, overlayPath, ebuilds, priority) <- loadValidatedEbuildsFull rt
   enterPhase rt "preflight"
   isGit <- liftIO (isGitWorkTree (timedRunner (rtMetrics rt) productionCommandRunner) overlayPath)
   unless isGit $
@@ -1163,7 +1172,7 @@ runGencache rt pkgArgs force excludeArgs = do
     ensureCfg <- liftIO (productionEnsureConfig rt cfg run overlayPath tree)
     result <-
       liftIO $
-        withRunToolsSession rt run ensureCfg tree Nothing $ \tools ->
+        withRunToolsSession rt run ensureCfg tree Nothing priority $ \tools ->
           bracket
             (newGpgHandle gpgOps)
             teardownGpgHandle
@@ -1218,18 +1227,22 @@ formatSuccessLine key sl =
 
 loadValidatedEbuilds ::
   (WithLog env Message m, MonadIO m) =>
-  Options ->
+  Runtime ->
   m [Ebuild]
-loadValidatedEbuilds opts = do
-  (_, _, ebuilds) <- loadValidatedEbuildsFull opts
+loadValidatedEbuilds rt = do
+  (_, _, ebuilds, _) <- loadValidatedEbuildsFull rt
   pure ebuilds
 
+-- | Load the config, apply the run's priority, then validate the overlay
+-- and collect its ebuilds.
 loadValidatedEbuildsFull ::
   (WithLog env Message m, MonadIO m) =>
-  Options ->
-  m (OverlayConfig, FilePath, [Ebuild])
-loadValidatedEbuildsFull opts = do
+  Runtime ->
+  m (OverlayConfig, FilePath, [Ebuild], EffectivePriority)
+loadValidatedEbuildsFull rt = do
+  let opts = rtOptions rt
   cfg <- loadConfigOrDie (optConfig opts)
+  priority <- applyPriorityOrDie rt cfg
   -- Local name must not shadow the OverlayConfig field accessor `overlayPath`.
   let resolvedOverlay = case optOverlayPath opts of
         Just p -> p
@@ -1240,7 +1253,7 @@ loadValidatedEbuildsFull opts = do
   liftIO (collectEbuilds resolvedOverlay) >>= \case
     Left err -> dieError (discoveryErrorMessage err)
     Right [] -> dieError ("no ebuilds found in overlay: " <> resolvedOverlay)
-    Right ebuilds -> pure (cfg, resolvedOverlay, ebuilds)
+    Right ebuilds -> pure (cfg, resolvedOverlay, ebuilds, priority)
 
 emitReport :: (WithLog env Message m, MonadIO m) => UpdateReport -> m ()
 emitReport report = do
@@ -1280,6 +1293,20 @@ loadConfigOrDie override = do
   case result of
     Left err -> dieError (configErrorMessage err)
     Right cfg -> pure cfg
+
+-- | Apply the command-line and config priority to every manager thread
+-- right after the config load, before any workload process starts.
+applyPriorityOrDie :: (WithLog env Message m, MonadIO m) => Runtime -> OverlayConfig -> m EffectivePriority
+applyPriorityOrDie rt cfg = do
+  applied <-
+    liftIO $
+      applyCommandPriority
+        productionThreadOps
+        (rtMetrics rt)
+        (usingLoggerT (rtLogger rt) . logWarning)
+        (rtPriority rt)
+        (configPriority cfg)
+  either (dieError . T.unpack) pure applied
 
 dieError :: (WithLog env Message m, MonadIO m) => String -> m a
 dieError msg = do
